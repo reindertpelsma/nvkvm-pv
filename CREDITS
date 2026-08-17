@@ -1,0 +1,70 @@
+# Credits and Acknowledgements
+
+## gVisor — nvproxy
+
+This project is heavily derived from and inspired by the **nvproxy** package
+in the [gVisor](https://github.com/google/gvisor) project:
+
+    pkg/sentry/devices/nvproxy/
+    pkg/abi/nvgpu/
+
+gVisor is copyright 2018–2024 The gVisor Authors and licensed under the
+Apache License 2.0. See: https://github.com/google/gvisor/blob/master/LICENSE
+
+### Specific derivations
+
+The following components in nvkvm are directly derived from gVisor nvproxy:
+
+| nvkvm file                          | gVisor origin                                      |
+|-------------------------------------|----------------------------------------------------|
+| src/abi/nvgpu.h                     | pkg/abi/nvgpu/frontend.go, nvgpu.go                |
+| src/abi/uvm.h                       | pkg/abi/nvgpu/uvm.go                               |
+| src/qemu/nvkvm_objects.c            | pkg/sentry/devices/nvproxy/object.go               |
+| src/qemu/nvkvm_frontend.c           | pkg/sentry/devices/nvproxy/frontend.go             |
+| src/qemu/nvkvm_dispatch.c           | pkg/sentry/devices/nvproxy/version.go (dispatch)   |
+| src/qemu/nvkvm_mmap_host.c          | pkg/sentry/devices/nvproxy/frontend_mmap.go        |
+| tests/integration/test_basic.py     | test/gpu/smoke_test.go, pytorch_test.go            |
+| tests/integration/test_adversarial.py | pkg/sentry/devices/nvproxy/nvproxy_test.go       |
+
+### Key design concepts adapted from nvproxy
+
+- **Versioned ioctl dispatch tables**: maps ioctl NR → handler per driver version
+- **Pointer translation pattern**: zero guest VAs, substitute host pointers before
+  calling real ioctl, restore before returning to guest (gVisor: `rmAllocInvoke`,
+  `rmControlInvoke`)
+- **RM object dependency graph**: parent/child and arbitrary dependency tracking
+  with transitive cascade-free on parent free (gVisor: `objFree`, `prependFreedLockedRecursive`)
+- **OS descriptor memory pinning**: pin application pages, mmap+mremap to get
+  contiguous host mapping, pass to driver (gVisor: `rmAllocOSDescriptor`)
+- **FD translation**: guest fd → host fd mapping per session
+  (gVisor: `HasFrontendFD`, `GetFrontendFD`/`SetFrontendFD`)
+- **Isolation model**: per-process session with independent client/object scope,
+  no cross-session handle reuse (gVisor: per-container nvproxy instance)
+- **Test patterns**: ABI struct size parity, handler capability checking,
+  cascade-free tests, security boundary tests
+
+### Primary reference files read
+
+```
+pkg/sentry/devices/nvproxy/nvproxy.go         — global state, device registration
+pkg/sentry/devices/nvproxy/frontend.go        — ioctl dispatch, rmAlloc/rmControl/rmFree
+pkg/sentry/devices/nvproxy/frontend_mmap.go   — mmap passthrough
+pkg/sentry/devices/nvproxy/uvm.go             — UVM ioctl handling
+pkg/sentry/devices/nvproxy/object.go          — RM object lifecycle
+pkg/sentry/devices/nvproxy/version.go         — ABI versioning
+pkg/sentry/devices/nvproxy/nvproxy_test.go    — unit tests (handler/capability model)
+pkg/abi/nvgpu/frontend.go                     — ioctl structs
+pkg/abi/nvgpu/uvm.go                          — UVM structs
+g3doc/proposals/nvidia_driver_proxy.md        — design rationale
+```
+
+## NVIDIA open-gpu-kernel-modules
+
+NVIDIA ABI struct definitions (ioctl numbers, parameter structs) derived from:
+https://github.com/NVIDIA/open-gpu-kernel-modules
+
+Licensed under MIT and GPL-2.0 (dual-licensed). Header files used:
+- `src/common/sdk/nvidia/inc/nvos.h`
+- `kernel-open/common/inc/nv-ioctl.h`
+- `kernel-open/common/inc/nv-ioctl-numbers.h`
+- `kernel-open/nvidia-uvm/uvm_ioctl.h`

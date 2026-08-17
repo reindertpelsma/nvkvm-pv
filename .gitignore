@@ -1,0 +1,28 @@
+# build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+# ...but *.mod is a kernel build artifact rule (nvkvm-guest.mod) and it also
+# matches go.mod, which is how tests/abi_parity/go.mod got left behind when this
+# repo was extracted — the Go package then had no module file and `go test`
+# refused to run it at all.
+!go.mod
+!go.sum
+*.symvers
+*.order
+.tmp_versions/
+Module.symvers
+modules.builtin
+modules.order
+*.so
+# generated: stub binary embedded for QEMU
+src/stub/nvkvm_stub
+src/stub/nvkvm_stub_bin.h
+# editor
+.vscode/
+.idea/
+# local secrets — never commit
+*.key
+.env
