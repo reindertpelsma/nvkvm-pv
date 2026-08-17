@@ -122,6 +122,64 @@ static struct proc_dir_entry *proc_gpu_bdf_dir;
 static struct kobject *sys_nvidia_kobj;
 static struct kobject *sys_nvidia_uvm_kobj;
 
+/*
+ * Static stubs.
+ *
+ * Several files under /proc/driver/nvidia are probed by tooling that treats
+ * ENOENT as "no NVIDIA driver present" — nvidia-container-toolkit and most
+ * install/detection scripts among them.  Only `version` carries information
+ * worth forwarding from the host; the rest exist so a probe finds a file of the
+ * right shape, and deliberately disclose nothing about the host:
+ *
+ *   registry        empty.  The host's is empty too, but even when it is not it
+ *                   holds host-wide driver parameter overrides.
+ *   suspend         the real file is 0644 and is a COMMAND file: writing to it
+ *   suspend_depth   drives host power transitions.  Ours are 0444 and inert.
+ *                   Read content matches the host's so a parser sees valid
+ *                   options, but nothing here can act on the host.
+ *   warnings/README static NVIDIA boilerplate, byte-identical on every install.
+ *   patches/README  likewise.
+ *   capabilities/   directories only, no entries.  The real tree exposes MIG and
+ *                   fabric-imex topology; an empty tree is the honest answer for
+ *                   a guest with no MIG, and discloses no host topology.
+ */
+static int stub_show(struct seq_file *m, void *v)
+{
+	(void)v;
+	seq_puts(m, (const char *)m->private);
+	return 0;
+}
+
+static int stub_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, stub_show, pde_data(inode));
+}
+
+static const struct proc_ops stub_pops = {
+	.proc_open    = stub_open,
+	.proc_read    = seq_read,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+};
+
+static char stub_registry[]   = "";
+static char stub_suspend[]    = "suspend hibernate resume\n";
+static char stub_suspend_dep[] = "default modeset uvm\n";
+static char stub_warn_readme[] =
+	"The NVIDIA graphics driver tries to detect potential problems\n"
+	"with the host system and warns about them using the system's\n"
+	"logging mechanisms. Important warning message are also logged\n"
+	"to dedicated text files in this directory.\n";
+static char stub_patch_readme[] =
+	"The NVIDIA graphics driver's kernel interface files can be\n"
+	"patched to improve compatibility with new Linux kernels or to\n"
+	"fix bugs in these files. When applied, each official patch\n"
+	"provides a short text file with a short description of itself\n"
+	"in this directory.\n";
+
+static struct nvkvm_hostfile_entry version_entry = {
+	.name = "version", .file_id = NVKVM_HFILE_NVIDIA_VERSION,
+};
 static struct nvkvm_hostfile_entry params_entry = {
 	.name = "params", .file_id = NVKVM_HFILE_NVIDIA_PARAMS,
 };
@@ -143,6 +201,42 @@ int nvkvm_hostfile_init(void)
 	if (!proc_create_data("params", 0444, proc_nvidia_dir,
 			      &hostfile_pops, &params_entry))
 		pr_warn("nvkvm: failed to create /proc/driver/nvidia/params\n");
+
+	/* Forwarded from the host: the NVRM banner.  The driver version and build
+	 * date are already known to the guest (nvidia-smi reports them, and guest
+	 * userspace must be version-matched to work at all), so this discloses
+	 * nothing new — but its absence makes detection tooling conclude there is
+	 * no driver. */
+	if (!proc_create_data("version", 0444, proc_nvidia_dir,
+			      &hostfile_pops, &version_entry))
+		pr_warn("nvkvm: failed to create /proc/driver/nvidia/version\n");
+
+	/* Inert stubs — see the comment above stub_show(). */
+	proc_create_data("registry", 0444, proc_nvidia_dir,
+			 &stub_pops, stub_registry);
+	proc_create_data("suspend", 0444, proc_nvidia_dir,
+			 &stub_pops, stub_suspend);
+	proc_create_data("suspend_depth", 0444, proc_nvidia_dir,
+			 &stub_pops, stub_suspend_dep);
+	{
+		struct proc_dir_entry *d;
+
+		d = proc_mkdir("warnings", proc_nvidia_dir);
+		if (d)
+			proc_create_data("README", 0444, d, &stub_pops,
+					 stub_warn_readme);
+		d = proc_mkdir("patches", proc_nvidia_dir);
+		if (d)
+			proc_create_data("README", 0444, d, &stub_pops,
+					 stub_patch_readme);
+		/* Directories only: an empty capabilities tree is the honest
+		 * answer for a guest with no MIG, and leaks no host topology. */
+		d = proc_mkdir("capabilities", proc_nvidia_dir);
+		if (d) {
+			proc_mkdir("mig", d);
+			proc_mkdir("gpu0", d);
+		}
+	}
 
 	proc_gpus_dir = proc_mkdir("gpus", proc_nvidia_dir);
 	if (proc_gpus_dir) {

@@ -13,9 +13,32 @@ QEMU_PREFIX="/opt/qemu-nvkvm"
 REPO_ROOT="$(realpath "$(dirname "$0")/..")"
 
 # ── Guard: already built ───────────────────────────────────────────────────
-if [ -x "$QEMU_PREFIX/bin/qemu-system-x86_64" ]; then
+# --force rebuilds even when the binary exists.  You need this after editing
+# anything under src/qemu/ or src/common/: the guard below is what makes a plain
+# re-run a no-op, so without it you will test the OLD device against NEW guest
+# code and get a confusing mismatch (a new NVKVM_HFILE_* id, for instance, comes
+# back as "Invalid argument" because the old binary's whitelist rejects it).
+# The QEMU source tree and ninja build dir are reused, so a forced rebuild is
+# incremental — minutes, not the full ~20.
+NVKVM_FORCE=0
+for arg in "$@"; do
+    case "$arg" in
+        -f|--force) NVKVM_FORCE=1 ;;
+        -h|--help)
+            echo "usage: $0 [--force]"
+            echo "  --force   rebuild even if the binary already exists"
+            exit 0 ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
+
+if [ -x "$QEMU_PREFIX/bin/qemu-system-x86_64" ] && [ "$NVKVM_FORCE" -eq 0 ]; then
     echo "INFO: $QEMU_PREFIX/bin/qemu-system-x86_64 already exists — skipping build."
+    echo "INFO: re-run with --force to rebuild (needed after editing src/qemu/)."
     exit 0
+fi
+if [ "$NVKVM_FORCE" -eq 1 ]; then
+    echo "INFO: --force given; rebuilding over the existing install."
 fi
 
 echo "=== nvkvm QEMU build ==="

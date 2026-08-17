@@ -2744,6 +2744,23 @@ static bool nvkvm_hfile_path(uint32_t id, uint32_t gpu_index,
 	switch (id) {
 	case NVKVM_HFILE_NVIDIA_PARAMS:
 		return g_strlcpy(buf, "/proc/driver/nvidia/params", buflen) < buflen;
+	case NVKVM_HFILE_NVIDIA_VERSION:
+		/* The NVRM banner.  Read by nvidia-container-toolkit and by most
+		 * driver-detection scripts; without it they conclude no driver is
+		 * present.  It carries the driver version and build date, which the
+		 * guest already knows -- nvidia-smi reports the same version, and the
+		 * guest userspace has to be version-matched to the host to work at
+		 * all -- so this discloses nothing new.
+		 *
+		 * Deliberately NOT exposed, because these do disclose host state the
+		 * guest has no need for:
+		 *   registry            host-wide driver parameter overrides
+		 *   capabilities/       MIG and fabric-imex topology
+		 *   suspend[_depth]     host power state, and writable
+		 *   warnings/           host driver warnings
+		 * Add a case here only with the same argument: the guest already had
+		 * the information, or it cannot act on it. */
+		return g_strlcpy(buf, "/proc/driver/nvidia/version", buflen) < buflen;
 	case NVKVM_HFILE_NVIDIA_INITSTATE:
 		return g_strlcpy(buf, "/sys/module/nvidia/initstate", buflen) < buflen;
 	case NVKVM_HFILE_NVIDIA_UVM_INITSTATE:

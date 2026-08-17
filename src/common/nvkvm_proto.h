@@ -691,7 +691,8 @@ enum nvkvm_host_file {
 	NVKVM_HFILE_NVIDIA_NUMA_STATUS    = 4, /* /proc/driver/nvidia/gpus/<bdf>/numa_status */
 	NVKVM_HFILE_NVIDIA_INFORMATION    = 5, /* /proc/driver/nvidia/gpus/<bdf>/information */
 	NVKVM_HFILE_NVIDIA_REG_BASE       = 6, /* /proc/driver/nvidia/gpus/<bdf>/registry */
-	NVKVM_HFILE_MAX                   = 7,
+	NVKVM_HFILE_NVIDIA_VERSION        = 7, /* /proc/driver/nvidia/version      */
+	NVKVM_HFILE_MAX                   = 8,
 };
 
 #define NVKVM_HFILE_MAX_SIZE   8192
