@@ -21,7 +21,7 @@ rented for this run advertised 580.95.05 and all three came up on 575.51.03.
 | 550 | 550.40.53–565 | **550.54.14** | no | **newly booted, 28/28** |
 | 570 | 570–575 | — | yes (575.51.03) | already covered |
 | 580 | 580–595 | **580.95.05, 595.84** | no | **newly booted** |
-| 610 | 610+ | **610.43.02** | no | **newly booted, 27/28** |
+| 610 | 610+ | **610.43.02** | no | **newly booted, 28/28** (27/28 before the cmdType-60 fix) |
 
 Four profile rows went from "measured but never booted" to booted: **545, 550,
 580, 610**. The 580 row was exercised at both ends of its range (580.95.05 and
@@ -81,8 +81,14 @@ Ubuntu 24.04 / kernel 6.8, 4 vCPU / 16 GB, repo on 9p at `/mnt/nvkvm`.
 | `egl_context` | EGL 1.5 | EGL 1.5 | EGL 1.5 | EGL 1.5 | EGL 1.5 |
 | `gl_renderer` | ES 3.2 NVIDIA 545.23.08 | ES 3.2 NVIDIA 550.54.14 | ES 3.2 NVIDIA 580.95.05 | ES 3.2 NVIDIA 595.84 | ES 3.2 NVIDIA 610.43.02 |
 | `gl_renderer_is_nvidia` | PASS | PASS | PASS | PASS | PASS |
-| `gl_draw_pixel_check` | PASS | PASS | PASS | **FAIL 0x8CDD** | **FAIL 0x8CDD** |
-| **verdict** | **28/28 PASS** | **28/28 PASS** | **28/28 PASS** | **27/28** | **27/28** |
+| `gl_draw_pixel_check` | PASS | PASS | PASS | **FAIL 0x8CDD** ‡ | **FAIL 0x8CDD** ‡ |
+| **verdict** | **28/28 PASS** | **28/28 PASS** | **28/28 PASS** | **27/28** ‡ | **27/28** ‡ |
+
+‡ **superseded 2026-08-17.** These two cells are what the suite printed on the
+day, and they are left as printed. The cause was nvkvm's own NVKMS allowlist,
+not the driver; with `cmdType=60` allowed, both rows PASS
+`gl_draw_pixel_check` and 610.43.02 is a clean **28/28**. See
+[Attribution](#attribution-nvkvm-not-nvidia--measured-2026-08-17).
 
 Exact strings, since a renderer check that does not print its renderer is not
 worth much:
@@ -97,6 +103,15 @@ worth much:
 
 ## Finding: offscreen GL rendering is broken on 595 and 610
 
+> **RESOLVED 2026-08-17 — this was ours, and it is fixed.** The cause is
+> nvkvm's NVKMS inner-cmdType allowlist, not the NVIDIA driver. The same probe
+> passes on bare metal on 595.84 and 610.43.02; it failed only inside a guest,
+> because branches 595+ issue NVKMS `cmdType=60` and
+> `src/qemu/nvkvm_nvkms_allowlist.h` — captured on a 575-era session — denied
+> it. Allowing 60 takes the 610 guest from 27/28 to **28/28**. Full evidence in
+> [Attribution](#attribution-nvkvm-not-nvidia--measured-2026-08-17) below; the
+> original observation is kept as written.
+
 `gl_draw_pixel_check` allocates its own 64×64 FBO, clears it, draws a triangle
 over the lower-left half, and asserts the triangle colour inside and the clear
 colour outside. On 595.84 and 610.43.02 the FBO never becomes complete:
@@ -106,8 +121,9 @@ gl_draw_pixel_check  FAIL  FBO incomplete: status=0x8CDD
 ```
 
 `0x8CDD` is `GL_FRAMEBUFFER_UNSUPPORTED`. A standalone probe in the guest
-confirmed it is not an attachment-format issue — **every** configuration fails
-identically, with `glGetError() == GL_NO_ERROR` at every step:
+(since committed as `tests/integration/fbo_formats_probe.c`) confirmed it is not
+an attachment-format issue — **every** configuration fails identically, with
+`glGetError() == GL_NO_ERROR` at every step:
 
 | colour attachment | `glCheckFramebufferStatus` |
 |---|---|
@@ -140,7 +156,9 @@ attempted on the same box and abandoned: purging 595 left its DKMS modules in
 what apt had installed, and forcing them out left the box with no buildable
 driver. Not pursued further — it is a nice-to-have for bisecting, not a profile
 row. Anyone bisecting this should `dkms remove` the outgoing driver *before*
-purging its packages.
+purging its packages. (That advice is correct and was followed on 2026-08-17;
+the swap works cleanly now. 590 is still not reachable, for an unrelated
+packaging reason — see "590.48.01: DID NOT RUN" below.)
 
 Everything else about GL is healthy on the broken drivers — the EGL device
 binds, the context is current, and `GL_RENDERER` is the NVIDIA GPU. Only
@@ -153,6 +171,151 @@ Worth knowing because a suite that stopped at `GL_RENDERER` — which is what
 "offscreen EGL works" has meant so far — reports these two drivers as fully
 working.
 
+## Attribution: nvkvm, not NVIDIA — measured 2026-08-17
+
+The obvious reading of the table above is "NVIDIA broke offscreen GL in 595".
+That reading is wrong, and one cheap test kills it: **run the same probe on
+bare metal, no VM, on a host running the suspect driver.**
+
+### The decisive test
+
+Ubuntu 22.04 box, RTX 3060, kernel 6.8.0-59-generic. Host driver swapped in
+place to 610.43.02 (`nvidia-driver-610-open=610.43.02-0ubuntu0.22.04.1`;
+`nvidia-smi` on 610 renames its banner fields to `KMD Version` / `CUDA UMD
+Version`, which breaks hardcoded parsers). `tests/validate.sh` run **on the
+host**, no guest anywhere:
+
+```
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  610.43.02  Release Build
+
+  PASS gl_renderer            GL_RENDERER='NVIDIA GeForce RTX 3060/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 610.43.02'
+  PASS gl_draw_pixel_check    64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear
+
+ TOTAL 28   PASS 26   FAIL 1   SKIP 1
+```
+
+The one FAIL is `guest_module` (`nvkvm_guest not in lsmod`), which is the
+correct answer outside a guest, and `abi_profile` SKIPs for the same reason.
+The five-format probe from the table above
+(`tests/integration/fbo_formats_probe.c`), on that same bare-metal host:
+
+```
+FBO| GL_RGBA/GL_UNSIGNED_BYTE texture   status=0x8CD5 GL_FRAMEBUFFER_COMPLETE  glGetError alloc=0x0 attach=0x0 after=0x0
+FBO| GL_RGBA8 renderbuffer              status=0x8CD5 GL_FRAMEBUFFER_COMPLETE  glGetError alloc=0x0 attach=0x0 after=0x0
+FBO| GL_RGB565 renderbuffer             status=0x8CD5 GL_FRAMEBUFFER_COMPLETE  glGetError alloc=0x0 attach=0x0 after=0x0
+FBO| GL_RGBA4 renderbuffer              status=0x8CD5 GL_FRAMEBUFFER_COMPLETE  glGetError alloc=0x0 attach=0x0 after=0x0
+FBO| GL_RGB5_A1 renderbuffer            status=0x8CD5 GL_FRAMEBUFFER_COMPLETE  glGetError alloc=0x0 attach=0x0 after=0x0
+SUMMARY| 0/5 configurations incomplete
+```
+
+595.84 on bare metal (second box, also RTX 3060, also 22.04/6.8.0-59): same,
+`gl_draw_pixel_check PASS`, `SUMMARY| 0/5 configurations incomplete`. 575.51.03
+on bare metal before the swap: same. **Every driver passes on bare metal.**
+
+Then the guest was booted on that first box — same box, same GPU, same
+610.43.02, same probe source compiled from the same file:
+
+```
+SUMMARY| 5/5 configurations incomplete
+```
+
+Bare metal 0/5, guest 5/5, one machine, one driver, one afternoon. That is the
+A/B, and it says the guest path is what breaks it.
+
+### Root cause
+
+The guest's QEMU log during the failing probe contains exactly one refusal:
+
+```
+nvkvm: DENY nvkms cmdType=60
+```
+
+That is `src/qemu/nvkvm_nvkms_allowlist.h`, whose allowed set was *captured
+from a live 575-era Vulkan/EGL session*. A list captured on one driver branch
+expires when the branch moves. An instrumented QEMU build, logging every NVKMS
+wrapper (allowed or denied) rather than only the denials, shows what the 610
+ICD actually issues for one offscreen context:
+
+```
+NVKMS cmdType=0  size=1440 paramsz=16     (ALLOC_DEVICE)
+NVKMS cmdType=17 size=152  paramsz=16     (REGISTER_SURFACE)
+NVKMS cmdType=60 size=32   paramsz=16     <-- denied
+NVKMS cmdType=18 size=16   paramsz=16     (UNREGISTER_SURFACE)
+```
+
+Three things worth reading off that trace. `60` lands *between* register and
+unregister, so it acts on a just-registered surface. It carries a 32-byte
+params block. And `61`/`62` — the two "query-class (captured)" entries the
+allowlist was built around — are **not issued at all** by the 610 ICD, so 60 is
+less an addition to that pair than its replacement.
+
+Denying it returns `-EACCES` / `NV_ERR_NOT_SUPPORTED`. The ICD's response is to
+unregister the surface and report every colour format unrenderable — which is
+precisely the observed symptom, including the clean `glGetError()`: from GL's
+point of view nothing errored, there is simply no renderable format.
+
+The command is **not named** here because it cannot be. The DKMS tree ships
+only `nvidia-modeset/nvkms-ioctl.h` (the wrapper struct); the
+`NvKmsIoctlCommand` enum that would name 60 is not in any shipped header.
+`grep -rn NVKMS_IOCTL_ALLOC_DEVICE /usr/src/nvidia-610.43.02/` returns nothing.
+
+### The fix, and what it measures
+
+One line — `case 60:` in `nvkvm_nvkms_allowlist.h`. Rebuild QEMU, reboot the
+guest, nothing else changed:
+
+| | 610.43.02 guest | 595.84 guest |
+|---|---|---|
+| five-format probe, before | 5/5 incomplete | 5/5 incomplete |
+| five-format probe, after | **0/5 incomplete** | **0/5 incomplete** |
+| `gl_draw_pixel_check`, before | FAIL 0x8CDD | FAIL 0x8CDD |
+| `gl_draw_pixel_check`, after | **PASS** | **PASS** |
+| `validate.sh`, after | **28/28 PASS** | `gl_draw_pixel_check` PASS † |
+
+† the 595 box scores 25/28 for an unrelated reason: its host was built from a
+component package subset that omits `libnvidia-ptxjitcompiler`, so
+`cuda_ptx_jit` FAILs `rc=221 CUDA_ERROR_JIT_COMPILER_NOT_FOUND` and the two
+kernel checks SKIP behind it. That is a defect in how that box was provisioned,
+not in nvkvm, and it is orthogonal to GL. The 610 box, provisioned from the
+full driver metapackage, is a clean 28/28.
+
+So both "broken" rows in the table above are now **28/28-capable**, and the
+610 row's `27/28` is stale.
+
+### Correction to the denied-commands table
+
+The 595.84 row below reads "none observed". That is wrong — it was measured
+before the GL probe ran, and NVKMS denials only appear once something creates
+an offscreen context. Re-measured on a 595.84 guest, the *only* denial during
+the failing probe is `nvkms cmdType=60`, and after the fix 595.84 shows the
+same three RM control denials 610 does (`0x00730102`, `0x2080019f`,
+`0x2080220b`). Those three are genuinely harmless: on 610 the guest scores
+28/28 *with them still being denied* — the DENY count goes 12 → 4 and every
+remaining one is an RM control.
+
+### 590.48.01: DID NOT RUN — not installable from the Ubuntu archive
+
+The bisection between 580.95.05 (works) and 595.84 (broke) was attempted and
+abandoned again, for a different reason than last time. The DKMS trap noted
+below is real and is now handled — `dkms remove <module>/<version> --all`
+before purging the packages, and the outgoing driver goes away cleanly. The
+wall is packaging: in jammy, `nvidia-driver-590-open` (590.48.01-0ubuntu0.22.04.4)
+is a metapackage whose *only* dependency is `nvidia-driver-595-open`, and every
+590 component package pulls its 595 counterpart alongside itself. Installing
+the components explicitly and pinned still ends with both trees on disk, 595
+winning the vendor links, and `nvidia-smi` reporting **595.84**:
+
+```
+Depends: nvidia-driver-595-open
+...
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.84
+```
+
+A standalone 590.48.01 needs NVIDIA's `.run` installer, not apt. Since the
+attribution no longer depends on it — the bug is ours, and it is fixed on both
+595 and 610 — this was dropped rather than pursued. Anyone who wants the exact
+NVIDIA release that introduced cmdType 60 should start from the `.run`.
+
 ## Control commands denied by the allowlist
 
 Non-fatal on every row (all workloads still passed), but new branches issue
@@ -163,11 +326,21 @@ control commands the allowlist was generated without:
 | 545.23.08 | `0x00730102`, `0x00730138` |
 | 550.54.14 | `0x00730102` |
 | 580.95.05 | none observed |
-| 595.84 | none observed |
+| 595.84 | ~~none observed~~ → `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
 | 610.43.02 | `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
 
-610 is the notable one: three distinct RM control commands plus an NVKMS
-command type. None of them broke CUDA, Vulkan or GL bring-up.
+The 595.84 row was re-measured 2026-08-17; "none observed" was taken before
+anything created an offscreen GL context, which is the only thing that reaches
+NVKMS. 595 and 610 in fact deny the same four things.
+
+The three RM control commands are non-fatal — 610.43.02 scores 28/28 with all
+three still denied. **The NVKMS `cmdType=60` denial was not**: it is what broke
+offscreen GL on both branches, and it is now allowed. See
+[Attribution](#attribution-nvkvm-not-nvidia--measured-2026-08-17). The general
+lesson stands and is worth stating plainly: *an allowlist captured on one
+driver branch is a time bomb on the next one*, and its failures do not
+necessarily look like denials — this one surfaced four layers up as
+`GL_FRAMEBUFFER_UNSUPPORTED` with `glGetError()` clean.
 
 ## Profiles not reached, and why
 
@@ -223,6 +396,27 @@ Three, all in repo scripts rather than the ABI table, and all of the same shape
 Both `stage_guest_libs.sh` bugs only bite when a guest is re-staged across a
 driver change, which is exactly what building this matrix required, and exactly
 what anyone adding a new driver version will do.
+
+Two more turned up on 2026-08-17 while chasing the FBO failure, both in the
+rebuild loop rather than in nvkvm itself:
+
+4. **`run_remote_test.sh rebuild` cannot actually rebuild QEMU.** It copies
+   `src/qemu/*.c`/`*.h` into `/opt/qemu-src/hw/misc/` and runs `ninja`, but
+   skips steps 4–5 of `build_qemu.sh` — staging `src/abi` + `src/common`
+   headers into `hw/misc/nvkvm_inc/` and rewriting the `../../src/{common,abi}/`
+   includes to point at them. The build stops at
+   `fatal error: ../../src/common/nvkvm_proto.h: No such file or directory`.
+   Anyone iterating on the QEMU side must replicate those two steps, or the
+   ninja run fails and (worse, if the failure is not read) the *old* binary
+   stays installed and the experiment silently measures nothing.
+
+5. **`pkill -f '[q]emu-system-x86_64'` kills the shell that runs it** whenever
+   the rest of that command line also mentions the binary — e.g. the
+   `cp /opt/qemu-src/build/qemu-system-x86_64 ...` that usually follows it. The
+   bracket trick only hides the *pattern* from itself; the literal path later
+   in the same command line still matches, pkill sees its own remote shell, and
+   everything after the pkill silently never runs. Put the pkill on a line of
+   its own, in its own SSH invocation.
 
 The suite caught all three by checking values rather than exit codes: the
 llvmpipe fallback showed up as

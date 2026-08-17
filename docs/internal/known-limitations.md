@@ -132,6 +132,51 @@ platform present is in the same paragraph of the matrix:
 Under investigation. Do not assume a screenshot proves anything here — check the
 client's `GL_RENDERER`.
 
+### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
+
+Kept here because the diagnosis is the useful part, and because the shape of
+this bug will recur.
+
+For a while, creating an offscreen framebuffer inside a guest failed on
+595.84 and 610.43.02. Every colour attachment format returned
+`GL_FRAMEBUFFER_UNSUPPORTED` (`0x8CDD`) from `glCheckFramebufferStatus`, with
+`glGetError()` clean at every step. Context creation and `GL_RENDERER` were
+healthy (`GL_VENDOR='NVIDIA Corporation'`,
+`GL_VERSION='OpenGL ES 3.2 NVIDIA 610.43.02'`), so any check that stopped at
+the renderer string reported these drivers as fully working. It tracked the
+driver version and not the ABI profile row — 595.84 and 580.95.05 take the
+same profile row on the same box and disagree — which made "NVIDIA regressed
+it in 595" the natural conclusion.
+
+**It was ours.** The test that settled it took half an hour: install 610.43.02
+on a host and run `tests/validate.sh` on bare metal, no VM. It passes —
+`gl_draw_pixel_check PASS`, and a five-format probe reports
+`0/5 configurations incomplete`. 595.84 on bare metal passes too. Booting a
+guest on that *same box, same GPU, same driver* gives `5/5 incomplete`.
+
+The cause is `src/qemu/nvkvm_nvkms_allowlist.h`. Its allowed set was captured
+live from a 575-era Vulkan/EGL session, and branches 595+ issue an NVKMS inner
+`cmdType=60` that the capture never saw. Default-deny returned `-EACCES` /
+`NV_ERR_NOT_SUPPORTED`; the ICD's response was to unregister the surface and
+declare every format unrenderable. Allowing `60` takes the 610.43.02 guest from
+27/28 to **28/28**, and fixes 595.84 identically. Full trace, including the
+`0/1440 → 17/152 → 60/32 → 18/16` NVKMS sequence and why cmdType 60 cannot be
+named from any shipped header, is in
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md).
+
+Three things to carry forward:
+
+- **An allowlist captured on one driver branch expires on the next.** This one
+  was three branches stale. `61`/`62`, the entries it was built around, are not
+  even issued by the 610 ICD any more.
+- **A denied ioctl does not necessarily surface as a denial.** This one surfaced
+  four layers up as a GL enum, with no GL error set and nothing in guest
+  `dmesg`. The only evidence was one line in the QEMU log.
+- **"Works on bare metal?" is the cheapest question in this project.** It costs
+  one box and separates *our* bugs from the driver's, and `tests/validate.sh`
+  runs unmodified on bare hardware (`guest_module` FAILs, which is the correct
+  answer there, and `abi_profile` SKIPs).
+
 ### PRIME-imported buffers are backed by guest pages, not host memory
 
 `nvkvm_gem_get_sg_table()` (`src/guest/nvkvm_drm.c:132-155`) lazily allocates
@@ -188,6 +233,16 @@ The NVKMS allowlist calls itself interim:
 `/dev/nvidia-modeset` is host-global and privileged. If you do not need
 Vulkan/EGL, run compute-only (`graphics=off` on the QEMU device, `make
 NVKVM_GRAPHICS=0` for the guest module) and the device never opens.
+
+The allowlist now carries a third unnamed entry, `cmdType=60`, added
+2026-08-17 because branches 595+ need it for any offscreen render target (see
+the fixed entry above). Like 61/62 it is required in practice and unaudited in
+principle: the `NvKmsIoctlCommand` enum that would name it is not in any
+shipped header — the DKMS tree ships only the wrapper struct in
+`nvidia-modeset/nvkms-ioctl.h`. That makes the interim status *more* pressing,
+not less: the allowlist is now three commands wide on evidence that amounts to
+"a real ICD issued it", and it has already been shown to break silently and
+non-locally when a driver branch moves.
 
 ---
 
