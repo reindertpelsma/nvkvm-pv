@@ -1,5 +1,31 @@
 # Audit: guest pointers at the host boundary
 
+## Status at a glance
+
+Severities below are **as first assessed**. Four findings have since been fixed;
+the rest are open. Read this table before the detail.
+
+| finding | severity as found | status |
+|---|---|---|
+| U-1 | re-rated LOW | not a defect — see the maintainer note |
+| U-2 | CRITICAL | **fixed** — rewrite sites fail closed (`nvkvm_stub.c`, `U-2` markers) |
+| U-3 | CRITICAL | **fixed** — default-deny gate on `NVOS32.function`, only `ALLOC_SIZE` allowed |
+| U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
+| U-5 | HIGH | open |
+| U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
+| U-7 … U-13 | HIGH → UNKNOWN | open |
+| U-14 | by design | documented for completeness |
+
+A separate defect found while fixing U-6 — the host driver writing past a
+`g_malloc` on every `REGISTER_CHANNEL` — is in the addendum at the end, and is
+also fixed.
+
+**This document names locations, not techniques.** It deliberately contains no
+working bypass procedure for anything still open. The source is public, so it
+offers an attacker nothing the code does not; it exists so a reader can judge the
+boundary honestly rather than take a claim on trust.
+
+
 **Scope.** The architectural invariant *"no guest pointer is ever forwarded to the host NVIDIA
 driver."* Static analysis only — no GPU, no VM, no execution. Every classification below cites
 `file:line` in this tree, or in NVIDIA open-gpu-kernel-modules tag `575.51.03` where the question
@@ -245,7 +271,7 @@ never OOB)"* — and the "never OOB" half is what fails: the record framing is v
 
 ---
 
-### U-2 — CRITICAL — `RM_CONTROL`, `RM_ALLOC` and the NVKMS wrapper forward their pointer verbatim when `aux_size == 0` (socket path)
+### U-2 — FIXED — fail-closed — `RM_CONTROL`, `RM_ALLOC` and the NVKMS wrapper forward their pointer verbatim when `aux_size == 0` (socket path)
 
 **Fields:** `NVOS54.params@16`; `NVOS21.pAllocParms@16`; `NVOS64.pAllocParms@16`;
 `NvKmsIoctlParams.address@8` (`src/common/nvkvm_proto.h:112`).
@@ -271,7 +297,7 @@ invites a wrong conclusion and asks to be checked "before relying on this long-t
 
 ---
 
-### U-3 — CRITICAL — `NV_ESC_RM_VID_HEAP_CONTROL` with `function = NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR` pins a guest VA
+### U-3 — FIXED — function gate — `NV_ESC_RM_VID_HEAP_CONTROL` with `function = NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR` pins a guest VA
 
 **Field:** `NVOS32_PARAMETERS.data.AllocOsDesc.descriptor` (`NvP64`, inside the 144-byte union at
 offset 40), with `data.AllocOsDesc.limit` as the length.
@@ -310,7 +336,7 @@ enumerate offsets.
 
 ---
 
-### U-4 — CRITICAL — the inner-pointer marshalling for all 15 handled control commands is bypassable by a guest-chosen count
+### U-4 — FIXED — fail-closed — the inner-pointer marshalling for all 15 handled control commands is bypassable by a guest-chosen count
 
 **Fields:** `grInfoList` / `fbInfoList` / `busInfoList` / `biosInfoList` / `surfaceInfoList` /
 `capsTbl` / `engineList` / `classList` (offset 8 of the inner params); the three
@@ -362,7 +388,7 @@ subset the ring accepts.
 
 ---
 
-### U-5 — HIGH — `paramsSize` / `allocParmsSize` are never bounded against `aux_size`
+### U-5 — OPEN — HIGH — `paramsSize` / `allocParmsSize` are never bounded against `aux_size`
 
 **Fields:** `NVOS54.paramsSize@24`; `NVOS64.allocParmsSize@32`.
 
@@ -382,7 +408,7 @@ buffer moved into the aux slot, and nothing re-tied them.
 
 ---
 
-### U-6 — HIGH — UVM virtual-address ranges are interpreted in **QEMU's** address space, unvalidated
+### U-6 — FIXED — VA ownership table — UVM virtual-address ranges are interpreted in **QEMU's** address space, unvalidated
 
 **Fields:** `base`/`length` or `requestedBase`/`length` on 15 of the 31 schema rows; plus
 `UVM_MIGRATE_PARAMS.semaphoreAddress`.
@@ -417,7 +443,7 @@ verified layout" justification for skipping the size floor is stale.
 
 ---
 
-### U-7 — HIGH — `NVOS64.pRightsRequested` is never overwritten by anything
+### U-7 — OPEN — HIGH — `NVOS64.pRightsRequested` is never overwritten by anything
 
 **Field:** `NVOS64_PARAMETERS.pRightsRequested`, offset 24 (`src/abi/nvgpu.h:184`).
 **Driver dereferences it:** yes. `src/nvidia/src/kernel/rmapi/alloc_free.c:155-180`:
@@ -436,7 +462,7 @@ itself.
 
 ---
 
-### U-8 — MEDIUM — `NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS` (0x127) writes `gpuCount²` words to a guest VA
+### U-8 — OPEN — MEDIUM — `NV0000_CTRL_CMD_SYSTEM_GET_P2P_CAPS` (0x127) writes `gpuCount²` words to a guest VA
 
 **Fields:** `busPeerIds`, `busEgmPeerIds` (both `NvP64`).
 **Driver dereferences them:** yes, and writes. `embedded_param_copy.c:570-604`: two
@@ -456,7 +482,7 @@ accepts it, but `must_punt` does not exclude it either — see U-1).
 
 ---
 
-### U-9 — MEDIUM — `ISOLATE_CMD_MMAP` / `ISOLATE_CMD_MUNMAP` take a raw guest VA
+### U-9 — OPEN — MEDIUM — `ISOLATE_CMD_MMAP` / `ISOLATE_CMD_MUNMAP` take a raw guest VA
 
 **Field:** `isolate_cmd_mmap.gva`, `isolate_cmd_munmap.gva`.
 
@@ -483,7 +509,7 @@ class, and it is listed so it is not lost. It is also partly by design: the `OS_
 
 ---
 
-### U-10 — MEDIUM — DRM `PRIME_FENCE_CONTEXT_CREATE` (nr 0x45) has two pointers; neither is handled
+### U-10 — OPEN — MEDIUM — DRM `PRIME_FENCE_CONTEXT_CREATE` (nr 0x45) has two pointers; neither is handled
 
 **Fields:** `import_mem_nvkms_params_ptr` (offset 16) and `event_nvkms_params_ptr` (offset 32) in
 `drm_nvidia_prime_fence_context_create_params` (ogkm `kernel-open/nvidia-drm/nvidia-drm-ioctl.h:199-213`).
@@ -498,7 +524,7 @@ are unaffected.
 
 ---
 
-### U-11 — MEDIUM — frontend pointer fields at offsets the generic rewrite does not reach
+### U-11 — OPEN — MEDIUM — frontend pointer fields at offsets the generic rewrite does not reach
 
 All of these are zeroed by the guest and by nothing on the host. Grouped because the analysis is
 identical.
@@ -517,7 +543,7 @@ guarantees that, not because a walk is demonstrated.
 
 ---
 
-### U-12 — MEDIUM — `NV0000_CTRL_CMD_GPU_GET_ID_INFO` (0x202) `szName`
+### U-12 — OPEN — MEDIUM — `NV0000_CTRL_CMD_GPU_GET_ID_INFO` (0x202) `szName`
 
 **Field:** `NV0000_CTRL_GPU_GET_ID_INFO_PARAMS.szName` (`NvP64`).
 
@@ -527,7 +553,7 @@ A short, low-entropy, attacker-positioned write inside the isolate.
 
 ---
 
-### U-13 — UNKNOWN severity — `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` (0x2080110b) `pRunlistPreemptEvent`
+### U-13 — OPEN — UNKNOWN severity — `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` (0x2080110b) `pRunlistPreemptEvent`
 
 `NvP64`, documented in the header as "KEVENT handle for Async HW runlist preemption". It is not in
 `embedded_param_copy.c`, which suggests RM treats it as an opaque handle rather than a user pointer —

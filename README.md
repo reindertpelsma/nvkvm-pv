@@ -37,8 +37,8 @@ doorbell page, so there is no per-operation cost to pay:
 
 - **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
   security boundary you should rely on. We audited it ourselves and published what
-  we found — 14 unenforced paths, with severities and containment — in
-  [the pointer audit](docs/internal/audit-guest-pointers.md).
+  we found — 14 unenforced paths with severities and containment, four since fixed
+  — in [the pointer audit](docs/internal/audit-guest-pointers.md).
   **Do not put untrusted tenants behind it.**
 - **Not a virtual monitor.** There is no scanout path. A GPU-accelerated desktop
   runs inside the guest and frames leave by *capture*, not by a virtual display.
