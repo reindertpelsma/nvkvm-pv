@@ -93,6 +93,37 @@ faults on a *store* into a mapping derived from it. That points at the mapping
 handed to userspace rather than the memslot itself — the GPA is right, what is
 mapped on top of it is not.
 
+## IMPORTANT reframing — it is not a hang
+
+`error: kvm run failed Bad address` is `KVM_RUN` returning **EFAULT**. QEMU exits
+the VM, dumps the CPU state, and that vCPU stops. So:
+
+- the guest is **not** deadlocked and CUDA is **not** spinning
+- guest SSH dies because the VM stopped making progress, not because of GPU load
+- QEMU's residual CPU% is other threads, not a spin
+
+**Do not look for a lock.** Look for why KVM cannot use the host userspace address
+behind a guest GPA. EFAULT from `KVM_RUN` means the GPA resolved to a
+`userspace_addr` in the memslot that the kernel could not access — a hole in the
+window mapping, an unmapped extent, or an extent whose `MAP_FIXED` install did not
+land where the memslot claims.
+
+The fault is a **store from CPL=3** into a window-derived mapping, so the suspect
+is what `nvkvm_mmap.c` hands to guest userspace on top of the window, not the
+memslot registration (which succeeds — `sparse_ensure: 64 GiB at GPA=0x6000000000
+slot=64`).
+
+### Also ruled out
+- **Host overcommit / map limits.** Laptop and a working vast host are BOTH
+  `vm.overcommit_memory=0`; `max_map_count` is *higher* on the laptop (1048576 vs
+  65530). Not the differentiator.
+- **`DENY ctrl cmd 0x00730102`** is `NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS`. The
+  Blackwell bring-up saw the identical DENY and still scored 28/28, and a refused
+  ioctl cannot produce an EFAULT on a store. Benign. (Worth *synthesizing*
+  guest-side anyway — display topology is owned by `nvkvm_kms.c`, so forwarding it
+  asks the host's RM about the host's real heads, which is the wrong answer by
+  construction. Housekeeping, not a fix.)
+
 ## Next step
 
 Trace where the guest blocks on first sustained window access. `nvkvm_sparse_ensure()`
