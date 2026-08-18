@@ -1642,9 +1642,7 @@ static void ring_qva_unmap(void *nv, uint64_t ring_gpa, void *qva,
 	if (qva == MAP_FAILED || !qva)
 		return;
 	if (nv && ring_gpa) {
-		mmap(qva, region, PROT_READ | PROT_WRITE,
-		     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE | MAP_FIXED,
-		     -1, 0);
+		nvkvm_window_restore_anon(qva, region);
 		nvkvm_sparse_gpa_free((VirtIONvgpu *)nv, ring_gpa, region);
 	} else {
 		munmap(qva, region);
@@ -1698,9 +1696,7 @@ int nvkvm_isolate_ring_setup(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 			if (qva == MAP_FAILED) {
 				/* Restore the anon backing we clobbered so the
 				 * window stays fully mapped for KVM. */
-				mmap(target, region, PROT_READ | PROT_WRITE,
-				     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
-				     MAP_FIXED, -1, 0);
+				nvkvm_window_restore_anon(target, region);
 				nvkvm_sparse_gpa_free((VirtIONvgpu *)nv,
 						      ring_gpa, region);
 				ring_gpa = 0;

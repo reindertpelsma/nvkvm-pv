@@ -83,6 +83,61 @@ fs_clone3_run:
 	retq
 	.size	fs_clone3_run, .-fs_clone3_run
 
+	.globl	fs_clone_run
+	.type	fs_clone_run, @function
+/*
+ * fs_clone_run — legacy clone(2) fallback for fs_clone3_run.
+ *
+ * Caller signature:
+ *   long fs_clone_run(unsigned long flags, void *child_stack_top,
+ *                     void (*entry)(void *arg), void *arg);
+ *
+ * Needed because Docker's default seccomp profile answers clone3 with
+ * ENOSYS (deliberately, so that glibc falls back to clone) — a freestanding
+ * stub that only knows clone3 cannot spawn a single worker there, and every
+ * GPU ioctl then fails.  See nvkvm_stub.c's worker spawn loop.
+ *
+ * clone(2) on x86_64 is syscall 56 with
+ *   rdi = flags, rsi = child_stack, rdx = ptid, r10 = ctid, r8 = tls
+ * and, unlike clone3, the CHILD returns from the syscall with rax = 0 and
+ * rsp = child_stack (which must therefore be the TOP of the region, already
+ * 16-byte aligned).  The child-side sequence below is identical to the
+ * clone3 path's.
+ */
+fs_clone_run:
+	pushq	%r12
+	pushq	%r13
+
+	movq	%rdx, %r12		/* entry_fn  */
+	movq	%rcx, %r13		/* entry_arg */
+
+	/* rdi = flags and rsi = child_stack are already in place. */
+	xorq	%rdx, %rdx		/* ptid = NULL */
+	xorq	%r10, %r10		/* ctid = NULL */
+	xorq	%r8,  %r8		/* tls  = NULL */
+	movq	$56, %rax		/* SYS_clone   */
+	syscall
+
+	testq	%rax, %rax
+	js	.Lc_parent		/* negative errno in parent */
+	jnz	.Lc_parent		/* tid > 0 in parent        */
+
+	/* CHILD: rsp = child_stack (we supplied it), r12 = entry, r13 = arg. */
+	xorq	%rbp, %rbp		/* stop unwinders here */
+	movq	%r13, %rdi
+	callq	*%r12
+	/* If entry returns, exit just this thread. */
+	movq	$60, %rax		/* SYS_exit */
+	xorq	%rdi, %rdi
+	syscall
+	ud2
+
+.Lc_parent:
+	popq	%r13
+	popq	%r12
+	retq
+	.size	fs_clone_run, .-fs_clone_run
+
 	/* Mark the stack non-executable so the static binary has no
 	 * PT_GNU_STACK with X bit set. */
 	.section .note.GNU-stack,"",@progbits

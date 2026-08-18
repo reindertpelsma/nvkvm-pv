@@ -149,20 +149,34 @@ whitelist.
 
 ## Guest-physical address windows
 
-Three fixed windows above any realistic guest RAM ceiling
-(`src/qemu/virtio_nvgpu.h:81-103`):
+Three windows, placed as one contiguous block above guest RAM. The **sizes** are
+compile-time constants; the **base is not** — it is computed at device realize
+from the host's and the guest's physical address width
+(`nvkvm_gpa_layout_compute`, `src/qemu/nvkvm_mmap_host.c`). It used to be fixed
+at 1 TB / 1.5 TB / 2 TB, which needs 41-42 physical address bits and so was
+unaddressable on any consumer laptop — see
+[Host CPU](supported-drivers.md#host-cpu) for the requirement and the failure it
+caused.
 
-| window | base | size | purpose |
+| window | offset in block | size | purpose |
 |---|---|---|---|
-| shared memory | 1 TB (`0x10000000000`) | 16 MiB | ioctl parameter slots |
-| legacy mmap window | 1.5 TB (`0x18000000000`) | 16 GiB | `/dev/nvidia-uvm` mappings |
-| sparse window | 2 TB (`0x20000000000`) | 128 GiB | everything else |
+| shared memory | `+0` | 16 MiB (1 GiB slot) | ioctl parameter slots |
+| legacy mmap window | `+1 GiB` | 16 GiB | `/dev/nvidia-uvm` mappings |
+| sparse window | `+17 GiB` | 128 GiB | everything else |
 
-The sparse window's real base is the firmware-assigned address of a 128 GiB
+The block is packed against the top of the addressable GPA space:
+`base = 2^min(host_bits, guest_bits) - 145 GiB`, subject to staying above guest
+RAM. On a 39-bit laptop with a 6 GiB guest that is `0x5bc0000000` (367 GiB); on
+a 46-bit server it is about 63.86 TiB. Both are logged at realize.
+
+The sparse window's real base is still the firmware-assigned address of a
 prefetchable 64-bit MMIO BAR with no backing, registered purely so QEMU/PCI
-reserve the range (`src/qemu/virtio_nvgpu_pci.c:29-42`,
-`src/qemu/nvkvm_mmap_host.c:184-224`). The constant above is only a fallback for
-a transport without the BAR.
+reserve the range (`src/qemu/virtio_nvgpu_pci.c`, `src/qemu/nvkvm_mmap_host.c`).
+Because firmware allocates 64-bit BARs downward from the top of the address
+space and the computed sparse base is also `2^bits - 128 GiB`, the two normally
+land on exactly the same address. The computed base is the fallback when there
+is no BAR, and also the override when firmware places the BAR somewhere that
+crosses the GPA limit or overlaps the shm/mmap regions.
 
 Config space advertises **one** window spanning both the mmap and sparse ranges,
 including the unbacked gap between them. That is safe because the guest only

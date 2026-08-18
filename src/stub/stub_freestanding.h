@@ -195,6 +195,20 @@ struct clone_args {
 extern long fs_clone3_run(struct clone_args *args, size_t args_sz,
 			  void (*entry)(void *arg), void *arg);
 
+/*
+ * fs_clone_run — legacy clone(2) spawn, used only when clone3 is unavailable.
+ *
+ * Docker's default seccomp profile returns ENOSYS for clone3 on purpose, so
+ * that libcs fall back to clone(2).  Without this fallback the stub cannot
+ * start a worker inside a stock container and every forwarded ioctl fails.
+ *
+ * Unlike fs_clone3_run, child_stack_top is the TOP of the region (clone(2)
+ * takes the stack pointer directly, not base+size) and must be 16-byte
+ * aligned.  Same flags, same entry contract.
+ */
+extern long fs_clone_run(unsigned long flags, void *child_stack_top,
+			 void (*entry)(void *arg), void *arg);
+
 /* ── Tiny formatted output (no libc) ────────────────────────────────────────
  *
  * Supports just the conversions the stub actually uses:

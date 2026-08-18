@@ -79,13 +79,32 @@
 #define VIRTIO_ID_NVGPU             50
 
 /*
- * Guest-physical address layout for shared memory and mmap window.
- * These live above any realistic guest RAM ceiling (1 TB and 1.5 TB),
- * so they never alias guest RAM regardless of VM size.
+ * Guest-physical address layout for the nvkvm GPA windows.
+ *
+ * PORTABILITY — host MAXPHYADDR.  These three bases used to be compile-time
+ * constants at 1 TB (shm), 1.5 TB (legacy mmap window) and 2 TB (sparse
+ * window).  A GPA of 1 TB needs 41 physical address bits; the sparse window's
+ * top (2 TB + 128 GiB) needs 42.  Every host this was developed on was a
+ * server part (EPYC / Xeon, 46-52 bits), so it always fit.  Consumer mobile
+ * Intel ships **39 bits** — an i7-11800H tops out at 512 GiB of GPA — and
+ * there KVM rejects the very first window at device realize:
+ *
+ *   KVM_SET_USER_MEMORY_REGION failed, slot=6, start=0x10000000000,
+ *                               size=0x1000000: Invalid argument
+ *   kvm_set_phys_mem: error registering slot: Invalid argument
+ *
+ * and QEMU dies before the guest boots.  (Note the failing slot is the 16 MiB
+ * *shm* region, not the sparse window: the whole fixed layout is affected, not
+ * just the big one.)
+ *
+ * The bases are therefore computed at realize time from the *narrower* of the
+ * host's and the guest's physical address width — see nvkvm_gpa_layout_compute
+ * in nvkvm_mmap_host.c.  Only the sizes stay compile-time.
  */
-#define NVKVM_SHM_GPA_BASE          0x10000000000ULL  /* 1 TB  */
-#define NVKVM_MMAP_WIN_GPA_BASE     0x18000000000ULL  /* 1.5 TB */
-#define NVKVM_MMAP_WIN_SIZE         (16ULL << 30)     /* 16 GB window */
+
+/* Legacy per-mmap window (still used by /dev/nvidia-uvm mappings, which cannot
+ * be MAP_FIXED into the sparse window). */
+#define NVKVM_MMAP_WIN_SIZE         (16ULL << 30)     /* 16 GiB window */
 
 /*
  * Sparse GPA window: a large VMM-backed GPA range used for memory-ioctl
@@ -99,8 +118,57 @@
  *
  * Lives above the existing 16 GB mmap window.
  */
-#define NVKVM_SPARSE_GPA_BASE       0x20000000000ULL  /* 2 TB  */
-#define NVKVM_SPARSE_GPA_SIZE       (128ULL << 30)    /* 128 GB sparse window */
+#define NVKVM_SPARSE_GPA_SIZE       (128ULL << 30)    /* 128 GiB sparse window */
+
+/*
+ * Floor for a deliberate shrink.  The sparse window is large because CUDA fires
+ * >1500 individual mmaps during a single cuCtxCreate and the single-memslot
+ * window is what keeps those off KVM's ~509-memslot budget.  What matters is
+ * therefore the window's *total byte capacity*, not the mmap count: 16 GiB
+ * still admits >1500 mappings averaging ~10 MiB, which covers a cuCtxCreate on
+ * a consumer card.  We never go below this silently — see the shrink log line
+ * and the "cannot fit" error in nvkvm_gpa_layout_compute.
+ */
+#define NVKVM_SPARSE_GPA_SIZE_MIN   (16ULL << 30)     /* 16 GiB floor */
+
+/* A whole 1 GiB slot is reserved for the shm region (which is only
+ * NVKVM_SHM_NSLOTS * slot_size, ~16 MiB) so every later region in the block
+ * stays 1 GiB aligned regardless of the slot geometry. */
+#define NVKVM_SHM_GPA_SLOT          (1ULL << 30)      /* 1 GiB */
+
+/* Minimum alignment of the whole block (the old base was 1 TiB aligned; the
+ * requirement is "at least 1 GiB"). */
+#define NVKVM_GPA_ALIGN             (1ULL << 30)      /* 1 GiB */
+
+/*
+ * Resolved GPA layout, computed once at device realize.
+ *
+ * The three regions are placed as one contiguous block:
+ *
+ *   block_base + 0                     shm       (1 GiB slot, ~16 MiB used)
+ *   block_base + 1 GiB                 mmap_win  (NVKVM_MMAP_WIN_SIZE)
+ *   block_base + 1 GiB + mmap_size     sparse    (sparse_size)
+ *
+ * The block is placed top-down: as high as it can go while still ending at or
+ * below 2^bits, which keeps it as far as possible from guest RAM and from the
+ * bottom-up 64-bit PCI BAR allocator.
+ */
+struct nvkvm_gpa_layout {
+	uint64_t shm_base;
+	uint64_t mmap_base;
+	uint64_t mmap_size;
+	uint64_t sparse_base;
+	uint64_t sparse_size;
+	uint64_t block_base;
+	uint64_t block_size;
+	uint64_t limit;        /* 1 << bits — one past the last usable GPA   */
+	uint64_t ram_top;      /* conservative top of guest RAM              */
+	uint64_t floor;        /* lowest GPA the block is allowed to start at */
+	uint32_t host_bits;    /* host MAXPHYADDR (CPUID 0x80000008)         */
+	uint32_t guest_bits;   /* guest MAXPHYADDR (CPU "phys-bits" prop)    */
+	uint32_t bits;         /* the binding minimum of the two            */
+	bool     shrunk;       /* sparse window was reduced to make it fit   */
+};
 
 /* ── Object graph (mirrors gVisor nvproxy object.go) ────────────────────── */
 
@@ -248,7 +316,7 @@ typedef struct VirtIONvgpu {
 	pthread_mutex_t     mmap_win_lock;
 
 	/*
-	 * Sparse GPA window — see NVKVM_SPARSE_GPA_BASE in the comment block
+	 * Sparse GPA window — see struct nvkvm_gpa_layout in the comment block
 	 * above.  sparse_gpa_base / sparse_size are GPA-space; sparse_vmm_va
 	 * is the MAP_NORESERVE anon region in QEMU's mm that backs the slot.
 	 * sparse_cur is the next free GPA offset; sparse_kvm_slot is the
@@ -280,10 +348,19 @@ typedef struct VirtIONvgpu {
 	 * that returns the BAR's current GPA (0 until the guest programs it).
 	 * The raw KVM memslot is installed lazily once the base is known
 	 * (nvkvm_sparse_ensure); if no BAR/callback, we fall back to the fixed
-	 * NVKVM_SPARSE_GPA_BASE so a transport without the BAR still works.
+	 * computed gpa.sparse_base so a transport without the BAR still works.
 	 */
 	uint64_t          (*window_base_get)(void *opaque);
 	void               *window_base_opaque;
+
+	/*
+	 * Resolved GPA layout for this VM (host/guest MAXPHYADDR derived).
+	 * Filled once in virtio_nvgpu_device_realize before any region is
+	 * registered; every window base below comes from here rather than from
+	 * a compile-time constant.  The PCI proxy also reads gpa.sparse_size to
+	 * size its reservation BAR, so a shrunk window shrinks the BAR too.
+	 */
+	struct nvkvm_gpa_layout gpa;
 
 	/* Session table */
 	TAILQ_HEAD(, nvkvm_session) sessions;
@@ -480,7 +557,27 @@ void nvkvm_obj_add_dep(struct nvkvm_client *client,
 void nvkvm_set_kvm_vm_fd(int fd);
 
 /*
- * Sparse GPA window helpers.  See NVKVM_SPARSE_GPA_BASE.
+ * Physical-address-width probes and GPA window placement (nvkvm_mmap_host.c).
+ *
+ * nvkvm_host_phys_bits(): the host's MAXPHYADDR, from CPUID leaf 0x80000008
+ * EAX[7:0], falling back to /proc/cpuinfo's "address sizes" line.  0 if
+ * neither could be read.
+ *
+ * nvkvm_guest_phys_bits(): the guest's MAXPHYADDR, read generically off the
+ * first CPU's "phys-bits" QOM property (x86 resolves this at CPU realize, and
+ * -cpu host/max default it to the host's width).  0 if unavailable.
+ *
+ * nvkvm_gpa_layout_compute(): resolve the whole window block.  Returns true on
+ * success; on false, errbuf holds a human-readable explanation naming the host
+ * width, the guest RAM top, the window size and what would have fit.
+ */
+uint32_t nvkvm_host_phys_bits(void);
+uint32_t nvkvm_guest_phys_bits(void);
+bool     nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
+				  char *errbuf, size_t errlen);
+
+/*
+ * Sparse GPA window helpers.  See struct nvkvm_gpa_layout.
  *
  * nvkvm_sparse_init: called once at device realize.  mmaps the VMM-side
  * window as MAP_NORESERVE | MAP_ANONYMOUS and installs the KVM region.
@@ -501,6 +598,18 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
 /* #80/H-1: return a GPA extent to the window free-list (recycled by alloc). */
 void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size);
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
+
+/*
+ * nvkvm_window_restore_anon(qva, len): re-establish anonymous MAP_NORESERVE
+ * backing over an extent of the sparse window after the fd mapping that
+ * occupied it is torn down.  The window is covered by a single KVM memslot,
+ * so its VA must stay claimed for the slot's whole lifetime -- a munmap here
+ * would leave the memslot pointing at an unmapped page, and the next guest
+ * access to that GPA fails KVM_RUN with EFAULT (unrecoverable, not an MMIO
+ * exit).  Returns 0 on success, -errno on failure (logged loudly: a silent
+ * failure would reintroduce exactly that hole).
+ */
+int nvkvm_window_restore_anon(void *qva, size_t len);
 
 /* #80/H-2: tear down a session — close its handles, free its RM object graph,
  * fd list, and the struct itself.  Called when the session's last isolate is

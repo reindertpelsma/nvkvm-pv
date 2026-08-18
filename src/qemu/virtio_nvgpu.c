@@ -1290,19 +1290,72 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	nv->admin_gpu_fd = -1;
 	nv->admin_state  = 0;
 
-	/* Register shared memory as a KVM memory region at NVKVM_SHM_GPA_BASE.
+	/*
+	 * Resolve the GPA window layout for THIS VM before registering anything.
+	 *
+	 * These bases used to be compile-time constants at 1 TB / 1.5 TB / 2 TB,
+	 * which need 41-42 physical address bits.  Consumer mobile Intel has 39
+	 * (512 GiB), and KVM rejects the first memslot outright, killing QEMU
+	 * before the guest boots.  nvkvm_gpa_layout_compute() derives the base
+	 * from the narrower of the host's and the guest's MAXPHYADDR and places
+	 * the block against the top of that space, above guest RAM.
+	 */
+	{
+		char lerr[768];
+
+		if (!nvkvm_gpa_layout_compute(&nv->gpa, lerr, sizeof(lerr))) {
+			error_setg(errp, "%s", lerr);
+			return;
+		}
+
+		/* Auditable: the decision, its inputs and its result, in one
+		 * line each.  This is the record that says why the window
+		 * landed where it did on this particular host. */
+		info_report("nvkvm: GPA width: host MAXPHYADDR %u bits, guest "
+			    "MAXPHYADDR %u bits -> using %u bits (limit 0x%llx, "
+			    "%llu GiB)",
+			    nv->gpa.host_bits, nv->gpa.guest_bits, nv->gpa.bits,
+			    (unsigned long long)nv->gpa.limit,
+			    (unsigned long long)(nv->gpa.limit >> 30));
+		info_report("nvkvm: GPA windows: guest RAM top ~0x%llx (%llu GiB), "
+			    "floor 0x%llx -> block base 0x%llx size %llu GiB "
+			    "[shm 0x%llx, mmap 0x%llx +%llu GiB, sparse 0x%llx "
+			    "+%llu GiB]%s",
+			    (unsigned long long)nv->gpa.ram_top,
+			    (unsigned long long)(nv->gpa.ram_top >> 30),
+			    (unsigned long long)nv->gpa.floor,
+			    (unsigned long long)nv->gpa.block_base,
+			    (unsigned long long)(nv->gpa.block_size >> 30),
+			    (unsigned long long)nv->gpa.shm_base,
+			    (unsigned long long)nv->gpa.mmap_base,
+			    (unsigned long long)(nv->gpa.mmap_size >> 30),
+			    (unsigned long long)nv->gpa.sparse_base,
+			    (unsigned long long)(nv->gpa.sparse_size >> 30),
+			    nv->gpa.shrunk ? " (SPARSE WINDOW SHRUNK)" : "");
+		if (nv->gpa.shrunk)
+			warn_report("nvkvm: the sparse GPA window was reduced to "
+				    "%llu GiB (from %llu GiB) to fit this VM's "
+				    "%u-bit address space; a single cuCtxCreate "
+				    "issues >1500 mmaps, so very large GPU "
+				    "working sets may exhaust it",
+				    (unsigned long long)(nv->gpa.sparse_size >> 30),
+				    (unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
+				    nv->gpa.bits);
+	}
+
+	/* Register shared memory as a KVM memory region at gpa.shm_base.
 	 * The guest reads shm_base/shm_len from the virtio config space and maps
 	 * this region to access ioctl parameter slots with zero virtio copies. */
 	memory_region_init_ram_ptr(&nv->shm_mr, OBJECT(dev), "virtio-nvgpu-shm",
 				   nv->shm_size, nv->shm_base);
 	memory_region_add_subregion(get_system_memory(),
-				    NVKVM_SHM_GPA_BASE, &nv->shm_mr);
+				    nv->gpa.shm_base, &nv->shm_mr);
 	nv->shm_mr_registered = true;
-	nv->shm_gpa = NVKVM_SHM_GPA_BASE;
+	nv->shm_gpa = nv->gpa.shm_base;
 
 	/* Mmap window: 16 GB GPA range for GPU memory mappings */
-	nv->mmap_win_gpa  = NVKVM_MMAP_WIN_GPA_BASE;
-	nv->mmap_win_size = NVKVM_MMAP_WIN_SIZE;
+	nv->mmap_win_gpa  = nv->gpa.mmap_base;
+	nv->mmap_win_size = nv->gpa.mmap_size;
 	nv->mmap_win_cur  = 0;
 
 	/* Sparse GPA window — used by the memory-ioctl path for guest-VA
@@ -1310,19 +1363,20 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	 * a single big KVM region. */
 	nv->sparse_kvm_slot = -1;
 	/*
-	 * #55 interim safety: the GPA windows (shm @1TB, mmap @1.5TB, sparse
-	 * @2TB) squat on fixed GPAs above guest RAM.  That holds for any normal
-	 * config, but a guest configured with >=1 TB RAM would overlap the shm
-	 * window and silently corrupt — fail loudly instead.  The real fix is to
-	 * expose the window as a 64-bit PCI BAR so guest firmware assigns/reserves
-	 * the range (docs/design/gpa_window_pci_bar.md).
+	 * Belt-and-braces overlap guard.  nvkvm_gpa_layout_compute() already
+	 * refuses to place the block below its floor (guest RAM top + room for
+	 * the reservation BAR), so this should be unreachable — assert it
+	 * anyway rather than silently corrupting guest RAM if the floor
+	 * calculation ever drifts from the machine's real layout.
 	 */
-	if (current_machine && current_machine->ram_size >= NVKVM_SHM_GPA_BASE) {
+	if (nv->gpa.block_base < nv->gpa.ram_top) {
 		error_setg(errp,
-			"nvkvm: guest RAM (0x%" PRIx64 ") overlaps the fixed GPA "
-			"windows at 0x%llx; reduce RAM or migrate to the PCI-BAR "
-			"window (#55)", (uint64_t)current_machine->ram_size,
-			(unsigned long long)NVKVM_SHM_GPA_BASE);
+			"nvkvm: GPA window block at 0x%llx would overlap guest "
+			"RAM (top ~0x%llx, ram_size 0x%" PRIx64 "); reduce guest "
+			"RAM or run on a host with more physical address bits",
+			(unsigned long long)nv->gpa.block_base,
+			(unsigned long long)nv->gpa.ram_top,
+			(uint64_t)(current_machine ? current_machine->ram_size : 0));
 		return;
 	}
 	if (nvkvm_sparse_init(nv) < 0)
@@ -1330,7 +1384,7 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 			"memory-ioctl path will degrade\n");
 
 	/* Populate virtio config space so the guest can locate both regions */
-	nv->config_space.shm_base     = cpu_to_le64(NVKVM_SHM_GPA_BASE);
+	nv->config_space.shm_base     = cpu_to_le64(nv->gpa.shm_base);
 	nv->config_space.shm_len      = cpu_to_le64(nv->shm_size);
 	/* The guest validates every host-returned GPA against this window.
 	 * Two GPA windows are in play:
@@ -1343,10 +1397,9 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	 * guest only ever validates GPAs QEMU actually returns (always inside
 	 * one of the two sub-windows), so accepting the superset — including the
 	 * unbacked gap between them — is safe. */
-	nv->config_space.mmap_win_gpa = cpu_to_le64(NVKVM_MMAP_WIN_GPA_BASE);
+	nv->config_space.mmap_win_gpa = cpu_to_le64(nv->gpa.mmap_base);
 	nv->config_space.mmap_win_len = cpu_to_le64(
-		(NVKVM_SPARSE_GPA_BASE + NVKVM_SPARSE_GPA_SIZE) -
-		NVKVM_MMAP_WIN_GPA_BASE);
+		(nv->gpa.sparse_base + nv->gpa.sparse_size) - nv->gpa.mmap_base);
 
 	/* Advertise the graphics capability to the guest (QEMU dictates). */
 	nv->config_space.flags = cpu_to_le64(

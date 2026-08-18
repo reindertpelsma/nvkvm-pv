@@ -39,7 +39,11 @@ DECLARE_INSTANCE_CHECKER(VirtIONvgpuPCI, VIRTIO_NVGPU_PCI,
  * MMIO region, so these accessors are never invoked in practice.
  */
 #define NVKVM_BAR_WINDOW       2
-#define NVKVM_BAR_WINDOW_SIZE  (128ULL << 30)
+/* Size is NOT a constant any more: it follows the vdev's resolved sparse
+ * window (nv->gpa.sparse_size), which realize may have shrunk to fit a narrow
+ * host's physical address space.  A BAR larger than the window it reserves
+ * would make firmware reserve — and possibly fail to place — a range we never
+ * use.  NVKVM_SPARSE_GPA_SIZE remains the unshrunk default. */
 
 struct VirtIONvgpuPCI {
 	VirtIOPCIProxy parent_obj;
@@ -104,9 +108,15 @@ static void virtio_nvgpu_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 
 	/* #55: MMIO reservation BAR (no RAM, no memslot — avoids the probe's
 	 * collision).  Firmware assigns its GPA; QEMU/PCI then reserve that
-	 * 128 GiB range for us. */
+	 * range for us.  Size comes from the vdev's realize-time GPA layout
+	 * (qdev_realize above has already run), so on a narrow host the BAR
+	 * shrinks together with the window instead of asking firmware for a
+	 * 128 GiB range that cannot be placed. */
+	uint64_t bar_size = dev->vdev.gpa.sparse_size;
+	if (bar_size == 0)
+		bar_size = NVKVM_SPARSE_GPA_SIZE;
 	memory_region_init_io(&dev->window_bar, OBJECT(dev), &nvkvm_winbar_ops,
-			      dev, "nvkvm-gpa-window", NVKVM_BAR_WINDOW_SIZE);
+			      dev, "nvkvm-gpa-window", bar_size);
 	pci_register_bar(&vpci_dev->pci_dev, NVKVM_BAR_WINDOW,
 			 PCI_BASE_ADDRESS_SPACE_MEMORY |
 			 PCI_BASE_ADDRESS_MEM_TYPE_64 |

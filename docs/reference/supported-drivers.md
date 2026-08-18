@@ -158,6 +158,143 @@ Known gaps, neither of which blocks CUDA:
 - Untested beyond two GPUs, and NVLink/P2P between guest GPUs was not exercised
   at all.
 
+## Host CPU
+
+**This is the first hardware requirement nvkvm has that is about the CPU rather
+than the GPU.** It exists because the GPA windows have to live somewhere the
+host's page tables can actually address.
+
+nvkvm places three guest-physical windows above guest RAM — a 16 MiB shared
+memory region, a 16 GiB legacy mmap window and a 128 GiB sparse window, 145 GiB
+of GPA span in total. Those used to sit at fixed addresses (1 TB, 1.5 TB and
+2 TB), which needs **41-42 physical address bits**. Every host this project was
+developed on was a server part, so it always fit:
+
+| host | CPU | physical address bits | max GPA |
+|---|---|---|---|
+| laptop | Core i7-11800H (Tiger Lake-H) | 39 | 512 GiB |
+| rental | Xeon E5-2673 v4 (Broadwell) | 46 | 64 TiB |
+| rental | EPYC 8224P (Zen 4) | 52 | 4 PiB |
+
+39 bits is standard for consumer **mobile** Intel, and on such a host KVM
+rejected the very first window at device realize:
+
+```
+qemu-system-x86_64: kvm_set_user_memory_region: KVM_SET_USER_MEMORY_REGION failed,
+                    slot=6, start=0x10000000000, size=0x1000000: Invalid argument
+kvm_set_phys_mem: error registering slot: Invalid argument
+```
+
+and QEMU died before the guest booted. (Note the failing slot is the 16 MiB
+*shm* region, not the big sparse window — the whole fixed layout was affected.)
+
+### What the requirement actually is
+
+The window base is no longer a constant. At device realize nvkvm reads
+
+- the **host** MAXPHYADDR from CPUID leaf `0x80000008` EAX bits 7:0
+  (`/proc/cpuinfo`'s "address sizes" line is only a fallback — it can be
+  filtered by container runtimes), and
+- the **guest** MAXPHYADDR from the CPU's `phys-bits` QOM property, which is
+  what `-cpu host` copies from the host and what QEMU may cap below it,
+
+takes the **narrower of the two**, and places the whole 145 GiB block against
+the top of that space, above guest RAM. `base + span <= 2^bits` is checked, not
+just `base`.
+
+The practical requirement is therefore:
+
+> **The host needs enough physical address bits that 145 GiB of window fits
+> above the guest's RAM.** In round numbers: **39 bits (512 GiB) is enough for
+> any guest up to ~230 GiB of RAM**, which covers every consumer laptop. 46+
+> bits, as on any server part, is enough for a 1 TB-RAM guest with room to
+> spare.
+
+Measured placements:
+
+| host bits | guest RAM | resulting window base | sparse window |
+|---|---|---|---|
+| 39 | 6 GiB | `0x5bc0000000` (367 GiB) | 128 GiB, full |
+| 46 | 16 GiB | `0xffbc0000000` (63.86 TiB) | 128 GiB, full |
+| 46 | 1 TB (hypothetical) | 63.86 TiB | 128 GiB, full |
+
+### When it does not fit
+
+If the block will not fit, the sparse window is **halved** — deliberately, with
+a `warn_report` naming the new size — down to a floor of **16 GiB**. The window
+is large because a single `cuCtxCreate` fires >1500 individual mmaps and the
+single-memslot window is what keeps those off KVM's ~509-memslot budget; what
+matters is the window's total byte capacity, and 16 GiB still admits >1500
+mappings averaging ~10 MiB. A shrink is logged as:
+
+```
+nvkvm: sparse GPA window 128 GiB does not fit below the 512 GiB GPA limit
+       with 260 GiB of guest RAM — halving to 64 GiB
+```
+
+Below that floor realize **fails with a clear error** rather than starting with
+a window that would break at the 1500th mmap:
+
+```
+nvkvm: the GPA windows do not fit in this VM's physical address space.
+       host MAXPHYADDR 36 bits, guest MAXPHYADDR 36 bits -> usable GPA limit
+       64 GiB. Guest RAM top is 12 GiB, so the windows must start above 32 GiB,
+       and the smallest layout nvkvm supports needs 33 GiB (1 GiB shm + 16 GiB
+       mmap window + 16 GiB sparse window) — 1 GiB more than there is room for.
+       Reduce guest RAM to at most 10 GiB, or run on a host with more physical
+       address bits.
+```
+
+A 36-bit host (64 GiB of GPA, the x86-64 architectural minimum) cannot run
+nvkvm at any useful guest size. No such host has been tested — no part that old
+carries a supported GPU.
+
+### Checking your host
+
+```bash
+grep -m1 'address sizes' /proc/cpuinfo     # "39 bits physical, 48 bits virtual"
+```
+
+The chosen layout is logged at realize on every run, so the decision is always
+auditable:
+
+```
+nvkvm: GPA width: host MAXPHYADDR 39 bits, guest MAXPHYADDR 39 bits -> using 39 bits (limit 0x8000000000, 512 GiB)
+nvkvm: GPA windows: guest RAM top ~0x280000000 (10 GiB), floor 0x4000000000 -> block base 0x5bc0000000 size 145 GiB [shm 0x5bc0000000, mmap 0x5c00000000 +16 GiB, sparse 0x6000000000 +128 GiB]
+```
+
+### Interaction with the reservation BAR
+
+The sparse window is also advertised as a 64-bit prefetchable reservation BAR
+(`#55`), and it is the **firmware-assigned** BAR address that the window's KVM
+memslot is actually installed at; the computed `sparse_base` is the fallback
+when there is no BAR, and the override when firmware picks something unusable.
+
+Where firmware puts it is **not** predictable from the address width alone.
+Measured, SeaBIOS 1.16.3, same 128 GiB BAR:
+
+| host bits | GPA limit | computed `sparse_base` | BAR actually assigned |
+|---|---|---|---|
+| 39 | 512 GiB | `0x6000000000` (384 GiB) | `0x6000000000` — same address |
+| 46 | 64 TiB | ~63.86 TiB | `0x380000000000` (56 TiB) — 8 TiB lower |
+
+So do not assume the BAR lands at `2^bits - window`; on the 39-bit host it did
+and on the 46-bit host it did not. What matters is that both are inside the
+limit and neither overlaps the shm/mmap regions, which nvkvm now checks
+explicitly: if firmware places the BAR so that it crosses the GPA limit, or on
+top of the shm/legacy-mmap regions, nvkvm logs that and uses its own computed
+base rather than handing KVM a range it will reject or letting the window
+shadow the shm slots.
+
+One residual, untriggered risk is worth naming: the computed block is placed at
+the top of the addressable space, which on some machines is inside the range
+firmware treats as the 64-bit PCI hole. Nothing else large enough to reach it
+has been observed (firmware allocated only our own BAR up there, and lower than
+our block on the 46-bit host), and both verified hosts booted clean — but the
+block is not itself PCI-reserved, so a machine that filled its 64-bit hole to
+the top could in principle collide. Making the shm/mmap regions reservation
+BARs too would close it.
+
 ## Host kernel
 
 The QEMU-side isolate spawn uses `close_range(2)` where available (Linux 5.9+),
