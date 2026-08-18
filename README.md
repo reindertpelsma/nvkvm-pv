@@ -284,12 +284,22 @@ Traced, with two hypotheses eliminated by experiment:
   changed nothing — `vkCreateDevice` still returned `-4` — so it was never the
   cause, and allowing it would have widened a security boundary for no gain.
   The entry was reverted.
-* **The real failure is a channel/compute class mismatch.** The userspace driver
-  creates its channel as `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`) on this Hopper
-  part, then allocating `HOPPER_COMPUTE_A` (`0xcbc0`) under that parent fails
-  with `NV_ERR_OBJECT_NOT_FOUND` (`0x57`). `HOPPER_CHANNEL_GPFIFO_A` (`0xc86f`)
-  is allowlisted but never requested, so the open question is why class
-  discovery steers the driver to an Ampere channel on an H100.
+* **Not class discovery either.** The failure is a channel/compute mismatch: the
+  userspace driver creates its channel as `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`)
+  on this Hopper part, then allocating `HOPPER_COMPUTE_A` (`0xcbc0`) under that
+  parent fails with `NV_ERR_OBJECT_NOT_FOUND` (`0x57`). The obvious suspect was
+  a truncated or filtered class list, but instrumenting
+  `NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2` shows the guest receives it intact —
+  48 classes in a 100-entry array, including both `HOPPER_CHANNEL_GPFIFO_A`
+  (`0xc86f`) and `HOPPER_COMPUTE_A` (`0xcbc0`). The driver has the Hopper
+  channel class available and picks the Ampere one anyway, so the remaining
+  question is why, not what it was told. Run with `NVKVM_DEBUG=1` to see the
+  `CLASSLIST_V2` line.
+
+**This does not affect CUDA.** All 19 CUDA checks pass on the H100 over that
+same Ampere channel, with byte-exact verification, and the class list reaching
+the guest is complete — nvkvm is not withholding Hopper classes from the
+driver.
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
 595.84 row has no 28/28 measurement — its box was re-provisioned without

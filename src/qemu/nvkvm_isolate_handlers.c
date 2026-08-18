@@ -2191,6 +2191,34 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		}
 	}
 
+	/*
+	 * Diagnostic: report what GET_CLASSLIST_V2 delivers to the guest.  V2
+	 * inlines { NvU32 numClasses; NvU32 classList[] } in the aux buffer, and
+	 * a truncated or filtered list here would silently steer the userspace
+	 * driver to the wrong engine classes for the GPU's architecture -- the
+	 * failure mode this was written to rule out on Hopper.  Cheap (a handful
+	 * of calls per process) and invaluable when bringing up a new
+	 * architecture, so it is kept, behind NVKVM_DEBUG.
+	 */
+	if (inner_cmd == 0x00800292u && aux_buf && req->aux_size >= 8) {
+		const uint32_t *v = (const uint32_t *)aux_buf;
+		uint32_t n = v[0];
+		uint32_t cap = (req->aux_size - 4) / 4;
+		if (n > cap) n = cap;
+		int has_c86f = 0, has_c56f = 0, has_cbc0 = 0;
+		for (uint32_t i = 0; i < n; i++) {
+			if (v[1+i] == 0xc86f) has_c86f = 1;
+			if (v[1+i] == 0xc56f) has_c56f = 1;
+			if (v[1+i] == 0xcbc0) has_cbc0 = 1;
+		}
+		NVKVM_DBG(
+			"nvkvm: CLASSLIST_V2 ret=%lld nvstatus=0x%x aux_size=%u "
+			"numClasses=%u cap=%u hopper_gpfifo_c86f=%d "
+			"ampere_gpfifo_c56f=%d hopper_compute_cbc0=%d\n",
+			(long long)ret, nvstatus, req->aux_size, v[0], cap,
+			has_c86f, has_c56f, has_cbc0);
+	}
+
 	if (inner_cmd) {
 		NVKVM_DBG(
 			"nvkvm: ioctl_on_isolate: isolate=%u handle=%u cmd=0x%x "
