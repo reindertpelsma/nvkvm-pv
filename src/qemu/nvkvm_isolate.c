@@ -30,6 +30,11 @@
 #include <sys/stat.h>
 #include <linux/capability.h>
 
+/* Isolation-mode config + the UID-separation primitives (header-only so the
+ * security test in tests/security/uid_isolate_test.c exercises the same code
+ * this device runs, not a copy of it). */
+#include "nvkvm_isolate_uid.h"
+
 #ifndef MS_REC
 #define MS_REC      16384
 #endif
@@ -98,32 +103,63 @@ static int nvkvm_write_child_map(pid_t pid, const char *which, const char *val)
  * Parent-side: set up the rootless uid/gid mapping for a child that was
  * clone()'d with CLONE_NEWUSER.  ns-root 0 -> our euid/egid (single-line map,
  * permitted even for an unprivileged parent).  Returns 0 / -1.
+ *
+ * COMBINED namespace+uid mode needs a SECOND line.  The child becomes ns-root
+ * (uid 0) so it can mount/pivot_root, and only then drops to its per-isolate
+ * uid — but setresuid() to an id that is not mapped into the user namespace
+ * fails with EINVAL, so the target uid must appear in the map.  We map it
+ * identity (host uid N -> ns uid N) so the host-visible uid really is the
+ * separated one; a namespaced-but-unmapped uid would give a process that looks
+ * separated from the inside and is uid `nobody` on the host, which is the
+ * opposite of what this mode is for.
+ *
+ * Writing a multi-line map requires CAP_SETUID/CAP_SETGID in the PARENT user
+ * namespace.  UID mode already demands both (checked up front in
+ * nvkvm_iso_cfg_validate), so this adds no new requirement.  `setgroups: deny`
+ * is still written — it is always permitted and is strictly stronger than the
+ * setgroups(0, NULL) the child would otherwise do.
  */
-static int nvkvm_map_child_userns(pid_t pid)
+static int nvkvm_map_child_userns(pid_t pid, uid_t extra_uid, gid_t extra_gid)
 {
-	char map[64];
+	char map[128];
 	if (nvkvm_write_child_map(pid, "setgroups", "deny") < 0)
 		return -1;
-	snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)geteuid());
+	if (extra_uid)
+		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
+			 (unsigned)geteuid(), (unsigned)extra_uid,
+			 (unsigned)extra_uid);
+	else
+		snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)geteuid());
 	if (nvkvm_write_child_map(pid, "uid_map", map) < 0)
 		return -1;
-	snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)getegid());
+	if (extra_gid)
+		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
+			 (unsigned)getegid(), (unsigned)extra_gid,
+			 (unsigned)extra_gid);
+	else
+		snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)getegid());
 	if (nvkvm_write_child_map(pid, "gid_map", map) < 0)
 		return -1;
 	return 0;
 }
 
 /*
- * Spawn the isolate child.  When hardening, clone() it directly into fresh
- * user + pid + net + ipc + uts namespaces (CLONE_NEWUSER lets an unprivileged
- * parent create the rest; the child is PID 1 of the new pid ns and clone()
- * returns its real host pid — no intermediate process, no second fork).  A
- * NULL child stack with no CLONE_VM makes the raw clone behave like fork.
+ * Spawn the isolate child.  In namespace mode, clone() it directly into fresh
+ * user + pid + net + ipc + uts + mount namespaces (CLONE_NEWUSER lets an
+ * unprivileged parent create the rest; the child is PID 1 of the new pid ns and
+ * clone() returns its real host pid — no intermediate process, no second fork).
+ * A NULL child stack with no CLONE_VM makes the raw clone behave like fork.
+ *
+ * In UID-separation mode (NVKVM_ISO_LAYER_UID without NVKVM_ISO_LAYER_NS) there
+ * are no namespaces to create — that is the entire point, since this mode
+ * exists for hosts where CLONE_NEWUSER is unavailable — so a plain fork() is
+ * used and the boundary is established later by nvkvm_iso_drop_privilege().
+ *
  * Returns child pid (>0) / 0 in child / -1 on error, like fork().
  */
-static pid_t nvkvm_isolate_spawn(bool harden)
+static pid_t nvkvm_isolate_spawn(unsigned mode)
 {
-	if (!harden)
+	if (!(mode & NVKVM_ISO_LAYER_NS))
 		return fork();
 	unsigned long flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET |
 			      CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS |
@@ -692,10 +728,136 @@ reader_exit:
 
 /* ── Table management ───────────────────────────────────────────────────── */
 
+/* ── Isolation-mode configuration ───────────────────────────────────────
+ *
+ * Env-var driven, matching the existing isolate knobs (NVKVM_ISOLATE_NO_HARDEN,
+ * NVKVM_RING_DISABLE, NVKVM_STUB_PATH, ...):
+ *
+ *   NVKVM_ISOLATE_MODE       auto (default) | namespace | uid | uid+chroot |
+ *                            namespace+uid | seccomp | none
+ *   NVKVM_ISOLATE_UID_BASE   first uid/gid of this VM's window (default 500000)
+ *   NVKVM_ISOLATE_UNSAFE_ACK required, with the exact acknowledgement string,
+ *                            before mode 'none' is accepted
+ *   NVKVM_ISOLATE_NO_HARDEN  legacy hatch — maps to the 'seccomp' rung, which
+ *                            is exactly what it does today (it turns off the
+ *                            namespaces; it has never turned off the stub's
+ *                            seccomp filter).  Kept back-compatible on purpose:
+ *                            silently making an existing hatch WEAKER than it
+ *                            was would be its own security bug.
+ *
+ * Resolution is strict for explicitly named modes.  `auto` is the exception,
+ * and a deliberate one: it probes the ladder by ATTEMPTING each rung, which is
+ * the only reliable detection (the kernel sysctls report user namespaces as
+ * available inside a stock Docker container that blocks them via seccomp and
+ * AppArmor).  auto never selects 'none'.
+ */
+static void nvkvm_isolate_cfg_resolve(struct nvkvm_isolate_cfg *cfg,
+				      char *err, size_t errsz,
+				      char *report, size_t reportsz)
+{
+	const char *mode_s = getenv("NVKVM_ISOLATE_MODE");
+	const char *base_s = getenv("NVKVM_ISOLATE_UID_BASE");
+	const char *ack_s  = getenv(NVKVM_ISO_UNSAFE_ACK_ENV);
+
+	err[0] = '\0';
+	report[0] = '\0';
+	cfg->mode     = NVKVM_ISO_MODE_AUTO;          /* default: probe */
+	cfg->uid_base = NVKVM_ISO_UID_BASE_DEFAULT;
+
+	if (mode_s && *mode_s) {
+		if (nvkvm_iso_mode_parse(mode_s, &cfg->mode, err, errsz) != 0)
+			return;
+	} else if (getenv("NVKVM_ISOLATE_NO_HARDEN") != NULL) {
+		cfg->mode = NVKVM_ISO_LAYER_SECCOMP;
+		snprintf(report, reportsz,
+			 "isolate mode: NVKVM_ISOLATE_NO_HARDEN=1 selects the "
+			 "'seccomp' rung (namespaces off, stub seccomp filter "
+			 "still applied — unchanged from previous releases). "
+			 "Prefer NVKVM_ISOLATE_MODE=seccomp.");
+	}
+
+	if (base_s && *base_s) {
+		char *end = NULL;
+		unsigned long v = strtoul(base_s, &end, 0);
+		if (!end || *end || v == 0 || v > 0xFFFFFFFFUL) {
+			snprintf(err, errsz,
+				 "NVKVM_ISOLATE_UID_BASE='%s' is not a number",
+				 base_s);
+			return;
+		}
+		cfg->uid_base = (uint32_t)v;
+	}
+
+	/*
+	 * 'none' removes every layer, so it is the one setting where a typo is
+	 * catastrophic.  Require the acknowledgement rather than accepting a
+	 * bare mode=none.
+	 */
+	if (cfg->mode != NVKVM_ISO_MODE_AUTO &&
+	    nvkvm_iso_needs_unsafe_ack(cfg->mode) &&
+	    !(ack_s && !strcmp(ack_s, NVKVM_ISO_UNSAFE_ACK_VALUE))) {
+		snprintf(err, errsz,
+			 "isolation mode 'none' removes every boundary (no "
+			 "namespaces, no uid separation, no seccomp filter) and "
+			 "must be acknowledged explicitly. Set %s=%s alongside "
+			 "it, or use 'seccomp' — the lowest rung that still "
+			 "confines anything.",
+			 NVKVM_ISO_UNSAFE_ACK_ENV, NVKVM_ISO_UNSAFE_ACK_VALUE);
+		return;
+	}
+
+	if (cfg->mode == NVKVM_ISO_MODE_AUTO) {
+		if (nvkvm_iso_auto_select(&cfg->mode, report, reportsz,
+					  err, errsz) != 0)
+			cfg->mode = NVKVM_ISO_MODE_AUTO;   /* stays invalid */
+	}
+}
+
+/*
+ * True when the resolved configuration is weaker than namespace mode and the
+ * operator should be told loudly, at every start.
+ */
+bool nvkvm_isolate_cfg_is_degraded(const struct nvkvm_isolate_table *t)
+{
+	return (t->cfg.mode & NVKVM_ISO_LAYER_NS) == 0;
+}
+
+const char *nvkvm_isolate_cfg_report(const struct nvkvm_isolate_table *t)
+{
+	return t->cfg_report;
+}
+
+int nvkvm_isolate_cfg_check(const struct nvkvm_isolate_table *t,
+			    char *err, size_t errsz)
+{
+	if (t->cfg_error[0]) {
+		snprintf(err, errsz, "%s", t->cfg_error);
+		return -1;
+	}
+	return nvkvm_iso_cfg_validate(&t->cfg, err, errsz);
+}
+
+const char *nvkvm_isolate_cfg_describe(const struct nvkvm_isolate_table *t,
+				       char *buf, size_t bufsz)
+{
+	if (t->cfg.mode & NVKVM_ISO_LAYER_UID)
+		snprintf(buf, bufsz,
+			 "isolate sandbox: %s (uid window %u..%u, %u slots)",
+			 nvkvm_iso_mode_str(t->cfg.mode), t->cfg.uid_base,
+			 t->cfg.uid_base + NVKVM_ISO_UID_SLOTS - 1,
+			 NVKVM_ISO_UID_SLOTS);
+	else
+		snprintf(buf, bufsz, "isolate sandbox: %s",
+			 nvkvm_iso_mode_str(t->cfg.mode));
+	return buf;
+}
+
 void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 {
 	memset(t, 0, sizeof(*t));
 	pthread_mutex_init(&t->lock, NULL);
+	nvkvm_isolate_cfg_resolve(&t->cfg, t->cfg_error, sizeof(t->cfg_error),
+				  t->cfg_report, sizeof(t->cfg_report));
 	t->next_id = 1;
 	for (int i = 0; i < NVKVM_ISOLATE_MAX; i++) {
 		struct nvkvm_isolate *iso = &t->isolates[i];
@@ -758,6 +920,8 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			 * can re-park a stale ENTER_LOOP waiter from a just-killed slot. */
 			iso->sync_open_fd = -1;
 			iso->reader_started = false;
+			iso->run_uid      = 0;
+			iso->run_gid      = 0;
 			iso->ring_memfd   = -1;
 			iso->ring_qva     = NULL;
 			iso->ring_region_size = 0;
@@ -802,15 +966,64 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	pid_t pid;
 	/*
-	 * Phase 0 lockdown.  When hardening is on we clone() the child directly
-	 * into fresh user/pid/net/ipc/uts namespaces (it is PID 1 of the new pid
-	 * ns; clone() returns its real host pid).  The child blocks on syncpipe
-	 * until we write its uid/gid maps from the parent (rootless single-line
-	 * map), then drops all caps and execs.  No intermediate process.
+	 * Phase 0 lockdown.  In namespace mode we clone() the child directly
+	 * into fresh user/pid/net/ipc/uts/mount namespaces (it is PID 1 of the new
+	 * pid ns; clone() returns its real host pid).  The child blocks on syncpipe
+	 * until we write its uid/gid maps from the parent, then drops all caps and
+	 * execs.  No intermediate process.
 	 */
-	bool harden = (getenv("NVKVM_ISOLATE_NO_HARDEN") == NULL);
+	const unsigned mode = t->cfg.mode;
+	const unsigned layers = mode & NVKVM_ISO_LAYERS_ALL;
+	const bool use_ns     = (layers & NVKVM_ISO_LAYER_NS)      != 0;
+	const bool use_uid    = (layers & NVKVM_ISO_LAYER_UID)     != 0;
+	const bool use_chroot = (layers & NVKVM_ISO_LAYER_CHROOT)  != 0;
+	const bool use_seccomp = (layers & NVKVM_ISO_LAYER_SECCOMP) != 0;
+	/* Capability/no_new_privs drop belongs to every rung that confines at
+	 * all — including the bare 'seccomp' rung, whose TSYNC filter REQUIRES
+	 * no_new_privs on every thread. */
+	const bool harden     = (layers != 0);
+
+	/*
+	 * UID-separation mode: derive this isolate's unique host uid/gid from its
+	 * slot index.  The slot is held exclusively from alloc_isolate_slot()
+	 * until nvkvm_isolate_kill() clears in_use — which happens only AFTER
+	 * waitpid() has reaped the stub — so the uid cannot be in use by another
+	 * live isolate of this VM, and is not re-issued while its previous holder
+	 * still exists.  The scan below turns that argument into an enforced
+	 * check rather than an invariant maintained by inspection.
+	 */
+	uid_t run_uid = 0;
+	if (use_uid) {
+		uint32_t slot = id % NVKVM_ISOLATE_MAX;
+		if (nvkvm_iso_uid_for_slot(t->cfg.uid_base, slot, &run_uid) != 0) {
+			fprintf(stderr,
+				"nvkvm: isolate slot %u has no uid in the "
+				"configured window (base=%u); refusing to spawn "
+				"an isolate without uid separation\n",
+				slot, t->cfg.uid_base);
+			close(sv[0]); close(sv[1]); iso->in_use = false;
+			return -ERANGE;
+		}
+		pthread_mutex_lock(&t->lock);
+		for (int i = 0; i < NVKVM_ISOLATE_MAX; i++) {
+			struct nvkvm_isolate *o = &t->isolates[i];
+			if (o != iso && o->in_use && o->run_uid == run_uid) {
+				pthread_mutex_unlock(&t->lock);
+				fprintf(stderr,
+					"nvkvm: uid %u already held by live "
+					"isolate %u — refusing to reuse it\n",
+					(unsigned)run_uid, o->id);
+				close(sv[0]); close(sv[1]); iso->in_use = false;
+				return -EADDRINUSE;
+			}
+		}
+		iso->run_uid = run_uid;
+		iso->run_gid = (gid_t)run_uid;
+		pthread_mutex_unlock(&t->lock);
+	}
+
 	int syncpipe[2] = { -1, -1 };
-	if (harden && pipe2(syncpipe, O_CLOEXEC) < 0) {
+	if (use_ns && pipe2(syncpipe, O_CLOEXEC) < 0) {
 		int e = errno;
 		close(sv[0]); close(sv[1]); iso->in_use = false;
 		return -e;
@@ -833,9 +1046,9 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		}
 		lseek(mfd, 0, SEEK_SET);
 
-		pid = nvkvm_isolate_spawn(harden);
+		pid = nvkvm_isolate_spawn(mode);
 		if (pid == 0) {
-			if (harden) {
+			if (use_ns) {
 				/* Wait for the parent to install our uid/gid maps. */
 				char go;
 				close(syncpipe[1]);
@@ -867,12 +1080,35 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				}
 			}
 			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
-			if (harden && nvkvm_child_enter_mount_ns() < 0)
+			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
-			nvkvm_isolate_closefrom(harden ? NVKVM_DEV_DIRFD + 1 : 4);
+			/* uid+chroot: root at /dev, dirfd = the root (parks at
+			 * NVKVM_DEV_DIRFD too).  Needs CAP_SYS_CHROOT, so it
+			 * must precede both drops below. */
+			if (use_chroot && nvkvm_iso_enter_chroot(NVKVM_DEV_DIRFD) < 0)
+				_exit(124);
+			nvkvm_isolate_closefrom((use_ns || use_chroot)
+						? NVKVM_DEV_DIRFD + 1 : 4);
+			/* UID separation goes here: AFTER the mount-ns work (which
+			 * needs CAP_SYS_ADMIN in the userns) and BEFORE the cap
+			 * drop (setresuid needs CAP_SETUID, which that drop
+			 * removes).  Verified-irreversible or _exit. */
+			if (use_uid &&
+			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid,
+						     use_ns) != 0)
+				_exit(125);
 			if (harden)
 				nvkvm_drop_all_caps();   /* no_new_privs + dumpable + caps */
-			const char *argv[] = { "nvkvm_stub", NULL };
+			/* The stub applies its seccomp allowlist unless told
+			 * otherwise.  argv is the mechanism the stub itself
+			 * nominates for this ("Re-add via argv if a debug hatch
+			 * is ever needed", src/stub/nvkvm_stub.c) — the env is
+			 * deliberately cleared, and argv has the useful property
+			 * of being visible in ps, so a stub running without
+			 * seccomp cannot hide. */
+			const char *argv[] = { "nvkvm_stub", NULL, NULL };
+			if (!use_seccomp)
+				argv[1] = "--no-seccomp";
 			const char *envp[] = { NULL };  /* M6: drop QEMU env */
 			fexecve(mfd, (char *const *)argv, (char *const *)envp);
 			_exit(127);
@@ -889,9 +1125,9 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 		const char *dbg_mode = getenv("NVKVM_STUB_DEBUG");
 		bool keep_env = (dbg_mode && *dbg_mode == '1');
 
-		pid = nvkvm_isolate_spawn(harden);
+		pid = nvkvm_isolate_spawn(mode);
 		if (pid == 0) {
-			if (harden) {
+			if (use_ns) {
 				char go;
 				close(syncpipe[1]);
 				if (read(syncpipe[0], &go, 1) != 1)
@@ -921,12 +1157,21 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 					if (dn > 3) close(dn);
 				}
 			}
-			if (harden && nvkvm_child_enter_mount_ns() < 0)
+			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
-			nvkvm_isolate_closefrom(harden ? NVKVM_DEV_DIRFD + 1 : 4);
+			if (use_chroot && nvkvm_iso_enter_chroot(NVKVM_DEV_DIRFD) < 0)
+				_exit(124);
+			nvkvm_isolate_closefrom((use_ns || use_chroot)
+						? NVKVM_DEV_DIRFD + 1 : 4);
+			if (use_uid &&
+			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid,
+						     use_ns) != 0)
+				_exit(125);
 			if (harden)
 				nvkvm_drop_all_caps();
-			const char *argv[] = { "nvkvm_stub", NULL };
+			const char *argv[] = { "nvkvm_stub", NULL, NULL };
+			if (!use_seccomp)
+				argv[1] = "--no-seccomp";
 			const char *empty_env[] = { NULL };
 			fexecve(binfd, (char *const *)argv,
 				keep_env ? environ : (char *const *)empty_env);
@@ -936,7 +1181,26 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	if (pid < 0) {
 		int e = errno;
-		if (harden) { close(syncpipe[0]); close(syncpipe[1]); }
+		if (use_ns) {
+			close(syncpipe[0]); close(syncpipe[1]);
+			/* The single most likely reason clone(CLONE_NEWUSER) fails
+			 * on an otherwise healthy host, and the reason UID mode
+			 * exists.  Name it instead of returning a bare -EPERM. */
+			if (e == EPERM || e == EINVAL || e == ENOSPC)
+				fprintf(stderr,
+				  "nvkvm: clone(CLONE_NEWUSER|...) failed: %s. "
+				  "User namespaces are unavailable in this "
+				  "environment. Do NOT conclude anything from "
+				  "kernel.unprivileged_userns_clone or "
+				  "user.max_user_namespaces: on a stock Docker "
+				  "container both read as permissive (1 and "
+				  "55416, measured) while the default seccomp "
+				  "profile and AppArmor still refuse the clone. "
+				  "NVKVM_ISOLATE_MODE=uid (or uid+chroot) is the "
+				  "namespace-free alternative — read "
+				  "docs/internal/isolate-model.md first, it is a "
+				  "materially weaker boundary.\n", strerror(e));
+		}
 		close(sv[0]);
 		close(sv[1]);
 		iso->in_use = false;
@@ -945,9 +1209,12 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	/* clone() returns the stub's real host pid directly — no intermediate. */
 	pid_t stub_pid = pid;
-	if (harden) {
+	if (use_ns) {
 		close(syncpipe[0]);
-		int rc = nvkvm_map_child_userns(pid);   /* write uid/gid maps */
+		/* Combined mode also maps the per-isolate uid identity-wise, so the
+		 * child can setresuid() to it once the mount ns is built. */
+		int rc = nvkvm_map_child_userns(pid, use_uid ? run_uid : 0,
+						use_uid ? (gid_t)run_uid : 0);
 		/* Signal the child to proceed (or, on failure, let its read see EOF
 		 * → _exit(126) → we fail closed below). */
 		if (rc == 0)
@@ -995,9 +1262,16 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 
 	*isolate_id_out = id;
 
-	NVKVM_DBG(
-		"nvkvm_isolate: created isolate %u pid=%d sock=%d\n",
-		id, stub_pid, sv[0]);
+	if (use_uid)
+		NVKVM_DBG(
+			"nvkvm_isolate: created isolate %u pid=%d sock=%d "
+			"uid=%u gid=%u mode=%s\n",
+			id, stub_pid, sv[0], (unsigned)run_uid,
+			(unsigned)run_uid, nvkvm_iso_mode_str(mode));
+	else
+		NVKVM_DBG(
+			"nvkvm_isolate: created isolate %u pid=%d sock=%d\n",
+			id, stub_pid, sv[0]);
 	return 0;
 }
 
@@ -1117,6 +1391,14 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	iso->ring_ready  = false;
 	iso->ring_gpa    = 0;
 	iso->pid    = 0;
+	/*
+	 * Release the UID-separation id.  Safe here and nowhere earlier: the
+	 * waitpid() above has already reaped the stub, so no process is running
+	 * as this uid any more.  Clearing it before the reap would let the next
+	 * isolate to land in this slot share a uid with a still-live process.
+	 */
+	iso->run_uid = 0;
+	iso->run_gid = 0;
 	iso->in_use = false;
 	pthread_mutex_unlock(&iso->lock);
 

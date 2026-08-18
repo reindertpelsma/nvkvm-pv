@@ -2744,11 +2744,29 @@ static void apply_relocations(void)
 
 #define WORKER_STACK_SIZE (128 * 1024)  /* 128 KiB per worker */
 
-int main(void)
+/* Tiny freestanding strcmp — argv scanning only, no libc available. */
+static int stub_streq(const char *a, const char *b)
 {
+	while (*a && *a == *b) { a++; b++; }
+	return *a == *b;
+}
+
+int main(int argc, char **argv)
+{
+	/*
+	 * The isolation mode's seccomp layer.  On by default: if QEMU passes us
+	 * nothing (or an unrecognised argv), we apply the filter.  Only the
+	 * explicit "--no-seccomp" turns it off, so a truncated or corrupted
+	 * argv fails CLOSED.
+	 */
+	int want_seccomp = 1;
+
 #ifdef NVKVM_STUB_EMBEDDED
 	apply_relocations();
 #endif
+	for (int i = 1; i < argc && argv && argv[i]; i++)
+		if (stub_streq(argv[i], "--no-seccomp"))
+			want_seccomp = 0;
 	handle_table_init();
 	job_queue_init();
 
@@ -2839,9 +2857,16 @@ int main(void)
 	 *
 	 * The NVKVM_STUB_NO_SECCOMP env hatch was dropped along with libc:
 	 * the parent calls clearenv() before exec so there is no environment
-	 * to inspect anyway.  Re-add via argv if a debug hatch is ever needed.
+	 * to inspect anyway.  Re-added via argv, as that comment anticipated:
+	 * QEMU passes "--no-seccomp" for the isolation modes whose seccomp
+	 * layer is off ('none', and only 'none' among the presets).  Absence
+	 * of the flag means apply it, so a mangled argv fails closed.
 	 */
-	{
+	if (!want_seccomp) {
+		fs_dprintf(STDERR_FD,
+			"nvkvm_stub: SECCOMP FILTER DISABLED by --no-seccomp; "
+			"this isolate has NO syscall confinement\n");
+	} else {
 		long sr = apply_seccomp();
 		/* R2-L2: TSYNC reports a per-thread sync failure as a POSITIVE
 		 * return (the offending tid) and applies the filter to nothing —

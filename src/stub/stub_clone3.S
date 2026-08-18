@@ -25,12 +25,20 @@
 	 * and call main.  On return, exit_group(main's return value).
 	 *
 	 * The kernel sets rsp to argc, then argv[0..argc-1], NULL, envp[]...
-	 * We ignore them — main() takes no args.
+	 * main() takes (argc, argv): QEMU passes "--no-seccomp" there when the
+	 * configured isolation mode has the seccomp layer switched off.  argv
+	 * is the mechanism this file's own comment nominated for a debug hatch
+	 * (the environment is deliberately cleared before exec), and it has the
+	 * useful property of showing up in ps — a stub running without seccomp
+	 * cannot hide.  Read argc/argv BEFORE realigning rsp, which destroys
+	 * the pointer to them.
 	 */
 	.globl	_start
 	.type	_start, @function
 _start:
 	xorq	%rbp, %rbp		/* clear frame pointer */
+	movq	(%rsp), %rdi		/* argc                */
+	leaq	8(%rsp), %rsi		/* argv                */
 	andq	$-16, %rsp		/* 16-byte align stack */
 	callq	main
 	movq	%rax, %rdi		/* exit code = main's return */
