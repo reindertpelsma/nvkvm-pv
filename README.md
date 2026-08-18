@@ -41,7 +41,9 @@ doorbell page, so there is no per-operation cost to pay:
 ## What it is not
 
 - **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
-  security boundary you should rely on. We audited it ourselves and published what
+  security boundary you should rely on. It also runs in **containers**, where
+  Linux namespaces are usually blocked — the isolate falls back to UID separation,
+  which is weaker; see [the isolate model](docs/internal/isolate-model.md). We audited it ourselves and published what
   we found — 14 unenforced paths with severities and containment, four since fixed
   — in [the pointer audit](docs/internal/audit-guest-pointers.md).
   **Do not put untrusted tenants behind it.**
