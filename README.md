@@ -264,7 +264,20 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
+| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`, see below) |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
+
+On the H100 every CUDA and bring-up check passes (`sm_90`, PTX JIT, kernel
+launch, matmul, byte-exact 8 MiB round trips) and OpenGL renders through the
+forwarder, but `vk_compute_dispatch` fails: `vkCreateDevice` returns `-4`
+(`VK_ERROR_DEVICE_LOST`) in the guest while the *same binary* returns `0` on the
+host with the same driver. Vulkan enumeration works and both sides see the same
+5 queue families — only device creation differs. The QEMU log shows the
+default-deny gate rejecting `alloc class 0x0000a083` and
+`ctrl cmd 0x20803401`, neither of which is in nvproxy's set. Minimal reproducer:
+[`tests/repro/vk_create_device.c`](tests/repro/vk_create_device.c). Those IDs
+need identifying against NVIDIA's open kernel modules before anything is added
+to the allowlist — it is a security boundary, not a compatibility knob.
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
 595.84 row has no 28/28 measurement — its box was re-provisioned without
