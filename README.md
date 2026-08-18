@@ -263,6 +263,7 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
+| GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
