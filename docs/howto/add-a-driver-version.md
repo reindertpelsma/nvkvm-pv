@@ -12,7 +12,7 @@ never seen, and check whether any struct in `src/abi/` changed shape.
 ## 0. First, just try it
 
 You may not need a new row at all. `nvkvm_abi_id_for_version()`
-(`src/common/nvkvm_abi.h:311-368`) maps ranges, not points, so a 572 driver
+(`src/common/nvkvm_abi.h:311-381`) maps ranges, not points, so a 572 driver
 already selects the 570 profile and a 585 driver already selects 580.
 
 Note that it takes `major`, `minor` **and** `patch`, because two measured
@@ -68,7 +68,7 @@ byte-identical to a row that already exists, only the *range mapping* needs
 changing.
 
 - **Identical to an existing row** → extend that row's range in
-  `nvkvm_abi_id_for_version()` (`src/common/nvkvm_abi.h:311-368`), add the tag
+  `nvkvm_abi_id_for_version()` (`src/common/nvkvm_abi.h:311-381`), add the tag
   to that row's measured-tag comment, and update the range comment. Nothing else
   moves. This is what happened with 575 (shares 570's layouts) and with 590/595
   (both measured byte-identical to 580).
@@ -87,7 +87,7 @@ Three edits in `src/common/nvkvm_abi.h`:
    and a comment listing **the tags whose probes produced it**. Annotate any
    value that differs from its predecessor with the struct name that grew, as
    the 535, 570, 580 and 610 rows do.
-3. The range in `nvkvm_abi_id_for_version()` (`:311-368`).
+3. The range in `nvkvm_abi_id_for_version()` (`:311-381`).
 
 Check `nvkvm_abi_by_id()`'s default (`:279-303`) still says what you want. It
 looks the fallback up by id rather than array index, specifically so adding a
@@ -164,7 +164,7 @@ reconstruction in the stub before it can be allowed — see
 [the forwarding model](../internal/forwarding-model.md). Adding an allowlist
 entry with no handler is worse than leaving it out; `0x70`
 (`NV_ESC_EXPORT_TO_DMABUF_FD`) was removed from the frontend list for exactly
-that reason (`src/qemu/nvkvm_fe_alloc_allowlist.h:34-39`).
+that reason (`src/qemu/nvkvm_fe_alloc_allowlist.h:40-45`).
 
 ## 7. Check the alloc-class size table
 
@@ -185,7 +185,7 @@ failures are specific and the comments record them:
 
 (`src/guest/nvkvm_main.c:1664-1697`.) A new architecture generation typically
 brings new channel/compute/graphics class ids, which also need adding to the
-alloc-class allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:53-142`).
+alloc-class allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`).
 
 ## 8. Update the documentation
 

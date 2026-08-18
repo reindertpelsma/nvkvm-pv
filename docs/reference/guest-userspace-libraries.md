@@ -16,7 +16,7 @@ NVML and `libcuda` enforce the match themselves. A mismatch gives
 
 The staged version is derived from the bundle, not from a constant: `V` is
 parsed out of the bundle's `libcuda.so.*` filename
-(`scripts/stage_guest_libs.sh:23-27`). Every subsequent name is `<lib>.so.$V`.
+(`scripts/stage_guest_libs.sh:55`). Every subsequent name is `<lib>.so.$V`.
 
 **Except two libraries, which are not driver-versioned at all.** See
 [below](#not-driver-versioned).
@@ -56,7 +56,7 @@ during Ada/Turing bring-up.
 
 ### Optional — absence degrades a capability
 
-`scripts/make_host_bundle.sh:33-35`.
+`scripts/make_host_bundle.sh:43-47`.
 
 | library | staged to | covers |
 |---|---|---|
@@ -72,7 +72,7 @@ during Ada/Turing bring-up.
 | `libnvcuvid` | system (+ `.so.1`, `.so`) | NVDEC, and NVENC depends on it |
 
 The GLVND vendor libraries are staged by `stage_guest_libs.sh` from whatever the
-bundle contains (`scripts/stage_guest_libs.sh:90-94`):
+bundle contains (`scripts/stage_guest_libs.sh:123-128`):
 
 | library | SONAME link |
 |---|---|
@@ -84,13 +84,13 @@ bundle contains (`scripts/stage_guest_libs.sh:90-94`):
 
 `libnvidia-encode` depends on `libnvcuvid`, so both must be present and
 version-matched or ffmpeg reports "Cannot load libnvidia-encode.so.1"
-(`scripts/stage_guest_libs.sh:68-71`). Staging them makes the encoder loadable;
+(`scripts/stage_guest_libs.sh:101-104`). Staging them makes the encoder loadable;
 it does not make it work — see
 [Known limitations](../internal/known-limitations.md#nvenc-does-not-work-in-the-guest-on-5755103--open).
 
 ### Not driver-versioned
 
-`scripts/make_host_bundle.sh:37-47`:
+`scripts/make_host_bundle.sh:49-54`:
 
 ```
 libcuda.so.575.51.03              <- driver version
@@ -105,13 +105,13 @@ alongside the driver, and carry their own SONAME version.
 
 A glob on `$lib.so.$V` therefore never matches them and skips them **in
 silence**. `make_host_bundle.sh` collects them by resolving the real file behind
-the `.so.1` SONAME link instead (`scripts/make_host_bundle.sh:62-71`), and
+the `.so.1` SONAME link instead (`scripts/make_host_bundle.sh:74-81`), and
 `stage_guest_libs.sh` globs `$lib.so.*` for these two specifically
 (`scripts/stage_guest_libs.sh:134-155`).
 
 These are the EGL **external platform** libraries — a different mechanism from
 the GLVND vendor config. The failure mode is the one worth memorising
-(`scripts/make_host_bundle.sh:44-46`):
+(`scripts/make_host_bundle.sh:56-58`):
 
 > without them a Wayland client falls back to llvmpipe while the EGL device
 > platform still reports NVIDIA -- i.e. software rendering that looks correct in
@@ -121,7 +121,7 @@ the GLVND vendor config. The failure mode is the one worth memorising
 
 As load-bearing as the libraries. All written by `stage_guest_libs.sh`;
 `make_host_bundle.sh` also collects the host's own copies into
-`host-libs-$V/config/` for reference (`scripts/make_host_bundle.sh:80-84`).
+`host-libs-$V/config/` for reference (`scripts/make_host_bundle.sh:88-96`).
 
 | file | contents | without it |
 |---|---|---|
@@ -132,7 +132,7 @@ As load-bearing as the libraries. All written by `stage_guest_libs.sh`;
 | `/etc/ld.so.conf.d/nvidia-guest.conf` | `/usr/local/nvidia-guest/lib` | the CUDA dir is off the loader path entirely and everything resolves from the system dir instead (`:195-198`) |
 | `/etc/modprobe.d/blacklist-nvkvm-nouveau.conf` | `blacklist nouveau` | nouveau auto-binds the BAR-less `nvkvm-gpu` identity device and can only fail/noise (`:235-241`) — needs a guest reboot |
 
-The Wayland one, verbatim (`scripts/stage_guest_libs.sh:122-131`):
+The Wayland one, verbatim (`scripts/stage_guest_libs.sh:153-163`):
 
 > A Wayland GL client (es2gears, glmark2, any toolkit) calls
 > `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND)`; with no
@@ -151,7 +151,7 @@ The Wayland one, verbatim (`scripts/stage_guest_libs.sh:122-131`):
 
 Three pieces are needed for GPU-accelerated GL/EGL on the virtual KMS head, and
 if any is missing the NVIDIA path is silently skipped and Mesa falls back to
-llvmpipe (`scripts/stage_guest_libs.sh:96-109`):
+llvmpipe (`scripts/stage_guest_libs.sh:128-133`):
 
 1. **The GBM backend.** Mesa's `libgbm` dlopens `<drmdriver>_gbm.so` from the
    GBM backends directory, by the card's DRM driver name — which is
@@ -183,5 +183,5 @@ and that is the currently observed state
 [Known limitations](../internal/known-limitations.md#gl-clients-under-wayland-render-on-the-gpu-but-present-nothing--open).
 
 `stage_guest_libs.sh` reports what it staged and exits **2** if anything was
-missing from the bundle (`scripts/stage_guest_libs.sh:243-253`). Treat a
+missing from the bundle (`scripts/stage_guest_libs.sh:335-346`). Treat a
 nonzero exit as "do not trust a subsequent parity run".

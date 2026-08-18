@@ -97,11 +97,15 @@ kernel launch.
 The last five rows additionally cleared the PTX JIT path, a matmul checked
 against a CPU reference, a Vulkan compute dispatch and offscreen EGL, via
 `tests/validate.sh` — see [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md)
-for the per-check values and for the one failure they surfaced (offscreen
-framebuffer objects are unusable on 595 and 610).
+for the per-check values and for the one failure they surfaced: offscreen
+framebuffer objects came back `GL_FRAMEBUFFER_UNSUPPORTED` on 595.84 and
+610.43.02. That was **nvkvm's own bug, and it is fixed** — the NVKMS inner-
+cmdType allowlist, captured on a 575-era session, denied the `cmdType=60` that
+branches 595+ issue per offscreen surface. With 60 allowed both branches pass
+`gl_draw_pixel_check` and 610.43.02 is a clean 28/28.
 
 Turing is the floor in practice, not by an explicit check: the alloc-class
-allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:53-142`) carries the Volta,
+allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`) carries the Volta,
 Turing, Ampere, Ada, Hopper and Blackwell channel/compute/DMA-copy classes, and
 the channel-alloc sizing in the guest handles `TURING_CHANNEL_GPFIFO_A`,
 `AMPERE_CHANNEL_GPFIFO_A` and `HOPPER_CHANNEL_GPFIFO_A`
@@ -109,7 +113,7 @@ the channel-alloc sizing in the guest handles `TURING_CHANNEL_GPFIFO_A`,
 added to the allowlist.
 
 Multi-GPU hosts are enumerated — QEMU scans `/dev/nvidia0..15`
-(`src/qemu/nvkvm_isolate_handlers.c:121-129`) and the guest creates that many
+(`src/qemu/nvkvm_isolate_handlers.c:125-129`) and the guest creates that many
 `/dev/nvidiaN` nodes — but the tested configurations above are single-GPU.
 
 ## Host kernel

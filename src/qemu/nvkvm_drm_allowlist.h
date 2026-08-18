@@ -70,9 +70,20 @@ static inline bool nvkvm_drm_nr_allowed(unsigned nr)
 	 * deliberately NOT allowed.  They carry raw guest VAs / mint mappings
 	 * with no guest-VA marshalling — a guest VA forwarded to the host
 	 * render node is pinned in the stub's address space (stub-heap info
-	 * disclosure).  The legitimate guest DRM proxy (nvkvm_drm.c) never
-	 * issues them (its ioctl table wires only GET_DEV_INFO / DMABUF_SUPPORTED
-	 * / SEMSURF_FENCE_* + GEM_CLOSE), so denying them is regression-free.
+	 * disclosure).  Denying them is regression-free, but NOT for the reason
+	 * this comment used to give ("the guest ioctl table wires only
+	 * GET_DEV_INFO / DMABUF_SUPPORTED / SEMSURF_FENCE_* + GEM_CLOSE") — that
+	 * list is stale.  nvkvm_drm_ioctls[] (src/guest/nvkvm_drm.c:688-720) now
+	 * also wires 0x09, 0x0b, 0x0e and 0x18.  The accurate statement is
+	 * per-ioctl:
+	 *   - 0x02 / 0x0a / 0x0d are still absent from the guest table entirely,
+	 *     so nothing can issue them;
+	 *   - 0x0e (GEM_IDENTIFY_OBJECT) IS wired guest-side but is answered
+	 *     ENTIRELY in the guest (nvkvm_drm_gem_identify_object,
+	 *     src/guest/nvkvm_drm.c:391-405) and never forwarded, so this deny
+	 *     is never reached on the legitimate path.
+	 * A malicious guest can of course still craft any of the four; that is
+	 * what this default-deny is for.
 	 * EXPORT_DMABUF (0x0d) will be re-added WITH marshalling when the
 	 * dma-buf present path lands (docs/design/virtual_modeset.md Piece 1).
 	 */

@@ -2,12 +2,18 @@
  * nvkvm_fe_alloc_allowlist.h — default-deny frontend-ioctl + RM_ALLOC class
  * allowlists (nvproxy parity, companion to nvkvm_ctrl_allowlist.h / #76).
  *
- * Frontend NRs: gVisor nvproxy 575-ABI frontendIoctl set (22) + the two it adds
- *   through v570 + NV_ESC_EXPORT_TO_DMABUF_FD (0x70), an nvkvm-only sanitized
- *   extension nvproxy doesn't have. Covers our empirically-observed set.
- * Alloc classes: nvproxy 575-ABI RM_ALLOC class set (87) — already a superset of
- *   our empirically-observed CUDA classes. nvproxy deliberately omits privileged
- *   memory (0x3f), OS_DESCRIPTOR (0x71), bare NV01_EVENT (0x5); we omit them too.
+ * Frontend NRs (23): gVisor nvproxy 575-ABI frontendIoctl set (22) + the two it
+ *   adds through v570. Covers our empirically-observed set.  NV_ESC_EXPORT_TO_
+ *   DMABUF_FD (0x70) was an nvkvm-only extension here and has since been REMOVED
+ *   (audit G-7, see the note in the table below) — do not read this line as
+ *   saying it is present.
+ * Alloc classes (89): nvproxy 575-ABI RM_ALLOC class set (87) — already a
+ *   superset of our empirically-observed CUDA classes — plus two nvkvm
+ *   additions, each annotated at its row: NV01_EVENT (0x5) and AMPERE_B
+ *   (0xc797).  nvproxy deliberately omits privileged memory (0x3f),
+ *   OS_DESCRIPTOR (0x71) and bare NV01_EVENT (0x5); we keep the first two
+ *   omissions but NOT the third — 0x5 is allowed here for graphics/compute
+ *   completion events (#84).
  *
  * Both gates live in QEMU (the guest module is untrusted). Unknown NR / class is
  * DENIED. Provenance: docs/audits/nvproxy_frontend_alloc.md.

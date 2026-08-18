@@ -23,34 +23,45 @@ Reads the driver version from `nvidia-smi`, collects libraries from
 `/usr/lib/x86_64-linux-gnu` (override with `$SYSLIB`) into
 `host-libs-<version>/` at the repository root, and copies the vendor JSON
 configs into `host-libs-<version>/config/`
-(`scripts/make_host_bundle.sh:20-84`). Because the repository root is the 9p
+(`scripts/make_host_bundle.sh:20-96`). Because the repository root is the 9p
 share, the bundle appears in the guest at `/mnt/nvkvm/host-libs-<version>/`.
 
 The script splits its list three ways.
 
-**Required** (`scripts/make_host_bundle.sh:28`) — absence is a hard failure:
+**Required** (`scripts/make_host_bundle.sh:29`) — absence is a hard failure:
 
 ```
 libcuda  libnvidia-ml  libnvidia-ptxjitcompiler  libnvidia-nvvm
 ```
 
-**Optional** (`:33-35`) — absence degrades a capability:
+**Optional** (`:43-47`) — absence degrades a capability:
 
 ```
 libnvidia-glcore libnvidia-eglcore libnvidia-glsi libnvidia-tls
 libnvidia-rtcore libnvidia-gpucomp libnvidia-allocator
 libnvidia-encode libnvcuvid libnvidia-glvkspirv
+libEGL_nvidia libGLX_nvidia libGLESv2_nvidia libGLESv1_CM_nvidia
+libnvidia-cfg
 ```
 
-**Not driver-versioned** (`:47`) — see below:
+The five GLVND vendor libraries on the last two lines were added after being
+found missing: `stage_guest_libs.sh` stages every one of them by name, so a
+bundle without them made that script exit 2 with five `MISSING` lines. The first
+is `libEGL_nvidia`, which is what `/usr/share/glvnd/egl_vendor.d/10_nvidia.json`
+points at — without it EGL has no NVIDIA vendor and every GL/EGL client silently
+falls back to Mesa llvmpipe. `libGLX_nvidia` is the Vulkan ICD named by
+`nvidia_icd.json`, so its absence silently demotes Vulkan to lavapipe
+(`scripts/make_host_bundle.sh:34-42`).
+
+**Not driver-versioned** (`:59`) — see below:
 
 ```
 libnvidia-egl-wayland  libnvidia-egl-gbm
 ```
 
-Plus `nvidia-smi` itself (`:74`) and the JSON configs from
+Plus `nvidia-smi` itself (`:86`) and the JSON configs from
 `/usr/share/glvnd/egl_vendor.d`, `/usr/share/egl/egl_external_platform.d` and
-`/usr/share/vulkan/icd.d` (`:80-84`).
+`/usr/share/vulkan/icd.d` (`:92-96`).
 
 ## In the guest
 
@@ -58,14 +69,27 @@ Plus `nvidia-smi` itself (`:74`) and the JSON configs from
 sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh
 ```
 
-It picks the first `/mnt/nvkvm/host-libs-*` directory, or takes one as `$1`
-(`scripts/stage_guest_libs.sh:18`). The version it stages is derived from the
-bundle itself — `V` is parsed out of the `libcuda.so.*` filename — so the guest
-is pinned to whatever the bundle contains
-(`scripts/stage_guest_libs.sh:23-27`).
+It takes a bundle as `$1`, or resolves one against the **host driver version**
+the guest module reported in `dmesg` (`scripts/stage_guest_libs.sh:30-50`). If
+that version cannot be read and more than one bundle is present it **refuses to
+guess**, prints the candidates and exits 1. It only auto-picks when exactly one
+bundle exists.
+
+That is not incidental. It used to be `ls -d /mnt/nvkvm/host-libs-* | head -1`,
+i.e. whichever bundle sorted first alphabetically — fine while a host has only
+ever had one driver, silently wrong the moment it has had two. A box taken from
+580.95.05 to 595.84 has both bundles on the share and `"580.95.05" < "595.84"`,
+so the guest was staged with the *old* userspace against the *new* kernel
+driver: `cuInit rc=803`, `CUDA_ERROR_SYSTEM_DRIVER_MISMATCH`, with nothing in
+the staging output suggesting the wrong bundle had been picked
+(`scripts/stage_guest_libs.sh:19-29`).
+
+The version it stages is then derived from the bundle itself — `V` is parsed out
+of the `libcuda.so.*` filename — so the guest is pinned to whatever the bundle
+contains (`scripts/stage_guest_libs.sh:55`).
 
 **Check the exit status.** It exits 2 with a list if anything was missing
-(`:246-253`).
+(`:335-346`).
 
 Two destination directories, and both must match
 (`scripts/stage_guest_libs.sh:8-12`):
@@ -80,19 +104,19 @@ libraries:
 
 | file | why |
 |---|---|
-| `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` | without it `libGLX_nvidia` never enters its NVIDIA device-detection path and the Vulkan ICD bows out to llvmpipe (`:206-218`) |
-| `/usr/share/vulkan/icd.d/nvidia_icd.json` | the Vulkan ICD on Linux *is* `libGLX_nvidia.so.0`; without the manifest the loader enumerates only lavapipe and a "Vulkan parity" run measures the CPU rasteriser (`:220-233`) |
+| `/usr/share/glvnd/egl_vendor.d/10_nvidia.json` | without it `libGLX_nvidia` never enters its NVIDIA device-detection path and the Vulkan ICD bows out to llvmpipe (`:299-312`) |
+| `/usr/share/vulkan/icd.d/nvidia_icd.json` | the Vulkan ICD on Linux *is* `libGLX_nvidia.so.0`; without the manifest the loader enumerates only lavapipe and a "Vulkan parity" run measures the CPU rasteriser (`:315-325`) |
 | `/usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json` | see below |
 | `/usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json` | the EGL external platform for `EGL_PLATFORM_GBM` on an NVIDIA gbm device |
 
 and one symlink that is easy to miss: `$SYS/gbm/nvidia-drm_gbm.so` →
-`libnvidia-allocator.so.$V` (`:113-117`). Mesa's `libgbm` dlopens
+`libnvidia-allocator.so.$V` (`:142-149`). Mesa's `libgbm` dlopens
 `<drmdriver>_gbm.so` by the card's DRM driver name (`nvidia-drm`), and the
 NVIDIA backend *is* `libnvidia-allocator`. Without it, `gbm_create_device()` on
 card0 returns a Mesa "dri" device and the NVIDIA EGL platform never gets a
 chance.
 
-Finally it blacklists `nouveau` (`:238-241`) — the emulated `nvkvm-gpu` PCI
+Finally it blacklists `nouveau` (`:328-333`) — the emulated `nvkvm-gpu` PCI
 device has no BARs, so nouveau auto-binding to it can only fail and make noise.
 Takes effect after a guest reboot.
 
@@ -105,13 +129,13 @@ Every failure mode in this area produces a system that *looks* correct.
 
 **A missing library used to produce no output at all.** Every copy was
 `cp -f ... 2>/dev/null`, so an absent library was invisible and the script still
-printed "done" (`scripts/stage_guest_libs.sh:31-35`):
+printed "done" (`scripts/stage_guest_libs.sh:63-67`):
 
 > this is how the whole GL/Vulkan stack went missing while the script still
 > printed "done"
 
 Every copy now routes through a `stage()` helper that prints `STAGED` or
-`MISSING` and remembers the misses for the summary (`:38-49`).
+`MISSING` and remembers the misses for the summary (`:70-81`).
 
 **A hardcoded version deleted the libraries it had just staged.** The
 stale-sweep was `rm -f $CUDADIR/lib*.so.575.51.03`, with the version literal. On
@@ -122,7 +146,7 @@ directory `ld.so` searches first. Applications kept working by accident —
 `libnvidia-ptxjitcompiler` is staged **only** in that directory, so every
 `cuModuleLoadData(PTX)` died with `CUDA_ERROR_JIT_COMPILER_NOT_FOUND` (221),
 which reads as "kernels are broken", not "a library is missing"
-(`scripts/stage_guest_libs.sh:54-60`, `:167-175`).
+(`scripts/stage_guest_libs.sh:207-221`).
 
 Both sweeps are now version-aware and skip symlinks:
 
@@ -140,16 +164,16 @@ done
 header claimed CUDA apps resolve `libcuda` from `/usr/local/nvidia-guest/lib`
 "via nvidia-guest.conf, AHEAD of the system dir", but nothing created that file,
 so the directory was off the `ld.so` path entirely and every app silently
-resolved from the system directory instead (`scripts/stage_guest_libs.sh:195-198`).
+resolved from the system directory instead (`scripts/stage_guest_libs.sh:235-242`).
 
 **A missing JIT dependency moves the failure one layer down.**
 `libnvidia-ptxjitcompiler` dlopens `libnvidia-nvvm.so.4`. Staging the JIT
 compiler without nvvm leaves `cuInit` and plain memcpy passing, and only PTX
-module loads failing (`scripts/stage_guest_libs.sh:161-165`). Found during
+module loads failing (`scripts/stage_guest_libs.sh:201-206`). Found during
 Ada/Turing bring-up.
 
 **A missing external platform produces a correctly-sized black window.** This
-is the sharpest example. `scripts/stage_guest_libs.sh:122-131`:
+is the sharpest example. `scripts/stage_guest_libs.sh:153-163`:
 
 > A Wayland GL client (es2gears, glmark2, any toolkit) calls
 > `eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND)`; with no

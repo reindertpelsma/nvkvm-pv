@@ -316,12 +316,12 @@ Specific things a reader should weigh:
   This is forced by the driver: UVM binds its file's `nvfp` to the calling task's
   `mm` during `UVM_INITIALIZE`, and the matching `mmap` must come from the same
   `mm` — which is QEMU, because QEMU is what installs the KVM memory region
-  (`src/qemu/nvkvm_isolate_handlers.c:985-995`). The schema allowlist
-  (`src/qemu/nvkvm_isolate_handlers.c:516-562`) is the mitigation.
+  (`src/qemu/nvkvm_isolate_handlers.c:1229-1237`). The schema allowlist
+  (`src/qemu/nvkvm_isolate_handlers.c:599-645`) is the mitigation.
 - **Intra-VM access control is the guest kernel's job, by design.** QEMU does
   not check which guest process may touch which object; it checks cross-VM and
   host-process boundaries only
-  (`src/qemu/nvkvm_isolate_handlers.c:997-1007`). A malicious guest *kernel* is
+  (`src/qemu/nvkvm_isolate_handlers.c:1240-1252`). A malicious guest *kernel* is
   outside the model that check would defend.
 - **The guest does not defend against the host.** `src/guest/nvkvm_mmap.c:18-20`:
   "A malicious host could abuse this, but we are not defending against the
@@ -342,7 +342,7 @@ Do not put untrusted tenants behind this.
 The multi-channel form carries three guest-userspace pointers to handle arrays,
 which the single-aux-slot path cannot marshal. The guest zeroes them *and*
 `num_channels` (`src/guest/nvkvm_ioctl.c:462-479`), and the stub re-zeroes the
-same 28 bytes at the boundary (`src/stub/nvkvm_stub.c:1192-1196`).
+same 28 bytes at the boundary (`src/stub/nvkvm_stub.c:1280-1283`).
 
 > multi-channel idle degrades to a best-effort single-channel drain, which is
 > fine for the pre-teardown use libcuda makes of this call.
@@ -384,7 +384,7 @@ The guest synthesises an opaque per-fd id instead
   (`src/qemu/nvkvm_mmap_host.c:296-300`).
 - **Isolate mmap table**: 8192 entries; on overflow the mapping is torn down and
   the request fails rather than leaking
-  (`src/qemu/nvkvm_isolate_handlers.c:1939-1972`).
+  (`src/qemu/nvkvm_isolate_handlers.c:2434-2470`).
 - **Guest RAM ≥ 1 TB is refused.** The GPA windows sit at fixed addresses (1 TB
   shm, 1.5 TB mmap, 2 TB sparse); a VM with ≥1 TB RAM would overlap and silently
   corrupt, so realize fails loudly instead
@@ -409,11 +409,19 @@ The legacy `NVKVM_REQ_OPEN` / `_CLOSE` / `_IOCTL` / `_MMAP` / `_MUNMAP`
 handlers in `src/qemu/virtio_nvgpu.c` are under `#if 0` as tombstones
 (`src/qemu/virtio_nvgpu.c:230-236`).
 
-Two comments in the graphics layer are stale in the other direction: the
-`src/guest/nvkvm_drm.c:23-25` header note and the `Audit G-3` block in
-`src/qemu/nvkvm_drm_allowlist.h` both describe a smaller guest DRM ioctl table
-than the code now has — `0x09`, `0x0b`, `0x0e` and `0x18` were added later
-(`src/guest/nvkvm_drm.c:688-720`).
+One comment in the graphics layer was stale in the other direction, and has been
+corrected: the `Audit G-3` block in `src/qemu/nvkvm_drm_allowlist.h` justified
+its four exclusions by asserting the guest DRM proxy "wires only GET_DEV_INFO /
+DMABUF_SUPPORTED / SEMSURF_FENCE_* + GEM_CLOSE". `nvkvm_drm_ioctls[]`
+(`src/guest/nvkvm_drm.c:688-720`) also wires `0x09`, `0x0b`, `0x0e` and `0x18`.
+The conclusion survives — `0x02`/`0x0a`/`0x0d` are genuinely absent from the
+guest table, and `0x0e` is wired but answered entirely guest-side
+(`src/guest/nvkvm_drm.c:391-405`) and never forwarded — but the stated reason
+did not, and a reason that no longer holds is worse than no reason.
+
+The `src/guest/nvkvm_drm.c:23-25` header note is *not* stale: the three ioctls
+it defers (`IMPORT_USERSPACE_MEMORY`, `MAP_OFFSET`, `EXPORT_DMABUF`) are still
+absent from the guest table.
 
 ### Pinned host memory
 

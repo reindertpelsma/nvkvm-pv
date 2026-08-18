@@ -213,7 +213,7 @@ pages. The guest kernel module is out of the picture for every subsequent
 access.
 
 **Host side** — `nvkvm_req_mmap_on_isolate()`,
-`src/qemu/nvkvm_isolate_handlers.c:1764-1979`. QEMU allocates a GPA from a
+`src/qemu/nvkvm_isolate_handlers.c:2263-2478`. QEMU allocates a GPA from a
 pre-reserved window and `MAP_FIXED`s the real device fd over that window's
 backing:
 
@@ -221,7 +221,7 @@ backing:
 qva = mmap(target, len, req->prot,
            MAP_SHARED | MAP_FIXED, h->fd, (off_t)req->offset);
 ```
-— `src/qemu/nvkvm_isolate_handlers.c:1833-1834`
+— `src/qemu/nvkvm_isolate_handlers.c:2332-2333`
 
 and then does *no KVM ioctl at all*, because one memslot already covers the
 whole window (`:1852-1854`).
@@ -238,7 +238,7 @@ with CUDA:
 > Sparse/holey device regions inside one big prereserved KVM memory region are
 > fully supported by KVM (per-page gup on fault).
 >
-> — `src/qemu/nvkvm_isolate_handlers.c:1801-1809`
+> — `src/qemu/nvkvm_isolate_handlers.c:2300-2311`
 
 So: at device realize, QEMU reserves 128 GiB of anonymous `MAP_NORESERVE`
 address space (`src/qemu/nvkvm_mmap_host.c:146-149`) and installs **one**
@@ -246,7 +246,7 @@ address space (`src/qemu/nvkvm_mmap_host.c:146-149`) and installs **one**
 (`src/qemu/nvkvm_mmap_host.c:209-210`). Individual device mappings are then
 `MAP_FIXED` slices carved out of that region. Teardown restores the anonymous
 backing rather than `munmap`ing, because a `munmap` would punch a hole in the
-window's single VMA (`src/qemu/nvkvm_isolate_handlers.c:1998-2005`).
+window's single VMA (`src/qemu/nvkvm_isolate_handlers.c:2412-2420`).
 
 The window's guest-physical base is not a constant. QEMU registers a 128 GiB
 prefetchable 64-bit MMIO BAR with no backing, purely so guest firmware
@@ -261,7 +261,7 @@ its QEMU-listener-managed memslot collided with the raw one and broke `cuInit`
 QEMU chooses. It gets a GPA from the window riding the window's anonymous
 backing, with no QEMU-side device mmap at all — the stub owns the real UVM
 mapping in its own address space and the GPU reaches the memory by DMA
-(`src/qemu/nvkvm_isolate_handlers.c:1856-1885`). The earlier design that
+(`src/qemu/nvkvm_isolate_handlers.c:2354-2385`). The earlier design that
 `MAP_FIXED`'d UVM at `req->offset` in QEMU's address space collided across
 concurrent processes — `libcuda` picks the same UVM VA in every process, and
 QEMU has one address space — so the second process hit `EEXIST` and
@@ -326,24 +326,43 @@ The fix runs in the guest sanitiser (`src/guest/nvkvm_ioctl.c:379-412`):
 `p_memory` is deliberately left unchanged so the kernel sees the same VA the
 stub has mapped.
 
-`nvkvm_cpu_pages_migrate_range()` (`src/guest/nvkvm_mmap.c:782-985`) does this
+`nvkvm_cpu_pages_migrate_range()` (`src/guest/nvkvm_mmap.c:823-1138`) does this
 in 2 MiB chunks — one memfd, one batched upload, one `mmap_on_isolate` and one
 `remap_pfn_range` per chunk — with the chunk size chosen for a specific reason
-(`src/guest/nvkvm_mmap.c:770-778`):
+(`src/guest/nvkvm_mmap.c:771-803`):
 
 > Each chunk = ONE memfd + ONE `mmap_on_isolate` + ONE `remap_pfn_range` (vs the
 > old per-4KB-page path: ~5 forwarded round-trips EACH — measured 2.44s for a
-> 16MB OS_DESCRIPTOR). Chunking (rather than one memfd for the whole range)
-> bounds the transient memory: during migration the data lives in BOTH the
-> pinned guest pages AND the memfd, so a multi-GB single memfd would need ~2x
-> the RAM.
+> 16MB OS_DESCRIPTOR). 2MB amortizes the ~4 fixed per-chunk forwards over 512
+> pages (negligible).
 
-The VMA swap happens once, after every chunk is in place: zap the range, mark
-`VM_PFNMAP`, `remap_pfn_range` each chunk's GPA, force WB, drop the original
-anon pins (`:912-951`). Same cacheability lesson, recorded again with numbers:
-mapping this range uncached made the guest's post-DtoH read
-"a stream of uncached, unprefetched loads — measured 0.07 GB/s vs 9.6 GB/s on
-the host (130x)" (`src/guest/nvkvm_mmap.c:920-935`).
+Migration is strictly **per chunk**: copy the chunk into its memfd, swap that
+chunk's PTEs onto the memfd's GPA, release that chunk's pinned guest pages, and
+only then start the next chunk (`src/guest/nvkvm_mmap.c:948-1117`). That
+ordering is what bounds the duplicated data — the window in which one chunk
+exists both in the pinned guest pages and in its memfd is exactly one chunk,
+2 MiB, whether the caller registers 16 MiB or 2 GiB. The memfd itself is *not*
+transient: it is the backing store the guest VMA points at for the lifetime of
+the registration, so total memfd bytes necessarily equal the registered size.
+
+The single VMA conversion happens once, up front, before any chunk moves
+(`src/guest/nvkvm_mmap.c:890-945`): set `VM_PFNMAP | VM_IO | VM_DONTEXPAND |
+VM_DONTDUMP`, and clear `VM_MAYWRITE` on a copy-on-write mapping —
+`remap_pfn_range()` refuses any sub-VMA remap of a COW mapping unless it covers
+the whole VMA exactly, which is what ordinary `malloc()`/`MAP_PRIVATE` memory
+is, so before that fix every multi-chunk registration failed `-EINVAL` and
+surfaced as `CUDA_ERROR_INVALID_VALUE` (`src/guest/nvkvm_mmap.c:907-925`). Same
+cacheability lesson as above, recorded again with numbers: mapping this range
+uncached made the guest's post-DtoH read "a stream of uncached, unprefetched
+loads — measured 0.07 GB/s vs 9.6 GB/s on the host (130x)"
+(`src/guest/nvkvm_mmap.c:926-944`).
+
+A single call is capped at 2 GiB (`NVKVM_MIG_MAX_RANGE`,
+`src/guest/nvkvm_mmap.c:806-821`) — a guest-side policy limit derived from
+QEMU's fixed 8192-entry mmap-token table, not a hardware one. This replaced an
+earlier 16 MiB `-E2BIG` check that was a side effect of batching every chunk's
+memfd before the VMA swap; see
+[known limitations](docs/internal/known-limitations.md#pinned-host-memory).
 
 ### Demand faults
 
@@ -432,21 +451,42 @@ blob and zeroes those too — the driver will write into the extension:
   zeroes it rather than marshalling (`src/guest/nvkvm_main.c:1628-1639`).
 
 **2. Boundary: overwrite at the far end.** The stub does not check whether the
-guest zeroed anything. It writes over the field:
+guest zeroed anything. It picks the pointer's *offset* from the cmd — which
+selects the struct layout, and which a guest cannot use to skip the write — and
+then writes either the aux pointer or an explicit 0:
 
 ```c
+int ptr_off = -1;
+if ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
+     job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
+    (job_type == 'd' && (job_nr == 0x54 || job_nr == 0x49) &&
+     job.param_size >= 16)) {
+        ptr_off = NVKVM_NVKMS_ADDR_OFF;
+} else if (job_type == 'F' && (job_nr == 0x2a || job_nr == 0x2b) &&
+           job.param_size >= 24) {
+        ptr_off = 16;
 } else if (job.aux_size > 0 && job.param_size >= 24) {
-        uint64_t aux_ptr = (uint64_t)(uintptr_t)job.aux_buf;
-        __builtin_memcpy((char *)job.param_buf + 16, &aux_ptr,
-                         sizeof(uint64_t));
+        ptr_off = 16;
+}
+if (ptr_off >= 0) {
+        uint64_t ptr_val = (job.aux_size > 0)
+                ? (uint64_t)(uintptr_t)job.aux_buf : 0;
+        __builtin_memcpy((char *)job.param_buf + ptr_off,
+                         &ptr_val, sizeof(uint64_t));
 }
 ```
-— `src/stub/nvkvm_stub.c:862-866`
+— `src/stub/nvkvm_stub.c:901-921`
 
 Offset 16 is where both `NVOS54.params` and `NVOS21`/`NVOS64.p_alloc_parms`
 live (four 4-byte handles precede them). The NVKMS wrapper and two DRM ioctls
-carry their single pointer at offset 8 instead and are handled by the branch
-above (`src/stub/nvkvm_stub.c:850-861`).
+(`SEMSURF_FENCE_CTX_CREATE`, nr 0x54, and `GEM_EXPORT_NVKMS_MEMORY`, nr 0x49)
+carry their single pointer at offset 8 (`NVKVM_NVKMS_ADDR_OFF`,
+`src/common/nvkvm_proto.h:112`) instead.
+
+The first two arms are the **U-2** fix. Both rewrites used to be gated on
+`job.aux_size > 0` — a value the guest chooses — so a guest sending
+`aux_size == 0` fell out of both branches and its own eight bytes reached
+`stub_ioctl()` and the driver verbatim (`src/stub/nvkvm_stub.c:876-900`).
 
 **What step 2 does not cover — stated plainly.** This rewrite is the closest
 thing in the tree to a categorical mechanism, and it is not one:
@@ -512,15 +552,15 @@ in QEMU. Bounding the blast radius is not the same as closing the bug class, and
 this document should not be read as claiming otherwise.
 
 `job.aux_buf` is a private anonymous mapping in the stub, filled by `recv()`
-from the socket (`src/stub/nvkvm_stub.c:1857-1862`) — not shared memory, not
+from the socket (`src/stub/nvkvm_stub.c:1944-1945`) — not shared memory, not
 guest-writable. The inner-pointer reconstructions for the `InfoList`,
 `GET_BUILD_VERSION`, `FIFO_GET_CHANNELLIST` and `EXPORT_OBJECT_TO_FD` families
 happen the same way, pointing into the aux blob's extension region
-(`src/stub/nvkvm_stub.c:945-1076`).
+(`src/stub/nvkvm_stub.c:986-1160`).
 
 **3. Boundary: zero again on the way back.** Every substituted pointer is a
 stub virtual address and must not be visible to the guest
-(`src/stub/nvkvm_stub.c:1316-1349`). Same for the version-string pointers, the
+(`src/stub/nvkvm_stub.c:1404-1458`). Same for the version-string pointers, the
 `InfoList` pointer, and the DRM/NVKMS ones.
 
 ### "The boundary, not the untrusted guest, must ensure no guest pointer is ever forwarded"
@@ -532,7 +572,7 @@ place where it was most nearly violated. `NV_ESC_RM_IDLE_CHANNELS` carries three
 Read the block below as a statement of intent, not as the shipping control: it
 lives in `src/qemu/nvkvm_dispatch.c`, whose **every** call site is inside the
 `#if 0` at `src/qemu/virtio_nvgpu.c:236-588`. The file still compiles and links
-(`scripts/build_qemu.sh:144`), so it reads as live; nothing in it executes. The
+(`scripts/build_qemu.sh:169`), so it reads as live; nothing in it executes. The
 control that does ship is quoted further down, in the stub.
 
 ```c
@@ -592,7 +632,7 @@ boundary.** `src/qemu/nvkvm_dispatch.c:375-379` says so:
 > on it.
 
 The live neutralisation is in the stub, on a private copy of the parameters
-(`src/stub/nvkvm_stub.c:1180-1196`):
+(`src/stub/nvkvm_stub.c:1268-1283`):
 
 > so the guest-controlled `NvP64` array pointers were reaching the host driver,
 > which would walk them as user pointers in the stub's address space. […]
@@ -622,7 +662,7 @@ an opaque 32-bit token from QEMU's global table.
   (`src/guest/nvkvm_ioctl.c:268-546`).
 - **Stub**: `handle_lookup()` maps handle id → its own local fd immediately
   before the ioctl, and restores the handle id immediately after, "never leak a
-  stub fd" (`src/stub/nvkvm_stub.c:1139-1219`, `:1299-1314`).
+  stub fd" (`src/stub/nvkvm_stub.c:1228-1265`, `:1299-1314`).
 
 Sentinels are respected rather than translated: `libcuda` passes `-1` for "no
 ctrl fd" and `0` or `-1` for "no associated fd", and translating those would
@@ -703,10 +743,14 @@ QEMU's expected-size table and UVM schema floor, and the stub's UVM fd offset
 and NVOS46 status offset. `tests/abi_parity` asserts the compiled-in table
 against measured values.
 
-**Two of the eight rows have actually been booted**: 570 (on driver 575.51.03)
-and 535 (on 535.309.01). Every other row is measured from OGKM source by
-`tools/abi_derive.sh` and asserted by `tests/abi_parity`, but has not been
-brought up in this repository. Deriving a layout is not booting one. See
+**Six of the eight rows have actually been booted**: 535 (on 535.309.01) and
+570 (on 575.51.03) earlier, then 545 (545.23.08), 550 (550.54.14), 580 (at both
+ends of its range, 580.95.05 and 595.84) and 610 (610.43.02) in the boot-matrix
+run. The remaining two, 515 and 525, are measured from OGKM source by
+`tools/abi_derive.sh` and asserted by `tests/abi_parity` but have not been
+brought up: the drivers that select them do not build against kernel 6.8, which
+is what every KVM-capable test host ran. Deriving a layout is not booting one.
+See [`tests/BOOT_MATRIX.md`](tests/BOOT_MATRIX.md) and
 [`docs/reference/supported-drivers.md`](docs/reference/supported-drivers.md).
 
 One category of version drift the profile table does **not** cover, and which
@@ -742,13 +786,13 @@ Consequences visible throughout the code:
   so the file's `nvfp` lineage matches the process running the RM ioctls. QEMU
   reserves a handle slot, asks the stub to open the device
   (`ISOLATE_CMD_OPEN_DEVICE`), and receives a `SCM_RIGHTS` copy back to keep in
-  its own table (`src/qemu/nvkvm_isolate_handlers.c:186-259`).
+  its own table (`src/qemu/nvkvm_isolate_handlers.c:192-303`).
 - **`/dev/nvidia-uvm` is opened twice by the stub itself** at startup, and a
   `RECEIVE_FD` carrying a UVM fd from QEMU is deliberately *dropped* in favour
-  of one of those local opens (`src/stub/nvkvm_stub.c:243-258`, `:2722-2728`).
+  of one of those local opens (`src/stub/nvkvm_stub.c:255-266`, `:2722-2728`).
 - **UVM ioctls run in QEMU's process**, because UVM's mmap must come from the
   same `mm` that ran `UVM_INITIALIZE`, and that mmap is what installs the KVM
-  region (`src/qemu/nvkvm_isolate_handlers.c:985-995`). This is the one place
+  region (`src/qemu/nvkvm_isolate_handlers.c:1229-1237`). This is the one place
   where privileged QEMU executes a guest-named ioctl, which is why the UVM
   schema allowlist exists.
 - **`RM_SHARE` after every successful alloc.** The kernel's default share policy
@@ -757,11 +801,11 @@ Consequences visible throughout the code:
   UVM's kernel-internal client cannot dup `libcuda`'s VA space and `cuCtxCreate`
   fails with `NV_ERR_INSUFFICIENT_PERMISSIONS`. QEMU issues an `NV_ESC_RM_SHARE`
   granting `RS_ACCESS_DUP_OBJECT` on the new handle
-  (`src/qemu/nvkvm_isolate_handlers.c:1490-1610`).
+  (`src/qemu/nvkvm_isolate_handlers.c:1992-2109`).
 
   The share type is `RS_SHARE_TYPE_ALL`, and the reasoning is worth reading in
   full because it is counter-intuitive
-  (`src/qemu/nvkvm_isolate_handlers.c:1561-1586`):
+  (`src/qemu/nvkvm_isolate_handlers.c:2065-2088`):
 
   > This is NOT a cross-tenant hole: cross-VM/host containment comes from the
   > handle NAMESPACE (reach-gating), not the share type. A foreign client cannot
@@ -783,7 +827,7 @@ A freestanding static PIE. No libc, no pthread — futex-based mutex/cond, raw
 syscall wrappers, a `clone3` trampoline and a tiny printf all live in
 `src/stub/stub_freestanding.h` (`src/stub/nvkvm_stub.c:4-7`). It applies its own
 `R_X86_64_RELATIVE` relocations before touching global data
-(`src/stub/nvkvm_stub.c:2611-2640`), because it is `fexecve`'d from a memfd with
+(`src/stub/nvkvm_stub.c:2711-2745`), because it is `fexecve`'d from a memfd with
 no dynamic linker.
 
 It is embedded in the QEMU binary as a byte array (`xxd -i`,
@@ -816,7 +860,7 @@ create namespaces (`src/qemu/nvkvm_isolate.c:50-64`):
    (`src/qemu/nvkvm_isolate.c:837-852`), environment cleared
    (`src/qemu/nvkvm_isolate.c:860`).
 6. After the worker pool is spawned, a seccomp allowlist with `TSYNC`
-   (`src/stub/nvkvm_stub.c:2510-2592`) — 20 syscalls, everything else `EPERM`.
+   (`src/stub/nvkvm_stub.c:2610-2692`) — 20 syscalls, everything else `EPERM`.
 
 Three of those steps carry post-mortems worth reading.
 
@@ -841,7 +885,7 @@ handle to the *whole host `/dev`* at a fixed fd and pivoted into an empty tmpfs:
 
 **Plain W^X is insufficient.** The seccomp filter denies `PROT_EXEC` on `mmap`
 and `mprotect` outright, not just `W|X` together
-(`src/stub/nvkvm_stub.c:2523-2540`):
+(`src/stub/nvkvm_stub.c:2624-2641`):
 
 > an attacker can mmap a page RW, write shellcode, then mprotect it R-X — each
 > step passes W^X but the result is executable attacker code. The stub's own
@@ -851,7 +895,7 @@ and `mprotect` outright, not just `W|X` together
 `TSYNC` matters for the same class of reason: the worker pool is spawned before
 `apply_seccomp()` runs, and a non-TSYNC filter would bind to the reader thread
 only, leaving the threads that run all attacker-influenced ioctl handling
-completely unsandboxed (`src/stub/nvkvm_stub.c:2584-2589`).
+completely unsandboxed (`src/stub/nvkvm_stub.c:2684-2689`).
 
 A `SIGSEGV` inside the stub terminates it rather than returning
 (`src/stub/nvkvm_stub.c:674-686`): returning would re-execute the faulting
@@ -879,15 +923,15 @@ Six default-deny gates, all in QEMU, all in `nvkvm_req_ioctl_on_isolate()`:
 
 | gate | entries | file |
 |---|---|---|
-| UVM command schema | 31 | `src/qemu/nvkvm_isolate_handlers.c:516-562` |
+| UVM command schema | 31 | `src/qemu/nvkvm_isolate_handlers.c:599-645` |
 | DRM render-node NR | 14 | `src/qemu/nvkvm_drm_allowlist.h` |
-| NVKMS inner cmdType | 6 | `src/qemu/nvkvm_nvkms_allowlist.h` |
-| frontend ioctl NR | 23 | `src/qemu/nvkvm_fe_alloc_allowlist.h:19-49` |
-| `RM_ALLOC` class | 89 | `src/qemu/nvkvm_fe_alloc_allowlist.h:53-142` |
+| NVKMS inner cmdType | 7 | `src/qemu/nvkvm_nvkms_allowlist.h` |
+| frontend ioctl NR | 23 | `src/qemu/nvkvm_fe_alloc_allowlist.h:25-55` |
+| `RM_ALLOC` class | 89 | `src/qemu/nvkvm_fe_alloc_allowlist.h:59-149` |
 | RM control command | 166 + 2 rules | `src/qemu/nvkvm_ctrl_allowlist.h:28-240` |
 
 Plus a runtime per-VM `hClient` set built from observed successful allocs
-(`src/qemu/nvkvm_isolate_handlers.c:1460-1488`), consulted on `DUP_OBJECT`'s
+(`src/qemu/nvkvm_isolate_handlers.c:1959-1990`), consulted on `DUP_OBJECT`'s
 source client and on every `'F'` ioctl carrying an `hClient` at param offset 0.
 
 They live in QEMU rather than the guest because the guest kernel module is
@@ -905,7 +949,7 @@ behind each deliberate exclusion is in
 - **QEMU's boundary is cross-VM and host-process.** Not intra-VM. Intra-VM
   access control is emulated by the guest kernel module, which owns the guest's
   pids, uids, namespaces and fds and is the authority
-  (`src/qemu/nvkvm_isolate_handlers.c:997-1007`). QEMU deliberately does not
+  (`src/qemu/nvkvm_isolate_handlers.c:1240-1252`). QEMU deliberately does not
   second-guess it — doing so would reject a handle the guest legitimately shared
   into another isolate (CUDA IPC) and would add nothing, since a malicious guest
   kernel would just forge `session_id`.
@@ -949,7 +993,7 @@ design.
 
 The cost is paid up front instead: a single `cuCtxCreate` issues more than 1500
 device `mmap`s, each a virtqueue round trip
-(`src/qemu/nvkvm_isolate_handlers.c:1802-1805`). The sparse window exists to
+(`src/qemu/nvkvm_isolate_handlers.c:2303-2306`). The sparse window exists to
 make that setup cost survivable — one KVM memslot instead of 1500.
 
 ### The residual control traffic, and the SPSC ring
@@ -987,7 +1031,7 @@ is one parameter (`src/common/nvkvm_ring.h:106-110`):
 > never an OOB write.
 
 A malformed record tears down that one isolate (`stub_exit(140)`,
-`src/stub/nvkvm_stub.c:2374`) — per-guest DoS, never out-of-bounds.
+`src/stub/nvkvm_stub.c:2474`) — per-guest DoS, never out-of-bounds.
 
 **Wake-up without a futex.** There is no synchronisation word in guest-writable
 memory. The guest's per-session pump kthread issues a blocking `ENTER_LOOP`
@@ -995,9 +1039,9 @@ virtqueue request; QEMU offloads it to its thread pool
 (`src/qemu/virtio_nvgpu.c:853-868`) and forwards it to the stub, whose reader
 thread spins on the request ring, executing eligible controls **inline** — no
 worker hand-off, "that latency is the whole point"
-(`src/stub/nvkvm_stub.c:2146-2147`). At every drain edge it still polls the
+(`src/stub/nvkvm_stub.c:2233-2234`). At every drain edge it still polls the
 socket non-blocking, so slow-path IOCTL/INTERRUPT/EXIT stay serviced
-(`src/stub/nvkvm_stub.c:2317-2342`).
+(`src/stub/nvkvm_stub.c:2416-2442`).
 
 The exit edge is the interesting bit
 (`src/common/nvkvm_ring.h:243-247`):
@@ -1021,7 +1065,7 @@ control not in the pointer-carrying set (`InfoList` family,
 `GET_BUILD_VERSION`, `EXPORT_OBJECT_TO_FD`, `FIFO_GET_CHANNELLIST`). Anything
 else the stub **PUNTs** — and PUNT means *not executed*, so the guest's fallback
 to the virtqueue can never double-run a side-effecting control
-(`ring_ctrl_must_punt()`, `src/stub/nvkvm_stub.c:2215-2247`).
+(`ring_ctrl_must_punt()`, `src/stub/nvkvm_stub.c:2309-2340`).
 
 **It is a pure optimisation with a fallback at every layer** — setup failure,
 BAR not yet programmed, ring full, ineligible command, stub PUNT, all land on
@@ -1036,7 +1080,7 @@ record *contents*. Every gate described under
 per-VM `hClient` allowlist, the `DUP_OBJECT` source-client check, the `'F'`-type
 default-deny — lives in `nvkvm_req_ioctl_on_isolate` (QEMU), and the ring does
 not pass through QEMU at all: the guest writes records into the shared memfd and
-`ring_exec_one` (`src/stub/nvkvm_stub.c:2254`) executes them. `grep allowlist
+`ring_exec_one` (`src/stub/nvkvm_stub.c:2342`) executes them. `grep allowlist
 src/stub/nvkvm_stub.c` returns only seccomp comments. `ring_ctrl_must_punt`
 decides *marshalling* eligibility, not *permission*, and it accepts
 `aux_size == 0` explicitly. (The inner-params pointer rewrite on that path is no

@@ -20,7 +20,7 @@ Steps 1 and 2 are one script. Step 3 is done by cloud-init on first guest boot.
 - Root, for `apt-get` and for writing `/opt` and `/usr/lib/nvkvm`.
 
 `scripts/build_qemu.sh` installs its own dependencies
-(`scripts/build_qemu.sh:28-49`):
+(`scripts/build_qemu.sh:55-74`):
 
 ```
 ninja-build meson libglib2.0-dev libpixman-1-dev python3 python3-venv
@@ -38,13 +38,25 @@ embedded.
 sudo bash scripts/build_qemu.sh
 ```
 
-Idempotent: it exits 0 immediately if `/opt/qemu-nvkvm/bin/qemu-system-x86_64`
-already exists (`scripts/build_qemu.sh:16-19`). To force a rebuild, remove that
-binary or the whole `/opt/qemu-nvkvm`.
+Guarded, not idempotent-in-the-useful-sense: it exits 0 immediately if
+`/opt/qemu-nvkvm/bin/qemu-system-x86_64` already exists
+(`scripts/build_qemu.sh:37-41`). **A plain re-run after editing anything under
+`src/qemu/` or `src/common/` is therefore a silent no-op** — you keep testing the
+old binary against new guest code, which surfaces as a confusing mismatch rather
+than as a build error (a new `NVKVM_HFILE_*` id, for instance, comes back
+"Invalid argument" from the stale binary's whitelist).
+
+Pass `--force` to rebuild over the existing install
+(`scripts/build_qemu.sh:25-44`). The QEMU source tree and the ninja build dir
+are reused, so a forced rebuild is incremental — minutes, not the full ~20:
+
+```bash
+sudo bash scripts/build_qemu.sh --force
+```
 
 What it does, in the order it does it:
 
-**1b. Build and install the isolate stub** (`scripts/build_qemu.sh:65-69`).
+**1b. Build and install the isolate stub** (`scripts/build_qemu.sh:90-94`).
 `make -C src/stub` produces `nvkvm_stub` and `nvkvm_stub_bin.h`. The build flags
 matter (`src/stub/Makefile:11-18`): `-nostdlib -static -fPIE -ffreestanding
 -fno-stack-protector -fno-builtin`, linked `-nostdlib -static -pie
@@ -53,7 +65,7 @@ matter (`src/stub/Makefile:11-18`): `-nostdlib -static -fPIE -ffreestanding
 `/usr/lib/nvkvm/nvkvm_stub` as the runtime fallback path.
 
 This step is load-bearing and its absence is silent — the script's own comment
-(`scripts/build_qemu.sh:52-64`):
+(`scripts/build_qemu.sh:77-89`):
 
 > with neither the define nor the generated header the QEMU build SUCCEEDS with
 > `stub_elf = NULL`, `stub_elf_len = 0`, and silently falls back to
@@ -62,14 +74,14 @@ This step is load-bearing and its absence is silent — the script's own comment
 > `nvkvm-gpu[GA106] M5.1: open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF`
 > i.e. the device comes up with forwarding OFF and NOTHING says why.
 
-**2. Fetch QEMU** (`scripts/build_qemu.sh:74-75`):
+**2. Fetch QEMU** (`scripts/build_qemu.sh:99-100`):
 
 ```bash
 git clone --depth=1 --branch v9.2.0 \
     https://gitlab.com/qemu-project/qemu.git /opt/qemu-src
 ```
 
-**3-4. Inject the nvkvm sources by copy** (`scripts/build_qemu.sh:82-100`). Not
+**3-4. Inject the nvkvm sources by copy** (`scripts/build_qemu.sh:107-125`). Not
 a symlink, not a submodule:
 
 ```bash
@@ -81,7 +93,7 @@ cp src/stub/nvkvm_stub_bin.h               /opt/qemu-src/hw/misc/
 ```
 
 All of `src/abi` and `src/common` is copied, not a hand-picked subset — an
-incomplete copy fails the build (`scripts/build_qemu.sh:88-90`). The stub blob
+incomplete copy fails the build (`scripts/build_qemu.sh:113-115`). The stub blob
 lands in `hw/misc/` rather than `nvkvm_inc/` because `nvkvm_isolate.c` includes
 it by bare name.
 
@@ -89,22 +101,22 @@ it by bare name.
 existing `/opt/qemu-src` tree until the copy is repeated. See
 [Rebuilding after a source change](#rebuilding-after-a-source-change).
 
-**5. Rewrite includes** (`scripts/build_qemu.sh:111-118`). Two `sed` passes:
+**5. Rewrite includes** (`scripts/build_qemu.sh:136-143`). Two `sed` passes:
 `"../../src/{common,abi}/X.h"` → `"nvkvm_inc/X.h"`, and
 `<linux/types.h>` → `"linux_types_compat.h"` (QEMU's `osdep.h` conflicts with
 the kernel UAPI types).
 
-**6. Patch `hw/misc/meson.build`** (`scripts/build_qemu.sh:126-172`) —
+**6. Patch `hw/misc/meson.build`** (`scripts/build_qemu.sh:151-197`) —
 idempotent, guarded by `grep -q virtio_nvgpu.c`. Adds
 `nvkvm_inc = include_directories('nvkvm_inc')` and a `system_ss.add(when:
 ['CONFIG_VIRTIO'], ...)` block listing the eleven `.c` files.
 
-**6b. Patch `hw/virtio/virtio.c`** (`scripts/build_qemu.sh:178-209`). Inserts
+**6b. Patch `hw/virtio/virtio.c`** (`scripts/build_qemu.sh:203-234`). Inserts
 `[50] = "virtio-nvgpu",` into `virtio_device_names[]` right after the
 `[VIRTIO_ID_GPIO]` entry — QEMU's table ends around ID 41 and
 `virtio_id_to_name()` asserts `device_id < G_N_ELEMENTS(virtio_device_names)`.
 
-**7. Configure** (`scripts/build_qemu.sh:214-231`):
+**7. Configure** (`scripts/build_qemu.sh:239-256`):
 
 ```bash
 ./configure \
@@ -125,7 +137,7 @@ through virtio-gpu GL.
 `-DNVKVM_STUB_EMBEDDED` is the define whose absence produces the silent
 forwarding-off failure described above.
 
-**8-9. Build and install** (`scripts/build_qemu.sh:236-243`). QEMU 9.2
+**8-9. Build and install** (`scripts/build_qemu.sh:261-268`). QEMU 9.2
 configures out of tree, so ninja runs against `/opt/qemu-src/build`.
 
 Output: `/opt/qemu-nvkvm/bin/qemu-system-x86_64`.
@@ -186,8 +198,15 @@ by default deliberately — see
 
 ## Rebuilding after a source change
 
-`build_qemu.sh` short-circuits once the binary exists, so the incremental loop
-is manual:
+`build_qemu.sh` short-circuits once the binary exists, so a plain re-run changes
+nothing. Use `--force`; it reuses the QEMU tree and the ninja build dir, so it is
+incremental:
+
+```bash
+sudo bash scripts/build_qemu.sh --force
+```
+
+The manual loop people reach for instead is:
 
 ```bash
 # QEMU-side change
@@ -200,8 +219,22 @@ make -C src/stub
 cp src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
 ```
 
-(This is what `scripts/run_remote_test.sh rebuild` does at `:40-74`; that script
-itself is hardcoded to a private dev box and is not a reproducible entry point.)
+**Both of those recipes are broken on their own, and so is
+`scripts/run_remote_test.sh rebuild` (`:44-80`)** — that script is in any case
+hardcoded to a private dev box and is not a reproducible entry point. Copying
+`src/qemu/*.c` back over `hw/misc/` restores the `../../src/common/...` and
+`../../src/abi/...` includes that step 5 rewrote, so the next `ninja` stops at
+`fatal error: ../../src/common/nvkvm_proto.h: No such file or directory`. Either
+replicate steps 4 and 5 by hand after every copy, or — simpler and what you
+should actually do — re-run the script:
+
+```bash
+sudo bash scripts/build_qemu.sh --force
+```
+
+If you do drive ninja by hand, read its output: on failure the *old* binary
+stays installed at `/opt/qemu-nvkvm/bin/`, and the experiment silently measures
+nothing.
 
 Guest-side, after remounting the 9p share:
 
@@ -220,8 +253,22 @@ against stub headers in `tests/unit/stubs/`:
 cd tests/unit && make && make run
 ```
 
-Seven binaries: `test_dispatch test_frontend test_handle mock_stub test_isolate
-test_tables test_open_scm` (`tests/unit/Makefile:33`).
+`tests/unit/Makefile:33` names seven binaries — `test_dispatch test_frontend
+test_handle mock_stub test_isolate test_tables test_open_scm` — but **four of
+them do not currently build**, and because `test_dispatch` is first, a plain
+`make` fails there and produces nothing (verified 2026-08-18, gcc 15.2):
+
+| target | state |
+|---|---|
+| `test_dispatch` | **compile error** — declares `nvkvm_ioctl_expected_param_size` with one parameter at `:98` against the two-parameter declaration it already included from `virtio_nvgpu.h:369`; *conflicting types* |
+| `test_frontend`, `test_handle` | **link error** — `nvkvm_debug_enabled`, defined only in `src/qemu/virtio_nvgpu.c:1095`, is in no unit-test source list |
+| `test_isolate` | **compile error** — needs `-D_GNU_SOURCE` for `CLONE_NEWUSER` (the Makefile passes it only to `test_tables`/`test_open_scm`); with it added, **link error** on `nvkvm_debug_enabled`, `nvkvm_gpa_to_vmm_va`, `nvkvm_sparse_gpa_alloc`, `nvkvm_sparse_gpa_free`, `nvkvm_virtio_push_evt` |
+| `mock_stub`, `test_tables`, `test_open_scm` | build and run |
+
+Do not read "unit tests" as covering the dispatch, frontend, handle or isolate
+code today. `test_dispatch` additionally targets `src/qemu/nvkvm_dispatch.c`,
+which is dead code (see
+[the pointer audit](../internal/audit-guest-pointers.md), section 2).
 
 **ABI parity** — host, needs Go with cgo:
 
@@ -230,9 +277,13 @@ cd tests/abi_parity && go test -v ./...
 ```
 
 It asserts compiled-in struct sizes against hardcoded expectations sourced from
-gVisor `pkg/abi/nvgpu` and OGKM `nvos.h`. Five tests: frontend struct sizes (22),
-alloc-param struct sizes, UVM struct sizes (23), the guest↔QEMU protocol struct
-sizes, and ioctl-number range/distinctness checks. It talks to no driver and no
+gVisor `pkg/abi/nvgpu` and OGKM `nvos.h`. Nine tests across two files. Six in
+`abi_parity_test.go`: frontend struct sizes (23 cases), alloc-param struct sizes
+(5), UVM struct sizes (23), the guest↔QEMU protocol struct sizes, and two
+ioctl-number range/distinctness checks. Three more in `abi_profile_test.go`
+cover the ABI profile table itself — that each measured driver version selects
+the expected profile, that the boundaries *inside* the 535 and 550 branches are
+sharp, and that versions on the same side of a boundary stay put. It talks to no driver and no
 GPU. Several expectations carry the bug they were added to catch — e.g. NVOS32
 must be 184, not 88, because an 88 truncated the `ALLOC_SIZE` union and libGLX
 saw `size=0`.
@@ -242,8 +293,9 @@ saw `size=0`.
 > negations `!go.mod` / `!go.sum` at `.gitignore:12-13` restore it. If you fork
 > or re-extract this tree, check that file survived.
 
-**Integration tests** — inside the guest, module loaded. Only `test_ioctl_fwd`
-has a Makefile rule (`tests/integration/Makefile`); the other ~20 programs are
+**Integration tests** — inside the guest, module loaded. Two programs have
+Makefile rules — `test_ioctl_fwd` and `fbo_formats_probe`, the offscreen-EGL FBO
+completeness probe (`tests/integration/Makefile:4-12`); the other ~20 are
 compiled ad hoc:
 
 ```bash

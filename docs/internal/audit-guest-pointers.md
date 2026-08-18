@@ -43,7 +43,7 @@ overwrites it on a path that actually executes.
 **No.** There is one *near*-categorical mechanism, and it is conditional on a guest-supplied value,
 which disqualifies it.
 
-`src/stub/nvkvm_stub.c:862-866`:
+`src/stub/nvkvm_stub.c:901-921`:
 
 ```c
 } else if (job.aux_size > 0 && job.param_size >= 24) {
@@ -57,9 +57,9 @@ so this single line covers the three highest-traffic ioctls. But:
 
 - **`job.aux_size` is guest-controlled.** It arrives in `nvkvm_req_ioctl_on_isolate.aux_size`
   straight off the virtqueue (`src/qemu/virtio_nvgpu.c:900-922`), and the only host check anywhere
-  is a `> 1 MiB` denial for RM_CONTROL (`src/qemu/nvkvm_isolate_handlers.c:1314`). A guest that
+  is a `> 1 MiB` denial for RM_CONTROL (`src/qemu/nvkvm_isolate_handlers.c:1762`). A guest that
   sends `aux_size = 0` takes the `else` and **no branch writes anything** — `param_buf + 16` reaches
-  `stub_ioctl()` at `src/stub/nvkvm_stub.c:1284` exactly as the guest wrote it.
+  `stub_ioctl()` at `src/stub/nvkvm_stub.c:1372` exactly as the guest wrote it.
 - It only ever covers **offset 16**. Every pointer field at another offset
   (`NVOS64.pRightsRequested@24`, `NVOS02.pMemory@24`, `NVOS33.pLinearAddress@32`,
   `NVOS56.pNewCpuAddress@24`, DRM `event_nvkms_params_ptr@32`) is untouched by design.
@@ -68,7 +68,7 @@ so this single line covers the three highest-traffic ioctls. But:
 
 I searched for the alternative — a schema of `(cmd, offset)` pointer descriptors, a "zero every
 `NvP64` before forwarding" sweep, a generated rewrite table — and found none.
-`nvkvm_uvm_schema[]` (`src/qemu/nvkvm_isolate_handlers.c:545`) is the closest thing in the tree, but
+`nvkvm_uvm_schema[]` (`src/qemu/nvkvm_isolate_handlers.c:599`) is the closest thing in the tree, but
 it describes **fd** fields (`fd_off[2]`), not pointer fields, and its comment says the fd translation
 was deliberately *not* generalised (`:541-544`). Everything else is hand-written and per-ioctl:
 roughly 51 rewrite sites in `nvkvm_stub.c`, each gated on its own set of guest-supplied values.
@@ -96,7 +96,7 @@ at `:230-235` stating the enclosed handlers are "dead code as of Step 3d.1 (gues
 sends these request types)". `handle_ioctl` at `:360` — the function containing line 444 — is
 `static` and has no other reference.
 
-The file is still compiled and linked (`scripts/build_qemu.sh:144`), which is why it looks alive.
+The file is still compiled and linked (`scripts/build_qemu.sh:169`), which is why it looks alive.
 So the reassuring comment at `nvkvm_dispatch.c:383-392` — *"the boundary (not the untrusted guest)
 must ensure no guest pointer is ever forwarded"* — decorates code that never runs, and the
 `IDLE_CHANNELS` overflow hardening beneath it (`:393-403`, the 64-bit math and the 4096 cap) is
@@ -107,15 +107,25 @@ likewise unreachable. The file's own note at `:375-379` is accurate and should b
 1. **There is no ABI param-size validation on the live path.** The size table
    (`nvkvm_ioctl_expected_param_size`) was the only place that checked `param_size == sizeof(struct)`
    per command. The live path (`nvkvm_req_ioctl_on_isolate`) has `min_size` floors for UVM only
-   (`nvkvm_isolate_handlers.c:1092`) and, for `'F'` ioctls, nothing but ad-hoc
+   (`nvkvm_isolate_handlers.c:1284`) and, for `'F'` ioctls, nothing but ad-hoc
    `req->param_size >= N` guards before individual field reads. A guest may declare any
    `param_size` up to `MAX_PARAM_SIZE` (`nvkvm_stub.c:443`) for any command.
-2. **`tests/unit/test_dispatch.c` does not test what it appears to.** It declares
-   `extern size_t nvkvm_ioctl_expected_param_size(unsigned int cmd);` at `:98` — one parameter —
-   against a two-parameter definition (`nvkvm_dispatch.c:25-26`). Every one of its ~20 call sites
-   passes one argument; the callee then reads an uninitialised register as
-   `const struct nvkvm_abi_profile *prof` and dereferences it at `:61`/`:88`. That is undefined
-   behaviour, and it is exercising dead code either way.
+2. **`tests/unit/test_dispatch.c` does not test what it appears to — it does not build at all.**
+   It declares `extern size_t nvkvm_ioctl_expected_param_size(unsigned int cmd);` at `:98` — one
+   parameter — against the two-parameter definition (`nvkvm_dispatch.c:25-26`), which it has
+   already seen via `virtio_nvgpu.h:369` included at `:27`. That is a constraint violation, not
+   merely undefined behaviour: the compiler rejects it with *conflicting types for
+   `nvkvm_ioctl_expected_param_size`*. Since `test_dispatch` is the first target of
+   `tests/unit/Makefile:33`, a plain `make` in `tests/unit` fails there and builds nothing.
+   Verified 2026-08-18 with gcc 15.2. Even if it did build it would be exercising dead code.
+
+   Three of the other six targets do not build either, for reasons unrelated to this one:
+   `test_frontend` and `test_handle` fail to link on `nvkvm_debug_enabled`, which is defined only
+   in `src/qemu/virtio_nvgpu.c:1095` and is in no unit-test source list; `test_isolate` needs
+   `-D_GNU_SOURCE` for `CLONE_NEWUSER` (the Makefile passes it only to `test_tables` and
+   `test_open_scm`) and then still fails to link on `nvkvm_debug_enabled`,
+   `nvkvm_gpa_to_vmm_va`, `nvkvm_sparse_gpa_alloc`, `nvkvm_sparse_gpa_free` and
+   `nvkvm_virtio_push_evt`. Only `mock_stub`, `test_tables` and `test_open_scm` build.
 
 ### The live path, for the record
 
@@ -126,13 +136,13 @@ guest virtqueue
             └─ nvkvm_req_ioctl_on_isolate        nvkvm_isolate_handlers.c:1031
                  ├─ UVM branch  → ioctl() IN QEMU'S OWN PROCESS      :1143
                  └─ everything else → nvkvm_isolate_ioctl            nvkvm_isolate.c:1789  (pure transport)
-                      └─ stub reader → job queue → worker_thread     nvkvm_stub.c:812
-                           └─ stub_ioctl(fd, cmd, param_buf)         nvkvm_stub.c:1284
+                      └─ stub reader → job queue → worker_thread     nvkvm_stub.c:834
+                           └─ stub_ioctl(fd, cmd, param_buf)         nvkvm_stub.c:1372
 
 guest-mapped SPSC ring (parallel, no QEMU involvement at all)
-  └─ ring_consumer_loop                          nvkvm_stub.c:2347
-       └─ ring_exec_one                          nvkvm_stub.c:2254
-            └─ stub_ioctl(fd, rq.cmd, param)     nvkvm_stub.c:2299
+  └─ ring_consumer_loop                          nvkvm_stub.c:2447
+       └─ ring_exec_one                          nvkvm_stub.c:2342
+            └─ stub_ioctl(fd, rq.cmd, param)     nvkvm_stub.c:2399
 ```
 
 The second path is the one that matters most and is discussed as **U-1**.
@@ -149,25 +159,35 @@ The second path is the one that matters most and is discussed as **U-1**.
 | RM_ALLOC classes | 89 | 81 | 0 | 5 | 3 |
 | UVM schema rows | 31 | 16 | 0 | 15 | 0 |
 | DRM ioctls | 14 | 11 | 0 | 3 | 0 |
-| NVKMS inner cmdTypes | 6 | 6 | 0 | 0 (wrapper: 1) | 0 |
+| NVKMS inner cmdTypes | 7 | 6 | 0 | 0 (wrapper: 1) | 1 |
 | Isolate control commands | 15 | 14 | 0 | 1 | 0 |
 
 The 15 isolate control commands are the `case ISOLATE_CMD_*` arms of `stub_dispatch_cmd`
-(`src/stub/nvkvm_stub.c:2402-2500`). `ISOLATE_CMD_IOCTL` is counted under the surfaces above, not
+(`src/stub/nvkvm_stub.c:2502-2596`). `ISOLATE_CMD_IOCTL` is counted under the surfaces above, not
 here; the one `UNENFORCED` entry is `ISOLATE_CMD_MMAP`/`_MUNMAP` (U-9, counted once). The rest carry
 only handle ids, uuids and scalars — including the `REALIZE_UVM_FD` state snapshot
-(`src/stub/nvkvm_stub.c:1939-1953`), which is handles and UUIDs throughout.
+(`src/stub/nvkvm_stub.c:2043-2057`), which is handles and UUIDs throughout.
 
 Counts from the prior docs pass all verified: 166 control entries
 (`grep -c` on `nvkvm_ctrl_allowlist.h`), 89 alloc classes, 23 frontend NRs, 31 UVM rows,
-14 DRM, 6 NVKMS.
+14 DRM, 7 NVKMS.
+
+The NVKMS row moved from 6 to 7 on 2026-08-17 when `cmdType=60` was added
+(`src/qemu/nvkvm_nvkms_allowlist.h:61`). It is counted `UNKNOWN`, not
+`NO_POINTERS`: all that is measured about it is that the 595+/610 ICD issues it
+once per offscreen context with a 32-byte params block, between REGISTER_SURFACE
+and UNREGISTER_SURFACE. The `NvKmsIoctlCommand` enum that would name it ships in
+no header, so whether those 32 bytes contain a pointer cannot be determined from
+anything public. The same caveat has always applied to 61/62, which this table
+classified `NO_POINTERS`; that classification was never better evidenced than
+this one.
 
 **`ENFORCED` total across the whole boundary: one.** `NV_ESC_RM_IDLE_CHANNELS`
-(`src/stub/nvkvm_stub.c:1192-1196`) — an unconditional
+(`src/stub/nvkvm_stub.c:1280-1283`) — an unconditional
 `memset(param_buf + 12, 0, 28)` gated only on `_IOC_TYPE=='F' && _IOC_NR==0x41 && param_size >= 40`,
 none of which a guest can use to skip it. That is what enforcement looks like, and it is the only
 instance of it in the tree. (It exists because this exact hole was found on the live path after the
-fact — see `nvkvm_stub.c:1181-1191`.)
+fact — see `nvkvm_stub.c:1269-1279`.)
 
 The 7 `UNENFORCED` frontend NRs are `0x27`, `0x2a`, `0x2b`, `0x4a`, `0x4e`, `0x4f`, `0x5e`; the
 single `ENFORCED` one is `0x41`. Frontend NRs deserve one credit: **`NV_ESC_IOCTL_XFER_CMD`
@@ -187,7 +207,7 @@ they carry pointers — cannot be determined from the open tree. They are allowl
 Note `0x20808159`, `0x20808162`, `0x2080852e`, `0x2080852f` also match the
 `cmd & 0x8000` rule-based passthrough, so they would be forwarded even if removed from the table.
 
-The two rule-based passthroughs (`nvkvm_isolate_handlers.c:632-635`) —
+The two rule-based passthroughs (`nvkvm_isolate_handlers.c:822-827`) —
 `cmd & 0x8000` and `(cmd >> 16) == 0x2081` — admit an **unbounded** set of control commands, none
 of which can be pointer-audited because the set is not enumerable. The comment justifying them
 (`nvkvm_ctrl_allowlist.h:15-18`) asserts both are "GSP-routed, no app pointers". That assertion is
@@ -199,7 +219,7 @@ not verifiable from the open tree and is not verified here.
 
 Severity accounts for the Phase 0 mitigation: the stub is unprivileged and
 `clone()`d into fresh user/pid/net/ipc/uts namespaces with a seccomp allowlist
-(`src/stub/nvkvm_stub.c:2507-2537`, `:2731-2734`), so a guest VA that reaches the driver corrupts
+(`src/stub/nvkvm_stub.c:2610-2692`, `:2830-2845`), so a guest VA that reaches the driver corrupts
 *within one isolate*. That bounds blast radius; it does not remove the bug. **U-6 is the exception —
 it lands in QEMU, where the mitigation does not apply.**
 
@@ -243,7 +263,7 @@ it lands in QEMU, where the mitigation does not apply.**
 `src/nvidia/src/kernel/rmapi/control.c:262` with `PARAM_LOCATION_USER` — `copy_from_user` on entry
 and `copy_to_user` on exit, `paramsSize` bytes.
 
-`ring_exec_one` (`src/stub/nvkvm_stub.c:2254`) executes guest-authored ring records inline. The
+`ring_exec_one` (`src/stub/nvkvm_stub.c:2342`) executes guest-authored ring records inline. The
 pointer rewrite is at `:2293`:
 
 ```c
@@ -253,7 +273,7 @@ if (rq.aux_size) {
 }
 ```
 
-and `ring_ctrl_must_punt` (`:2221`) explicitly **accepts** `aux_size == 0`:
+and `ring_ctrl_must_punt` (`:2309`) explicitly **accepts** `aux_size == 0`:
 
 ```c
 if (aux_size == 0)
@@ -275,12 +295,12 @@ out (`src/nvidia/src/kernel/rmapi/embedded_param_copy.c:435`, `:448`) — and
 **The ring is not opt-in at the boundary.** `nvkvm_isolate_ring_setup` runs for every isolate unless
 the *host* sets `NVKVM_RING_DISABLE` (`src/qemu/nvkvm_isolate.c:988`), and it `MAP_FIXED`s the ring
 memfd into the guest-visible sparse GPA window (`:1330-1345`), handing the GPA to the guest via
-`NVKVM_REQ_SETUP_RING` (`src/qemu/nvkvm_isolate_handlers.c:459`). The guest-side
+`NVKVM_REQ_SETUP_RING` (`src/qemu/nvkvm_isolate_handlers.c:449`). The guest-side
 `ring_enable` module parameter defaults to false (`src/guest/nvkvm_main.c:424`) — but that is guest
 code, exactly the class of "control" this audit exists to reject. A malicious guest sets it, or
 writes ring records directly.
 
-The stub's own comment at `:2153-2155` states the trust model correctly — *"the request ring is
+The stub's own comment at `:2240-2242` states the trust model correctly — *"the request ring is
 producer-writable by the (untrusted) guest … a malformed ring is fatal to THIS isolate only (DoS,
 never OOB)"* — and the "never OOB" half is what fails: the record framing is validated, the
 *contents* are not.
@@ -294,7 +314,7 @@ never OOB)"* — and the "never OOB" half is what fails: the record framing is v
 **Driver dereferences them:** yes for all three (control.c:262; `alloc_free.c` param copy;
 NVKMS `copy_from_user` on `address`/`size`).
 
-Same defect as U-1 on the socket path, at `src/stub/nvkvm_stub.c:854-866`. Both branches require
+Same defect as U-1 on the socket path, at `src/stub/nvkvm_stub.c:901-921`. Both branches require
 `job.aux_size > 0`. Nothing upstream forces it: `virtio_nvgpu.c:917-922` takes `aux_size` from the
 guest and only nulls `aux_buf` if the slot lookup fails; `nvkvm_req_ioctl_on_isolate` never checks
 it except for the 1 MiB cap.
@@ -364,7 +384,7 @@ enumerate offsets.
 sizeof(NV0080_CTRL_GR_INFO))` with **no** `SKIP_COPYIN` flag — copy in **and** out, i.e. an
 arbitrary read *and* write of `grInfoListSize * 8` bytes at the supplied address.
 
-The stub reconstructs these pointers at `src/stub/nvkvm_stub.c:965-1075`. The guard is `:974-976`:
+The stub reconstructs these pointers at `src/stub/nvkvm_stub.c:986-1160`. The guard is `:1030`:
 
 ```c
 uint32_t ls = 0;
@@ -387,8 +407,8 @@ Concretely: `aux_size = 16` (the exact size of `NV0080_CTRL_GR_GET_INFO_PARAMS`)
 `aux_buf+8 = <target>`. `1000 * 8 = 8000 >= 16` → skip → the driver copies 8000 bytes from and to
 `<target>` in the stub's address space.
 
-The same shape applies to `GET_BUILD_VERSION` (`:1064`, guarded on
-`sz > 0 && sz <= 512 && aux_size >= 40 + sz*3`) and `FIFO_GET_CHANNELLIST` (`:1037`, guarded on
+The same shape applies to `GET_BUILD_VERSION` (`:1144`, guarded on
+`sz > 0 && sz <= 512 && aux_size >= 40 + sz*3`) and `FIFO_GET_CHANNELLIST` (`:1100`, guarded on
 `nc > 0 && nc <= 4096 && aux_size >= 24 + nc*8`). In every case the guard's failure mode is
 *"leave the guest's pointer in place"* rather than *"zero it"* or *"reject"*.
 
@@ -399,7 +419,7 @@ The same shape applies to `GET_BUILD_VERSION` (`:1064`, guarded on
 `0x20801802`
 
 The ring path punts all of them to the socket path (`ring_ctrl_must_punt`,
-`src/stub/nvkvm_stub.c:2238-2245`), so U-4 is socket-path only — but U-1 makes that moot for the
+`src/stub/nvkvm_stub.c:2332-2339`), so U-4 is socket-path only — but U-1 makes that moot for the
 subset the ring accepts.
 
 ---
@@ -408,11 +428,12 @@ subset the ring accepts.
 
 **Fields:** `NVOS54.paramsSize@24`; `NVOS64.allocParmsSize@32`.
 
-The stub points `NVOS54.params` at a `blob_alloc(aux_size)` buffer (`nvkvm_stub.c:862-866`,
-allocation at `:1456`) but forwards the guest's `paramsSize` unchanged. The driver allocates and
+The stub points `NVOS54.params` at a `blob_alloc(aux_size)` buffer (`nvkvm_stub.c:901-921`,
+allocation at `:1944-1945`) but forwards the guest's `paramsSize` unchanged. The driver allocates and
 copies `paramsSize` bytes from that address (`control.c:262`) and copies the same count back out.
 Nothing in QEMU or the stub relates the two: `grep` for a `params_size` clamp finds only
-`nvkvm_isolate_handlers.c:802` (QEMU's own admin ioctl) and the 1 MiB `aux_size` cap at `:1314`.
+`nvkvm_stub.c:1891` (the stub's generic transport cap) and the 1 MiB `aux_size` cap at
+`nvkvm_isolate_handlers.c:1762`.
 
 A guest sending `aux_size = 8` and `paramsSize = 0x100000` gets a ~1 MiB over-read and over-write
 of the stub's heap, adjacent to whatever `mmap` placed after the aux blob. This is a heap
@@ -432,7 +453,7 @@ buffer moved into the aux slot, and nothing re-tied them.
 and `semaphoreAddress` is one the driver **writes** `semaphorePayload` to on async completion.
 
 `nvkvm_req_ioctl_on_isolate` handles `dev_id == NVKVM_DEV_UVM` by calling
-`ioctl(tfd, req->cmd, param_buf)` **in QEMU's own process** (`nvkvm_isolate_handlers.c:1143`), for
+`ioctl(tfd, req->cmd, param_buf)` **in QEMU's own process** (`nvkvm_isolate_handlers.c:1471`), for
 the reason given at `:1037-1046` (UVM binds `nvfp` to the calling task's mm at `UVM_INITIALIZE`, and
 the matching `mmap` must come from the same mm). The schema
 (`:545-591`) validates `cmd` (default-deny), a `min_size` floor, and translates up to two **fd**
@@ -502,7 +523,7 @@ accepts it, but `must_punt` does not exclude it either — see U-1).
 
 **Field:** `isolate_cmd_mmap.gva`, `isolate_cmd_munmap.gva`.
 
-`src/stub/nvkvm_stub.c:1884-1886`:
+`src/stub/nvkvm_stub.c:1971-1973`:
 
 ```c
 uint32_t flags = cmd->map_flags | MAP_FIXED;
@@ -513,9 +534,9 @@ void *addr = stub_mmap((void *)(uintptr_t)cmd->gva, (size_t)cmd->length,
 and `:1893`: `stub_munmap((void *)(uintptr_t)cmd->gva, (size_t)cmd->length)`.
 
 `gva` originates in `nvkvm_req_mmap_on_isolate.gva` off the virtqueue and reaches
-`nvkvm_isolate_mmap` (`nvkvm_isolate_handlers.c:1957-1962`) untouched — `grep -n gva
+`nvkvm_isolate_mmap` (`nvkvm_isolate_handlers.c:2438-2444`) untouched — `grep -n gva
 nvkvm_isolate_handlers.c` shows it is stored and passed, never bounded. `length` and `prot` *are*
-bounded (`:1832-1848`, audit M-1/N-2), and seccomp blocks `PROT_EXEC` (`nvkvm_stub.c:2524-2525`),
+bounded (`:1926-1942`, audit M-1/N-2), and seccomp blocks `PROT_EXEC` (`nvkvm_stub.c:2625-2626`),
 so this is a corruption/unmap primitive rather than a code-execution one.
 
 Strictly this is a guest pointer reaching the *host kernel's mmap*, not the NVIDIA driver, so it sits
@@ -530,12 +551,12 @@ class, and it is listed so it is not lost. It is also partly by design: the `OS_
 **Fields:** `import_mem_nvkms_params_ptr` (offset 16) and `event_nvkms_params_ptr` (offset 32) in
 `drm_nvidia_prime_fence_context_create_params` (ogkm `kernel-open/nvidia-drm/nvidia-drm-ioctl.h:199-213`).
 
-The stub's DRM branch (`src/stub/nvkvm_stub.c:857`) handles only `job_nr == 0x54` and
+The stub's DRM branch (`src/stub/nvkvm_stub.c:906`) handles only `job_nr == 0x54` and
 `job_nr == 0x49`. NR 0x45 falls to the generic branch, which writes the aux pointer at offset 16 —
 accidentally covering `import_mem_nvkms_params_ptr`, but only when `aux_size > 0`, and never
 covering offset 32. `event_nvkms_params_ptr` is forwarded verbatim in every case.
 
-Reachable only when `nv->graphics` is set (`nvkvm_isolate_handlers.c:1175-1182`); compute-only VMs
+Reachable only when `nv->graphics` is set (`nvkvm_isolate_handlers.c:1557-1564`); compute-only VMs
 are unaffected.
 
 ---
@@ -582,13 +603,13 @@ host-side. Listing it as `UNENFORCED` with severity `UNKNOWN` rather than droppi
 
 `NV_ESC_RM_ALLOC_MEMORY` with `hClass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` **deliberately** forwards
 the guest VA: the guest migrates the range onto memfds and the stub `MAP_FIXED`s them at the same VA
-(`src/guest/nvkvm_ioctl.c:396-409`, `src/stub/nvkvm_stub.c:1268-1276`), so
+(`src/guest/nvkvm_ioctl.c:396-409`, `src/stub/nvkvm_stub.c:1357-1366`), so
 `RmAllocOsDescriptor` → `pin_user_pages` finds pages that alias guest userspace. This is the one
 place where a guest VA reaching the driver is the intended behaviour, and the invariant as stated in
 `ARCHITECTURE.md` does not admit it. It should be stated as an explicit exception rather than left
 as an unremarked contradiction. Note that `hClass` is **not** gated for nr 0x27 — the alloc-class
-allowlist applies only to nr 0x2b (`nvkvm_isolate_handlers.c:1288`) — and
-`nvkvm_fe_alloc_allowlist.h:9-11` states OS_DESCRIPTOR (0x71) is deliberately omitted from that
+allowlist applies only to nr 0x2b (`nvkvm_isolate_handlers.c:1736`) — and
+`nvkvm_fe_alloc_allowlist.h:13-16` states OS_DESCRIPTOR (0x71) is deliberately omitted from that
 allowlist, which is true and irrelevant on this path.
 
 ---
@@ -606,7 +627,7 @@ plus the `class/cl*.h` and `nvos.h` bodies.
 | class | name | struct | field | host handling |
 |---|---|---|---|---|
 | 0x0000 | `NV01_ROOT` | `NV0000_ALLOC_PARAMETERS` | `pOsPidInfo` (`NvP64`) | none — see below |
-| 0x0005 | `NV01_EVENT` | `NV0005_ALLOC_PARAMETERS` | `data` (`NvP64`, an **fd**) | partial, `nvkvm_stub.c:1238-1265` |
+| 0x0005 | `NV01_EVENT` | `NV0005_ALLOC_PARAMETERS` | `data` (`NvP64`, an **fd**) | partial, `nvkvm_stub.c:1327-1355` |
 | 0x0079 | `NV01_EVENT_OS_EVENT` | `NV0005_ALLOC_PARAMETERS` | `data` (`NvP64`, an **fd**) | partial, same site |
 | 0x003e | `NV01_MEMORY_SYSTEM` | `NV_MEMORY_ALLOCATION_PARAMS` | `address` (`NvP64`, `[OUT]`) | none |
 | 0x0040 | `NV01_MEMORY_LOCAL_USER` | `NV_MEMORY_ALLOCATION_PARAMS` | `address` (`NvP64`, `[OUT]`) | none |
@@ -617,7 +638,7 @@ plus the `class/cl*.h` and `nvos.h` bodies.
 Notes on each, because the severities differ a lot:
 
 - **`NV0005.data` (0x05 / 0x79)** is an fd, not a VA — the driver resolves it with
-  `osUserHandleToKernelPtr`. It **is** translated, at `nvkvm_stub.c:1246-1263`, but only for the
+  `osUserHandleToKernelPtr`. It **is** translated, at `nvkvm_stub.c:1335-1352`, but only for the
   nvos64 form: the gate at `:1238-1241` requires `job.param_size > 32`, deliberately (audit G-5), so
   that a raw nvos21-form fd is not misread as a handle_id. The consequence is that on the nvos21
   path a raw *guest* fd number reaches the driver. That is an fd-confusion issue rather than a
@@ -641,9 +662,9 @@ Notes on each, because the severities differ a lot:
 tables live only in the guest — two of them, `src/guest/nvkvm_main.c:1651-1743` (nvos21) and
 `:1777-1869` (nvos64, used only as a fallback when userspace passed `alloc_parms_size == 0`), with a
 flat `NVKVM_SHM_SLOT_DEFAULT_SIZE` ceiling at `:1871`. Neither the stub nor QEMU has an equivalent:
-`nvkvm_stub.c:1803` and `:2232` are generic transport caps, and the QEMU-side gates
+`nvkvm_stub.c:1891` is a generic transport cap, and the QEMU-side gates
 (`virtio_nvgpu.c:435`, `nvkvm_isolate.c:549`) are slot-capacity checks. The 1 MiB inner-params cap at
-`nvkvm_isolate_handlers.c:1314` applies to `RM_CONTROL` only, not `RM_ALLOC`. So `aux_size` for an
+`nvkvm_isolate_handlers.c:1762` applies to `RM_CONTROL` only, not `RM_ALLOC`. So `aux_size` for an
 alloc is guest-chosen and host-unverified — this is the `RM_ALLOC` half of U-5.
 
 ---
@@ -657,14 +678,14 @@ The pattern is consistent across U-1 through U-4: someone identifies a pointer, 
 rewrite, guards it with a condition derived from guest-supplied values, and the guard's failure mode
 is *forward the guest's bytes* rather than *reject*. `IDLE_CHANNELS` is the single site that got it
 right, and it only got it right on the second attempt, after the first fix landed in dead code
-(`nvkvm_stub.c:1181-1191`).
+(`nvkvm_stub.c:1269-1279`).
 
 Concretely, in priority order:
 
 1. **Fix the fail-open direction first — this is cheap and it is most of the win.** Every
    conditional rewrite site should zero the field when its guard fails, instead of leaving it. Turn
    `if (guard) { p = stub_ptr; }` into `if (guard) { p = stub_ptr; } else { p = 0; }` at
-   `nvkvm_stub.c:854-866`, `:974-985`, `:1037-1050`, `:1064-1074`, and `:2293-2296`. This alone
+   `nvkvm_stub.c:901-921`, `:1030-1045`, `:1100-1125`, `:1144-1160`, and `:2392-2396`. This alone
    closes U-2, U-4, and the `aux_size == 0` half of U-1, without any new infrastructure.
 2. **Route the ring through the same gates as the socket path, or delete it.** U-1 is not a pointer
    bug so much as an entire unmediated channel; it also bypasses the control allowlist, the hClient
@@ -695,7 +716,7 @@ Concretely, in priority order:
 
 **On the isolate mitigation.** It is real and it is load-bearing: Phase 0 `clone()`s the stub into
 fresh user/pid/net/ipc/uts namespaces, unprivileged, under a seccomp allowlist that blocks `execve`,
-`ptrace`, `fork`, and `PROT_EXEC` mappings (`src/stub/nvkvm_stub.c:2507-2537`, `:2731-2734`). Every
+`ptrace`, `fork`, and `PROT_EXEC` mappings (`src/stub/nvkvm_stub.c:2610-2692`, `:2830-2845`). Every
 finding above except U-6 corrupts *within one isolate* — one guest process's own GPU context — and
 not QEMU, not the host, not another VM. That is the difference between "critical" and "catastrophic"
 and it should be stated plainly. It is not a reason to leave the bugs: an isolate still holds live

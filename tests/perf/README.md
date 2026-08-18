@@ -63,10 +63,14 @@ End-to-end vLLM 0.11.0 + Qwen2.5-32B-Instruct-AWQ, host vs guest, on an RTX
 temperature-0 token bit-identical across the boundary.  Runner
 `apps/llm_serving_bench.py`, comparator `compare_llm_parity.py`.
 Two caveats live in that doc and should be read before quoting the table:
-- the guest cannot allocate a pinned host buffer larger than **16 MiB**
-  (`nvkvm_cpu_pages_migrate_range()` -> -E2BIG, `NVKVM_MIG_MAXCHK == 8`), so
-  stock vLLM does not start; the run disables vLLM's pinned buffers on BOTH
-  sides.  `apps/pinned_host_probe.py` bisects the cap.
+- the run disables vLLM's pinned host buffers on BOTH sides.  At the time the
+  guest could not register more than **16 MiB** (`nvkvm_cpu_pages_migrate_range()`
+  -> -E2BIG), so stock vLLM did not start.  **That cap is gone as of 2026-08-17**:
+  per-chunk migration, a `VM_MAYWRITE` copy-on-write fix and a new 2 GiB ceiling
+  (`NVKVM_MIG_MAX_RANGE`, `src/guest/nvkvm_mmap.c:821`) mean stock vLLM now starts
+  in a guest with pinning enabled.  **The table above was NOT re-measured** — it
+  is still a pinning-disabled-on-both-sides comparison.  Do not read it as a
+  pinning-on result.  `apps/pinned_host_probe.py` bisects the cap.
 - decode parity is contingent on CUDA graphs.  With `--enforce-eager` the guest
   drops to **0.82x** decode — the per-launch control tax, which graph capture
   removes 95% of.  The "control-RTT is only 1-2% of per-token time" comment is

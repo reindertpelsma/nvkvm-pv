@@ -77,7 +77,7 @@ minors.
 Controlled by the read-only module parameter `num_gpus` (default 1), clamped to
 16 (`src/guest/nvkvm_main.c:67-69`, `:134-135`). QEMU independently enumerates
 the host's `/dev/nvidia0..15` when the guest asks
-(`src/qemu/nvkvm_isolate_handlers.c:121-129`).
+(`src/qemu/nvkvm_isolate_handlers.c:125-129`).
 
 ## `/dev/nvidia-modeset` is doubly gated
 
@@ -146,20 +146,48 @@ during `cuInit`/`cuCtxCreate`; the real `nvidia.ko` is not loaded in the guest,
 so without these it bails into `CUDA_ERROR_UNKNOWN` (999)
 (`src/guest/nvkvm_hostfile.c:1-15`).
 
-The module installs proc entries and sysfs kobjects that delegate each read to
-the host over `NVKVM_REQ_READ_HOST_FILE`:
+Four proc entries and two sysfs kobjects delegate each read to the host over
+`NVKVM_REQ_READ_HOST_FILE` (`src/guest/nvkvm_hostfile.c:195-249`):
 
 ```
 /proc/driver/nvidia/params
+/proc/driver/nvidia/version
 /proc/driver/nvidia/gpus/0000:00:07.0/information
 /proc/driver/nvidia/gpus/0000:00:07.0/registry
 /sys/module/nvidia/initstate
 /sys/module/nvidia_uvm/initstate
 ```
 
+`version` — the NVRM banner — is forwarded because tooling that probes
+`/proc/driver/nvidia` treats `ENOENT` as "no NVIDIA driver present";
+`nvidia-container-toolkit` and most detection scripts do exactly that. It
+discloses nothing new: the guest already reads the driver version out of
+`nvidia-smi`, and its userspace has to be version-matched to work at all
+(`src/guest/nvkvm_hostfile.c:205-212`).
+
+The rest of the tree is **inert guest-side stubs** — no host round trip, no
+disclosure (`src/guest/nvkvm_hostfile.c:124-178`, `:215-238`):
+
+| path | mode | content |
+|---|---|---|
+| `registry` | 0444 | empty |
+| `suspend` | 0444 | `suspend hibernate resume` |
+| `suspend_depth` | 0444 | `default modeset uvm` |
+| `warnings/README` | 0444 | static NVIDIA boilerplate |
+| `patches/README` | 0444 | static NVIDIA boilerplate |
+| `capabilities/mig/`, `capabilities/gpu0/` | dirs | empty |
+
+`suspend` and `suspend_depth` are the ones worth being precise about. The real
+files are 0644 *command* files: writing to them drives host power transitions.
+These are 0444 **and carry no `.proc_write` handler**, which is what actually
+holds — 0444 alone would not stop a root process in the guest, since
+`CAP_DAC_OVERRIDE` ignores mode bits. A write gets `EIO` and the content is
+unchanged. The empty `capabilities/` tree is the honest answer for a guest with
+no MIG, and leaks no host MIG or fabric-imex topology.
+
 The sysfs kobjects are created under `/sys/module/`, so they appear as sibling
 fake modules named `nvidia` and `nvidia_uvm`
-(`src/guest/nvkvm_hostfile.c:135-170`).
+(`src/guest/nvkvm_hostfile.c:252-261`).
 
 The BDF in those paths is the **guest** BDF, hardcoded
 (`src/guest/nvkvm_hostfile.c:28-31`), which is why the QEMU command line places
@@ -220,4 +248,4 @@ Two ioctls never leave the guest:
 Its sibling `NV2080_CTRL_CMD_GPU_GET_PID_INFO` takes the opposite route: it *is*
 forwarded, but each guest pid is rewritten to `0x80000000 | isolate_id` for QEMU
 to resolve to a real host pid, and restored on the way back
-(`src/guest/nvkvm_main.c:895-961`, `src/qemu/nvkvm_isolate_handlers.c:1351-1407`).
+(`src/guest/nvkvm_main.c:895-961`, `src/qemu/nvkvm_isolate_handlers.c:1849-1930`).

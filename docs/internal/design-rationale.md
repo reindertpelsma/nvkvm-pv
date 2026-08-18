@@ -81,7 +81,7 @@ node to be a real DRM device at the canonical major with the matching sysfs tree
 A kernel module is also where the intra-VM security boundary has to live. QEMU
 deliberately does not enforce which guest process may touch which object,
 because the guest kernel is the authority on the guest's pids, uids, namespaces
-and fds (`src/qemu/nvkvm_isolate_handlers.c:997-1007`).
+and fds (`src/qemu/nvkvm_isolate_handlers.c:1240-1252`).
 
 ## Why sessions are keyed by `mm_struct`
 
@@ -104,7 +104,7 @@ them together "is correct, not a weakening"
 A guest that zeroes its own pointers is doing the boundary a favour, not
 providing a guarantee. So the stub does not check whether a pointer field is
 zero — it writes over it
-(`src/stub/nvkvm_stub.c:862-866`), and QEMU's dispatch does the same for the
+(`src/stub/nvkvm_stub.c:901-921`), and QEMU's dispatch does the same for the
 array-carrying case (`src/qemu/nvkvm_dispatch.c:383-403`).
 
 That is also why the aux-slot design was chosen over a generated per-command
@@ -146,11 +146,11 @@ The corollary is that an allowlist entry without a handler is a liability. `0x70
 (`NV_ESC_EXPORT_TO_DMABUF_FD`) was allowlisted but unhandled, so the stub would
 have created a dma-buf fd that nothing closed and nothing passed back — an fd
 leak per call, and a meaningless fd returned to the guest. It was removed
-(`src/qemu/nvkvm_fe_alloc_allowlist.h:34-39`).
+(`src/qemu/nvkvm_fe_alloc_allowlist.h:40-45`).
 
 ## Why one sparse window instead of per-mapping memory slots
 
-`src/qemu/nvkvm_isolate_handlers.c:1801-1809`:
+`src/qemu/nvkvm_isolate_handlers.c:2300-2311`:
 
 > A single `cuCtxCreate` issues >1500 tiny (4 KB) device mmaps; one memslot each
 > blows past both our pool and any sane slot count.
@@ -233,12 +233,12 @@ assuming an in-flight session covers a just-published record
 No libc means a much smaller post-RCE syscall surface and no dynamic linker to
 subvert. The seccomp allowlist is 20 syscalls, and the entries that had no
 freestanding caller were deleted specifically to shrink it
-(`src/stub/nvkvm_stub.c:2570-2572`).
+(`src/stub/nvkvm_stub.c:2670-2672`).
 
 It also makes the "no file on disk" property clean: the binary is a byte array
 in QEMU, written to a memfd and `fexecve`'d
 (`src/qemu/nvkvm_isolate.c:803-864`). The cost is self-relocation
-(`src/stub/nvkvm_stub.c:2596-2640`) and hand-rolled `msghdr`/`cmsghdr`/`siginfo`
+(`src/stub/nvkvm_stub.c:2697-2745`) and hand-rolled `msghdr`/`cmsghdr`/`siginfo`
 structs.
 
 ## Choices deliberately left as limitations
@@ -256,7 +256,7 @@ structs.
 - **UVM ioctls run in privileged QEMU**, because the driver requires the mmap
   and the `UVM_INITIALIZE` to share an `mm` and the mmap is what installs the
   KVM region. Mitigated by a default-deny schema
-  (`src/qemu/nvkvm_isolate_handlers.c:985-995`, `:516-562`).
+  (`src/qemu/nvkvm_isolate_handlers.c:1229-1237`, `:516-562`).
 - **`GET_DRM_FILE_UNIQUE_ID` returns a different value than the host would**,
   because the host's is a kernel pointer (`src/guest/nvkvm_drm.c:433-455`).
 
@@ -273,12 +273,12 @@ domain share a property: **they are silent**.
 - A wrong field offset returns `-EBADF` from inside the guest, so the host log
   shows no error at all (`src/guest/nvkvm_ioctl.c:301-312`).
 - A missing guest library leaves the staging script printing "done"
-  (`scripts/stage_guest_libs.sh:31-35`).
+  (`scripts/stage_guest_libs.sh:63-67`).
 - A missing EGL external platform yields a correctly-sized black window that
   looks like a working desktop in a screenshot
-  (`scripts/stage_guest_libs.sh:122-131`).
+  (`scripts/stage_guest_libs.sh:153-163`).
 - A missing QEMU build define produces a binary that builds fine and comes up
-  with forwarding off (`scripts/build_qemu.sh:52-64`).
+  with forwarding off (`scripts/build_qemu.sh:77-89`).
 - A wrong cacheability choice is a 100x slowdown on one CPU vendor and invisible
   on the other (`src/guest/nvkvm_mmap.c:44-61`).
 

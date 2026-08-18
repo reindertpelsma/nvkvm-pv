@@ -28,12 +28,12 @@ across every published OGKM branch (515 → 610):
 | `NVKVM_ABI_610` | V610 channel (376 B, `+hHandleVASpace`) | major ≥ 610 |
 
 Selection is `nvkvm_abi_id_for_version(major, minor, patch)`
-(`src/common/nvkvm_abi.h:311-368`). It takes the full version because **two
+(`src/common/nvkvm_abi.h:311-382`). It takes the full version because **two
 boundaries fall inside a branch** — 535 splits at the Confidential Computing
 channel fields (535.54.03 measures 304, 535.86.05 measures 360) and 550 splits
 at the V550 UVM array (550.40.07 measures 1200, 550.40.53 measures 9264). A
 major-only lookup mis-keys 535.54.03 (the original 535 GA) and 550.40.07.
-`nvkvm_abi_id_for_major()` (`:370`) is kept for callers that hold nothing else,
+`nvkvm_abi_id_for_major()` (`:392`) is kept for callers that hold nothing else,
 and is documented as lossy for exactly those two cases.
 
 Every range above was produced by compiling probes at named tags with
@@ -80,9 +80,9 @@ before the real ioctl). Two independent mechanisms converge:
 2. **Explicit stamp.** QEMU additionally writes the profile id into every
    `ISOLATE_CMD_IOCTL` header (`abi_profile`,
    `src/common/nvkvm_isolate_proto.h:107-109`; set at
-   `src/qemu/nvkvm_isolate.c:1820`), so the stub does no parsing at all — it
+   `src/qemu/nvkvm_isolate.c:1836`), so the stub does no parsing at all — it
    just calls `nvkvm_abi_by_id(job.abi_profile)`
-   (`src/stub/nvkvm_stub.c:1114`, `src/stub/nvkvm_stub.c:1400`).
+   (`src/stub/nvkvm_stub.c:1202`, `src/stub/nvkvm_stub.c:1488`).
 
 ## Consumption sites
 
@@ -92,10 +92,10 @@ before the real ioctl). Two independent mechanisms converge:
 | guest sanitiser fd offset | `src/guest/nvkvm_ioctl.c:313` | `uvm_map_ext_fd_off` |
 | guest alloc-param sizing | `src/guest/nvkvm_main.c:1659`, `:1662`, `:1701`, `:1712` | `nv00de_alloc_size`, `vaspace_alloc_size`, `mem_alloc_size`, `chan_alloc_size` |
 | QEMU expected-size table | `src/qemu/nvkvm_dispatch.c:61`, `:88` | UVM sizes |
-| QEMU UVM schema floor override | `src/qemu/nvkvm_isolate_handlers.c:1036-1039` | UVM sizes |
+| QEMU UVM schema floor override | `src/qemu/nvkvm_isolate_handlers.c:1280-1283` | UVM sizes |
 | QEMU dispatch fd offset | `src/qemu/nvkvm_dispatch.c:274` | `uvm_map_ext_fd_off` |
-| stub UVM fd offset | `src/stub/nvkvm_stub.c:1114` | `uvm_map_ext_fd_off` |
-| stub NVOS46 status offset | `src/stub/nvkvm_stub.c:1400` | `nvos46_status_off` |
+| stub UVM fd offset | `src/stub/nvkvm_stub.c:1202` | `uvm_map_ext_fd_off` |
+| stub NVOS46 status offset | `src/stub/nvkvm_stub.c:1488` | `nvos46_status_off` |
 
 ## Values are measured, never derived
 
@@ -156,7 +156,7 @@ quiet — `src/guest/nvkvm_ioctl.c:301-312` records what a wrong
 > error at all. Observed on GTX 1660 SUPER / 535.309.01 as `cuCtxCreate -> 999`.
 
 `tests/abi_parity` asserts the compiled-in table against measured values
-(`src/common/nvkvm_abi.h:23`).
+(`src/common/nvkvm_abi.h:28`).
 
 ## The default-row hazard
 
@@ -180,5 +180,10 @@ See [`docs/howto/add-a-driver-version.md`](../howto/add-a-driver-version.md).
 
 ## What is actually booted
 
-Two of the eight rows have been exercised end to end in this repository. See
+**Six of the eight rows** have been exercised end to end in this repository:
+`535` (535.309.01) and `570` (575.51.03) earlier, then `545` (545.23.08), `550`
+(550.54.14), `580` (at both ends of its range, 580.95.05 and 595.84) and `610`
+(610.43.02). `515` and `525` remain unbooted — the drivers that select them do
+not build against kernel 6.8. See
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md) and
 [`docs/reference/supported-drivers.md`](supported-drivers.md).

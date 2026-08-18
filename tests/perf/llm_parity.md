@@ -536,14 +536,17 @@ precisely the configuration that produced the historical phantom "17x gap", so:
 
 Stated rather than implied:
 
-- **Stock vLLM (pinned host buffers enabled) in the guest** — impossible today, §5a.
+- **Stock vLLM (pinned host buffers enabled) in the guest** — impossible when this
+  run was taken, §5a. Possible now (§5a-fix), but this table has **not** been
+  re-measured with pinning on and is still a pinning-off comparison on both sides.
 - **vLLM's OpenAI HTTP server / `benchmark_serving.py`.** Concurrency was driven
   through the in-process engine API instead, deliberately: hitting an HTTP
   endpoint from outside the guest would have put QEMU's slirp NAT in the
   measurement path, which is not what this test is about.
 - **Tensor parallelism / multi-GPU.** Single GPU only, `TP=1`.
 - **A rerun of the llama.cpp 7B rows** from `realapp_matrix.md` on this driver.
-- **Any fix for the 16 MiB cap.** Root-caused, not repaired.
+- **Any fix for the 16 MiB cap** — root-caused here, not repaired here. It *was*
+  repaired later the same day; see §5a-fix.
 
 ---
 
