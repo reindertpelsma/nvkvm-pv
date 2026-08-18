@@ -126,10 +126,13 @@ handed over, and there is no DMA path from the guest to host memory. Compare
 PCIe passthrough, where the GPU retains DMA access to host RAM and the isolation
 boundary is weaker than the VM boundary suggests.
 
-**No guest pointer is ever forwarded.** The guest sanitiser zeroes every
-pointer-sized field carrying a guest VA before the call crosses, and the host
-boundary overwrites those fields unconditionally rather than trusting the guest
-to have done it.
+**Guest pointers are not meant to cross, and the host is what enforces it.** The
+guest sanitiser zeroes pointer-sized fields carrying a guest VA, but that runs in
+the guest and is therefore not a control — a malicious guest simply skips it. The
+host boundary overwrites those fields itself. Enforcement today is per-ioctl and
+hand-written rather than categorical, and is **not yet complete**: we audited it
+and published what we found, open items included, in
+[the pointer audit](docs/internal/audit-guest-pointers.md).
 
 **In steady state there is no forwarded call at all.** Control operations cross
 the boundary; work does not. A kernel launch reaches the GPU as a write-combining
