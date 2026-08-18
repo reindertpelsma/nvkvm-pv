@@ -2357,6 +2357,36 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			resp->status = (uint32_t)se;
 			return 0;
 		}
+		NVKVM_DBG("nvkvm: WINMAP fd=%d dev_id=%d off=0x%lx len=%lu "
+			  "gpa=0x%llx qva=%p req_prot=0x%x\n",
+			  h->fd, h->dev_id, (unsigned long)req->offset,
+			  (unsigned long)len, (unsigned long long)gpa, qva,
+			  req->prot);
+		/*
+		 * The driver's own mmap handler may clear VM_WRITE (and
+		 * VM_MAYWRITE) on the VMA it just gave us, regardless of the
+		 * PROT_READ|PROT_WRITE we asked for.  Such a page cannot sit
+		 * under the sparse window's memslot: KVM resolves a memslot HVA
+		 * with get_user_pages(), and a guest store into a non-writable
+		 * VMA fails gup(write=1), so KVM_RUN returns EFAULT -- fatal and
+		 * unrecoverable, not a resumable MMIO exit.
+		 *
+		 * mprotect() is an O(1) probe for exactly this: it fails with
+		 * EACCES when VM_MAYWRITE was cleared.  On such a page, undo the
+		 * device mapping and let the GPA ride the window's anonymous
+		 * backing instead -- the same model the UVM branch below uses.
+		 * The isolate stub still holds the real device mapping in its own
+		 * address space, and the GPU reaches the memory by DMA rather
+		 * than through a QEMU CPU memslot.
+		 */
+		if (mprotect(qva, len, PROT_READ | PROT_WRITE) != 0) {
+			NVKVM_DBG("nvkvm: WINMAP gpa=0x%llx len=%lu is "
+				  "driver-readonly (%s) -- falling back to "
+				  "anonymous window backing\n",
+				  (unsigned long long)gpa, (unsigned long)len,
+				  strerror(errno));
+			nvkvm_window_restore_anon(qva, len);
+		}
 		/* No KVM ioctl: the sparse window's single memslot already maps
 		 * [gpa, gpa+len) → this VA range. */
 		kvm_slot = NVKVM_IN_WINDOW_SLOT;
