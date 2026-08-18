@@ -249,3 +249,28 @@ Its sibling `NV2080_CTRL_CMD_GPU_GET_PID_INFO` takes the opposite route: it *is*
 forwarded, but each guest pid is rewritten to `0x80000000 | isolate_id` for QEMU
 to resolve to a real host pid, and restored on the way back
 (`src/guest/nvkvm_main.c:895-961`, `src/qemu/nvkvm_isolate_handlers.c:1849-1930`).
+
+## Container process enumeration
+
+`NV2080_CTRL_CMD_GPU_GET_PIDS` — what `nvidia-smi` calls to list GPU processes —
+is **not forwarded**. The guest module synthesizes the answer from its own
+session table.
+
+Forwarding would be both wrong and leaky: each isolate is a separate RM client
+that cannot see the others' pids, and the host RM would report host pids that are
+meaningless inside the guest. The guest module is the only party that knows which
+*guest* processes hold GPU sessions.
+
+Sessions pin the tgid at creation (`get_task_pid(current, PIDTYPE_TGID)`) and the
+answer is rendered per-caller with `pid_vnr()`, which returns the number the
+calling task's PID namespace uses, or 0 if the process is not visible from there.
+Entries that resolve to 0 are skipped. So:
+
+- `nvidia-smi` in a Docker container **inside the guest** sees only the GPU
+  processes in its own namespace
+- `nvidia-smi` in the guest's init namespace sees all guest GPU pids
+- neither ever sees a host pid
+
+This mirrors how the real driver scopes `GET_PIDS` by `current`'s PID namespace,
+so it reproduces bare-metal semantics rather than approximating them.
+

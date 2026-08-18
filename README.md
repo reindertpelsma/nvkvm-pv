@@ -23,6 +23,9 @@ From a user's perspective, this is what it buys you:
   gets no MMIO window to it, and has no DMA path to host memory
 - **bring your own guest image** — a stock NVIDIA driver, not a licensed
   vGPU guest driver bound to one vendor's cloud
+- **keep your existing container workflow** — Docker with
+  `nvidia-container-toolkit` works unmodified inside the guest, so
+  `docker run --gpus all` behaves as it does on the host
 
 It is fast because the guest is not in a hot path. Control calls are forwarded;
 the work itself is not. A kernel launch reaches the GPU as a store to a mapped
@@ -145,21 +148,35 @@ driver 575.51.03, strictly serial on one GPU.
 | workload | host | guest | ratio |
 |---|---|---|---|
 | memory bandwidth (triad) | 336.2 | 336.3 GB/s | 1.00x |
-| N-body | 4615.5 | 4605.3 GFLOP/s | 1.00x |
-| Black-Scholes | 20974.6 | 20963.8 Mopt/s | 1.00x |
-| 2D convolution | 1176.6 | 1180.6 GFLOP/s | 1.00x |
-| SHA-256 | 756.0 | 756.0 MH/s | 1.00x |
-| reduction bandwidth | 122.0 | 119.7 GB/s | 0.98x |
-| Mandelbrot | 2.90e6 | 2.76e6 | 0.95x |
-| PyTorch matmul fp32 | 9.02 | 8.98 TFLOP/s | 1.00x |
 | PyTorch matmul fp16 (tensor cores) | 26.03 | 26.03 TFLOP/s | 1.00x |
-| ResNet-50 inference | 615.8 | 614.6 img/s | 1.00x |
-| ResNet-50 inference (AMP) | 1091.2 | 1092.4 img/s | 1.00x |
 | ResNet-50 training step | 199.5 | 199.6 img/s | 1.00x |
-| ViT-B/16 inference | 165.2 | 164.8 img/s | 1.00x |
 | BERT encoder | 277.6 | 277.3 seq/s | 1.00x |
 | Vulkan compute (vkpeak) | 8947.2 | 8975.3 GFLOP/s | 1.00x |
 | OpenGL offscreen (EGL) | 1.8 | 1.8 Mtri/s | 1.00x |
+| reduction bandwidth | 122.0 | 119.7 GB/s | 0.98x |
+| Mandelbrot | 2.90e6 | 2.76e6 | 0.95x |
+
+Eleven more — N-body, Black-Scholes, SHA-256, 2D convolution, ResNet-50
+inference and AMP, ViT-B/16, PyTorch fp32 — all land at 1.00x. Full table and
+method: [`tests/perf/realapp_matrix.md`](tests/perf/realapp_matrix.md).
+
+Where the guest is measurably slower it is latency-bound control paths, never
+sustained compute or bandwidth.
+
+### Containers
+
+Docker with `nvidia-container-toolkit` works inside the guest with no special
+handling — standard install, `docker run --gpus all`, and the GPU appears:
+
+```
+$ docker run --rm --gpus all nvidia/cuda:12.9.0-base nvidia-smi
+NVIDIA-SMI 575.51.03   Driver Version: 575.51.03   CUDA Version: 12.9
+0  NVIDIA GeForce RTX 3070   Off   00000000:00:07.0
+```
+
+Process enumeration is namespace-correct too — `nvidia-smi` inside a container
+sees only that container's GPU processes, never a host PID. See
+[device nodes](docs/reference/device-nodes.md).
 
 ### LLM serving
 
@@ -216,47 +233,29 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 
-\* These two read 27/28 until 2026-08-17: `gl_draw_pixel_check` failed with
-`GL_FRAMEBUFFER_UNSUPPORTED` on every attachment format. The cause was nvkvm's
-own NVKMS allowlist, which was captured on a 575-era session and denied a
-`cmdType` that branches 595+ need for offscreen render targets — not a driver
-regression; the same probe passes on bare metal on both drivers. After the fix
-610.43.02 is a clean 28/28. **There is no 28/28 measurement for 595.84**: the
-box it ran on was re-provisioned from a component-package subset that omits
-`libnvidia-ptxjitcompiler`, so `cuda_ptx_jit` now FAILs there and the run scores
-25/28 for a reason unrelated to nvkvm. What was re-measured on 595.84 after the
-fix is `gl_draw_pixel_check` PASS and `0/5 configurations incomplete`. See
+\* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
+595.84 row has no 28/28 measurement — its box was re-provisioned without
+`libnvidia-ptxjitcompiler`. Full detail in
 [`tests/BOOT_MATRIX.md`](tests/BOOT_MATRIX.md).
 
-NVIDIA guarantees no ioctl ABI stability across driver releases, so `nvkvm`
-keys struct layouts off the host driver version. **Eight profiles** cover every
-open-kernel-modules release from 515 to 610, derived by compiling `sizeof` /
-`offsetof` probes against 61 upstream tags (`tools/abi_derive.sh`).
+NVIDIA guarantees no ioctl ABI stability across driver releases, so `nvkvm` keys
+struct layouts off the host driver version. **Eight profiles** cover every
+open-kernel-modules release from 515 to 610, measured by compiling `sizeof` /
+`offsetof` probes against 61 upstream tags — and keyed on the full
+`major.minor.patch`, because two widely deployed branches change layout *inside*
+the branch. **Six of the eight have been booted**; no profile's values proved
+wrong in practice. See [ABI profiles](docs/reference/abi-profiles.md) and
+[supported drivers](docs/reference/supported-drivers.md).
 
-Selection is keyed on the full `major.minor.patch`, not the major alone, because
-two widely deployed branches change layout *inside* the branch — and 535 does so
-non-monotonically: the long-lived 535.43.x maintenance train picked up the
-Confidential Computing channel fields at 535.43.08 (2023-08-17), which is newer
-in wall-clock time than 535.54.03 (2023-06-14) despite sorting older.
-
-The table is derived for all eight; **six of the eight have been booted** and put
-through the validation suite. `515` and `525` are underived-by-boot only because
-the drivers selecting them do not build on kernel 6.8, which every KVM-capable
-test host ran — they need a host on kernel <= 6.5. No profile's table values
-proved wrong in practice.
-
-Run the suite yourself inside a guest:
+Verify any host yourself, inside a guest:
 
 ```bash
 sudo bash /mnt/nvkvm/tests/validate.sh
 ```
 
-28 checks covering device nodes, the full CUDA ladder (including a real kernel
-launch and the PTX JIT path), Vulkan compute and offscreen GL. It needs only a C
-compiler — the probes `dlopen` their libraries. A software-rasteriser fallback
-(llvmpipe/lavapipe/swrast) is an explicit **FAIL**, not a pass. Results per
-driver are in [`tests/BOOT_MATRIX.md`](tests/BOOT_MATRIX.md); see also
-[supported drivers](docs/reference/supported-drivers.md).
+28 checks — device nodes, the full CUDA ladder, Vulkan compute, offscreen GL.
+Needs only a C compiler, and a software-rasteriser fallback is an explicit
+**FAIL**, not a pass.
 
 ## Documentation
 
