@@ -316,7 +316,7 @@ typedef struct VirtIONvgpu {
 	pthread_mutex_t     mmap_win_lock;
 
 	/*
-	 * Sparse GPA window — see NVKVM_SPARSE_GPA_BASE in the comment block
+	 * Sparse GPA window — see struct nvkvm_gpa_layout in the comment block
 	 * above.  sparse_gpa_base / sparse_size are GPA-space; sparse_vmm_va
 	 * is the MAP_NORESERVE anon region in QEMU's mm that backs the slot.
 	 * sparse_cur is the next free GPA offset; sparse_kvm_slot is the
@@ -348,7 +348,7 @@ typedef struct VirtIONvgpu {
 	 * that returns the BAR's current GPA (0 until the guest programs it).
 	 * The raw KVM memslot is installed lazily once the base is known
 	 * (nvkvm_sparse_ensure); if no BAR/callback, we fall back to the fixed
-	 * NVKVM_SPARSE_GPA_BASE so a transport without the BAR still works.
+	 * computed gpa.sparse_base so a transport without the BAR still works.
 	 */
 	uint64_t          (*window_base_get)(void *opaque);
 	void               *window_base_opaque;
@@ -577,7 +577,7 @@ bool     nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 				  char *errbuf, size_t errlen);
 
 /*
- * Sparse GPA window helpers.  See NVKVM_SPARSE_GPA_BASE.
+ * Sparse GPA window helpers.  See struct nvkvm_gpa_layout.
  *
  * nvkvm_sparse_init: called once at device realize.  mmaps the VMM-side
  * window as MAP_NORESERVE | MAP_ANONYMOUS and installs the KVM region.

@@ -339,12 +339,22 @@ bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 		span  = nvkvm_align_up(span, NVKVM_GPA_ALIGN);
 
 		/*
-		 * Room below us for guest RAM *and* for firmware to place the
-		 * sparse reservation BAR.  A 64-bit PCI BAR is naturally
-		 * aligned to its own size, so the highest the BAR can end is
-		 * align_up(ram_top + slack, sparse_size) + sparse_size.  Keep
-		 * the whole block above that, so the bottom-up BAR allocator
-		 * and our top-down block can never meet.
+		 * Room below us for guest RAM *and* for the sparse reservation
+		 * BAR.  A 64-bit PCI BAR is naturally aligned to its own size,
+		 * so reserve align_up(ram_top + slack, sparse_size) +
+		 * sparse_size below the block.
+		 *
+		 * Measured (SeaBIOS 1.16.3, both a 39-bit and a 46-bit host):
+		 * firmware allocates 64-bit prefetchable BARs *downward* from
+		 * the top of the addressable space, so our 128 GiB BAR lands at
+		 * limit - 128 GiB.  Because the block is packed against the top
+		 * and the sparse region is last in it, our computed
+		 * sparse_base is also exactly limit - sparse_size — the two
+		 * agree by construction, and the BAR reserves precisely the
+		 * range we were going to use.  This floor is therefore
+		 * conservative rather than load-bearing in the common case; it
+		 * is what makes the "cannot fit" answer honest when firmware
+		 * would have nowhere to put the BAR at all.
 		 */
 		floor = nvkvm_align_up(ram_top + NVKVM_GPA_ALIGN, sparse_size)
 			+ sparse_size;
@@ -496,6 +506,23 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 		 * firmware that mis-places a 64-bit BAR degrades instead of
 		 * taking the VM down.
 		 */
+		/*
+		 * Firmware could also place the BAR on top of the shm or legacy
+		 * mmap regions, which are plain memslots it does not know
+		 * about.  Installing the window there would shadow shm and
+		 * corrupt every ioctl parameter slot, so prefer our own base.
+		 */
+		if (base < nv->gpa.sparse_base &&
+		    base + nv->sparse_size > nv->gpa.block_base) {
+			fprintf(stderr,
+				"nvkvm: firmware placed the window BAR at GPA=0x%llx, "
+				"overlapping the shm/mmap regions at 0x%llx; using the "
+				"computed base 0x%llx instead\n",
+				(unsigned long long)base,
+				(unsigned long long)nv->gpa.block_base,
+				(unsigned long long)nv->gpa.sparse_base);
+			base = nv->gpa.sparse_base;
+		}
 		if (nv->gpa.limit &&
 		    (base >= nv->gpa.limit ||
 		     nv->sparse_size > nv->gpa.limit - base)) {

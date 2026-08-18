@@ -2827,9 +2827,37 @@ int main(int argc, char **argv)
 		};
 		long tid = fs_clone3_run(&ca, sizeof(ca), worker_thread,
 					 (void *)(uintptr_t)(i + 1));
+		/*
+		 * clone3 is not always reachable.  Docker's DEFAULT seccomp
+		 * profile answers it with ENOSYS on purpose, so that libcs fall
+		 * back to clone(2) — measured on a stock container (kernel 7.0,
+		 * Seccomp:2 / Seccomp_filters:1), where a plain clone3 from any
+		 * process returns ENOSYS.  With no fallback here every worker
+		 * spawn failed, the stub exited, and every forwarded GPU ioctl
+		 * failed with the isolate torn down immediately after creation:
+		 * cuInit returned CUDA_ERROR_NO_DEVICE and nvidia-smi reported
+		 * "couldn't communicate with the NVIDIA driver", with nothing in
+		 * the log naming clone3 as the cause.  EPERM covers profiles
+		 * that deny rather than stub the call.
+		 *
+		 * clone(2) takes the stack POINTER, not base+size, so hand it
+		 * the (16-byte aligned) top of the same region.
+		 */
+		if (tid == -38 /*ENOSYS*/ || tid == -1 /*EPERM*/) {
+			unsigned char *top = (unsigned char *)stack +
+					     WORKER_STACK_SIZE;
+			top = (unsigned char *)((uintptr_t)top & ~(uintptr_t)15);
+			tid = fs_clone_run((unsigned long)ca.flags, top,
+					   worker_thread,
+					   (void *)(uintptr_t)(i + 1));
+			if (tid >= 0 && i == 0)
+				fs_dprintf(STDERR_FD,
+					"nvkvm_stub: clone3 unavailable "
+					"(seccomp ENOSYS); using clone(2)\n");
+		}
 		if (tid < 0) {
 			fs_dprintf(STDERR_FD,
-				"nvkvm_stub: clone3 worker %d failed: %ld\n",
+				"nvkvm_stub: clone3/clone worker %d failed: %ld\n",
 				i, tid);
 			stub_exit(1);
 		}
