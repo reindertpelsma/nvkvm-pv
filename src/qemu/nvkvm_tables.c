@@ -25,6 +25,10 @@
 
 #include "nvkvm_tables.h"
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+
 #include <assert.h>
 #include <linux/falloc.h>
 #include <errno.h>
@@ -61,6 +65,65 @@ static int  window_add_free_region(struct nvkvm_gpa_window *w,
 				    uint64_t off, uint64_t size);
 static void window_destroy_locked(struct nvkvm_gpa_window *w, int kvm_vm_fd);
 
+/* ── Host physical address width ───────────────────────────────────────── */
+
+/*
+ * Host MAXPHYADDR from CPUID leaf 0x80000008 EAX[7:0], /proc/cpuinfo as a
+ * fallback.  Kept self-contained: this file is also built standalone by
+ * tests/unit, so it must not pull in the QEMU device headers.
+ */
+static uint32_t tables_host_phys_bits(void)
+{
+#if defined(__x86_64__) || defined(__i386__)
+	uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+
+	if (__get_cpuid(0x80000000u, &eax, &ebx, &ecx, &edx) &&
+	    eax >= 0x80000008u &&
+	    __get_cpuid(0x80000008u, &eax, &ebx, &ecx, &edx)) {
+		uint32_t bits = eax & 0xffu;
+		if (bits >= 32 && bits <= 64)
+			return bits;
+	}
+#endif
+	{
+		FILE *f = fopen("/proc/cpuinfo", "r");
+		char line[256];
+		uint32_t out = 0;
+
+		if (f) {
+			while (fgets(line, sizeof(line), f)) {
+				unsigned int b = 0;
+				const char *colon;
+
+				if (strncmp(line, "address sizes", 13) != 0)
+					continue;
+				colon = strchr(line, ':');
+				if (colon &&
+				    sscanf(colon + 1, " %u bits physical", &b) == 1 &&
+				    b >= 32 && b <= 64) {
+					out = b;
+					break;
+				}
+			}
+			fclose(f);
+		}
+		if (out)
+			return out;
+	}
+	return 36;   /* x86-64 architectural minimum */
+}
+
+static uint64_t tables_default_gpa_base(void)
+{
+	uint32_t bits = tables_host_phys_bits();
+	uint64_t half;
+
+	if (bits > 52)
+		bits = 52;
+	half = 1ULL << (bits - 1);
+	return half < (1ULL << 40) ? half : (1ULL << 40);
+}
+
 /* ── nvkvm_tables_init / fini ──────────────────────────────────────────── */
 
 void nvkvm_tables_init(struct nvkvm_tables *t)
@@ -80,10 +143,15 @@ void nvkvm_tables_init(struct nvkvm_tables *t)
 	t->isolates.next_slot = 1;
 	t->mmaps.next_slot    = 1;
 
-	/* GPA windows: choose a base above any plausible guest RAM extent.
-	 * 1 TiB is the convention for "host-managed device memory" in many
-	 * KVM-backed setups. */
-	t->windows.next_gpa_base = (1ULL << 40);
+	/* GPA windows: choose a base above any plausible guest RAM extent but
+	 * still inside the host's addressable GPA range.
+	 *
+	 * This used to be a flat 1 TiB, which needs 41 physical address bits and
+	 * so is rejected by KVM on any consumer part (mobile Intel is 39 bits /
+	 * 512 GiB) — the same portability bug as the device's own windows.
+	 * Derive it from the host width instead: half the addressable space,
+	 * capped at 1 TiB so wide hosts keep the historical layout. */
+	t->windows.next_gpa_base = tables_default_gpa_base();
 }
 
 void nvkvm_tables_fini(struct nvkvm_tables *t)

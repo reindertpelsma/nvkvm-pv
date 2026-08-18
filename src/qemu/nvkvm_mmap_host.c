@@ -45,6 +45,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdint.h>
+#if defined(__x86_64__) || defined(__i386__)
+#include <cpuid.h>
+#endif
+
+#include "hw/boards.h"      /* current_machine->ram_size / maxram_size */
+#include "hw/core/cpu.h"    /* first_cpu                               */
+#include "qom/object.h"     /* object_property_get_uint("phys-bits")   */
 
 #include "virtio_nvgpu.h"
 
@@ -124,6 +131,280 @@ void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out)
 	*gpa_out = alloc_gpa(nv, length);
 }
 
+/* ── Physical address width + GPA window placement ────────────────────────── */
+
+/*
+ * Host MAXPHYADDR.
+ *
+ * CPUID leaf 0x80000008, EAX bits 7:0 is the authoritative source and is what
+ * KVM itself uses to bound a memslot's GPA (kvm_mmu_max_gfn() derives from the
+ * host's shadow_phys_bits) — which is exactly the check that rejects a 1 TB
+ * window on a 39-bit part.  /proc/cpuinfo's "address sizes" line is the same
+ * number formatted for humans and is only a fallback: it is absent on some
+ * architectures and can be filtered by container runtimes.
+ */
+uint32_t nvkvm_host_phys_bits(void)
+{
+	static uint32_t cached;
+	if (cached)
+		return cached;
+
+#if defined(__x86_64__) || defined(__i386__)
+	{
+		uint32_t eax = 0, ebx = 0, ecx = 0, edx = 0;
+		/* Leaf 0x80000008 only exists if the max extended leaf covers it. */
+		if (__get_cpuid(0x80000000u, &eax, &ebx, &ecx, &edx) &&
+		    eax >= 0x80000008u &&
+		    __get_cpuid(0x80000008u, &eax, &ebx, &ecx, &edx)) {
+			uint32_t bits = eax & 0xffu;
+			if (bits >= 32 && bits <= 64) {
+				cached = bits;
+				return cached;
+			}
+		}
+	}
+#endif
+
+	/* Fallback: "address sizes\t: 39 bits physical, 48 bits virtual" */
+	{
+		FILE *f = fopen("/proc/cpuinfo", "r");
+		char line[256];
+		if (f) {
+			while (fgets(line, sizeof(line), f)) {
+				unsigned int b = 0;
+				if (strncmp(line, "address sizes", 13) != 0)
+					continue;
+				const char *colon = strchr(line, ':');
+				if (colon && sscanf(colon + 1, " %u bits physical", &b) == 1 &&
+				    b >= 32 && b <= 64) {
+					cached = b;
+					break;
+				}
+			}
+			fclose(f);
+		}
+	}
+	return cached;   /* 0 if we could not determine it */
+}
+
+/*
+ * Guest MAXPHYADDR.
+ *
+ * The guest's addressable range is what actually matters for a GPA the guest
+ * must be able to reach, and QEMU may cap it below the host's.  x86 resolves
+ * X86CPU::phys_bits during CPU realize and exposes it as the "phys-bits"
+ * property; -cpu host and -cpu max default host-phys-bits=on, so this normally
+ * equals the host width.  Read it through QOM rather than target/i386/cpu.h:
+ * these sources are built into system_ss (target-independent), where the x86
+ * CPU headers are not available.
+ */
+uint32_t nvkvm_guest_phys_bits(void)
+{
+	uint64_t v;
+	Error *err = NULL;
+
+	if (!first_cpu)
+		return 0;
+	v = object_property_get_uint(OBJECT(first_cpu), "phys-bits", &err);
+	if (err) {
+		error_free(err);
+		return 0;
+	}
+	/* 0 means "auto, not resolved yet"; anything outside [32,64] is not a
+	 * width we should trust. */
+	if (v < 32 || v > 64)
+		return 0;
+	return (uint32_t)v;
+}
+
+/*
+ * Conservative upper bound on the top of guest RAM in GPA space.
+ *
+ * On x86 whatever does not fit under the 4 GiB PCI hole is remapped above
+ * 4 GiB, so the true top is 4 GiB + (ram_size - below_4g_size), which is
+ * always <= 4 GiB + ram_size.  maxram_size covers a configured memory-hotplug
+ * region, which is mapped above RAM as well.
+ */
+static uint64_t nvkvm_guest_ram_top(void)
+{
+	uint64_t ram = 0;
+
+	if (current_machine) {
+		ram = (uint64_t)current_machine->ram_size;
+		if ((uint64_t)current_machine->maxram_size > ram)
+			ram = (uint64_t)current_machine->maxram_size;
+	}
+	return (4ULL << 30) + ram;
+}
+
+static uint64_t nvkvm_align_up(uint64_t v, uint64_t a)
+{
+	return (v + a - 1) & ~(a - 1);
+}
+
+static uint64_t nvkvm_align_down(uint64_t v, uint64_t a)
+{
+	return v & ~(a - 1);
+}
+
+/*
+ * Resolve the GPA window block.
+ *
+ * Placement rule
+ * ==============
+ *   bits  = min(host MAXPHYADDR, guest MAXPHYADDR)   [the binding limit]
+ *   limit = 1 << bits                                [one past the last GPA]
+ *   span  = 1 GiB (shm slot) + mmap_win + sparse
+ *   base  = align_down(limit - span, 1 GiB)          [as high as it will go]
+ *
+ * i.e. the block is packed against the top of the addressable space, and the
+ * check is on base + span <= limit — the *whole* window must fit, not just its
+ * base.  Top-down placement keeps the block as far from guest RAM as the
+ * address space allows (the property the old 1 TB constant was reaching for)
+ * and keeps it clear of firmware's 64-bit BAR allocator, which fills the PCI64
+ * hole bottom-up starting just above RAM.
+ *
+ * The floor the block may not cross is guest RAM top plus room for the sparse
+ * reservation BAR (which firmware must place below us) plus 1 GiB of slack:
+ *
+ *   floor = align_up(4 GiB + ram_size, 1 GiB) + sparse_size + 1 GiB
+ *
+ * If base < floor the sparse window is halved and we try again, down to
+ * NVKVM_SPARSE_GPA_SIZE_MIN, logging each shrink.  If even the floor size does
+ * not fit we fail with a message naming every number involved, rather than
+ * silently handing back a window that would break at the 1500th mmap.
+ */
+bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
+			      char *errbuf, size_t errlen)
+{
+	uint32_t host_bits, guest_bits, bits;
+	uint64_t limit, ram_top, sparse_size;
+
+	memset(out, 0, sizeof(*out));
+
+	host_bits  = nvkvm_host_phys_bits();
+	guest_bits = nvkvm_guest_phys_bits();
+
+	/* Take the narrower of the two: the host width bounds what KVM will
+	 * accept for a memslot, the guest width bounds what the guest can
+	 * address.  A GPA needs to satisfy both. */
+	bits = 0;
+	if (host_bits && guest_bits)
+		bits = host_bits < guest_bits ? host_bits : guest_bits;
+	else if (host_bits)
+		bits = host_bits;
+	else if (guest_bits)
+		bits = guest_bits;
+
+	if (!bits) {
+		/* Neither probe worked.  36 bits (64 GiB) is the x86-64
+		 * architectural minimum, so it is the only safe assumption. */
+		bits = 36;
+		fprintf(stderr, "nvkvm: could not determine host or guest "
+			"physical address width; assuming %u bits\n", bits);
+	}
+
+	/*
+	 * QEMU cannot represent a GPA wider than its target address space.
+	 * TARGET_PHYS_ADDR_SPACE_BITS is the right constant but it is
+	 * *target-specific* (target/i386/cpu-param.h) and these sources are
+	 * compiled into system_ss, which is built once for all targets — so it
+	 * is not visible here.  Use it when it is, and otherwise fall back to
+	 * x86-64's value (52), which is also the architectural ceiling for
+	 * MAXPHYADDR.
+	 */
+#ifdef TARGET_PHYS_ADDR_SPACE_BITS
+	if (bits > TARGET_PHYS_ADDR_SPACE_BITS)
+		bits = TARGET_PHYS_ADDR_SPACE_BITS;
+#else
+	if (bits > 52)
+		bits = 52;
+#endif
+
+	limit   = (bits >= 64) ? UINT64_MAX : (1ULL << bits);
+	ram_top = nvkvm_guest_ram_top();
+
+	out->host_bits  = host_bits;
+	out->guest_bits = guest_bits;
+	out->bits       = bits;
+	out->limit      = limit;
+	out->ram_top    = ram_top;
+	out->mmap_size  = NVKVM_MMAP_WIN_SIZE;
+
+	for (sparse_size = NVKVM_SPARSE_GPA_SIZE;;
+	     sparse_size /= 2) {
+		uint64_t span, base, floor;
+
+		span  = NVKVM_SHM_GPA_SLOT + NVKVM_MMAP_WIN_SIZE + sparse_size;
+		span  = nvkvm_align_up(span, NVKVM_GPA_ALIGN);
+
+		/*
+		 * Room below us for guest RAM *and* for firmware to place the
+		 * sparse reservation BAR.  A 64-bit PCI BAR is naturally
+		 * aligned to its own size, so the highest the BAR can end is
+		 * align_up(ram_top + slack, sparse_size) + sparse_size.  Keep
+		 * the whole block above that, so the bottom-up BAR allocator
+		 * and our top-down block can never meet.
+		 */
+		floor = nvkvm_align_up(ram_top + NVKVM_GPA_ALIGN, sparse_size)
+			+ sparse_size;
+
+		if (span <= limit) {
+			base = nvkvm_align_down(limit - span, NVKVM_GPA_ALIGN);
+			if (base >= floor) {
+				out->sparse_size = sparse_size;
+				out->block_base  = base;
+				out->block_size  = span;
+				out->floor       = floor;
+				out->shm_base    = base;
+				out->mmap_base   = base + NVKVM_SHM_GPA_SLOT;
+				out->sparse_base = out->mmap_base +
+						   NVKVM_MMAP_WIN_SIZE;
+				out->shrunk      =
+					(sparse_size != NVKVM_SPARSE_GPA_SIZE);
+				return true;
+			}
+			out->floor = floor;
+		}
+
+		if (sparse_size <= NVKVM_SPARSE_GPA_SIZE_MIN) {
+			snprintf(errbuf, errlen,
+			 "nvkvm: the GPA windows do not fit in this VM's "
+			 "physical address space. host MAXPHYADDR %u bits, "
+			 "guest MAXPHYADDR %u bits -> usable GPA limit %llu GiB. "
+			 "Guest RAM top is %llu GiB, so the windows must start "
+			 "above %llu GiB, and the smallest layout nvkvm supports "
+			 "needs %llu GiB (1 GiB shm + %llu GiB mmap window + "
+			 "%llu GiB sparse window) — %llu GiB more than there is "
+			 "room for. Reduce guest RAM to at most %llu GiB, or run "
+			 "on a host with more physical address bits.",
+			 host_bits, guest_bits,
+			 (unsigned long long)(limit >> 30),
+			 (unsigned long long)(ram_top >> 30),
+			 (unsigned long long)(floor >> 30),
+			 (unsigned long long)(span >> 30),
+			 (unsigned long long)(NVKVM_MMAP_WIN_SIZE >> 30),
+			 (unsigned long long)(sparse_size >> 30),
+			 (unsigned long long)(((floor + span) - limit) >> 30),
+			 (unsigned long long)(
+				limit > (span + sparse_size + (5ULL << 30))
+				? ((limit - span - sparse_size -
+				    (5ULL << 30)) >> 30)
+				: 0));
+			return false;
+		}
+
+		fprintf(stderr,
+			"nvkvm: sparse GPA window %llu GiB does not fit below "
+			"the %llu GiB GPA limit with %llu GiB of guest RAM — "
+			"halving to %llu GiB\n",
+			(unsigned long long)(sparse_size >> 30),
+			(unsigned long long)(limit >> 30),
+			(unsigned long long)(ram_top >> 30),
+			(unsigned long long)((sparse_size / 2) >> 30));
+	}
+}
+
 /* ── Sparse GPA window ────────────────────────────────────────────────────── */
 
 /* Forward decls — definitions follow this block. */
@@ -143,14 +424,19 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 {
 	if (nv->sparse_vmm_va) return 0;  /* already initialised */
 
-	void *va = mmap(NULL, NVKVM_SPARSE_GPA_SIZE,
+	/* Size comes from the realize-time layout, not the compile-time
+	 * constant: on a narrow host it may have been deliberately shrunk. */
+	size_t win = nv->gpa.sparse_size ? (size_t)nv->gpa.sparse_size
+					 : (size_t)NVKVM_SPARSE_GPA_SIZE;
+
+	void *va = mmap(NULL, win,
 			PROT_READ | PROT_WRITE,
 			MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
 			-1, 0);
 	if (va == MAP_FAILED) {
 		NVKVM_DBG(
 			"nvkvm_sparse_init: mmap %llu GiB failed: %s\n",
-			(unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30),
+			(unsigned long long)(win >> 30),
 			strerror(errno));
 		return -errno;
 	}
@@ -164,7 +450,7 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 	 */
 	pthread_mutex_init(&nv->sparse_lock, NULL);
 	nv->sparse_gpa_base = 0;
-	nv->sparse_size     = NVKVM_SPARSE_GPA_SIZE;
+	nv->sparse_size     = win;
 	nv->sparse_vmm_va   = va;
 	nv->sparse_cur      = 0;
 	nv->sparse_kvm_slot = -1;
@@ -172,7 +458,7 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 	nv->sparse_free   = g_new0(struct nvkvm_gpa_extent, NVKVM_GPA_FREE_MAX);
 	nv->sparse_free_n = 0;
 	NVKVM_DBG("nvkvm_sparse_init: %llu GiB VMM buffer %p (memslot deferred to BAR base)\n",
-		  (unsigned long long)(NVKVM_SPARSE_GPA_SIZE >> 30), va);
+		  (unsigned long long)(win >> 30), va);
 	return 0;
 }
 
@@ -202,8 +488,36 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 			pthread_mutex_unlock(&nv->sparse_lock);
 			return 0;
 		}
+		/*
+		 * Firmware is not obliged to place the BAR somewhere KVM will
+		 * accept.  Check the *whole* range against the resolved GPA
+		 * limit before handing it to KVM_SET_USER_MEMORY_REGION, and
+		 * fall back to our own computed base rather than dying, so a
+		 * firmware that mis-places a 64-bit BAR degrades instead of
+		 * taking the VM down.
+		 */
+		if (nv->gpa.limit &&
+		    (base >= nv->gpa.limit ||
+		     nv->sparse_size > nv->gpa.limit - base)) {
+			fprintf(stderr,
+				"nvkvm: firmware placed the window BAR at GPA=0x%llx "
+				"+%llu GiB, which crosses this VM's %u-bit GPA limit "
+				"(%llu GiB); using the computed base 0x%llx instead\n",
+				(unsigned long long)base,
+				(unsigned long long)(nv->sparse_size >> 30),
+				nv->gpa.bits,
+				(unsigned long long)(nv->gpa.limit >> 30),
+				(unsigned long long)nv->gpa.sparse_base);
+			base = nv->gpa.sparse_base;
+		}
 	} else {
-		base = NVKVM_SPARSE_GPA_BASE;   /* no BAR transport — fixed fallback */
+		/* No BAR transport — use the computed fallback base. */
+		base = nv->gpa.sparse_base;
+	}
+	if (base == 0) {
+		pthread_mutex_unlock(&nv->sparse_lock);
+		fprintf(stderr, "nvkvm: sparse window has no usable base GPA\n");
+		return 0;
 	}
 	int slot = -1;
 	int rc = kvm_add_memory_region(base, nv->sparse_vmm_va,
