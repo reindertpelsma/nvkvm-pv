@@ -160,7 +160,7 @@ static int run_two_uid_experiment(uid_t uid_a, uid_t uid_b)
 		if (write(fd, "isolate-A-private", 17) != 17) _exit(3);
 		close(fd);
 		if (fchownat(AT_FDCWD, file_a, uid_a, uid_a, 0) != 0) _exit(3);
-		if (nvkvm_iso_drop_privilege(uid_a, (gid_t)uid_a, false) != 0)
+		if (nvkvm_iso_drop_privilege(uid_a, (gid_t)uid_a) != 0)
 			_exit(4);
 		if (write(pipe_ready[1], "a", 1) != 1) _exit(5);
 		close(pipe_ready[1]);
@@ -188,7 +188,7 @@ static int run_two_uid_experiment(uid_t uid_a, uid_t uid_b)
 	if (pid_b == 0) {
 		unsigned r = 0;
 		close(pipe_res[0]);
-		if (nvkvm_iso_drop_privilege(uid_b, (gid_t)uid_b, false) == 0)
+		if (nvkvm_iso_drop_privilege(uid_b, (gid_t)uid_b) == 0)
 			r |= R_DROP_OK;
 		r |= probe_peer(pid_a, file_a);
 		if (write(pipe_res[1], &r, sizeof(r)) != (ssize_t)sizeof(r))
@@ -293,7 +293,7 @@ static void run_chroot_experiment(uid_t uid)
 		close(p[1]);
 		if (nvkvm_iso_enter_chroot(TEST_DEV_DIRFD) == 0)
 			r |= C_CHROOT_OK;
-		if (nvkvm_iso_drop_privilege(uid, (gid_t)uid, false) != 0)
+		if (nvkvm_iso_drop_privilege(uid, (gid_t)uid) != 0)
 			_exit(4);
 
 		/* The chroot root must actually be /dev — checked against a node
@@ -567,7 +567,7 @@ static void test_preflight_without_caps(uid_t sacrificial_uid)
 		close(p[0]);
 		/* Become an ordinary uid: CAP_SETUID/CAP_SETGID go with it. */
 		if (nvkvm_iso_drop_privilege(sacrificial_uid,
-					     (gid_t)sacrificial_uid, false) != 0)
+					     (gid_t)sacrificial_uid) != 0)
 			_exit(4);
 		int rc = nvkvm_iso_cfg_validate(&c, err, sizeof(err));
 		unsigned char v = (rc != 0) ? 1 : 0;

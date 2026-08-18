@@ -720,18 +720,18 @@ static inline int nvkvm_iso_enter_chroot(int dev_dirfd_slot)
  * the parent's (root's) group — a drop that only half happened.  GID first,
  * then UID, then verify.
  *
- * `in_userns_setgroups_denied` covers combined namespace+uid mode: when the
- * parent writes "deny" to /proc/<pid>/setgroups, setgroups(2) is permanently
- * EPERM inside that user namespace.  That is a STRONGER guarantee than the
- * one we were trying to establish (the process can never gain a group), so
- * EPERM there is accepted — and only there.
+ * There is deliberately no "tolerate EPERM from setgroups" escape hatch. An
+ * earlier version had one, for combined namespace+uid mode where the parent
+ * wrote "deny" to /proc/<pid>/setgroups and setgroups(2) is then permanently
+ * EPERM. That produced a uid-separated isolate still carrying the host root
+ * group (measured: `Uid: 500004 ... Groups: 0`). The parent now leaves the
+ * policy at its default for combined mode instead, so clearing the group list
+ * must succeed in every mode and a failure here is a failure, full stop.
  */
-static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid,
-					   bool in_userns_setgroups_denied)
+static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid)
 {
 	uid_t ru, eu, su;
 	gid_t rg, eg, sg;
-	bool groups_cleared = true;
 
 	/* Refuse to "drop" to a privileged id — a misconfigured base that
 	 * resolved to 0 must fail loudly, not run the stub as root. */
@@ -739,12 +739,8 @@ static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid,
 		return -1;
 
 	/* 1. Supplementary groups first, while we still have CAP_SETGID. */
-	if (NVKVM_SETGROUPS(0, NULL) != 0) {
-		if (in_userns_setgroups_denied && errno == EPERM)
-			groups_cleared = false;   /* denied == cannot gain: fine */
-		else
-			return -1;
-	}
+	if (NVKVM_SETGROUPS(0, NULL) != 0)
+		return -1;
 
 	/* 2. GID before UID.  setresgid sets real, effective AND saved, so
 	 *    there is no saved-gid left to restore from. */
@@ -764,7 +760,7 @@ static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid,
 		return -1;
 	if (rg != gid || eg != gid || sg != gid)
 		return -1;
-	if (groups_cleared && syscall(SYS_getgroups, 0, NULL) != 0)
+	if (syscall(SYS_getgroups, 0, NULL) != 0)
 		return -1;
 
 	/*

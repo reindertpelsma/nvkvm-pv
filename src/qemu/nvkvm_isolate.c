@@ -1148,12 +1148,11 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 * removes); then the rest of the cap teardown. */
 			if (harden)
 				nvkvm_drop_caps_pre();
-			/* `false`: setgroups is left at its default "allow" for
-			 * combined mode (see nvkvm_map_child_userns), so a
-			 * setgroups failure is a real failure everywhere. */
+			/* setgroups is left at its default "allow" for combined
+			 * mode (see nvkvm_map_child_userns), so clearing the
+			 * group list must succeed in every mode. */
 			if (use_uid &&
-			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid,
-						     false) != 0)
+			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid) != 0)
 				_exit(125);
 			if (harden)
 				nvkvm_drop_caps_post();
@@ -1223,12 +1222,11 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 						? NVKVM_DEV_DIRFD + 1 : 4);
 			if (harden)
 				nvkvm_drop_caps_pre();
-			/* `false`: setgroups is left at its default "allow" for
-			 * combined mode (see nvkvm_map_child_userns), so a
-			 * setgroups failure is a real failure everywhere. */
+			/* setgroups is left at its default "allow" for combined
+			 * mode (see nvkvm_map_child_userns), so clearing the
+			 * group list must succeed in every mode. */
 			if (use_uid &&
-			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid,
-						     false) != 0)
+			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid) != 0)
 				_exit(125);
 			if (harden)
 				nvkvm_drop_caps_post();
