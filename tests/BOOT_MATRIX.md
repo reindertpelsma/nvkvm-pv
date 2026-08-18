@@ -423,3 +423,80 @@ llvmpipe fallback showed up as
 `vk_device_is_nvidia FAIL: SOFTWARE RASTERISER: 'llvmpipe ...' (vendorID 0x10005)`,
 and the 803 showed up as `cuda_init FAIL` with every downstream CUDA check
 reported SKIP rather than passed or omitted.
+
+
+## Blackwell (RTX 5090, sm_120) — driver 580.178.04, 2026-08-18
+
+First run on a fourth GPU architecture. **Enumeration works end to end; context
+creation does not.** No code changes were made for this run — the guest module,
+QEMU device and ABI profile selection were used exactly as shipped.
+
+```
+TOTAL 28   PASS 20   FAIL 3   SKIP 5      VERDICT: FAIL
+```
+
+Working (12 checks, unmodified):
+
+```
+guest_module          nvkvm_guest loaded
+dev_nodes             5/5  nvidia0 nvidiactl nvidia-uvm nvidia-uvm-tools nvidia-modeset
+nvidia_smi_gpu        NVIDIA GeForce RTX 5090
+nvidia_smi_driver     580.178.04
+nvidia_smi_cuda       13.0
+abi_profile           host driver 580.178.04 -> profile selected, slot_size=65536
+cuda_init             rc=0
+cuda_driver_version   CUDA 13.0 (raw 13000)
+cuda_device_count     1
+cuda_device_name      NVIDIA GeForce RTX 5090
+cuda_compute_cap      sm_120
+vk/egl/gl             loader, instance, physical device, context, renderer all NVIDIA
+```
+
+### The single blocker
+
+```
+FAIL  cuda_ctx_create   rc=1 (CUDA_ERROR_INVALID_VALUE)
+```
+
+Everything downstream cascades from it — five CUDA checks SKIP (correctly recorded
+as SKIP, not PASS), and `vk_compute_dispatch` fails `vkCreateDevice rc=-3`
+(`VK_ERROR_INITIALIZATION_FAILED`) for the same reason: no context.
+
+**This is the fourth instance of one recurring bug class**, and the previous three
+were all resolved the same way:
+
+| symptom | cause | fix |
+|---|---|---|
+| Ada `cuInit -> 801` | `NV50_THIRD_PARTY_P2P` allowed but absent from the guest size switch, so `alloc_parms_size=0` forwarded 0 bytes | add the size |
+| NVENC `InitializeEncoder` bails | `NV01_CONTEXT_DMA` had no entry in the per-class alloc-params size table | add `NV_CONTEXT_DMA_ALLOCATION_PARAMS` |
+| offscreen GL dead on 595/610 | NVKMS allowlist captured on 575 never saw `cmdType 60` | allow 60 |
+
+The expected cause here is a Blackwell-specific alloc class or control that is
+either absent from an allowlist, or allowed but with an unknown params size. The
+documented diagnostic is a host-vs-guest ioctl trace diff (`LD_PRELOAD` on the
+host, QEMU `DENY` log plus `rmdump` in the guest). **Not yet investigated.**
+
+### Two results that are NOT nvkvm defects
+
+`gl_draw_pixel_check` fails with `inside=RGBA(255,188,0,255)`, expected ~128 green.
+That is an **sRGB framebuffer**: 128/255 = 0.502 linear encodes to 0.735 sRGB =
+187.6 ≈ 188. The draw is correct; the suite's expectation assumes a linear
+framebuffer, which held on Ampere/Ada/Turing and does not here. Fix belongs in
+`tests/validate.sh`.
+
+`vk_compute_dispatch` is a cascade of `cuda_ctx_create`, not an independent Vulkan
+defect — `vk_instance`, `vk_physical_device` and `vk_device_is_nvidia` all pass.
+
+### Host-side note worth recording
+
+The RTX 5090 **requires the NVIDIA open kernel modules**. A box provisioned with
+the proprietary `nvidia-driver-575` shows the GPU on the PCI bus and then fails:
+
+```
+NVRM: The NVIDIA GPU 0000:00:07.0 (PCI ID: 10de:2b85)
+NVRM: installed in this system requires use of the NVIDIA open kernel modules.
+NVRM: GPU 0000:00:07.0: RmInitAdapter failed! (0x22:0x56:884)
+```
+
+Installing `nvidia-driver-580-open` resolves it. This is a host provisioning
+requirement, unrelated to nvkvm, but it will bite anyone bringing up Blackwell.
