@@ -147,6 +147,37 @@ fraction of host speed.
 
 Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
+## Known issues
+
+Read this before trusting a result from a guest.
+
+**Silent wrong results in repeated map/unmap after allocation churn.** An OpenCL
+program that repeatedly maps and unmaps a pinned buffer, after other buffers
+have been allocated and freed, reads zeros where the kernel's output should be —
+no error, no crash, just wrong data. Geekbench 7 `--gpu` fails validation on 11
+workloads in the guest while the identical binary on the same GPU and driver is
+clean on the host
+([guest](https://browser.geekbench.com/v7/gpu/79890) vs
+[host](https://browser.geekbench.com/v7/gpu/79862)). Reproducers and the full
+bisection are in [`tests/repro/`](tests/repro/). `validate.sh` does not cover
+this: its checks pass on the same guest, so **28/28 is not evidence that a given
+workload computes correctly**. Verify your own results against a host run.
+
+**OpenCL is off by default** for that reason — staging it requires
+`NVKVM_STAGE_OPENCL=1`. Without it, OpenCL programs fail loudly with "unknown
+OpenCL platform" rather than returning wrong answers quietly.
+
+**A driver-managed read-only page is mishandled.** Where the NVIDIA driver hands
+back a page with `VM_WRITE` cleared, nvkvm currently substitutes anonymous
+memory. Leaving the driver's mapping in place instead causes an unrecoverable
+`EFAULT` that kills the guest, so both current behaviours are wrong; the fix is
+a `KVM_MEM_READONLY` memslot for those pages, so reads are served and writes
+become resumable MMIO exits. This is the leading suspect for the corruption
+above, though removing the substitution does not by itself fix it.
+
+**Vulkan compute fails on Hopper** (`vk_compute_dispatch`) — see the note under
+[Tested platforms](#tested-platforms).
+
 ## Tested applications
 
 Guest vs host, one statically-linked binary run on both sides, RTX 3060, host
