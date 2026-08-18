@@ -163,3 +163,34 @@ what surfaced the sparse_init/sparse_ensure lines above and is the fastest way i
 
 Faulting addresses seen: `CR2=0x5af8dad1e000` (before the BAR cap),
 `CR2=0x60ece2b43000` (after both fixes). Both userspace VAs, both on a store.
+
+## Leading theory + the fix shape (2026-08-18, end of session)
+
+KVM does **not** validate backing at memslot registration — it checks alignment,
+size and overlap only. So an HVA inside a registered memslot can become unusable
+afterwards, and the guest touching it yields `KVM_RUN -> -EFAULT`, which is fatal:
+unlike the MMIO path (`KVM_RUN` returns 0 with `KVM_EXIT_MMIO`, QEMU emulates and
+resumes) there is nothing to resume into.
+
+The sparse window is a 64 GiB `MAP_NORESERVE` anonymous reservation with extents
+`MAP_FIXED`'d over it and a free-list recycling them
+(`nvkvm_sparse_free`, `NVKVM_GPA_FREE_MAX`). **Suspect: the free path punches a hole.**
+If releasing an extent `munmap`s it without restoring anonymous backing, the memslot
+still claims the range while the VMA is gone.
+
+### The fix shape
+
+Never destroy the VMA — only empty it. On free use `madvise(MADV_DONTNEED)`, or
+re-map anonymous over the extent with `MAP_FIXED|MAP_ANONYMOUS|MAP_NORESERVE`. Both
+release physical pages while keeping the mapping valid, so the next guest touch
+faults in a zero page normally and KVM never sees an unbacked address. `munmap` is
+the wrong verb for a recycled extent inside a fixed reservation.
+
+### DO NOT attempt userfaultfd
+
+UFFD looks like the textbook answer here (block on first touch, populate from the
+VMM, resume). **The project owner has ruled it out — it does not work in this
+design. Do not spend time on it.**
+
+### Check first
+`grep -n munmap src/qemu/nvkvm_mmap_host.c` — specifically the extent-free path.
