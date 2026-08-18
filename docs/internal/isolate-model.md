@@ -38,14 +38,14 @@ satisfying the driver, not the other way round.
 | memfds | **QEMU** | not device files |
 | eventfds | **QEMU** | stand-ins for guest eventfds |
 
-`src/qemu/nvkvm_isolate_handlers.c:182-189`:
+`src/qemu/nvkvm_isolate_handlers.c:199-213`:
 
 > UVM stays opened in QEMU (driver enforces opener-does-mmap, and mmap is done in
 > QEMU for KVM region installation). The other devices … open inside the isolate
 > so nvfp/mm lineage matches the process that runs RM ioctls.
 
 But the stub then *drops* the UVM fd QEMU sends it, in favour of one it opened
-itself (`src/stub/nvkvm_stub.c:243-254`):
+itself (`src/stub/nvkvm_stub.c:255-266`):
 
 > The NVIDIA UVM driver's `UVM_MM_INITIALIZE` rejects
 > (`NV_ERR_INVALID_ARGUMENT`) when the file passed via `uvm_fd` was opened by a
@@ -58,7 +58,7 @@ itself (`src/stub/nvkvm_stub.c:243-254`):
 > `SCM_RIGHTS` fd and use one of our local opens instead.
 
 **UVM *ioctls* nonetheless execute in QEMU's process**, not the stub's
-(`src/qemu/nvkvm_isolate_handlers.c:985-995`) — because UVM's mmap must come
+(`src/qemu/nvkvm_isolate_handlers.c:1229-1237`) — because UVM's mmap must come
 from the same `mm` that ran `UVM_INITIALIZE`, and that mmap is what installs the
 KVM memory region. This is the one place privileged QEMU executes a
 guest-named ioctl, which is why the UVM schema allowlist exists and is
@@ -69,7 +69,7 @@ maintains an invariant: QEMU always holds a copy of every fd the stub opened.
 QEMU reserves a handle slot with no fd (`nvkvm_handle_alloc_pending`), sends
 `ISOLATE_CMD_OPEN_DEVICE`, and the stub replies with an `SCM_RIGHTS`-attached
 copy in the same `sendmsg`, which QEMU attaches to the slot
-(`src/qemu/nvkvm_isolate_handlers.c:228-259`,
+(`src/qemu/nvkvm_isolate_handlers.c:250-285`,
 `src/common/nvkvm_isolate_proto.h:202-214`).
 
 ## What the stub is
@@ -83,14 +83,14 @@ A freestanding static PIE (`src/stub/nvkvm_stub.c:4-7`):
 
 It applies its own `R_X86_64_RELATIVE` relocations before touching global data,
 because it is `fexecve`'d from a memfd with no dynamic linker
-(`src/stub/nvkvm_stub.c:2594-2640`).
+(`src/stub/nvkvm_stub.c:2694-2745`).
 
 It is embedded in the QEMU binary as a byte array produced by `xxd -i`
 (`src/stub/Makefile:32-34`) and launched from an anonymous memfd — no file on
 disk (`src/qemu/nvkvm_isolate.c:803-864`). `/usr/lib/nvkvm/nvkvm_stub` is a
 fallback path used only when the embed is absent, and the build script warns at
 length that an accidental fallback is silent
-(`scripts/build_qemu.sh:52-64`).
+(`scripts/build_qemu.sh:77-89`).
 
 **Threading**: one reader thread on the socket, 16 workers
 (`NVKVM_STUB_WORKERS`, `src/stub/nvkvm_stub.c:433`). Non-IOCTL commands run
@@ -162,7 +162,7 @@ The read-only remount is also fail-closed, and used not to be
 
 The stub detects the dirfd by attempting `openat(fd, ".")` and falls back to
 absolute `/dev/<name>` paths when un-hardened
-(`src/stub/nvkvm_stub.c:331-367`).
+(`src/stub/nvkvm_stub.c:355-395`).
 
 ### 3. Capabilities
 
@@ -190,7 +190,7 @@ bytes into the host terminal, log or supervisor pipe
 ### 5. Seccomp
 
 Applied **after** the worker pool is spawned, with `TSYNC`
-(`src/stub/nvkvm_stub.c:2510-2592`). 20 syscalls allowed:
+(`src/stub/nvkvm_stub.c:2610-2692`). 20 syscalls allowed:
 
 ```
 read write recvmsg sendmsg ioctl mmap mprotect munmap ppoll close
@@ -206,7 +206,7 @@ post-RCE surface (`:2570-2572`).
 Two details are load-bearing.
 
 **`mmap` and `mprotect` deny `PROT_EXEC` outright, not just `W|X`**
-(`src/stub/nvkvm_stub.c:2523-2530`):
+(`src/stub/nvkvm_stub.c:2624-2631`):
 
 > Plain W^X (deny only W+X together) is insufficient: an attacker can mmap a page
 > RW, write shellcode, then mprotect it R-X — each step passes W^X but the result
@@ -236,7 +236,7 @@ and, in the non-embedded path, its inherited environment
 (`:841-851`, `:870-874`). Both are debugging hatches, not supported modes. The
 old `NVKVM_STUB_NO_SECCOMP` hatch was removed along with libc — "the parent
 calls `clearenv()` before exec so there is no environment to inspect anyway"
-(`src/stub/nvkvm_stub.c:2740-2742`).
+(`src/stub/nvkvm_stub.c:2839-2842`).
 
 ## Handles
 
@@ -286,13 +286,13 @@ for the child with `WNOHANG` in 10 ms steps rather than sleeping a fixed 500 ms
 
 On kill, QEMU also **reaps** anything the guest failed to release: every
 `iso_mmap_tbl` entry the isolate still held, its GPA window extents and KVM
-slots (`src/qemu/nvkvm_isolate_handlers.c:2036-2075`), and the session itself if
+slots (`src/qemu/nvkvm_isolate_handlers.c:2535-2573`), and the session itself if
 that was its last isolate (`:364-385`).
 
 ## The trust boundary
 
 **QEMU's boundary is cross-VM and host-process. It is not intra-VM.**
-`src/qemu/nvkvm_isolate_handlers.c:997-1007`:
+`src/qemu/nvkvm_isolate_handlers.c:1240-1252`:
 
 > intra-VM, per-guest-process access control (which process may touch which
 > object) is emulated entirely by the guest kernel module — it owns the guest's

@@ -2,8 +2,10 @@
 # build_qemu.sh — clone QEMU 9.2, patch virtio-nvgpu into it, and build a
 #                 minimal KVM-only QEMU binary at /opt/qemu-nvkvm.
 #
-# Idempotent: if /opt/qemu-nvkvm/bin/qemu-system-x86_64 already exists the
-# script prints a message and exits successfully.
+# Guarded: if /opt/qemu-nvkvm/bin/qemu-system-x86_64 already exists the script
+# prints a message and exits successfully WITHOUT rebuilding anything.  Pass
+# --force to rebuild over an existing install -- you need it after editing
+# anything under src/qemu/ or src/common/.
 
 set -euo pipefail
 

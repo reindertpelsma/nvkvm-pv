@@ -11,12 +11,18 @@ boundary being defended against, so a check it performs is advisory at best.
 >
 > — `src/qemu/nvkvm_ctrl_allowlist.h:20-22`
 
-There are six gates. All of them are in `nvkvm_req_ioctl_on_isolate()`
-(`src/qemu/nvkvm_isolate_handlers.c:980-1349`), in this order.
+There are nine gates, numbered below in the order an ioctl meets them. Six of
+them are static default-deny tables — gates 1 and 4-8, which is the count
+[`ARCHITECTURE.md`](../../ARCHITECTURE.md#the-allowlists) uses; the other three
+(graphics, ioctl type, per-VM `hClient`) are code checks with no table. Seven
+of the nine (1, 3-8) live in `nvkvm_req_ioctl_on_isolate()`
+(`src/qemu/nvkvm_isolate_handlers.c:1223-2219`); the graphics gate is
+authoritatively enforced earlier, at handle open, and the per-VM `hClient` set
+is consulted from two places inside the same function.
 
 ## 1. UVM command schema (default-deny)
 
-`src/qemu/nvkvm_isolate_handlers.c:516-562`. 31 entries. UVM ioctls are the one
+`src/qemu/nvkvm_isolate_handlers.c:599-645`. 31 entries. UVM ioctls are the one
 family that executes in QEMU's own (privileged) process rather than in an
 isolate, so an unknown `cmd` must never be forwarded blindly.
 
@@ -32,17 +38,17 @@ comment is explicit that they were *not* copied from gVisor:
 > (several differ: e.g. `REGISTER_GPU` is 32B here, not gVisor's 40B-with-NUMA;
 > `REGISTER_CHANNEL` 48 not 56; `MIGRATE` 48 not 56).
 >
-> — `src/qemu/nvkvm_isolate_handlers.c:510-515`
+> — `src/qemu/nvkvm_isolate_handlers.c:589-598`
 
 Five commands (44, 45, 53, 65, 66) carry `min_size = 0` deliberately: there is no
 driver-verified layout for them and an over-strict guess had already mis-denied
-`REGISTER_GPU` once (`src/qemu/nvkvm_isolate_handlers.c:521-526`).
+`REGISTER_GPU` once (`src/qemu/nvkvm_isolate_handlers.c:600-609`).
 
 Two `min_size` values are version-variant and are overridden from the active ABI
 profile at check time — `UVM_MAP_EXTERNAL_ALLOCATION` (33) and
 `UVM_ALLOC_SEMAPHORE_POOL` (68) — because the table carries the V550 sizes and a
 535 host legitimately sends the pre-V550 ones
-(`src/qemu/nvkvm_isolate_handlers.c:1026-1039`).
+(`src/qemu/nvkvm_isolate_handlers.c:1276-1290`).
 
 Notably denied by omission: `UVM_TOOLS_READ_PROCESS_MEMORY` (62) and
 `UVM_TOOLS_WRITE_PROCESS_MEMORY` (63) —
@@ -50,14 +56,14 @@ Notably denied by omission: `UVM_TOOLS_READ_PROCESS_MEMORY` (62) and
 > a cross-process memory peek/poke primitive with no place in our isolation
 > model
 >
-> — `src/qemu/nvkvm_isolate_handlers.c:558-561`
+> — `src/qemu/nvkvm_isolate_handlers.c:641-644`
 
 ## 2. Graphics gate
 
-`src/qemu/nvkvm_isolate_handlers.c:1124-1131`. When the device is built or
+`src/qemu/nvkvm_isolate_handlers.c:1555-1564`. When the device is built or
 configured compute-only, every DRM (`_IOC_TYPE == 'd'`) and NVKMS ioctl is
 refused. This is defence in depth — the authoritative enforcement is at handle
-open (`src/qemu/nvkvm_isolate_handlers.c:173-180`), which refuses to open the
+open (`src/qemu/nvkvm_isolate_handlers.c:199-213`), which refuses to open the
 render node or the modeset device at all, so a guest that ignores the cleared
 `NVKVM_CONFIG_F_GRAPHICS` config bit still has no fd to issue ioctls on.
 
@@ -70,7 +76,7 @@ matching `NVKVM_GRAPHICS=0` build which drops `nvkvm_drm.o` / `nvkvm_kms.o`
 
 ## 3. ioctl type gate
 
-`src/qemu/nvkvm_isolate_handlers.c:1133-1175`. After UVM (type 0) has returned
+`src/qemu/nvkvm_isolate_handlers.c:1546-1609`. After UVM (type 0) has returned
 above, an ioctl must be type `'d'` (DRM), the single NVKMS wrapper cmd, or type
 `'F'` (NVIDIA RM frontend). Anything else is `-EPERM`. The comment explains why
 this gate has to exist rather than relying on the per-family lists:
@@ -80,12 +86,12 @@ this gate has to exist rather than relying on the per-family lists:
 > through to the raw `ioctl()` in the stub — the kmd dispatches on `_IOC_NR`, so
 > that could reach a denied privileged escape.
 >
-> — `src/qemu/nvkvm_isolate_handlers.c:1113-1121`
+> — `src/qemu/nvkvm_isolate_handlers.c:1546-1554`
 
 ## 4. DRM render-node NR allowlist
 
 `src/qemu/nvkvm_drm_allowlist.h`, checked at
-`src/qemu/nvkvm_isolate_handlers.c:1139`. A `switch` rather than a table.
+`src/qemu/nvkvm_isolate_handlers.c:1572`. A `switch` rather than a table.
 Allowed: generic `VERSION` (0x00) and `GEM_CLOSE` (0x09); nvidia-private
 `GET_DEV_INFO`, `FENCE_SUPPORTED`, `PRIME_FENCE_CONTEXT_CREATE`,
 `GEM_PRIME_FENCE_ATTACH`, `GET_CLIENT_CAPABILITY`, `GEM_EXPORT_NVKMS_MEMORY`,
@@ -106,14 +112,14 @@ Display, modeset and permission surfaces are excluded as a class.
 ## 5. NVKMS inner-command allowlist
 
 `src/qemu/nvkvm_nvkms_allowlist.h`, checked at
-`src/qemu/nvkvm_isolate_handlers.c:1148-1166`. `/dev/nvidia-modeset` exposes
+`src/qemu/nvkvm_isolate_handlers.c:1581-1600`. `/dev/nvidia-modeset` exposes
 exactly one outer ioctl, `_IOWR('m', 0, NvKmsIoctlParams)` = `0xC0106D00`, whose
 16-byte wrapper is `{u32 cmdType; u32 size; u64 address}`. Gating the outer
 ioctl gates nothing, so the check reads the inner `cmdType` at param offset 0.
 
-Six commands are allowed: `ALLOC_DEVICE` (0), `FREE_DEVICE` (1),
-`REGISTER_SURFACE` (17), `UNREGISTER_SURFACE` (18), and two query commands
-(61, 62) captured from a live Vulkan/EGL session.
+Seven commands are allowed: `ALLOC_DEVICE` (0), `FREE_DEVICE` (1),
+`REGISTER_SURFACE` (17), `UNREGISTER_SURFACE` (18), two query commands
+(61, 62) captured from a live Vulkan/EGL session, and `cmdType` **60**.
 
 > the wrapper ... can carry ANY NVKMS command to a host-GLOBAL, privileged
 > display device — including the cross-client permission/sharing verbs
@@ -123,15 +129,27 @@ Six commands are allowed: `ALLOC_DEVICE` (0), `FREE_DEVICE` (1),
 >
 > — `src/qemu/nvkvm_nvkms_allowlist.h` (header comment)
 
+`cmdType` 60 was added 2026-08-17 (`src/qemu/nvkvm_nvkms_allowlist.h:24-46`).
+Denying it broke **all** offscreen GL in the guest on driver branches 595 and
+610: every colour attachment came back `GL_FRAMEBUFFER_UNSUPPORTED` (0x8CDD)
+with `glGetError()` clean, while the same probe passed on bare metal on the same
+box, GPU and driver. The allowed set had been captured live from a 575-era
+session, and branches 595+ issue a `cmdType` that capture never saw — notably
+61 and 62, the entries the list was built around, are not issued by the 610 ICD
+at all. Full evidence in [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md).
+The general lesson: an allowlist captured on one driver branch expires on the
+next, and its failures do not necessarily surface as denials.
+
 The header labels itself interim: the intended fix is to stop forwarding NVKMS
-at all in favour of the guest-side virtual head, and `cmdType` 61/62 are
-identified only as "query-class (captured)" — they should be pinned against
-`nvkms-api.h` before anyone relies on this long-term.
+at all in favour of the guest-side virtual head. `cmdType` 60, 61 and 62 are all
+unnamed — the `NvKmsIoctlCommand` enum that would name them ships in no header,
+so they are documented as measured rather than named, and should be pinned
+against `nvkms-api.h` if that enum ever becomes available.
 
 ## 6. Frontend NR allowlist
 
-`src/qemu/nvkvm_fe_alloc_allowlist.h:19-49`, checked at
-`src/qemu/nvkvm_isolate_handlers.c:1226-1235`. 23 entries — gVisor nvproxy's
+`src/qemu/nvkvm_fe_alloc_allowlist.h:25-55`, checked at
+`src/qemu/nvkvm_isolate_handlers.c:1659-1668`. 23 entries — gVisor nvproxy's
 575-ABI frontend set plus what it added through v570.
 
 ```
@@ -146,14 +164,14 @@ instructive: it had been allowlisted but was never handled, so
 > back, leaking a stub fd per call (self-isolate fd-exhaustion) and returning a
 > meaningless fd to the guest.
 >
-> — `src/qemu/nvkvm_fe_alloc_allowlist.h:34-39`
+> — `src/qemu/nvkvm_fe_alloc_allowlist.h:40-45`
 
 An allowlist entry with no handler is a liability, not a no-op.
 
 ## 7. RM_ALLOC class allowlist
 
-`src/qemu/nvkvm_fe_alloc_allowlist.h:53-142`, checked at
-`src/qemu/nvkvm_isolate_handlers.c:1236-1248`. 89 classes, read from `hClass` at
+`src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`, checked at
+`src/qemu/nvkvm_isolate_handlers.c:1735-1746`. 89 classes, read from `hClass` at
 param offset 12 (the shared NVOS21/NVOS64 prefix).
 
 Provenance is nvproxy's 575-ABI `RM_ALLOC` class set, which was already a
@@ -161,13 +179,13 @@ superset of the empirically observed CUDA classes. Two nvkvm additions are
 annotated: `NV01_EVENT` (0x05) for graphics/compute completion events, and
 `AMPERE_B` (0xc797) for GA10x 3D/graphics.
 
-nvproxy's omissions are kept: privileged memory (0x3f), `OS_DESCRIPTOR` (0x71)
-and bare `NV01_EVENT` (0x5) —
-
-> nvproxy deliberately omits privileged memory (0x3f), OS_DESCRIPTOR (0x71),
-> bare NV01_EVENT (0x5); we omit them too.
->
-> — `src/qemu/nvkvm_fe_alloc_allowlist.h:10-11`
+Two of nvproxy's omissions are kept: privileged memory (0x3f) and
+`OS_DESCRIPTOR` (0x71). The third is **not**: `NV01_EVENT` (0x5) is allowed here
+(`src/qemu/nvkvm_fe_alloc_allowlist.h:63`), added for graphics/compute
+completion events. The header comment used to claim all three omissions were
+kept; it was corrected to name the exception
+(`src/qemu/nvkvm_fe_alloc_allowlist.h:10-16`). Where the two disagree, the table
+is authoritative.
 
 (0x71 does appear on the wire — `NV_ESC_RM_ALLOC_MEMORY` allocates
 `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` and the guest handles it specially, see
@@ -177,15 +195,15 @@ but not via `NV_ESC_RM_ALLOC`, which is where this gate sits.)
 ## 8. RM control-command allowlist
 
 `src/qemu/nvkvm_ctrl_allowlist.h:28-240`, checked at
-`src/qemu/nvkvm_isolate_handlers.c:1259-1272`. **166 entries**, plus two
+`src/qemu/nvkvm_isolate_handlers.c:1758-1771`. **166 entries**, plus two
 rule-based passthroughs implemented in code rather than the table
-(`src/qemu/nvkvm_isolate_handlers.c:601-611`):
+(`src/qemu/nvkvm_isolate_handlers.c:822-827`):
 
 - `cmd & 0x8000` — the GSP legacy mask
 - `(cmd >> 16) == 0x2081` — the `NV2081_BINAPI` class
 
 Both are GSP-routed and carry no application pointers. The same check bounds the
-inner params at 1 MiB (`src/qemu/nvkvm_isolate_handlers.c:1263`).
+inner params at 1 MiB (`src/qemu/nvkvm_isolate_handlers.c:1762`).
 
 The table is generated, not hand-written, and its provenance is recorded at the
 top (`src/qemu/nvkvm_ctrl_allowlist.h:4-17`): gVisor nvproxy's 575-ABI
@@ -222,14 +240,14 @@ another fd or process if share rights allow
 (`src/qemu/virtio_nvgpu.h:286-300`).
 
 Every `hClient` this VM's isolates successfully use is recorded
-(`src/qemu/nvkvm_isolate_handlers.c:1460-1488`), including the kernel-assigned
+(`src/qemu/nvkvm_isolate_handlers.c:1959-1990`), including the kernel-assigned
 handle written back to `hObjNew` on a root-client alloc. Two gates then consult
 it:
 
-- **`DUP_OBJECT` source** (`src/qemu/nvkvm_isolate_handlers.c:1283-1299`): the
+- **`DUP_OBJECT` source** (`src/qemu/nvkvm_isolate_handlers.c:1782-1796`): the
   `h_client_src` at NVOS55 offset 12 must belong to this VM.
 - **Every `'F'` ioctl carrying an `hClient` at param offset 0**
-  (`src/qemu/nvkvm_isolate_handlers.c:1312-1348`): `ALLOC`, `ALLOC_MEMORY`,
+  (`src/qemu/nvkvm_isolate_handlers.c:1811-1847`): `ALLOC`, `ALLOC_MEMORY`,
   `CONTROL`, `FREE`, `DUP_OBJECT`, `SHARE`, `MAP_MEMORY`, `UNMAP_MEMORY`,
   `MAP_MEMORY_DMA`, `UNMAP_MEMORY_DMA`, `VID_HEAP_CONTROL`. The only exemption
   is the client-creating alloc itself.
@@ -241,7 +259,7 @@ and the kernel rejects a stale handle anyway.
 
 Intra-VM access control — which guest process may touch which object — is
 deliberately not checked in QEMU. The reasoning is at
-`src/qemu/nvkvm_isolate_handlers.c:997-1007`:
+`src/qemu/nvkvm_isolate_handlers.c:1240-1252`:
 
 > intra-VM, per-guest-process access control ... is emulated entirely by the
 > guest kernel module — it owns the guest's pids/uids/namespaces/fds and is the

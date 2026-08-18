@@ -298,7 +298,7 @@ host fd re-fires (`:748-754`).
 ## QEMU ↔ isolate
 
 `SOCK_SEQPACKET` over a socketpair, fd 0 in the child
-(`src/qemu/nvkvm_isolate.c:767`, `src/stub/nvkvm_stub.c:432`). Fixed-size
+(`src/qemu/nvkvm_isolate.c:783`, `src/stub/nvkvm_stub.c:432`). Fixed-size
 command structs; variable-length payloads follow as separate messages whose
 sizes are in the header. File descriptors travel by `SCM_RIGHTS`.
 
@@ -335,7 +335,7 @@ version-variant offsets without parsing a version string.
   before the payload is read, so a duplicated `txn_id` finds nothing. Leaving it
   on the list would let a second response `recv()` into a stack-allocated
   `pending` after the caller had already woken and returned — a use-after-free
-  write inside QEMU (`src/qemu/nvkvm_isolate.c:488-500`).
+  write inside QEMU (`src/qemu/nvkvm_isolate.c:505-524`).
 
 ## `READ_HOST_FILE`
 
@@ -355,12 +355,13 @@ read to QEMU. **The guest never names a path** — it sends an enum
 | 4 | `.../gpus/<bdf>/numa_status` |
 | 5 | `.../gpus/<bdf>/information` |
 | 6 | `.../gpus/<bdf>/registry` |
+| 7 | `/proc/driver/nvidia/version` |
 
 Per-GPU files take a `gpu_index` integer, resolved against a BDF list QEMU
 discovered by scanning its own `/proc/driver/nvidia/gpus/`, with a strict
 canonical-PCI-address format check on each name — so path traversal is not
 possible and a guest index can only ever resolve to a real host GPU
-(`src/qemu/nvkvm_isolate_handlers.c:2181-2269`). Files are reopened and reread
+(`src/qemu/nvkvm_isolate_handlers.c:2671-2735`). Files are reopened and reread
 on every call so content is live. Cap: 8 KiB.
 
 The BDF the guest exposes is its *own* — hardcoded `0000:00:07.0`

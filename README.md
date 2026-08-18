@@ -212,14 +212,19 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 | Ampere GA106 | 545.23.08 | 545 | 28/28 |
 | RTX 3060 | Ampere GA106 | 550.54.14 | 550 | 28/28 |
 | RTX 3060 Ti | Ampere GA104 | 580.95.05 | 580 | 28/28 |
-| RTX 3060 Ti | Ampere GA104 | 595.84 | 580 | 28/28 * |
+| RTX 3060 Ti | Ampere GA104 | 595.84 | 580 | `gl_draw_pixel_check` PASS * |
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
 
 \* These two read 27/28 until 2026-08-17: `gl_draw_pixel_check` failed with
 `GL_FRAMEBUFFER_UNSUPPORTED` on every attachment format. The cause was nvkvm's
 own NVKMS allowlist, which was captured on a 575-era session and denied a
 `cmdType` that branches 595+ need for offscreen render targets — not a driver
-regression; the same probe passes on bare metal on both drivers. See
+regression; the same probe passes on bare metal on both drivers. After the fix
+610.43.02 is a clean 28/28. **There is no 28/28 measurement for 595.84**: the
+box it ran on was re-provisioned from a component-package subset that omits
+`libnvidia-ptxjitcompiler`, so `cuda_ptx_jit` now FAILs there and the run scores
+25/28 for a reason unrelated to nvkvm. What was re-measured on 595.84 after the
+fix is `gl_draw_pixel_check` PASS and `0/5 configurations incomplete`. See
 [`tests/BOOT_MATRIX.md`](tests/BOOT_MATRIX.md).
 
 NVIDIA guarantees no ioctl ABI stability across driver releases, so `nvkvm`

@@ -222,23 +222,24 @@ buffers** before running the allowlist checks, and copies them back after
 (`src/qemu/virtio_nvgpu.c:641-661`). This is what makes the checks meaningful:
 a guest cannot mutate a field between the check and the use.
 
-Then the six allowlist gates, in order — see
+Then the allowlist gates, in order — six static default-deny tables plus the
+graphics, ioctl-type and per-VM `hClient` checks; see
 [Allowlists](../reference/allowlists.md).
 
 ## Stub side
 
-`worker_thread()` — `src/stub/nvkvm_stub.c:812-1453`.
+`worker_thread()` — `src/stub/nvkvm_stub.c:834-1541`.
 
 **Overwrite the pointer.** Offset 16 for `NVOS54.params` and
 `NVOS21`/`NVOS64.p_alloc_parms` (four 4-byte handles precede them); offset 8 for
 the NVKMS wrapper and two DRM ioctls
-(`src/stub/nvkvm_stub.c:838-866`). The target, `job.aux_buf`, is a private
+(`src/stub/nvkvm_stub.c:876-921`). The target, `job.aux_buf`, is a private
 anonymous mapping filled by `recv()` — not shared memory, not guest-writable
-(`:1857-1862`).
+(`:1944-1945`).
 
 **Reconstruct inner pointers** into the aux blob's extension region: the
 `InfoList` family, `FIFO_GET_CHANNELLIST`'s two lists,
-`GET_BUILD_VERSION`'s three strings (`:945-1076`).
+`GET_BUILD_VERSION`'s three strings (`:986-1160`).
 
 **Translate embedded fds**, handle id → local fd, immediately before the ioctl:
 
@@ -256,17 +257,17 @@ anonymous mapping filled by `recv()` — not shared memory, not guest-writable
 | `IMPORT_OBJECT_FROM_FD` | aux+0 |
 | NVKMS `REGISTER_SURFACE` planes | aux+16, +48, +80 |
 
-(`src/stub/nvkvm_stub.c:1084-1219`, `:869-1025`.)
+(`src/stub/nvkvm_stub.c:1170-1265`, `:928-1160`.)
 
 **Run the ioctl**, publishing `worker_inflight_txn[slot]` first so a concurrent
-`INTERRUPT` can find it (`:1277-1286`).
+`INTERRUPT` can find it (`:1370-1374`).
 
 **Restore and zero.** Every substituted pointer is zeroed and every handle id
-put back — "never leak a stub fd" (`:1299-1369`).
+put back — "never leak the stub's local fd" (`:1387-1458`).
 
 **Extract `nvstatus`** by `_IOC_NR`, not by size, because multiple structs share
-a length but place `Status` at different offsets (`:1379-1417`). `NVOS46`'s
-offset comes from the ABI profile.
+a length but place `Status` at different offsets (`:1460-1495`). `NVOS46`'s
+offset comes from the ABI profile (`:1488`).
 
 ## Per-command special cases worth knowing
 
@@ -277,15 +278,24 @@ offset comes from the ABI profile.
 stub already maps at the same VA, so `pin_user_pages` finds tmpfs pages that
 alias `libcuda`'s guest userspace (`src/guest/nvkvm_ioctl.c:379-412`, full quote
 in [ARCHITECTURE.md](../../ARCHITECTURE.md#the-other-direction-os_descriptor)).
-Chunked at 2 MiB, capped at 16 MiB per call
-(`src/guest/nvkvm_mmap.c:770-785`).
+Chunked at 2 MiB and migrated strictly per chunk — copy the chunk into its
+memfd, swap that chunk's PTEs, drop that chunk's pins, then move on — so the
+window in which a chunk exists in both places is one chunk wide regardless of
+the registration size (`src/guest/nvkvm_mmap.c:771-803`, `:948-1117`). A single
+call is capped at **2 GiB** (`NVKVM_MIG_MAX_RANGE`,
+`src/guest/nvkvm_mmap.c:806-821`, enforced at `:847`) — a guest-side policy
+limit derived from QEMU's 8192-entry mmap-token table, not a hardware one. The
+earlier **16 MiB** ceiling was a side effect of batching every chunk's memfd
+before a single VMA swap, and is gone; so is a second, undocumented cap beneath
+it, `remap_pfn_range()` refusing sub-VMA remaps of copy-on-write mappings, fixed
+by clearing `VM_MAYWRITE` (`src/guest/nvkvm_mmap.c:907-925`).
 
 ### `IDLE_CHANNELS` degrades to single-channel
 
 Three guest pointers to handle arrays that the single-aux-slot path cannot
 carry. The guest forces the single-channel form
 (`src/guest/nvkvm_ioctl.c:462-479`) and the stub re-zeroes the same 28 bytes at
-the boundary on a private copy (`src/stub/nvkvm_stub.c:1180-1196`). The
+the boundary on a private copy (`src/stub/nvkvm_stub.c:1268-1283`). The
 integer-overflow hardening on the aux-slot variant of this path is at
 `src/qemu/nvkvm_dispatch.c:383-403`.
 
@@ -306,7 +316,7 @@ The kernel's default share policy is `RS_SHARE_TYPE_PID`. In a split-process
 model the PIDs differ, so UVM cannot dup `libcuda`'s VA space and `cuCtxCreate`
 fails `NV_ERR_INSUFFICIENT_PERMISSIONS`. QEMU issues an `NV_ESC_RM_SHARE`
 granting `RS_ACCESS_DUP_OBJECT` on each new handle
-(`src/qemu/nvkvm_isolate_handlers.c:1490-1610`). Why `TYPE_ALL` is not a
+(`src/qemu/nvkvm_isolate_handlers.c:1992-2109`). Why `TYPE_ALL` is not a
 cross-tenant hole is argued at `:1561-1586` and demonstrated by
 `tests/security/poc_cross_proc_dup`.
 

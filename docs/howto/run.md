@@ -14,17 +14,22 @@ is done by cloud-init on first boot. Idempotent.
 
 It fetches the Ubuntu 24.04 (Noble) cloud image, converts it to qcow2 and grows
 it by 20 GB, writes cloud-init `user-data`/`meta-data`, and generates a seed ISO
-(`scripts/setup_guest.sh:36-108`). Artefacts land in `/opt/nvkvm-guest/`.
+(`scripts/setup_guest.sh:36-129`). Artefacts land in `/opt/nvkvm-guest/`.
 
 The cloud-init `runcmd` is the entire first-boot bring-up
-(`scripts/setup_guest.sh:82-89`):
+(`scripts/setup_guest.sh:104-110`):
 
 ```
 mkdir -p /mnt/nvkvm
 mount -t 9p -o trans=virtio,version=9p2000.L nvkvm_src /mnt/nvkvm
+grep -q nvkvm_src /etc/fstab || echo 'nvkvm_src /mnt/nvkvm 9p trans=virtio,version=9p2000.L,nofail 0 0' >> /etc/fstab
 cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build
 insmod /mnt/nvkvm/src/guest/nvkvm-guest.ko
 ```
+
+The `fstab` line matters: `runcmd` runs **once per instance**, so without it any
+later boot of the same image comes up with `/mnt/nvkvm` empty — no module
+source, no staging script, no test suite (`scripts/setup_guest.sh:96-103`).
 
 Packages installed: `build-essential git python3 linux-headers-virtual`.
 Login is `ubuntu` / `ubuntu` with passwordless sudo.
@@ -34,7 +39,7 @@ before: `ssh_pwauth: true` must be **top-level** (nested under the `users:`
 entry it is ignored and sshd keeps `PasswordAuthentication no`), and the
 password must come from `chpasswd:` rather than a `users:` hash, because
 cloud-init will not reset the password of a user that already exists in the
-image (`scripts/setup_guest.sh:62-73`).
+image (`scripts/setup_guest.sh:67-78`).
 
 `setup_guest.sh` does **not** stage the NVIDIA userspace. That is a separate
 manual step — see [step 4](#4-stage-the-nvidia-userspace).
@@ -50,7 +55,7 @@ bash scripts/make_host_bundle.sh
 It reads the driver version from `nvidia-smi`, collects the libraries from
 `/usr/lib/x86_64-linux-gnu` into `host-libs-<version>/` at the repository root,
 and copies the EGL/Vulkan loader JSON configs alongside them
-(`scripts/make_host_bundle.sh:20-84`). Because the repo root is the 9p share,
+(`scripts/make_host_bundle.sh:20-96`). Because the repo root is the 9p share,
 the bundle is visible in the guest at `/mnt/nvkvm/host-libs-<version>/`.
 
 The libraries are not redistributable, which is why they cannot live in the
@@ -66,16 +71,22 @@ sudo bash scripts/run_test_vm.sh
 ```
 
 Prefers `/opt/qemu-nvkvm/bin/qemu-system-x86_64`, falls back to system QEMU with
-a warning, or honours `$QEMU_BIN` (`scripts/run_test_vm.sh:21-31`). Extra
+a warning, or honours `$QEMU_BIN` (`scripts/run_test_vm.sh:29-40`). Extra
 arguments are appended to the QEMU command line.
 
-The command line, verbatim (`scripts/run_test_vm.sh:58-81`):
+RAM and vCPU count come from `$VM_MEM` and `$VM_SMP`, defaulting to `16G` and
+`4` (`scripts/run_test_vm.sh:24-25`). Larger models need them raised — the LLM
+parity runs use `VM_MEM=64G VM_SMP=16`, and a guest whose RAM does not exceed
+the model size turns model load disk-bound and fakes a large gap.
+
+The command line (`scripts/run_test_vm.sh:67-90`), with the two variables
+expanded to their defaults:
 
 ```
 qemu-system-x86_64 \
     -enable-kvm \
-    -m 16G \
-    -smp 4 \
+    -m 16G \           # $VM_MEM
+    -smp 4 \            # $VM_SMP
     -cpu host \
     -drive file=/opt/nvkvm-guest/ubuntu-24.04.qcow2,format=qcow2,if=virtio \
     -drive file=/opt/nvkvm-guest/seed.iso,format=raw,if=virtio,readonly=on \
@@ -151,12 +162,12 @@ sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh
 ```
 
 **Check the exit status.** The script exits 2 with an `INCOMPLETE — missing from
-bundle:` list if anything was absent (`scripts/stage_guest_libs.sh:246-253`).
+bundle:` list if anything was absent (`scripts/stage_guest_libs.sh:335-346`).
 Treat a nonzero exit as "do not trust a subsequent parity run". Full detail in
 [Stage the guest NVIDIA userspace](stage-guest-libraries.md).
 
 It also blacklists `nouveau`, which takes effect only after a guest reboot
-(`scripts/stage_guest_libs.sh:238-241`).
+(`scripts/stage_guest_libs.sh:328-333`).
 
 ## 5. Check it worked
 
@@ -182,7 +193,7 @@ Signs of specific failures:
 
 | symptom | look for |
 |---|---|
-| `open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF` | the stub was not embedded — rebuild QEMU with `-DNVKVM_STUB_EMBEDDED` and a fresh `nvkvm_stub_bin.h` ([Build](build.md)) |
+| `open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF` | the stub was not embedded — rebuild QEMU with `-DNVKVM_STUB_EMBEDDED` and a fresh `nvkvm_stub_bin.h`. Use `bash scripts/build_qemu.sh --force`; a plain re-run exits 0 without rebuilding once the binary exists ([Build](build.md)) |
 | `cuInit` → `CUDA_ERROR_UNKNOWN` (999) | the `/proc` and `/sys` shims — check `dmesg` for module load errors |
 | `cuInit` → 803, or "Driver/library version mismatch" | guest userspace not version-matched to the host driver |
 | `cuCtxCreate` → 304 | often a denied control command; grep the QEMU log for `DENY` |
