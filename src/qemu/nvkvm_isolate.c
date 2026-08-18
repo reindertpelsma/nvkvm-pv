@@ -68,14 +68,40 @@
  * Returns 0 on success, -1 on any failure (caller fail-closes unless the
  * NVKVM_ISOLATE_NO_HARDEN escape hatch is set).
  */
-static void nvkvm_drop_all_caps(void)
+/*
+ * Split into two halves because UID separation has to happen BETWEEN them.
+ *
+ * PR_CAPBSET_DROP requires CAP_SETPCAP, and setresuid() to a non-zero uid
+ * clears the whole permitted set — so calling the bounding-set loop after the
+ * uid drop silently does nothing. Measured on a real isolate before this was
+ * split: Uid/Gid/CapEff/Groups were all correctly dropped while CapBnd was
+ * still 000001ffffffffff, i.e. the full set. That is inert in practice (with
+ * no_new_privs set, no permitted caps, a non-root uid and no execve in the
+ * seccomp allowlist there is no path to regain anything) but it is a silent
+ * divergence from namespace mode, and "inert in practice" is not a property
+ * worth relying on when the fix is an ordering change.
+ *
+ * Order is now: pre() -> [uid drop] -> post(), and for the modes without a uid
+ * drop the two run back-to-back, which is byte-for-byte the previous sequence.
+ */
+static void nvkvm_drop_caps_pre(void)
 {
 	if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
 		_exit(126);
 	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-	/* Drop the capability bounding set (so caps can't be regained on exec). */
+	/* Drop the capability bounding set (so caps can't be regained on exec).
+	 * Needs CAP_SETPCAP, which we still hold here.  Dropping a capability
+	 * from the BOUNDING set does not remove it from permitted/effective, so
+	 * the loop can drop CAP_SETPCAP itself and keep going, and the uid drop
+	 * that follows still has its CAP_SETUID/CAP_SETGID. */
 	for (int c = 0; c <= 63; c++)
 		prctl(PR_CAPBSET_DROP, c, 0, 0, 0);  /* EINVAL past last cap: ok */
+}
+
+static void nvkvm_drop_caps_post(void)
+{
+	/* A uid change resets dumpable to fs.suid_dumpable; pin it back to 0. */
+	prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 	/* Zero effective/permitted/inheritable. */
 	struct __user_cap_header_struct hdr = {
 		.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0 };
@@ -122,7 +148,30 @@ static int nvkvm_write_child_map(pid_t pid, const char *which, const char *val)
 static int nvkvm_map_child_userns(pid_t pid, uid_t extra_uid, gid_t extra_gid)
 {
 	char map[128];
-	if (nvkvm_write_child_map(pid, "setgroups", "deny") < 0)
+	/*
+	 * setgroups policy.
+	 *
+	 * Plain namespace mode writes "deny", unchanged: it is what stops an
+	 * unprivileged process in a user namespace from dropping a supplementary
+	 * group to get past a negative group permission.
+	 *
+	 * Combined namespace+uid mode must NOT write it, and the reason is
+	 * measured rather than theoretical.  With "deny", setgroups(2) is
+	 * permanently EPERM inside the namespace, so the child cannot run
+	 * setgroups(0, NULL) and keeps QEMU's inherited supplementary group 0 —
+	 * observed on a real isolate as `Uid: 500004 ... Groups: 0`, i.e. a uid
+	 * separated isolate still carrying the host root group.  That defeats
+	 * half the point of adding uid separation on top.
+	 *
+	 * Leaving the policy at its default ("allow") lets the child clear the
+	 * group list outright, which is strictly stronger than being unable to
+	 * change it.  The exposure "deny" exists to prevent does not apply: the
+	 * child is blocked on the sync pipe until we release it, its very first
+	 * act is setgroups(0, NULL), and after the uid drop it holds no
+	 * CAP_SETGID — nor is setgroups in the stub's seccomp allowlist — so it
+	 * can never add a group back.
+	 */
+	if (!extra_uid && nvkvm_write_child_map(pid, "setgroups", "deny") < 0)
 		return -1;
 	if (extra_uid)
 		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
@@ -822,6 +871,11 @@ bool nvkvm_isolate_cfg_is_degraded(const struct nvkvm_isolate_table *t)
 	return (t->cfg.mode & NVKVM_ISO_LAYER_NS) == 0;
 }
 
+bool nvkvm_isolate_cfg_is_unconfined(const struct nvkvm_isolate_table *t)
+{
+	return (t->cfg.mode & NVKVM_ISO_LAYERS_ALL) == 0;
+}
+
 const char *nvkvm_isolate_cfg_report(const struct nvkvm_isolate_table *t)
 {
 	return t->cfg_report;
@@ -1089,16 +1143,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				_exit(124);
 			nvkvm_isolate_closefrom((use_ns || use_chroot)
 						? NVKVM_DEV_DIRFD + 1 : 4);
-			/* UID separation goes here: AFTER the mount-ns work (which
-			 * needs CAP_SYS_ADMIN in the userns) and BEFORE the cap
-			 * drop (setresuid needs CAP_SETUID, which that drop
-			 * removes).  Verified-irreversible or _exit. */
+			/* no_new_privs + bounding set, while CAP_SETPCAP is still
+			 * held; then the uid drop (needs CAP_SETUID, which it then
+			 * removes); then the rest of the cap teardown. */
+			if (harden)
+				nvkvm_drop_caps_pre();
+			/* `false`: setgroups is left at its default "allow" for
+			 * combined mode (see nvkvm_map_child_userns), so a
+			 * setgroups failure is a real failure everywhere. */
 			if (use_uid &&
 			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid,
-						     use_ns) != 0)
+						     false) != 0)
 				_exit(125);
 			if (harden)
-				nvkvm_drop_all_caps();   /* no_new_privs + dumpable + caps */
+				nvkvm_drop_caps_post();
 			/* The stub applies its seccomp allowlist unless told
 			 * otherwise.  argv is the mechanism the stub itself
 			 * nominates for this ("Re-add via argv if a debug hatch
@@ -1163,12 +1221,17 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				_exit(124);
 			nvkvm_isolate_closefrom((use_ns || use_chroot)
 						? NVKVM_DEV_DIRFD + 1 : 4);
+			if (harden)
+				nvkvm_drop_caps_pre();
+			/* `false`: setgroups is left at its default "allow" for
+			 * combined mode (see nvkvm_map_child_userns), so a
+			 * setgroups failure is a real failure everywhere. */
 			if (use_uid &&
 			    nvkvm_iso_drop_privilege(run_uid, (gid_t)run_uid,
-						     use_ns) != 0)
+						     false) != 0)
 				_exit(125);
 			if (harden)
-				nvkvm_drop_all_caps();
+				nvkvm_drop_caps_post();
 			const char *argv[] = { "nvkvm_stub", NULL, NULL };
 			if (!use_seccomp)
 				argv[1] = "--no-seccomp";
@@ -1186,7 +1249,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			/* The single most likely reason clone(CLONE_NEWUSER) fails
 			 * on an otherwise healthy host, and the reason UID mode
 			 * exists.  Name it instead of returning a bare -EPERM. */
-			if (e == EPERM || e == EINVAL || e == ENOSPC)
+			/* Log the full explanation once per QEMU process: every
+			 * guest process that opens the GPU triggers another
+			 * create, and repeating a six-line paragraph per attempt
+			 * buries the rest of the log.  Measured: 12 identical
+			 * copies from a single validate.sh run. */
+			static bool clone_fail_explained;
+			if ((e == EPERM || e == EINVAL || e == ENOSPC) &&
+			    clone_fail_explained)
+				fprintf(stderr,
+				  "nvkvm: clone(CLONE_NEWUSER|...) failed again: "
+				  "%s (isolate not created; see the first "
+				  "occurrence above)\n", strerror(e));
+			else if (e == EPERM || e == EINVAL || e == ENOSPC) {
+				clone_fail_explained = true;
 				fprintf(stderr,
 				  "nvkvm: clone(CLONE_NEWUSER|...) failed: %s. "
 				  "User namespaces are unavailable in this "
@@ -1200,6 +1276,7 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				  "namespace-free alternative — read "
 				  "docs/internal/isolate-model.md first, it is a "
 				  "materially weaker boundary.\n", strerror(e));
+			}
 		}
 		close(sv[0]);
 		close(sv[1]);

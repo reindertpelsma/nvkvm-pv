@@ -243,10 +243,16 @@ Two ways, and `auto` makes sure you do not have to go looking:
    and why each failed.
 2. Query it:
 
+   ```bash
+   # add -qmp unix:/tmp/mon.sock,server,nowait to the QEMU command line
+   { "execute": "qom-get", "arguments": {
+       "path": "/machine/peripheral-anon/device[1]/virtio-backend",
+       "property": "isolate-mode-active" } }
+   { "return": "isolate sandbox: uid+chroot (uid window 500000..504095, 4096 slots)" }
    ```
-   (qemu) qom-get /machine/peripheral/<id> isolate-mode-active
-   "isolate sandbox: uid+chroot (uid window 500000..504095, 4096 slots)"
-   ```
+
+   The property is on the virtio **backend**, not the PCI proxy — with an
+   explicit `id=` the path is `/machine/peripheral/<id>/virtio-backend`.
 
 `NVKVM_ISOLATE_MODE=none` removes every boundary, including the stub's seccomp
 filter, and refuses to start without

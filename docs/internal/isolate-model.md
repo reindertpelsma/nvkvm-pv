@@ -231,9 +231,14 @@ go looking:
    property `isolate-mode-active` on the virtio-nvgpu device:
 
    ```
-   (qemu) qom-get /machine/peripheral/<id> isolate-mode-active
-   "isolate sandbox: uid+chroot (uid window 500000..504095, 4096 slots)"
+   (qmp) { "execute": "qom-get", "arguments": {
+             "path": "/machine/peripheral-anon/device[1]/virtio-backend",
+             "property": "isolate-mode-active" } }
+   { "return": "isolate sandbox: uid+chroot (uid window 500000..504095, 4096 slots)" }
    ```
+
+   The property lives on the **virtio backend**, not on the PCI proxy — use
+   `/machine/peripheral/<id>/virtio-backend` when the device has an `id=`.
 
    The failure mode this exists to prevent is an operator who believes they
    have namespace isolation and has no way to check. A monitoring check can
@@ -433,9 +438,33 @@ boundary. In namespace mode they are the third and fourth layers of it.
 - **`namespace+uid`** — both. Supported, but usually pointless: if user
   namespaces are available the namespace sandbox is already strictly stronger,
   and the uid drop only buys defence-in-depth against a userns escape. It is not
-  the recommended default. (Note it does change one thing: with QEMU running as
-  root the rootless map is `0 -> 0`, so the isolate is host-uid 0 with no
-  capabilities; adding `uid` makes it a genuine unprivileged uid as well.)
+  the recommended default.
+
+  It does change one thing that is easy to miss. With QEMU running as root the
+  rootless map is `0 -> 0`, so in plain `namespace` mode **both isolates are
+  host-uid 0** — measured on two concurrent isolates:
+
+  ```
+  namespace       PID 24307 uid 0      PID 24347 uid 0
+  namespace+uid   PID 25528 uid 500002 PID 25574 uid 500004
+  ```
+
+  Their separation in plain namespace mode comes entirely from the namespaces;
+  add `uid` and it also comes from DAC. Whether that is worth it depends on how
+  much you trust the userns boundary.
+
+  Combined mode is also the one place the `setgroups` policy differs. Plain
+  namespace mode writes `deny` to `/proc/<pid>/setgroups`, which is what stops
+  an unprivileged process from dropping a supplementary group to get past a
+  negative group permission. Combined mode must not, because `deny` makes
+  `setgroups(2)` permanently `EPERM` inside the namespace and the child then
+  cannot clear the group list at all — observed on a real isolate as
+  `Uid: 500004 ... Groups: 0`, a uid-separated isolate still carrying the host
+  root group. Leaving the policy at its default lets the child clear the list
+  outright, which is strictly stronger than being unable to change it, and the
+  exposure `deny` guards against does not apply: the child is blocked on the
+  sync pipe until released, its first act is `setgroups(0, NULL)`, and after the
+  uid drop it has no `CAP_SETGID` and no `setgroups` in its seccomp allowlist.
 
 ### Operational constraints of UID mode
 
@@ -444,7 +473,8 @@ boundary. In namespace mode they are the third and fourth layers of it.
   failure is a startup error naming the missing capability, not an opaque
   isolate spawn failure with forwarding silently off. `--cap-add=SETUID
   --cap-add=SETGID` for a container, or run QEMU as root.
-- **Supplementary groups are dropped** (`setgroups(0, NULL)` before the drop),
+- **Supplementary groups are dropped** (`setgroups(0, NULL)` before the drop —
+  verified as an empty `Groups:` line in `/proc/<pid>/status` on a live isolate),
   so group-based access to the device nodes does not apply to the isolate.
   `/dev/nvidiactl` must be mode `0666` — this is checked at realize and refused
   with the actual mode in the message. The NVIDIA installer's default already
@@ -461,6 +491,14 @@ boundary. In namespace mode they are the third and fourth layers of it.
   previous holder still exists. `nvkvm_isolate_create()` additionally scans the
   table for a live isolate holding the same uid and refuses rather than
   duplicating. The residue that reuse *does* carry over is files (above).
+- **The bounding set is dropped before the uid drop, not after.**
+  `PR_CAPBSET_DROP` needs `CAP_SETPCAP`, and `setresuid()` to a non-zero uid
+  clears the permitted set — so the cap teardown is split into
+  `nvkvm_drop_caps_pre()` (no_new_privs + bounding set, run while the caps are
+  still held) and `nvkvm_drop_caps_post()` (capset zero + ambient clear). The
+  first version had them in one function after the uid drop and a live isolate
+  showed `CapEff: 0` with `CapBnd: 000001ffffffffff`; inert in practice, but a
+  silent divergence from namespace mode. Now measured as `CapBnd: 0`.
 - The drop is verified in-process, not assumed: `nvkvm_iso_drop_privilege()`
   sets gid before uid (the classic ordering bug — a uid drop first leaves the
   process unable to change its gid), uses `setresuid`/`setresgid` so the *saved*
@@ -530,7 +568,7 @@ absolute `/dev/<name>` paths when un-hardened
 
 `PR_SET_NO_NEW_PRIVS`, `PR_SET_DUMPABLE=0`, the whole capability bounding set
 dropped, effective/permitted/inheritable zeroed, ambient cleared
-(`src/qemu/nvkvm_isolate.c:66-81`). After this the stub is fully unprivileged.
+(`src/qemu/nvkvm_isolate.c`, `nvkvm_drop_caps_pre`/`_post`). After this the stub is fully unprivileged.
 
 ### 4. Inherited fds
 

@@ -188,6 +188,9 @@ int nvkvm_isolate_cfg_check(const struct nvkvm_isolate_table *t,
  */
 bool nvkvm_isolate_cfg_is_degraded(const struct nvkvm_isolate_table *t);
 
+/* True for mode 'none' — every layer off, including the seccomp filter. */
+bool nvkvm_isolate_cfg_is_unconfined(const struct nvkvm_isolate_table *t);
+
 /* Multi-line account of what `auto` attempted and why each rung was rejected. */
 const char *nvkvm_isolate_cfg_report(const struct nvkvm_isolate_table *t);
 

@@ -561,7 +561,8 @@ static void test_preflight_without_caps(uid_t sacrificial_uid)
 	if (pid == 0) {
 		char err[256] = {0};
 		struct nvkvm_isolate_cfg c = {
-			NVKVM_ISO_LAYER_UID, NVKVM_ISO_UID_BASE_DEFAULT
+			NVKVM_ISO_LAYER_UID | NVKVM_ISO_LAYER_SECCOMP,
+			NVKVM_ISO_UID_BASE_DEFAULT
 		};
 		close(p[0]);
 		/* Become an ordinary uid: CAP_SETUID/CAP_SETGID go with it. */

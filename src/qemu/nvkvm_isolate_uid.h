@@ -40,7 +40,6 @@
 #include <stdlib.h>
 #include <errno.h>
 #include <unistd.h>
-#include <grp.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -51,6 +50,51 @@
 #include <linux/capability.h>
 #include <linux/seccomp.h>
 #include <sys/prctl.h>
+
+/*
+ * This header is included from several translation units — the QEMU device
+ * (whose qemu/osdep.h defines _GNU_SOURCE), the unit-test targets (whose
+ * osdep.h stub does not), and tests/security/uid_isolate_test.c.  Rather than
+ * force _GNU_SOURCE on every consumer, fill in the Linux/glibc extensions the
+ * same way nvkvm_isolate.c already does for MS_REC / MS_PRIVATE / PR_CAP_AMBIENT:
+ * fixed ABI constants, guarded so a libc that does declare them still wins.
+ */
+#ifndef CLONE_NEWNS
+#define CLONE_NEWNS     0x00020000
+#endif
+#ifndef CLONE_NEWUTS
+#define CLONE_NEWUTS    0x04000000
+#endif
+#ifndef CLONE_NEWIPC
+#define CLONE_NEWIPC    0x08000000
+#endif
+#ifndef CLONE_NEWUSER
+#define CLONE_NEWUSER   0x10000000
+#endif
+#ifndef CLONE_NEWPID
+#define CLONE_NEWPID    0x20000000
+#endif
+#ifndef CLONE_NEWNET
+#define CLONE_NEWNET    0x40000000
+#endif
+#ifndef O_PATH
+#define O_PATH          010000000
+#endif
+
+/*
+ * setresuid/setresgid/getresuid/getresgid/setgroups go through syscall(2)
+ * rather than the glibc wrappers, for two reasons.  One, the wrappers need
+ * _GNU_SOURCE (see above).  Two — and this is the load-bearing one — glibc's
+ * wrappers implement the "setxid" broadcast that applies the change to every
+ * thread via a signal.  These are only ever called in the just-forked isolate
+ * child, which has exactly one thread, so the broadcast is pure overhead and a
+ * signal-based mechanism is the last thing wanted between fork and exec.
+ */
+#define NVKVM_SETRESUID(r, e, s)  syscall(SYS_setresuid, (r), (e), (s))
+#define NVKVM_SETRESGID(r, e, s)  syscall(SYS_setresgid, (r), (e), (s))
+#define NVKVM_GETRESUID(r, e, s)  syscall(SYS_getresuid, (r), (e), (s))
+#define NVKVM_GETRESGID(r, e, s)  syscall(SYS_getresgid, (r), (e), (s))
+#define NVKVM_SETGROUPS(n, list)  syscall(SYS_setgroups, (n), (list))
 
 /* ── Isolation layers and the four presets ───────────────────────────────
  *
@@ -695,7 +739,7 @@ static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid,
 		return -1;
 
 	/* 1. Supplementary groups first, while we still have CAP_SETGID. */
-	if (setgroups(0, NULL) != 0) {
+	if (NVKVM_SETGROUPS(0, NULL) != 0) {
 		if (in_userns_setgroups_denied && errno == EPERM)
 			groups_cleared = false;   /* denied == cannot gain: fine */
 		else
@@ -704,22 +748,23 @@ static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid,
 
 	/* 2. GID before UID.  setresgid sets real, effective AND saved, so
 	 *    there is no saved-gid left to restore from. */
-	if (setresgid(gid, gid, gid) != 0)
+	if (NVKVM_SETRESGID(gid, gid, gid) != 0)
 		return -1;
 
 	/* 3. Then UID.  Same reasoning: saved-uid must go too, otherwise the
 	 *    process can seteuid() straight back to root. */
-	if (setresuid(uid, uid, uid) != 0)
+	if (NVKVM_SETRESUID(uid, uid, uid) != 0)
 		return -1;
 
 	/* 4. Verify all three of each actually changed. */
-	if (getresuid(&ru, &eu, &su) != 0 || getresgid(&rg, &eg, &sg) != 0)
+	if (NVKVM_GETRESUID(&ru, &eu, &su) != 0 ||
+	    NVKVM_GETRESGID(&rg, &eg, &sg) != 0)
 		return -1;
 	if (ru != uid || eu != uid || su != uid)
 		return -1;
 	if (rg != gid || eg != gid || sg != gid)
 		return -1;
-	if (groups_cleared && getgroups(0, NULL) != 0)
+	if (groups_cleared && syscall(SYS_getgroups, 0, NULL) != 0)
 		return -1;
 
 	/*
@@ -729,15 +774,17 @@ static inline int nvkvm_iso_drop_privilege(uid_t uid, gid_t gid,
 	 *    would be a fiction, so this check runs in production, not only in
 	 *    the test.
 	 */
-	if (setresuid(0, 0, 0) == 0)  return -1;
-	if (setuid(0) == 0)           return -1;
-	if (seteuid(0) == 0)          return -1;
-	if (setresgid(0, 0, 0) == 0)  return -1;
-	if (setegid(0) == 0)          return -1;
+	if (NVKVM_SETRESUID(0, 0, 0) == 0)                return -1;
+	if (syscall(SYS_setuid, 0) == 0)                  return -1;
+	if (NVKVM_SETRESUID((uid_t)-1, 0, (uid_t)-1) == 0) return -1;  /* seteuid */
+	if (NVKVM_SETRESGID(0, 0, 0) == 0)                return -1;
+	if (NVKVM_SETRESGID((gid_t)-1, 0, (gid_t)-1) == 0) return -1;  /* setegid */
 	/* And confirm nothing moved. */
-	if (getresuid(&ru, &eu, &su) != 0 || ru != uid || eu != uid || su != uid)
+	if (NVKVM_GETRESUID(&ru, &eu, &su) != 0 ||
+	    ru != uid || eu != uid || su != uid)
 		return -1;
-	if (getresgid(&rg, &eg, &sg) != 0 || rg != gid || eg != gid || sg != gid)
+	if (NVKVM_GETRESGID(&rg, &eg, &sg) != 0 ||
+	    rg != gid || eg != gid || sg != gid)
 		return -1;
 
 	return 0;

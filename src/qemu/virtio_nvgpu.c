@@ -1252,7 +1252,19 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 		 * why each was rejected.
 		 */
 		const char *rep = nvkvm_isolate_cfg_report(&nv->isolates);
-		if (nvkvm_isolate_cfg_is_degraded(&nv->isolates)) {
+		if (nvkvm_isolate_cfg_is_unconfined(&nv->isolates)) {
+			/* Unmissable, at every start.  This mode required an
+			 * explicit acknowledgement to reach, and it is still
+			 * worth shouting about on the way past. */
+			warn_report("nvkvm: ****************************************");
+			warn_report("nvkvm: * ISOLATE CONFINEMENT IS COMPLETELY OFF *");
+			warn_report("nvkvm: ****************************************");
+			warn_report("nvkvm: isolate mode 'none': no namespaces, no "
+				    "uid separation, and the stub's seccomp "
+				    "filter is NOT installed. A compromised "
+				    "isolate has the full privileges of this "
+				    "QEMU process. Debugging only.");
+		} else if (nvkvm_isolate_cfg_is_degraded(&nv->isolates)) {
 			warn_report("nvkvm: %s", cfg_desc);
 			if (rep && *rep)
 				warn_report("nvkvm: %s", rep);
