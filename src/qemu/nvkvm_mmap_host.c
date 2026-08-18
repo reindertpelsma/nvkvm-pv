@@ -331,8 +331,28 @@ bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 	out->ram_top    = ram_top;
 	out->mmap_size  = NVKVM_MMAP_WIN_SIZE;
 
-	for (sparse_size = NVKVM_SPARSE_GPA_SIZE;;
-	     sparse_size /= 2) {
+	/*
+	 * Cap the sparse window at 1/8 of the addressable space before we even
+	 * start.  span <= limit is necessary but NOT sufficient: the sparse
+	 * window is a 64-bit PCI BAR, and the *guest firmware* has to find a
+	 * naturally-aligned hole for it.  MEASURED on a 39-bit host (i7-11800H,
+	 * limit 512 GiB): a 128 GiB BAR passed every arithmetic check here and
+	 * SeaBIOS then assigned no BAR at all to the device -- every other
+	 * function on the bus got one, 00:07.0 got none -- leaving the guest
+	 * with no window and KVM_RUN faulting on first touch.  A BAR that is a
+	 * large fraction of the whole address space is not placeable in
+	 * practice, however well it fits on paper.
+	 *
+	 * 1/8 is a no-op on any host wide enough to matter (46 bits gives an
+	 * 8 TiB cap against a 128 GiB window) and forces the shrink loop to run
+	 * exactly where it is needed.
+	 */
+	sparse_size = NVKVM_SPARSE_GPA_SIZE;
+	while (sparse_size > NVKVM_SPARSE_GPA_SIZE_MIN &&
+	       sparse_size > limit / 8)
+		sparse_size /= 2;
+
+	for (;; sparse_size /= 2) {
 		uint64_t span, base, floor;
 
 		span  = NVKVM_SHM_GPA_SLOT + NVKVM_MMAP_WIN_SIZE + sparse_size;
