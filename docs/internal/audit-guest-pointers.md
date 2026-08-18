@@ -7,7 +7,7 @@ the rest are open. Read this table before the detail.
 
 | finding | severity as found | status |
 |---|---|---|
-| U-1 | re-rated LOW | not a defect — see the maintainer note |
+| U-1 | re-rated MEDIUM | open — the allowlist is not wired into the ring path |
 | U-2 | CRITICAL | **fixed** — rewrite sites fail closed (`nvkvm_stub.c`, `U-2` markers) |
 | U-3 | CRITICAL | **fixed** — default-deny gate on `NVOS32.function`, only `ALLOC_SIZE` allowed |
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
@@ -205,7 +205,7 @@ it lands in QEMU, where the mitigation does not apply.**
 
 ---
 
-### U-1 — RE-RATED: LOW — see maintainer note — The SPSC ring path forwards `NVOS54.params` with no host mediation whatsoever
+### U-1 — RE-RATED: MEDIUM — see maintainer note — The SPSC ring path forwards `NVOS54.params` with no host mediation whatsoever
 
 > **Maintainer note (re-rating).** This entry over-rated the allowlist's role. The
 > ring bypasses the *control* allowlist, but object **allocation** still passes
@@ -219,8 +219,24 @@ it lands in QEMU, where the mitigation does not apply.**
 > client scoping. Treat the allowlist as hardening against RM bugs and against
 > commands with effects beyond the calling client, not as the boundary itself.
 >
+> **Re-rated twice.** CRITICAL was too high: object allocation still passes through
+> QEMU, so a guest can only issue controls against handles it legitimately
+> allocated, and RM's per-client scoping bounds their effect. But LOW was too low,
+> and this is the settled rating at MEDIUM. The ring is *ours* — nvkvm creates it
+> for every isolate and MAP_FIXEDs it into guest-visible GPA — so the allowlist
+> simply was never wired into that path. A defence-in-depth layer present on every
+> path except one is an omission, not a trade-off, and the cost of the gap is
+> precisely that a deny-listed command would skip its mitigation if RM ever had a
+> bug in one.
+>
+> **The fix is bounded:** the allowlist tables already exist; the ring path does not
+> consult them. Applying the same default-deny check stub-side closes it without
+> new infrastructure. Deleting the ring is also defensible — it is off by default
+> and measured no improvement to LLM decode, where control-RTT is only 1-2% of
+> per-token time.
+>
 > The original analysis below is kept because the *mechanism* it documents is
-> accurate and worth understanding; only the severity is wrong.
+> accurate and worth understanding.
 
 **Field:** `NVOS54_PARAMETERS.params` (offset 16), plus `paramsSize` (offset 24).
 **Driver dereferences it:** yes, `rmapiParamsAcquire` at
