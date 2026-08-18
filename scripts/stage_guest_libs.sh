@@ -124,11 +124,19 @@ stage "libGLX_nvidia.so.$V"       "$SYS" "libGLX_nvidia.so.0"
 stage "libGLESv2_nvidia.so.$V"    "$SYS" "libGLESv2_nvidia.so.2"
 stage "libGLESv1_CM_nvidia.so.$V" "$SYS" "libGLESv1_CM_nvidia.so.1"
 stage "libnvidia-cfg.so.$V"       "$SYS" "libnvidia-cfg.so.1"
-# OpenCL vendor library.  Without it the OpenCL loader finds no platform and
-# apps fail with "unknown OpenCL platform" (e.g. Geekbench --gpu).  Paired with
-# the /etc/OpenCL/vendors/nvidia.icd manifest written further down, which names
-# exactly this SONAME.
-stage "libnvidia-opencl.so.$V"    "$SYS" "libnvidia-opencl.so.1"
+# OpenCL vendor library -- OPT-IN, off by default.  Staging it makes the OpenCL
+# loader find a platform, but OpenCL through nvkvm currently returns WRONG
+# RESULTS: Geekbench 7 --gpu fails validation on 12+ workloads in the guest
+# (e.g. Particle Physics "similarity is 0%", Feature Matching "difference is
+# > 10%", every Photo Filter output unvalidated) while the same binary is clean
+# on the host.  A platform that silently computes wrong answers is worse than
+# no platform at all: without it apps fail loudly with "unknown OpenCL
+# platform", which is honest.  Set NVKVM_STAGE_OPENCL=1 to stage it anyway for
+# investigation.  Re-enable by default only once a correctness suite passes.
+if [ "${NVKVM_STAGE_OPENCL:-0}" = "1" ]; then
+    echo "stage_guest_libs: WARNING staging OpenCL -- known to return incorrect results" >&2
+    stage "libnvidia-opencl.so.$V"    "$SYS" "libnvidia-opencl.so.1"
+fi
 
 # -- EGL GBM stack (#102 modeset): GPU-accelerated GL/EGL on the virtual KMS
 # head needs THREE pieces, all of which must be present or the NVIDIA path is
@@ -322,8 +330,9 @@ JSON
 # actually staged, so a host without it does not get a manifest pointing at a
 # missing library (which would be worse than none: the loader would log an
 # error for every OpenCL app).
-if [ -e /usr/local/nvidia-guest/lib/libnvidia-opencl.so.1 ] ||
-   [ -e /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 ]; then
+if [ "${NVKVM_STAGE_OPENCL:-0}" = "1" ] &&
+   { [ -e /usr/local/nvidia-guest/lib/libnvidia-opencl.so.1 ] ||
+     [ -e /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 ]; }; then
     sudo mkdir -p /etc/OpenCL/vendors
     printf 'libnvidia-opencl.so.1\n' | sudo tee /etc/OpenCL/vendors/nvidia.icd >/dev/null
     echo "stage_guest_libs: OpenCL ICD -> /etc/OpenCL/vendors/nvidia.icd"
