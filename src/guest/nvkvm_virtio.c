@@ -1513,7 +1513,7 @@ int nvkvm_virtio_realize_uvm_mapping(__u32 isolate_id, __u32 fd_handle_id,
 
 /* ── READ_HOST_FILE ─────────────────────────────────────────────────────── */
 
-int nvkvm_virtio_read_host_file(__u32 file_id, __u32 shm_slot,
+int nvkvm_virtio_read_host_file(__u32 file_id, __u32 gpu_index, __u32 shm_slot,
 				__u32 max_len, __u32 *nbytes_out)
 {
 	struct {
@@ -1535,10 +1535,12 @@ int nvkvm_virtio_read_host_file(__u32 file_id, __u32 shm_slot,
 	msg->req.file_id = cpu_to_le32(file_id);
 	msg->req.shm_slot = cpu_to_le32(shm_slot);
 	msg->req.max_len  = cpu_to_le32(max_len);
-	/* Single virtual GPU at guest BDF 0000:00:07.0 -> host GPU index 0.
-	 * Multi-GPU (several virtio-nvgpu devices) would thread a per-device
-	 * index here; QEMU already enumerates all host GPUs into its BDF list. */
-	msg->req.gpu_index = cpu_to_le32(0);
+	/* Selects which host GPU a per-GPU file (INFORMATION / REGISTRY /
+	 * NUMA_STATUS) is read from: an index into QEMU's sorted host-BDF list.
+	 * The guest never names a path or a BDF, only this integer, so the
+	 * host-side whitelist stays the whole security boundary.  Ignored by
+	 * QEMU for the host-wide files (params, version, initstate). */
+	msg->req.gpu_index = cpu_to_le32(gpu_index);
 
 	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret == 0) {

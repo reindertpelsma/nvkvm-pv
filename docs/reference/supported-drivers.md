@@ -112,9 +112,51 @@ the channel-alloc sizing in the guest handles `TURING_CHANNEL_GPFIFO_A`,
 (`src/guest/nvkvm_main.c:1709-1713`). A pre-Volta card would need its classes
 added to the allowlist.
 
-Multi-GPU hosts are enumerated — QEMU scans `/dev/nvidia0..15`
-(`src/qemu/nvkvm_isolate_handlers.c:125-129`) and the guest creates that many
-`/dev/nvidiaN` nodes — but the tested configurations above are single-GPU.
+## Multi-GPU
+
+**Two GPUs work, measured 2026-08-18** on a 2x RTX 4070 host (driver 575.51.03,
+host BDFs `0000:00:07.0` and `0000:00:09.0`). Not merely enumerated: a PTX-JIT
+`vec_add` ran on each device with all 1,048,576 elements checked, and the host's
+own `nvidia-smi` attributed the load to the matching physical GPU (device 1 busy
+=> host GPU 1 at ~50%, host GPU 0 at 0%, and the mirror image for device 0). Two
+processes pinned with `CUDA_VISIBLE_DEVICES=0` and `=1` ran concurrently at full
+speed, ~2.26M and ~2.30M launches in 30 s, both results verified. `validate.sh`
+is 28/28 with `cuda_device_count 2`, and Vulkan enumerates both GPUs.
+
+Getting there needed three guest-side fixes (the QEMU side was already
+multi-GPU-correct — it scans `/dev/nvidia0..15`, keeps a sorted host-BDF list
+and resolves per-GPU file requests against it):
+
+- **`num_gpus` now autodetects.** It was a module parameter defaulting to `1`,
+  so a stock guest exposed only `/dev/nvidia0` and `cuDeviceGetCount` returned
+  **1** on a 2-GPU host — the second GPU was invisible, not broken. The default
+  is now `-1`, which probes the host and exposes exactly what it has. A positive
+  value still overrides.
+- **`gpu_index` is no longer hardcoded to 0.** Every per-GPU host-file read
+  (`information`, `registry`) asked for GPU 0 regardless of which GPU's file was
+  being read, so GPU 1's procfs would have reported GPU 0's UUID and VBIOS.
+- **`/proc/driver/nvidia/gpus/<bdf>/` is per-device and correctly named.** There
+  was one hardcoded directory, `0000:00:07.0` — the guest slot the identity PCI
+  device sits at. `strace` on guest `nvidia-smi` shows the lookup actually uses
+  the BDF **RM** reports, i.e. the *host* BDF: on this box it probed
+  `gpus/0000:00:07.0/` **and** `gpus/0000:00:09.0/`, and nothing in the guest
+  lives at `00:09.0`. The old name therefore matched only by coincidence, on
+  hosts whose first GPU also happens to sit at `00:07.0`. The tree is now built
+  from BDFs discovered from the host, one directory per GPU.
+
+Known gaps, neither of which blocks CUDA:
+
+- `numa_status` is still `ENOENT` for every GPU (it was before this work too —
+  only `information` and `registry` are synthesized). Guest `nvidia-smi` probes
+  it and tolerates its absence. QEMU already whitelists
+  `NVKVM_HFILE_NVIDIA_NUMA_STATUS`, so adding it is a one-line change if
+  something ever needs it.
+- Only **one** identity PCI device is created (`-device nvkvm-gpu,addr=7` in
+  `scripts/run_test_vm.sh`), so the guest PCI bus shows a single NVIDIA card
+  regardless of GPU count. CUDA, NVML and Vulkan all go through RM and are
+  unaffected; anything that counts GPUs by walking guest PCI would see one.
+- Untested beyond two GPUs, and NVLink/P2P between guest GPUs was not exercised
+  at all.
 
 ## Host kernel
 

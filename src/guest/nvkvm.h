@@ -254,6 +254,10 @@ struct nvkvm_inflight {
 
 #define NVKVM_MAX_GPUS  (NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1)
 
+/* "DDDD:BB:DD.F" — a PCI BDF string as it appears under
+ * /proc/driver/nvidia/gpus/.  Matches NVKVM_BDF_LEN on the QEMU side. */
+#define NVKVM_BDF_STRLEN  12
+
 struct nvkvm_state {
 	/* Device registration */
 	struct class  *class;
@@ -263,6 +267,12 @@ struct nvkvm_state {
 	dev_t          gpu_devno_base;
 	struct cdev    gpu_cdevs[NVKVM_MAX_GPUS];
 	int            num_gpus;
+	/* Host BDF of each GPU, as reported by the host's own
+	 * /proc/driver/nvidia/gpus/ tree ("0000:00:07.0").  libcuda and NVML
+	 * look per-GPU files up by the BDF that RM reports — which is the HOST
+	 * BDF, not the guest slot — so the synthetic proc tree has to be named
+	 * with these.  Filled by nvkvm_hostfile_discover_gpus(). */
+	char           gpu_bdf[NVKVM_MAX_GPUS][NVKVM_BDF_STRLEN + 1];
 	unsigned int   uvm_major;
 	dev_t          uvm_devno;
 	struct cdev    uvm_cdev;
@@ -424,12 +434,16 @@ int  nvkvm_virtio_realize_uvm_mapping(__u32 isolate_id, __u32 fd_handle_id,
 				      __u64 *gpa_base_out,
 				      __u64 *realize_token_out,
 				      __u32 *rm_status_out);
-int  nvkvm_virtio_read_host_file(__u32 file_id, __u32 shm_slot,
+int  nvkvm_virtio_read_host_file(__u32 file_id, __u32 gpu_index, __u32 shm_slot,
 				 __u32 max_len, __u32 *nbytes_out);
 
 /* nvkvm_hostfile.c — proc/sys entries fronting host files */
 int  nvkvm_hostfile_init(void);
 void nvkvm_hostfile_exit(void);
+/* Probe QEMU for the number of host GPUs, recording each one's BDF into
+ * nvkvm.gpu_bdf[].  Must run after the virtio probe (shm slots live).
+ * Returns the count (>= 0), or a negative errno if the probe itself failed. */
+int  nvkvm_hostfile_discover_gpus(void);
 int  nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
