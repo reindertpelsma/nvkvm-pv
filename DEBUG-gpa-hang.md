@@ -248,3 +248,61 @@ MMIO-trapped path so the access is emulated and resumable), or determine why the
 guest stores to it at all — it may be a *mis-mapped* object (guest expects a
 writable allocation, we placed a read-only `nvidiactl` page at that GPA).
 Worth checking which handle/offset produces this 4 KiB `nvidiactl` mapping.
+
+## 2026-08-18 (later) — faulting GPA CONFIRMED, both earlier theories dead
+
+Instrumented QEMU at the `kvm run failed` site with `cpu_synchronize_state()` +
+`cpu_get_phys_page_debug()` (QEMU's own page-table walker; `KVM_TRANSLATE`
+returns `valid=0` for every register in that post-fault context and is useless
+here).
+
+**Confirmed:** faulting guest VA `0x200224000` -> **GPA `0x6000056000`**
+= sparse window base `0x6000000000` + `0x56000`.
+
+At that HVA the fault-time maps snapshot shows:
+```
+734917032000-734917232000 rw-s 00000000 00:66 16   /dev/nvidia0
+```
+i.e. a **live, read-write** device VMA. 24 in-window VMAs, **zero holes**.
+
+### Both earlier theories are now disproven
+- **Not a hole / not munmap.** Zero holes at fault time (again).
+- **Not narrowed VMA protection.** The `mprotect` probe fires and converts the
+  two driver-readonly pages (`gpa=0x6000021000`, `gpa=0x6000031000`) to
+  anonymous backing, and **the fault still happens**. The faulting page is a
+  different, fully `rw-s` mapping. The r--s pages were a red herring.
+
+### Current best explanation (PTE-level, not VMA-level)
+KVM resolves a memslot HVA on a `VM_IO|VM_PFNMAP` VMA via
+`hva_to_pfn_remapped()`, which enforces:
+```c
+if (write_fault && !pte_write(*ptep)) { r = -EFAULT; goto out; }
+```
+A `/dev/nvidia0` VMA can be `rw-s` while the driver has that individual PTE
+installed read-only. A guest store then EFAULTs even though the VMA looks fine
+and `fixup_user_fault()` cannot upgrade it. Matches all evidence: rw-s VMA,
+CPL=3 store, GPA inside a live mapping, no hole.
+
+Ruled out this round: GPU runtime power management (host GPU is D0 /
+runtime_status=active / P0 at fault time).
+
+### Separate bug found in the WINMAP log (worth fixing on its own)
+GPA `0x6000021000` is handed out **twice** to two live mappings:
+```
+WINMAP fd=60 dev_id=0  off=0x0 len=4096   gpa=0x6000021000 req_prot=0x1
+WINMAP fd=63 dev_id=16 off=0x0 len=65536  gpa=0x6000021000 req_prot=0x2
+```
+The 64 KiB mapping overlays the 4 KiB one at the same window offset. Whether
+this is a legitimate free-then-reuse or a `nvkvm_sparse_gpa_alloc()` bug needs
+checking — a 4 KiB free-list extent must not satisfy a 64 KiB request.
+
+### Design point raised during this session (not yet implemented)
+Any host VMA under the memslot whose effective permissions are narrower than
+what the guest writes is a **guest-triggerable VMM abort** (QEMU treats EFAULT
+as fatal). Propagating the host driver's *effective* access bits down so the
+guest maps userspace no wider would turn such a write into an ordinary guest
+SIGSEGV instead. Contained-by-construction, and worth doing regardless of this
+bug. Note it is hardening, not a security boundary: a malicious guest kernel
+module can map RW anyway, so the real boundary fix is QEMU not treating EFAULT
+as fatal (it is resumable in principle -- RIP has not advanced -- the obstacle
+is that a bare gup failure does not report the faulting GPA to userspace).
