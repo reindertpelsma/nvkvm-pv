@@ -90,6 +90,115 @@ not the driver; with `cmdType=60` allowed, both rows PASS
 `gl_draw_pixel_check` and 610.43.02 is a clean **28/28**. See
 [Attribution](#attribution-nvkvm-not-nvidia--measured-2026-08-17).
 
+## Multi-GPU — 2x RTX 4070, 575.51.03 (measured 2026-08-18)
+
+Every row above is single-GPU (`cuda_device_count 1`). This is the first
+two-GPU boot. Host: 2x RTX 4070, driver 575.51.03, host BDFs `0000:00:07.0`
+and `0000:00:09.0`; guest Ubuntu 24.04 / kernel 6.8, 4 vCPU / 16 GB.
+
+`validate.sh` only ever touches device 0 (`cuDeviceGet(&dev, 0)`), so it cannot
+answer this on its own. `tests/multi_gpu.c` was added for it: it walks every
+device libcuda reports and, on each, creates a context, round-trips 8 MiB,
+JIT-compiles PTX and launches a kernel whose every element is checked — with
+per-device operands, so a launch routed to the wrong GPU cannot compare equal.
+
+| check | before (stock) | after (this branch) |
+|---|---|---|
+| `/dev/nvidia*` nodes | `nvidia0` only | `nvidia0`, `nvidia1` |
+| guest `nvidia-smi -L` | 1 GPU | 2 GPUs, both host UUIDs |
+| `cuDeviceGetCount` | **1** | **2** |
+| `gpus/` procfs dirs | `0000:00:07.0` only | `0000:00:07.0`, `0000:00:09.0` |
+| GPU 1 kernel launch | unreachable — device never enumerated | **1048576/1048576 correct** |
+| `vk_physical_device` | NVIDIA + llvmpipe | **2x NVIDIA + llvmpipe** |
+| `validate.sh` | 28/28 | **28/28** |
+
+The stock failure was *invisibility*, not breakage: `num_gpus` was a module
+parameter defaulting to 1, so the guest never created `/dev/nvidia1` and libcuda
+had nothing to enumerate. Loading the **unmodified** module with `num_gpus=2`
+was already enough to get 2/2 devices fully usable — the forwarding path was
+correct all along, because `dev_id = NVKVM_DEV_GPU(iminor(inode))` in
+`nvkvm_open` already routes `/dev/nvidiaN` to the host's `/dev/nvidiaN`.
+
+Both GPUs, verified per device (autodetect build):
+
+```
+CHECK|device_count|INFO|2
+CHECK|gpu0|INFO|handle=0 name='NVIDIA GeForce RTX 4070' pci=0000:00:07.0 sm_89 smcount=46 totalmem=11874MiB
+CHECK|gpu0|PASS|memcpy 8 MiB HtoD/DtoH byte-exact on device 0
+CHECK|gpu0|PASS|vec_add kernel on device 0: 1048576/1048576 elements correct (bias=1000003)
+CHECK|gpu1|INFO|handle=1 name='NVIDIA GeForce RTX 4070' pci=0000:00:09.0 sm_89 smcount=46 totalmem=11874MiB
+CHECK|gpu1|PASS|memcpy 8 MiB HtoD/DtoH byte-exact on device 1
+CHECK|gpu1|PASS|vec_add kernel on device 1: 1048576/1048576 elements correct (bias=2000006)
+CHECK|summary|PASS|2/2 device(s) fully usable
+```
+
+Distinct UUIDs, matching the host's two cards exactly:
+
+```
+GPU 0: NVIDIA GeForce RTX 4070 (UUID: GPU-3e8efc0d-cad9-65a7-0316-f004d91d936b)
+GPU 1: NVIDIA GeForce RTX 4070 (UUID: GPU-654a09ff-ce7b-db05-05b6-970a1bcdb91e)
+```
+
+### The kernel really ran on the second physical GPU
+
+Enumeration proves nothing, so this was checked from outside the guest. With the
+guest spinning a checked kernel on device 1, the **host's** `nvidia-smi`:
+
+```
+index, utilization.gpu, memory.used
+0, 0 %, 4 MiB
+1, 50 %, 173 MiB
+```
+
+and the mirror image with the guest on device 0:
+
+```
+0, 51 %, 173 MiB
+1, 0 %, 4 MiB
+```
+
+1,935,010 launches over 25 s on device 1, final result still element-wise
+correct.
+
+### Both at once
+
+Two guest processes, one pinned to each GPU, running concurrently:
+
+```
+CVD=0 -> pci=0000:00:07.0  spin 30.0s: 2260128 launches, final result still correct
+CVD=1 -> pci=0000:00:09.0  spin 30.0s: 2301615 launches, final result still correct
+```
+
+Host during the overlap — both cards busy, so the two isolates are genuinely
+parallel rather than serialized behind one device:
+
+```
+0, 46 %, 173 MiB
+1, 50 %, 173 MiB
+```
+
+Throughput per process matches the solo run (~2.3M launches / 30 s either way),
+i.e. no contention penalty from the one-isolate-per-guest-process model.
+
+`CUDA_VISIBLE_DEVICES=1` correctly resolves to `pci=0000:00:09.0`, so the
+ordinal remapping libcuda does on top of nvkvm's device list is consistent.
+
+### Override behaviour
+
+| `num_gpus=` | exposed | `cuDeviceGetCount` | result |
+|---|---|---|---|
+| unset (`-1`, autodetect) | 2 | 2 | 2/2 usable |
+| `1` | 1 | 1 | 1/1 usable — single-GPU behaviour preserved |
+| `4` (overshoot) | 4 nodes, 2 procfs dirs | 2 | 2/2 usable, extra nodes inert |
+
+### Not covered
+
+Three or more GPUs; NVLink/P2P between guest GPUs; mixed GPU models in one
+host; `numa_status`, which stays `ENOENT` (as it was before this work — guest
+`nvidia-smi` probes it and tolerates its absence). Only one identity PCI device
+is created, so the guest PCI bus shows one NVIDIA card whatever the GPU count;
+CUDA/NVML/Vulkan go through RM and do not care.
+
 Exact strings, since a renderer check that does not print its renderer is not
 worth much:
 

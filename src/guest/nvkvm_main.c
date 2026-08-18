@@ -64,9 +64,17 @@ struct nvkvm_state nvkvm;
 
 /* ── Module parameters ────────────────────────────────────────────────────── */
 
-static int num_gpus = 1;
+/*
+ * How many /dev/nvidia<N> nodes to expose.  -1 (the default) asks the host,
+ * via nvkvm_hostfile_discover_gpus(), and exposes exactly that many -- which
+ * is what makes a multi-GPU host usable without the guest being told about
+ * it.  A positive value overrides the probe; exposing more nodes than the
+ * host has just means opens on the extra ones fail.
+ */
+static int num_gpus = -1;
 module_param(num_gpus, int, 0444);
-MODULE_PARM_DESC(num_gpus, "Number of /dev/nvidia* devices to expose (default 1)");
+MODULE_PARM_DESC(num_gpus,
+		 "Number of /dev/nvidia* devices to expose (default -1 = autodetect from the host)");
 
 /* ── Forward declarations ─────────────────────────────────────────────────── */
 
@@ -106,7 +114,7 @@ static char *nvkvm_devnode(const struct device *dev, umode_t *mode)
 
 static int __init register_devices(void)
 {
-	int ret, i;
+	int ret, i, detected;
 	dev_t devno;
 
 	nvkvm.class = class_create("nvkvm");
@@ -131,8 +139,24 @@ static int __init register_devices(void)
 		goto err_ctl_region;
 	device_create(nvkvm.class, NULL, devno, NULL, "nvidiactl");
 
-	/* /dev/nvidia0 .. /dev/nvidia{N-1} — prefer major 195 minor 0..N-1 */
-	nvkvm.num_gpus = min(num_gpus, NV_MINOR_DEVICE_NUMBER_REGULAR_MAX + 1);
+	/* /dev/nvidia0 .. /dev/nvidia{N-1} — prefer major 195 minor 0..N-1.
+	 *
+	 * Discovery runs unconditionally, even under an explicit num_gpus=,
+	 * because it is also what fills nvkvm.gpu_bdf[] for the synthetic
+	 * /proc/driver/nvidia/gpus/<bdf>/ tree that nvkvm_hostfile_init()
+	 * builds a few lines later. */
+	detected = nvkvm_hostfile_discover_gpus();
+	if (detected < 0) {
+		pr_warn("nvkvm: host GPU discovery failed (%d); assuming 1\n",
+			detected);
+		detected = 0;
+	}
+	if (num_gpus > 0)
+		nvkvm.num_gpus = min(num_gpus, NVKVM_MAX_GPUS);
+	else
+		nvkvm.num_gpus = detected > 0 ? detected : 1;
+	pr_info("nvkvm: host reports %d GPU(s); exposing %d\n",
+		detected, nvkvm.num_gpus);
 	devno = MKDEV(NV_NVIDIA_MAJOR, 0);
 	ret = register_chrdev_region(devno, nvkvm.num_gpus, "nvidia");
 	if (ret)

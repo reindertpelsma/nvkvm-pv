@@ -25,16 +25,26 @@
 
 #include "nvkvm.h"
 
-/* PCI BDF of the virtio-nvgpu device in the guest.  libcuda probes
- * /proc/driver/nvidia/gpus/<bdf>/... using the *guest* BDF, so we expose
- * the synthetic dir under that name. */
-#define NVKVM_GUEST_GPU_BDF  "0000:00:07.0"
+/*
+ * libcuda and NVML look per-GPU files up as
+ * /proc/driver/nvidia/gpus/<bdf>/<leaf>, where <bdf> is the BDF that RM
+ * reports for that GPU.  RM here is the HOST's, so those are HOST BDFs --
+ * confirmed by strace: on a two-GPU host nvidia-smi probes
+ * gpus/0000:00:07.0/ and gpus/0000:00:09.0/, and nothing in the guest lives
+ * at 00:09.0.  So the synthetic tree is named from the host's BDFs, one
+ * directory per GPU, discovered at init via READ_HOST_FILE.
+ *
+ * (This used to be a single hardcoded "0000:00:07.0" -- the guest slot the
+ * identity PCI device sits at.  That matched only by coincidence, on hosts
+ * whose first GPU happens to also be at 00:07.0.)
+ */
 
 /* ── proc-entry helpers ───────────────────────────────────────────────────── */
 
 struct nvkvm_hostfile_entry {
 	const char *name;        /* basename under parent */
 	__u32       file_id;     /* NVKVM_HFILE_* */
+	__u32       gpu_index;   /* which host GPU, for per-GPU files; 0 otherwise */
 };
 
 static int hostfile_show(struct seq_file *m, void *v)
@@ -53,7 +63,8 @@ static int hostfile_show(struct seq_file *m, void *v)
 	slot_ptr = nvkvm_slot_addr(&nvkvm, shm_slot);
 	if (!slot_ptr) { nvkvm_slot_free(&nvkvm, shm_slot); return -ENOMEM; }
 
-	ret = nvkvm_virtio_read_host_file(e->file_id, (__u32)shm_slot,
+	ret = nvkvm_virtio_read_host_file(e->file_id, e->gpu_index,
+					  (__u32)shm_slot,
 					  NVKVM_HFILE_MAX_SIZE, &nbytes);
 	if (ret == 0 && nbytes > 0 && nbytes <= NVKVM_HFILE_MAX_SIZE)
 		seq_write(m, slot_ptr, nbytes);
@@ -101,7 +112,8 @@ static ssize_t initstate_show(struct kobject *kobj, struct kobj_attribute *a,
 	p = nvkvm_slot_addr(&nvkvm, shm_slot);
 	if (!p) { nvkvm_slot_free(&nvkvm, shm_slot); return -ENOMEM; }
 
-	ret = nvkvm_virtio_read_host_file(file_id, (__u32)shm_slot,
+	/* Host-wide file: QEMU ignores gpu_index for these. */
+	ret = nvkvm_virtio_read_host_file(file_id, 0, (__u32)shm_slot,
 					  NVKVM_HFILE_MAX_SIZE, &nbytes);
 	if (ret == 0 && nbytes > 0 && nbytes <= PAGE_SIZE - 1) {
 		memcpy(buf, p, nbytes);
@@ -118,7 +130,12 @@ static struct kobj_attribute initstate_attr =
 /* Module-global state */
 static struct proc_dir_entry *proc_nvidia_dir;
 static struct proc_dir_entry *proc_gpus_dir;
-static struct proc_dir_entry *proc_gpu_bdf_dir;
+/* One "gpus/<host-bdf>/" directory per GPU, plus the entry structs backing
+ * its files.  Indexed by host GPU index, which is exactly the gpu_index
+ * QEMU resolves against its own sorted BDF list. */
+static struct proc_dir_entry *proc_gpu_dirs[NVKVM_MAX_GPUS];
+static struct nvkvm_hostfile_entry gpu_info_entries[NVKVM_MAX_GPUS];
+static struct nvkvm_hostfile_entry gpu_reg_entries[NVKVM_MAX_GPUS];
 static struct kobject *sys_nvidia_kobj;
 static struct kobject *sys_nvidia_uvm_kobj;
 
@@ -183,12 +200,108 @@ static struct nvkvm_hostfile_entry version_entry = {
 static struct nvkvm_hostfile_entry params_entry = {
 	.name = "params", .file_id = NVKVM_HFILE_NVIDIA_PARAMS,
 };
-static struct nvkvm_hostfile_entry info_entry = {
-	.name = "information", .file_id = NVKVM_HFILE_NVIDIA_INFORMATION,
-};
-static struct nvkvm_hostfile_entry reg_entry = {
-	.name = "registry", .file_id = NVKVM_HFILE_NVIDIA_REG_BASE,
-};
+
+/* ── host-GPU discovery ──────────────────────────────────────────────────
+ *
+ * QEMU resolves a per-GPU file request as
+ * /proc/driver/nvidia/gpus/<its own sorted BDF list>[gpu_index]/<leaf>, and
+ * answers EINVAL once gpu_index runs past the end of that list.  So walking
+ * gpu_index upward until the read fails both counts the host's GPUs and,
+ * from each `information` body, yields the BDF to name its directory with --
+ * without adding a request type, and without the guest ever naming a path.
+ */
+
+/* Same shape check QEMU applies to a BDF: DDDD:BB:DD.F, all hex. */
+static bool nvkvm_bdf_valid(const char *s)
+{
+	int i;
+
+	for (i = 0; i < NVKVM_BDF_STRLEN; i++) {
+		char c = s[i];
+
+		if (i == 4 || i == 7) {
+			if (c != ':') return false;
+		} else if (i == 10) {
+			if (c != '.') return false;
+		} else if (!((c >= '0' && c <= '9') ||
+			     (c >= 'a' && c <= 'f') ||
+			     (c >= 'A' && c <= 'F'))) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Pull the BDF out of an `information` body's "Bus Location:  0000:00:07.0"
+ * line.  Returns false if the line is absent or malformed. */
+static bool nvkvm_parse_bus_location(const char *buf, size_t len, char *out)
+{
+	static const char key[] = "Bus Location:";
+	const size_t klen = sizeof(key) - 1;
+	size_t i, k;
+
+	if (len < klen)
+		return false;
+	for (i = 0; i + klen <= len; i++) {
+		if (memcmp(buf + i, key, klen))
+			continue;
+		i += klen;
+		while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+			i++;
+		if (i + NVKVM_BDF_STRLEN > len)
+			return false;
+		for (k = 0; k < NVKVM_BDF_STRLEN; k++)
+			out[k] = buf[i + k];
+		out[NVKVM_BDF_STRLEN] = '\0';
+		return nvkvm_bdf_valid(out);
+	}
+	return false;
+}
+
+int nvkvm_hostfile_discover_gpus(void)
+{
+	int i, shm_slot, count = 0;
+	void *slot_ptr;
+	char *tmp;
+
+	shm_slot = nvkvm_slot_alloc(&nvkvm);
+	if (shm_slot < 0)
+		return -ENOMEM;
+	slot_ptr = nvkvm_slot_addr(&nvkvm, shm_slot);
+	if (!slot_ptr) {
+		nvkvm_slot_free(&nvkvm, shm_slot);
+		return -ENOMEM;
+	}
+	tmp = kmalloc(NVKVM_HFILE_MAX_SIZE, GFP_KERNEL);
+	if (!tmp) {
+		nvkvm_slot_free(&nvkvm, shm_slot);
+		return -ENOMEM;
+	}
+
+	for (i = 0; i < NVKVM_MAX_GPUS; i++) {
+		__u32 nbytes = 0;
+		int ret = nvkvm_virtio_read_host_file(
+				NVKVM_HFILE_NVIDIA_INFORMATION, (__u32)i,
+				(__u32)shm_slot, NVKVM_HFILE_MAX_SIZE, &nbytes);
+
+		/* EINVAL here is the end of QEMU's BDF list, not a failure. */
+		if (ret || nbytes == 0)
+			break;
+		if (nbytes > NVKVM_HFILE_MAX_SIZE)
+			nbytes = NVKVM_HFILE_MAX_SIZE;
+		memcpy(tmp, slot_ptr, nbytes);
+		if (!nvkvm_parse_bus_location(tmp, nbytes, nvkvm.gpu_bdf[count])) {
+			pr_warn("nvkvm: host GPU %d has no parsable Bus Location; stopping discovery\n",
+				i);
+			break;
+		}
+		count++;
+	}
+
+	kfree(tmp);
+	nvkvm_slot_free(&nvkvm, shm_slot);
+	return count;
+}
 
 int nvkvm_hostfile_init(void)
 {
@@ -238,14 +351,37 @@ int nvkvm_hostfile_init(void)
 		}
 	}
 
+	/* One directory per host GPU, named with that GPU's host BDF.  Anything
+	 * beyond what discovery found (an explicit num_gpus= override that
+	 * overshoots) gets no directory: better a missing dir than one named
+	 * after a GPU that is not there. */
 	proc_gpus_dir = proc_mkdir("gpus", proc_nvidia_dir);
 	if (proc_gpus_dir) {
-		proc_gpu_bdf_dir = proc_mkdir(NVKVM_GUEST_GPU_BDF, proc_gpus_dir);
-		if (proc_gpu_bdf_dir) {
-			proc_create_data("information", 0444, proc_gpu_bdf_dir,
-					 &hostfile_pops, &info_entry);
-			proc_create_data("registry", 0444, proc_gpu_bdf_dir,
-					 &hostfile_pops, &reg_entry);
+		int i;
+
+		for (i = 0; i < nvkvm.num_gpus && i < NVKVM_MAX_GPUS; i++) {
+			if (!nvkvm.gpu_bdf[i][0])
+				continue;
+
+			proc_gpu_dirs[i] = proc_mkdir(nvkvm.gpu_bdf[i],
+						      proc_gpus_dir);
+			if (!proc_gpu_dirs[i]) {
+				pr_warn("nvkvm: could not create gpus/%s\n",
+					nvkvm.gpu_bdf[i]);
+				continue;
+			}
+
+			gpu_info_entries[i].name      = "information";
+			gpu_info_entries[i].file_id   = NVKVM_HFILE_NVIDIA_INFORMATION;
+			gpu_info_entries[i].gpu_index = (__u32)i;
+			gpu_reg_entries[i].name       = "registry";
+			gpu_reg_entries[i].file_id    = NVKVM_HFILE_NVIDIA_REG_BASE;
+			gpu_reg_entries[i].gpu_index  = (__u32)i;
+
+			proc_create_data("information", 0444, proc_gpu_dirs[i],
+					 &hostfile_pops, &gpu_info_entries[i]);
+			proc_create_data("registry", 0444, proc_gpu_dirs[i],
+					 &hostfile_pops, &gpu_reg_entries[i]);
 		}
 	}
 
@@ -275,9 +411,15 @@ void nvkvm_hostfile_exit(void)
 		kobject_put(sys_nvidia_kobj);
 		sys_nvidia_kobj = NULL;
 	}
-	if (proc_gpu_bdf_dir) {
-		remove_proc_subtree(NVKVM_GUEST_GPU_BDF, proc_gpus_dir);
-		proc_gpu_bdf_dir = NULL;
+	{
+		int i;
+
+		for (i = 0; i < NVKVM_MAX_GPUS; i++) {
+			if (!proc_gpu_dirs[i])
+				continue;
+			remove_proc_subtree(nvkvm.gpu_bdf[i], proc_gpus_dir);
+			proc_gpu_dirs[i] = NULL;
+		}
 	}
 	if (proc_gpus_dir) {
 		remove_proc_subtree("gpus", proc_nvidia_dir);
