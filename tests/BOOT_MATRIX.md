@@ -427,6 +427,17 @@ reported SKIP rather than passed or omitted.
 
 ## Blackwell (RTX 5090, sm_120) — driver 580.178.04, 2026-08-18
 
+> **RESOLVED, same day.** The section below records the first run (20/28) and is
+> kept because the diagnostic trail is the useful part. Blackwell is now **28/28**
+> — see "The fix" at the end.
+>
+> **One correction to my own analysis below:** I attributed `gl_draw_pixel_check`
+> to an sRGB framebuffer, with arithmetic showing 128 linear encodes to 188 sRGB.
+> The arithmetic is correct and the conclusion was wrong — that check passes
+> unchanged once a CUDA context can be created, so it was cascading from the same
+> root cause, not an independent test-expectation bug. A plausible mechanism with
+> supporting numbers is still a guess if you do not test it.
+
 First run on a fourth GPU architecture. **Enumeration works end to end; context
 creation does not.** No code changes were made for this run — the guest module,
 QEMU device and ABI profile selection were used exactly as shipped.
@@ -500,3 +511,45 @@ NVRM: GPU 0000:00:07.0: RmInitAdapter failed! (0x22:0x56:884)
 
 Installing `nvidia-driver-580-open` resolves it. This is a host provisioning
 requirement, unrelated to nvkvm, but it will bite anyone bringing up Blackwell.
+
+### The fix
+
+**`BLACKWELL_CHANNEL_GPFIFO_A` (0xC96F) was allowlisted but unsized** — the silent
+variant of the class, which is why the QEMU log showed no `DENY`. Instrumenting the
+guest forwarder to log every `RM_ALLOC` isolated it to the last alloc of
+`cuCtxCreate`:
+
+```
+before:  alloc hClass=0xc96f ap_size=0    origsz=0  status=0x1f   (NV_ERR_INVALID_ARGUMENT)
+after:   alloc hClass=0xc96f ap_size=368            status=0x0
+         alloc hClass=0xcab5 ap_size=8              status=0x0
+```
+
+libcuda passes a real params pointer but leaves `alloc_parms_size=0`, expecting the
+driver to size by hClass. Neither size-by-hClass switch had a case for 0xC96F, so
+0 bytes of params reached the host RM. Blackwell reuses `NV_CHANNEL_ALLOC_PARAMS`
+unchanged, so it shares the existing size (368 on the 580 profile, confirmed by
+compiling `sizeof`). Added 0xC96F and `_B` 0xCA6F to **both** the nvos21 and nvos64
+switches.
+
+**A second, latent bug surfaced while verifying.** `BLACKWELL_DMA_COPY_A` was
+recorded as `0xCBB5` — not a class NVIDIA ships. There is no `clcbb5.h` in
+open-gpu-kernel-modules, and 0xCBB5 is absent from QEMU's alloc allowlist while
+0xC9B5/0xCAB5 are present. Corrected to 0xC9B5 and added `_B` 0xCAB5. This was not
+speculative: with the channel fixed, the trace shows `hClass=0xcab5 ap_size=8
+status=0x0` immediately after every channel alloc — the 5090 uses the id that did
+not exist in the tree at all.
+
+All four ids confirmed against OGKM 580.95.05 (`clc96f.h`, `clca6f.h`, `clc9b5.h`,
+`clcab5.h`). No QEMU change was needed.
+
+**Result: 28 PASS / 0 FAIL / 0 SKIP**, reproduced twice. Blackwell is the fourth
+architecture fully working, after Ampere, Ada and Turing.
+
+### Why this keeps happening
+
+This is the fourth instance of "class reachable but params size unknown" in one
+month. The failure is always silent — nothing is denied, 0 bytes are forwarded, and
+the error surfaces several layers away as `INVALID_VALUE` or `801`. A guest-side
+warning when a *known-allowed* hClass hits the default arm of a size switch would
+have turned every one of these into a one-line log message instead of a bisect.
