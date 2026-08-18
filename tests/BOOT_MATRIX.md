@@ -553,3 +553,29 @@ month. The failure is always silent — nothing is denied, 0 bytes are forwarded
 the error surfaces several layers away as `INVALID_VALUE` or `801`. A guest-side
 warning when a *known-allowed* hClass hits the default arm of a size switch would
 have turned every one of these into a one-line log message instead of a bisect.
+
+## Hopper (sm_90) — wired, not testable on vast.ai
+
+Checked 2026-08-18 while adding Blackwell. **No work is needed and none was done.**
+
+`HOPPER_CHANNEL_GPFIFO_A` (0xC86F) and `HOPPER_DMA_COPY_A` (0xC8B5) are already
+defined in `src/abi/nvgpu.h` and already present in **both** size-by-hClass
+switches, alongside the Ampere and Blackwell classes. So the trap that broke
+Blackwell — allowlisted but unsized — does not apply to Hopper.
+
+That is safe by construction rather than by luck: `alloc_channel.h` in
+open-gpu-kernel-modules defines a single `NV_CHANNEL_ALLOC_PARAMS`, aliased as
+`NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS` for every GPFIFO class. `clc86f.h` defines
+only Hopper's *control* struct, not its own alloc params. Hopper therefore shares
+the same `chan_alloc_size` the group already uses.
+
+**It has not been booted, and cannot be on vast.ai.** Of 17 H100/H200/B200 offers
+available, **zero** have `vms_enabled` — the KVM template that every other row in
+this matrix was tested with is not offered on any datacenter-GPU host. The only
+datacenter card with VM support at all was a single Quadro RTX 6000, which is
+Turing and already covered.
+
+Testing Hopper needs a host with nested virtualisation and an H100 from somewhere
+other than vast — a bare-metal cloud instance, or hardware access. Recorded as an
+open gap rather than an assumed pass: the classes being present means the *known*
+failure mode is covered, not that Hopper works.
