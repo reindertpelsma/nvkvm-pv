@@ -3,6 +3,13 @@
 Run CUDA, PyTorch and Vulkan inside a KVM guest — on the same GPU your host is
 still using.
 
+![nvkvm booting a guest and driving the host GPU from inside it](docs/img/boot.gif)
+
+<sub>Real recording on an RTX 3050 Laptop GPU: cold boot to `nvidia-smi` inside
+the guest, with the host still holding the card. Idle time is fast-forwarded;
+nothing printed was cut. ([asciinema cast](docs/img/boot.cast) ·
+[how it was made](tools/demo/README.md))</sub>
+
 `nvkvm` gives a virtual machine real, driver-level access to an NVIDIA GPU
 without handing the card over to it. The host keeps the GPU. The guest gets
 `/dev/nvidia0` and friends, backed by a small kernel module that forwards the

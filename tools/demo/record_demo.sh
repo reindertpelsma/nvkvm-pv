@@ -39,39 +39,75 @@ if [ $# -gt 0 ]; then
 else
     cat > "$SCENARIO" <<'SCEN'
 set -u
-say()  { printf '\033[1;36m$ %s\033[0m\n' "$*"; }
-run()  { say "$*"; eval "$*"; echo; }
+# How to reach the guest.  Overridable because a stock test guest uses a
+# cloud-init password while a hardened one uses a key; what is *printed* is
+# always the tidy form, so neither ends up in the recording.
+GUEST_SSH="${NVKVM_GUEST_SSH:-ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=6 -o LogLevel=ERROR ubuntu@localhost}"
 
-printf '\033[1;37mnvkvm — paravirtual NVIDIA GPU for KVM guests\033[0m\n\n'
+hp()    { printf '\033[1;32mhost \033[0m\033[1;36m$ %s\033[0m\n' "$*"; }
+gp()    { printf '\033[1;35mguest\033[0m \033[1;36m$ %s\033[0m\n' "$*"; }
+note()  { printf '\033[1;37m%s\033[0m\n' "$*"; }
+pause() { sleep "${1:-0.6}"; }
 
-run 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader'
+# run <prompt-fn> <what to show> [what to actually run; defaults to shown]
+run() {
+    local where="$1" shown="$2"; shift 2
+    local real="${1:-$shown}"
+    "$where" "$shown"; pause 0.4; eval "$real"; echo; pause 0.5
+}
+# Same, for a command that runs inside the guest.
+grun() { run gp "$1" "$GUEST_SSH '${2:-$1}'"; }
 
-say 'scripts/run_test_vm.sh   # boot the guest'
-# Boot the VM in the background, tee-ing the serial console into view, then
-# stop following once the guest reports it is up.
+note 'nvkvm -- an NVIDIA GPU inside a KVM guest.'
+note 'No VFIO, no passthrough: the host keeps using the card the whole time.'
+echo; pause 1.2
+
+run hp 'nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader'
+run hp 'lspci -k -d 10de: | head -3'  'lspci -k -d 10de: 2>/dev/null | head -3'
+
+# ── boot ──────────────────────────────────────────────────────────────────
+hp 'scripts/run_test_vm.sh'
+pause 0.4
 : "${NVKVM_REPO:=$PWD}"
-rm -f /tmp/nvkvm-demo-boot.log
-setsid bash "$NVKVM_REPO/scripts/run_test_vm.sh" > /tmp/nvkvm-demo-boot.log 2>&1 < /dev/null &
-QEMU_SH=$!
-tail -f --pid=$$ /tmp/nvkvm-demo-boot.log 2>/dev/null &
+BOOTLOG=/tmp/nvkvm-demo-boot.log
+rm -f "$BOOTLOG"; : > "$BOOTLOG"
+setsid bash "$NVKVM_REPO/scripts/run_test_vm.sh" > "$BOOTLOG" 2>&1 < /dev/null &
+VMPID=$!
+tail -f -n +1 "$BOOTLOG" 2>/dev/null &
 TAILER=$!
 
-GUEST_SSH="ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-           -o ConnectTimeout=4 -o LogLevel=ERROR ubuntu@localhost"
-for _ in $(seq 1 150); do
+T0=$(date +%s)
+for _ in $(seq 1 180); do
     $GUEST_SSH true 2>/dev/null && break
-    sleep 2
+    sleep 1
 done
-sleep 1; kill $TAILER 2>/dev/null; wait $TAILER 2>/dev/null || true
-echo
+BOOT_SECS=$(( $(date +%s) - T0 ))
+sleep 0.7; kill $TAILER 2>/dev/null; wait $TAILER 2>/dev/null || true
+printf '\n\033[1;32m>>> guest is up (%ss)\033[0m\n\n' "$BOOT_SECS"
+pause 1.2
 
-printf '\033[1;32m--- guest is up -------------------------------------------------\033[0m\n\n'
-run "$GUEST_SSH 'sudo modprobe nvkvm_guest 2>/dev/null; ls -l /dev/nvidia*'"
-run "$GUEST_SSH 'nvidia-smi --query-gpu=name,driver_version --format=csv,noheader'"
-run "$GUEST_SSH 'vulkaninfo --summary 2>/dev/null | grep -m2 deviceName'"
+# ── guest bring-up ────────────────────────────────────────────────────────
+note 'The guest has no GPU yet.  Build and load the paravirtual driver:'
+echo; pause 0.8
+grun 'sudo make -C /mnt/nvkvm/src/guest' \
+     'cd /mnt/nvkvm/src/guest && sudo make KDIR=/lib/modules/$(uname -r)/build 2>&1 | tail -3'
+grun 'sudo insmod nvkvm-guest.ko' \
+     'cd /mnt/nvkvm/src/guest && sudo insmod ./nvkvm-guest.ko 2>&1 | head -2; lsmod | grep nvkvm'
+grun 'ls /dev/nvidia*'
+grun 'sudo scripts/stage_guest_libs.sh' \
+     'sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh 2>&1 | tail -2'
+pause 0.5
+grun 'nvidia-smi'
 
-printf '\033[1;37mSame physical GPU. No VFIO, no passthrough, host keeps using it.\033[0m\n'
-kill -TERM -$QEMU_SH 2>/dev/null || true
+# ── the point ─────────────────────────────────────────────────────────────
+note 'Same physical GPU -- and the host never gave it up:'
+echo; pause 0.8
+run hp 'lspci -k -d 10de: | grep -m1 "Kernel driver in use"' \
+    'lspci -k -d 10de: 2>/dev/null | grep -m1 "Kernel driver in use"'
+run hp 'nvidia-smi --query-gpu=name,memory.used --format=csv,noheader'
+
+# Leave the box as we found it.
+kill -TERM -$VMPID 2>/dev/null || kill -TERM $VMPID 2>/dev/null || true
 SCEN
 fi
 
