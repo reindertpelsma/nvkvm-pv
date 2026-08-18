@@ -670,6 +670,29 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
  * free-list is full it logs once and leaks the extent — bounded degradation,
  * never a crash.
  */
+int nvkvm_window_restore_anon(void *qva, size_t len)
+{
+	if (!qva || qva == MAP_FAILED || !len)
+		return 0;
+	void *r = mmap(qva, len, PROT_READ | PROT_WRITE,
+		       MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE | MAP_FIXED,
+		       -1, 0);
+	if (r == MAP_FAILED) {
+		/* The window now has a hole under a live memslot.  This is
+		 * fatal-ish: the guest will take an unrecoverable EFAULT on the
+		 * next touch of this GPA, so make the cause visible here rather
+		 * than at the far end.  Most likely vm.max_map_count exhaustion
+		 * from VMA splitting inside the window. */
+		fprintf(stderr,
+			"nvkvm: FATAL: failed to restore anon backing over "
+			"window VA %p+%zu: %s -- sparse window now has a hole "
+			"under its KVM memslot (check vm.max_map_count)\n",
+			qva, len, strerror(errno));
+		return -errno;
+	}
+	return 0;
+}
+
 void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size)
 {
 	if (!nv->sparse_vmm_va || !nv->sparse_free) return;

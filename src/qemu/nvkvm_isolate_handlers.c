@@ -2329,7 +2329,18 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			resp->status = ENOMEM;
 			return 0;
 		}
-		qva = mmap(target, len, req->prot,
+		/*
+		 * Map RW regardless of req->prot.  Inside the window the VA sits
+		 * under the sparse KVM memslot, and KVM resolves a memslot HVA
+		 * with get_user_pages()/hva_to_pfn_remapped(): on a device VMA
+		 * (VM_IO|VM_PFNMAP) that lacks VM_READ or VM_WRITE it cannot
+		 * produce a PFN and fails KVM_RUN with EFAULT -- unrecoverable,
+		 * not a resumable MMIO exit, so the guest dies on the access.
+		 * Narrowing the host VMA buys no isolation anyway: the memslot
+		 * already exposes [gpa, gpa+len) to the guest read-write, and
+		 * the guest's own PTE permissions still come from its mapping.
+		 */
+		qva = mmap(target, len, PROT_READ | PROT_WRITE,
 			   MAP_SHARED | MAP_FIXED, h->fd, (off_t)req->offset);
 		if (qva == MAP_FAILED) {
 			int se = errno;
@@ -2342,9 +2353,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 				(unsigned long long)gpa, se, strerror(se));
 			/* Restore the anonymous backing we just clobbered so the
 			 * window stays fully mapped for KVM. */
-			mmap(target, len, PROT_READ | PROT_WRITE,
-			     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
-			     MAP_FIXED, -1, 0);
+			nvkvm_window_restore_anon(target, len);
 			resp->status = (uint32_t)se;
 			return 0;
 		}
@@ -2414,9 +2423,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		if (kvm_slot == NVKVM_IN_WINDOW_SLOT) {
 			/* Restore anon backing inside the window (no munmap — that
 			 * would punch a hole in the sparse VMA). */
-			mmap(qva, len, PROT_READ | PROT_WRITE,
-			     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
-			     MAP_FIXED, -1, 0);
+			nvkvm_window_restore_anon(qva, len);
 		} else {
 			if (kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
 				struct nvkvm_kvm_mem_region mr = {
@@ -2448,9 +2455,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 					     req->gva, (uint64_t)len);
 		if (kvm_slot == NVKVM_IN_WINDOW_SLOT) {
 			if (qva != MAP_FAILED && qva)
-				mmap(qva, len, PROT_READ | PROT_WRITE,
-				     MAP_ANONYMOUS | MAP_PRIVATE |
-				     MAP_NORESERVE | MAP_FIXED, -1, 0);
+				nvkvm_window_restore_anon(qva, len);
 		} else {
 			if (kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
 				struct nvkvm_kvm_mem_region mr = {
@@ -2499,9 +2504,7 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 		 * window stays fully mapped (the single memslot covers it).
 		 * Do NOT munmap — that would punch a hole in the sparse VMA. */
 		if (e.qva)
-			mmap(e.qva, e.len, PROT_READ | PROT_WRITE,
-			     MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE |
-			     MAP_FIXED, -1, 0);
+			nvkvm_window_restore_anon(e.qva, e.len);
 	} else {
 		/* Legacy path: remove the per-mmap KVM memslot, return it to the
 		 * pool, and unmap the standalone QEMU host VA. */
@@ -2548,9 +2551,7 @@ static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
 
 		if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT) {
 			if (e.qva)
-				mmap(e.qva, e.len, PROT_READ | PROT_WRITE,
-				     MAP_ANONYMOUS | MAP_PRIVATE |
-				     MAP_NORESERVE | MAP_FIXED, -1, 0);
+				nvkvm_window_restore_anon(e.qva, e.len);
 		} else {
 			if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
 				struct nvkvm_kvm_mem_region mr = {

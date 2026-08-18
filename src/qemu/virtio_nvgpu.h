@@ -599,6 +599,18 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size);
 void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size);
 void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size);
 
+/*
+ * nvkvm_window_restore_anon(qva, len): re-establish anonymous MAP_NORESERVE
+ * backing over an extent of the sparse window after the fd mapping that
+ * occupied it is torn down.  The window is covered by a single KVM memslot,
+ * so its VA must stay claimed for the slot's whole lifetime -- a munmap here
+ * would leave the memslot pointing at an unmapped page, and the next guest
+ * access to that GPA fails KVM_RUN with EFAULT (unrecoverable, not an MMIO
+ * exit).  Returns 0 on success, -errno on failure (logged loudly: a silent
+ * failure would reintroduce exactly that hole).
+ */
+int nvkvm_window_restore_anon(void *qva, size_t len);
+
 /* #80/H-2: tear down a session — close its handles, free its RM object graph,
  * fd list, and the struct itself.  Called when the session's last isolate is
  * killed.  Caller must NOT hold nv->sessions_lock. */

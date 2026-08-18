@@ -194,3 +194,57 @@ design. Do not spend time on it.**
 
 ### Check first
 `grep -n munmap src/qemu/nvkvm_mmap_host.c` — specifically the extent-free path.
+
+## 2026-08-18 — root cause located (laptop, RTX 3050, 39-bit MAXPHYADDR)
+
+### Ruled out with direct evidence
+- **The "munmap punches a hole in the window" theory is dead.** QEMU was patched to
+  dump `/proc/self/maps` at the exact `kvm run failed` site. At fault time the
+  64 GiB window has **24 VMAs and ZERO holes** — fully covered. The
+  in-window-restore invariant is already implemented and holding: every teardown
+  path is guarded by `kvm_slot == NVKVM_IN_WINDOW_SLOT` and re-maps anonymous
+  `MAP_NORESERVE` backing instead of munmapping.
+- **No hardcoded GPA/VA left in the guest module** (only a `"nvkvm"` tag constant).
+- `vm.max_map_count` = 1048576 — not VMA exhaustion.
+
+### Root cause
+The window's single memslot covers **device-fd VMAs** (`/dev/nvidia0`,
+`/dev/nvidiactl`) that the NVIDIA driver maps with `VM_IO|VM_PFNMAP`. KVM
+resolves a memslot HVA via `get_user_pages()` / `hva_to_pfn_remapped()`. On a
+VMA that lacks the required `VM_READ`/`VM_WRITE` it cannot produce a PFN and
+fails `KVM_RUN` with `EFAULT` — **unrecoverable, not a resumable MMIO exit**,
+so the guest dies on the access rather than getting an error back.
+
+Fault-time snapshot (window base `0x7d9750000000`):
+```
+7d9750021000-7d9750031000 rw-s /dev/nvidia0
+7d9750031000-7d9750032000 r--s /dev/nvidiactl   <-- READ-ONLY page under the memslot
+7d9750032000-7d9750232000 rw-s /dev/nvidia0
+```
+The faulting instruction is a **store** (`Code=... <89> 07` = `mov %eax,(%edi)`,
+CPL=3). A guest store into that read-only page → `gup(write=1)` fails → EFAULT.
+
+We now request `PROT_READ|PROT_WRITE` for every in-window mapping, and every
+neighbouring VMA from the same code path duly comes back `rw-s`. That single
+page still comes back `r--s`, so **the driver's own mmap handler clears
+VM_WRITE** on it. It is read-only by the driver's construction, not by our
+prot argument.
+
+### Fixed in this branch (both correct hardening, neither is the cure)
+1. `nvkvm_window_restore_anon()` — all 7 in-window restore sites now go through a
+   checked helper that screams if a restore ever fails (previously the `mmap`
+   return value was ignored at every site, so a failure would have silently left
+   a hole under a live memslot).
+2. In-window mappings are created `PROT_READ|PROT_WRITE` instead of inheriting
+   the guest's `req->prot`. Narrowing the host VMA bought no isolation (the
+   memslot already exposes the range RW; guest PTE permissions come from the
+   guest's own mapping) and was an EFAULT hazard. This did fix a write-only
+   `/dev/nvidia0` VMA that was previously `-w-s`.
+
+### Next step
+A driver-imposed read-only page cannot be safely backed by the sparse memslot.
+Either keep such pages out of the window (give them their own non-memslot /
+MMIO-trapped path so the access is emulated and resumable), or determine why the
+guest stores to it at all — it may be a *mis-mapped* object (guest expects a
+writable allocation, we placed a read-only `nvidiactl` page at that GPA).
+Worth checking which handle/offset produces this 4 KiB `nvidiactl` mapping.
