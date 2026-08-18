@@ -2379,6 +2379,21 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		 * address space, and the GPU reaches the memory by DMA rather
 		 * than through a QEMU CPU memslot.
 		 */
+		/*
+		 * Pre-fault the mapping from QEMU.  The driver may leave the VMA
+		 * with no PTEs installed (pagemap shows present=0 on an rw-s
+		 * /dev/nvidia0 VMA).  KVM cannot populate those on demand: for a
+		 * VM_IO|VM_PFNMAP VMA it falls back to fixup_user_fault(), which
+		 * returns SIGBUS when there is no usable ->fault handler, and
+		 * KVM_RUN then fails with EFAULT.  Touching each page here forces
+		 * the PTEs in while we are still on a normal userspace fault path.
+		 * Reads only -- never write, that would disturb device state.
+		 */
+		{
+			volatile const uint8_t *p = (volatile const uint8_t *)qva;
+			for (size_t o = 0; o < len; o += 4096)
+				(void)p[o];
+		}
 		if (mprotect(qva, len, PROT_READ | PROT_WRITE) != 0) {
 			NVKVM_DBG("nvkvm: WINMAP gpa=0x%llx len=%lu is "
 				  "driver-readonly (%s) -- falling back to "

@@ -283,6 +283,19 @@ bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 	memset(out, 0, sizeof(*out));
 
 	host_bits  = nvkvm_host_phys_bits();
+	{	/* Debug knob: pretend the host has a narrower physical address
+		 * width, so a wide server exercises the same shrunk-window path a
+		 * narrow laptop takes.  Diagnostic only. */
+		const char *fb = getenv("NVKVM_FORCE_HOST_BITS");
+		if (fb && *fb) {
+			uint32_t v = (uint32_t)atoi(fb);
+			if (v >= 32 && v <= 52) {
+				fprintf(stderr, "nvkvm: NVKVM_FORCE_HOST_BITS=%u "
+					"(real %u)\n", v, host_bits);
+				host_bits = v;
+			}
+		}
+	}
 	guest_bits = nvkvm_guest_phys_bits();
 
 	/* Take the narrower of the two: the host width bounds what KVM will
@@ -453,6 +466,11 @@ static int  kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 				   bool readonly, int *slot_out);
 static void kvm_remove_memory_region(int slot);
 
+/* Debug: window base/len, read by the KVM fault path (see kvm-all.c). */
+void    *nvkvm_dbg_window_va;
+uint64_t nvkvm_dbg_window_gpa;
+uint64_t nvkvm_dbg_window_len;
+
 /*
  * One-shot setup of the sparse window — large MAP_NORESERVE region in
  * QEMU's mm + a single KVM memory slot covering the whole GPA range.
@@ -588,6 +606,11 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 	}
 	nv->sparse_gpa_base = base;
 	nv->sparse_kvm_slot = slot;
+	/* Debug hooks so the KVM fault path can map a faulting GPA back to the
+	 * window HVA and inspect its PTE via /proc/self/pagemap. */
+	nvkvm_dbg_window_va  = nv->sparse_vmm_va;
+	nvkvm_dbg_window_gpa = base;
+	nvkvm_dbg_window_len = nv->sparse_size;
 	pthread_mutex_unlock(&nv->sparse_lock);
 	NVKVM_DBG("nvkvm_sparse_ensure: %llu GiB at GPA=0x%llx slot=%d\n",
 		  (unsigned long long)(nv->sparse_size >> 30),
