@@ -201,6 +201,63 @@ Signs of specific failures:
 | `nvkvm: DENY ctrl cmd 0x...` | a control command outside the allowlist; see [Allowlists](../reference/allowlists.md) |
 | `nvkvm: host driver <v> → ABI profile <n>` | informational, printed at realize — confirm the profile matches your driver |
 
+## Isolate sandbox mode
+
+The isolate sandbox has four rungs. The default is `auto`, which probes and
+picks the strongest one this host can actually run.
+
+```bash
+# default — probe: namespace -> uid(+chroot) -> seccomp.  Never picks `none`.
+NVKVM_ISOLATE_MODE=auto  bash scripts/run_test_vm.sh
+
+# pin a rung (fails loudly at startup if it cannot run here)
+NVKVM_ISOLATE_MODE=namespace   bash scripts/run_test_vm.sh   # strongest
+NVKVM_ISOLATE_MODE=uid+chroot  bash scripts/run_test_vm.sh   # containers
+NVKVM_ISOLATE_MODE=uid         bash scripts/run_test_vm.sh
+NVKVM_ISOLATE_MODE=seccomp     bash scripts/run_test_vm.sh   # lowest real rung
+
+# one uid window per concurrently-running VM, 4096 apart
+NVKVM_ISOLATE_UID_BASE=504096 NVKVM_ISOLATE_MODE=uid bash scripts/run_test_vm.sh
+```
+
+**If you are running nvkvm inside a container, read this.** `namespace` mode
+cannot run under Docker's default profile — `docker run` with no security flags
+blocks `CLONE_NEWUSER` through its default seccomp profile and its
+`docker-default` AppArmor policy. The kernel sysctls will *not* tell you this:
+on a stock container `kernel.unprivileged_userns_clone` reads `1` and
+`user.max_user_namespaces` reads `55416` while `unshare -U` still fails. Use
+`auto` (which attempts the clone and finds out) or pin `uid+chroot`, and add
+`--cap-add=SETUID --cap-add=SETGID --cap-add=SYS_CHROOT` if your runtime has
+dropped them.
+
+`uid+chroot` is a **materially weaker** boundary than `namespace`. Read
+[The isolate model → Isolation modes](../internal/isolate-model.md#isolation-modes)
+before relying on it.
+
+### Which mode am I actually on?
+
+Two ways, and `auto` makes sure you do not have to go looking:
+
+1. QEMU logs the resolved mode at startup, at **warning** level whenever it is
+   weaker than `namespace`, together with which stronger rungs were attempted
+   and why each failed.
+2. Query it:
+
+   ```bash
+   # add -qmp unix:/tmp/mon.sock,server,nowait to the QEMU command line
+   { "execute": "qom-get", "arguments": {
+       "path": "/machine/peripheral-anon/device[1]/virtio-backend",
+       "property": "isolate-mode-active" } }
+   { "return": "isolate sandbox: uid+chroot (uid window 500000..504095, 4096 slots)" }
+   ```
+
+   The property is on the virtio **backend**, not the PCI proxy — with an
+   explicit `id=` the path is `/machine/peripheral/<id>/virtio-backend`.
+
+`NVKVM_ISOLATE_MODE=none` removes every boundary, including the stub's seccomp
+filter, and refuses to start without
+`NVKVM_ISOLATE_UNSAFE_ACK=i-understand-this-removes-all-isolation`.
+
 ## Compute-only checklist
 
 Both halves, or neither:

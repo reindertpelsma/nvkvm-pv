@@ -26,6 +26,7 @@
 #include <sys/types.h>
 
 #include "nvkvm_handle.h"
+#include "nvkvm_isolate_uid.h"
 
 #define NVKVM_ISOLATE_MAX  4096
 
@@ -45,6 +46,16 @@ struct nvkvm_isolate {
 	bool        in_use;
 	void       *nv;       /* #127: owning VirtIONvgpu, so the reader thread can
 	                       * push os-event wakeups (vq_evt). Copied from table->nv. */
+
+	/*
+	 * UID-separation mode only (NVKVM_ISO_MODE_UID): the unique host uid/gid
+	 * this isolate's stub runs as.  0 when the mode is off.  Derived from the
+	 * slot index, so it is unique among the VM's live isolates by construction
+	 * and is only re-issued after nvkvm_isolate_kill() has waitpid()'d the
+	 * previous holder (see nvkvm_isolate_uid.h).
+	 */
+	uid_t       run_uid;
+	gid_t       run_gid;
 
 	/*
 	 * lock: protects alive, in_use, pending_head, next_txn_id.
@@ -137,6 +148,14 @@ struct nvkvm_isolate_table {
 	uint32_t             next_id;
 	uint32_t             abi_profile;  /* #81: per-VM ABI id stamped into IOCTLs */
 	/*
+	 * Resolved isolation configuration for this VM (mode + uid window).
+	 * Filled by nvkvm_isolate_table_init() from the environment; validated
+	 * up front by nvkvm_isolate_cfg_check() at device realize.
+	 */
+	struct nvkvm_isolate_cfg cfg;
+	char                     cfg_error[256];  /* non-empty => config unusable */
+	char                     cfg_report[1024];/* what `auto` probed and chose */
+	/*
 	 * Owning VirtIONvgpu (opaque here to avoid a header cycle).  Set on the
 	 * first isolate create; used by ring setup/teardown to place the ring
 	 * memfd in the sparse GPA window (nvkvm_sparse_gpa_alloc/free) so the
@@ -146,6 +165,38 @@ struct nvkvm_isolate_table {
 };
 
 void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t);
+
+/*
+ * Validate the resolved isolation configuration against what this host can
+ * actually do, ONCE, at device realize.  Returns 0, or -1 with a
+ * human-readable reason written to `err`.
+ *
+ * This is deliberately up front: UID mode needs CAP_SETUID/CAP_SETGID, and
+ * discovering that at the first setresuid() — inside a forked child, three
+ * layers below the guest's first GPU ioctl — surfaces as an opaque isolate
+ * spawn failure.  It never falls back to a different mode: silently
+ * downgrading a security boundary is worse than refusing to start.
+ */
+int nvkvm_isolate_cfg_check(const struct nvkvm_isolate_table *t,
+			    char *err, size_t errsz);
+
+/*
+ * True when the resolved mode is weaker than `namespace`.  The caller logs
+ * nvkvm_isolate_cfg_report() at WARNING level in that case, at every start, so
+ * an operator reading their logs finds out they are on a weaker boundary
+ * without going looking for it.
+ */
+bool nvkvm_isolate_cfg_is_degraded(const struct nvkvm_isolate_table *t);
+
+/* True for mode 'none' — every layer off, including the seccomp filter. */
+bool nvkvm_isolate_cfg_is_unconfined(const struct nvkvm_isolate_table *t);
+
+/* Multi-line account of what `auto` attempted and why each rung was rejected. */
+const char *nvkvm_isolate_cfg_report(const struct nvkvm_isolate_table *t);
+
+/* Human-readable one-liner describing the active mode (for startup logging). */
+const char *nvkvm_isolate_cfg_describe(const struct nvkvm_isolate_table *t,
+				       char *buf, size_t bufsz);
 void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t);
 
 /*

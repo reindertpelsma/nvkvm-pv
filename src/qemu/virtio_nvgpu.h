@@ -230,6 +230,17 @@ typedef struct VirtIONvgpu {
 	 * device opens + ioctls) regardless of the untrusted guest. */
 	bool                graphics;
 
+	/*
+	 * The isolation mode actually in force, resolved at realize (mode `auto`
+	 * probes the ladder, so the configured value and the effective value can
+	 * differ).  Exposed as the read-only QOM property "isolate-mode-active"
+	 * so an operator or a monitoring check can read it back:
+	 *     (qemu) qom-get /machine/peripheral/<id> isolate-mode-active
+	 * The failure mode this defends against is an operator who believes they
+	 * have namespace isolation and has no way to check.
+	 */
+	char               *isolate_mode_active;
+
 	/* Mmap window: GPA range for GPU memory mappings */
 	uint64_t            mmap_win_gpa;
 	size_t              mmap_win_size;

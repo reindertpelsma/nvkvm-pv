@@ -326,10 +326,26 @@ Specific things a reader should weigh:
 - **The guest does not defend against the host.** `src/guest/nvkvm_mmap.c:18-20`:
   "A malicious host could abuse this, but we are not defending against the
   hypervisor."
-- **`NVKVM_ISOLATE_NO_HARDEN=1`** disables namespaces, capability dropping and
-  the `pivot_root` sandbox wholesale (`src/qemu/nvkvm_isolate.c:795`). It is a
-  debugging hatch. `NVKVM_STUB_DEBUG=1` additionally keeps the stub's stdio and
-  its inherited environment (`src/qemu/nvkvm_isolate.c:841-851`, `:870-874`).
+- **The isolate sandbox has four rungs, and in a container you will not be on
+  the strongest one.** `namespace` mode (namespaces + `pivot_root` + seccomp) is
+  the strongest and **cannot run under Docker's default profile** — `docker run`
+  with no security flags blocks `CLONE_NEWUSER` via its default seccomp profile
+  and AppArmor policy, regardless of what `kernel.unprivileged_userns_clone` and
+  `user.max_user_namespaces` say. The default mode `auto` therefore lands
+  containerized deployments on `uid+chroot`, which is **materially weaker**: no
+  pid/net/ipc/uts namespace, `/dev/nvidia-uvm` reachable by the stub (bypassing
+  QEMU's UVM allowlist), and `/dev/shm` shared with the host. `auto` logs this
+  at warning level at every start and the effective mode is readable back via
+  the `isolate-mode-active` QOM property. Full per-rung comparison:
+  [The isolate model → Isolation modes](isolate-model.md#isolation-modes).
+- **`NVKVM_ISOLATE_MODE=none`** removes every boundary including the stub's
+  seccomp filter. It requires an explicit
+  `NVKVM_ISOLATE_UNSAFE_ACK=i-understand-this-removes-all-isolation` and is a
+  debugging hatch, never a deployment mode. `auto` will never select it.
+  **`NVKVM_ISOLATE_NO_HARDEN=1`** is the legacy hatch and maps to the `seccomp`
+  rung — namespaces off, stub seccomp filter still applied, which is what it has
+  always done. `NVKVM_STUB_DEBUG=1` additionally keeps the stub's stdio and its
+  inherited environment (`src/qemu/nvkvm_isolate.c`).
 
 Do not put untrusted tenants behind this.
 

@@ -1094,6 +1094,20 @@ VirtIONvgpu *nvkvm_get_global_device(void)
  * is set in the environment; errors and security DENY logs are unconditional. */
 int nvkvm_debug_enabled;
 
+/*
+ * Read-only QOM property backing "isolate-mode-active": the isolation mode
+ * that is actually in force after `auto` has probed the ladder.  Readable with
+ *     (qemu) qom-get /machine/peripheral/<id> isolate-mode-active
+ * or over QMP, so a monitoring check can assert the boundary it expects
+ * instead of trusting that the configured mode is the one that happened.
+ */
+static char *nvkvm_get_isolate_mode_active(Object *obj, Error **errp)
+{
+	VirtIONvgpu *nv = VIRTIO_NVGPU(obj);
+	return g_strdup(nv->isolate_mode_active ? nv->isolate_mode_active
+					        : "unknown");
+}
+
 static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 {
 	VirtIODevice *vdev = VIRTIO_DEVICE(dev);
@@ -1211,6 +1225,65 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	 * stub uses matching version-variant offsets. */
 	nv->isolates.abi_profile = nv->abi ? nv->abi->id : NVKVM_ABI_570;
 
+	/*
+	 * Validate the isolate sandbox configuration ONCE, here, before the guest
+	 * exists.  UID-separation mode needs CAP_SETUID/CAP_SETGID; finding that
+	 * out at the first setresuid() — in a forked child, behind the guest's
+	 * first GPU ioctl — shows up as an opaque spawn failure with forwarding
+	 * silently off.  Fail the realize instead, and never fall back to a
+	 * different mode than the one that was asked for.
+	 */
+	{
+		char cfg_err[256], cfg_desc[256];
+		if (nvkvm_isolate_cfg_check(&nv->isolates, cfg_err,
+					    sizeof(cfg_err)) != 0) {
+			error_setg(errp, "nvkvm: %s", cfg_err);
+			return;
+		}
+		nvkvm_isolate_cfg_describe(&nv->isolates, cfg_desc,
+					   sizeof(cfg_desc));
+
+		/*
+		 * Anything weaker than namespace mode is reported at WARNING
+		 * level, at every start — not as a debug line. Someone reading
+		 * their logs must be able to discover they are on a weaker
+		 * boundary without going looking for it, so the report names
+		 * the selected rung, the stronger rungs that were attempted and
+		 * why each was rejected.
+		 */
+		const char *rep = nvkvm_isolate_cfg_report(&nv->isolates);
+		if (nvkvm_isolate_cfg_is_unconfined(&nv->isolates)) {
+			/* Unmissable, at every start.  This mode required an
+			 * explicit acknowledgement to reach, and it is still
+			 * worth shouting about on the way past. */
+			warn_report("nvkvm: ****************************************");
+			warn_report("nvkvm: * ISOLATE CONFINEMENT IS COMPLETELY OFF *");
+			warn_report("nvkvm: ****************************************");
+			warn_report("nvkvm: isolate mode 'none': no namespaces, no "
+				    "uid separation, and the stub's seccomp "
+				    "filter is NOT installed. A compromised "
+				    "isolate has the full privileges of this "
+				    "QEMU process. Debugging only.");
+		} else if (nvkvm_isolate_cfg_is_degraded(&nv->isolates)) {
+			warn_report("nvkvm: %s", cfg_desc);
+			if (rep && *rep)
+				warn_report("nvkvm: %s", rep);
+			warn_report("nvkvm: this is WEAKER than the default "
+				    "'namespace' isolation — see "
+				    "docs/internal/isolate-model.md");
+		} else {
+			info_report("nvkvm: %s", cfg_desc);
+			if (rep && *rep)
+				info_report("nvkvm: %s", rep);
+		}
+
+		/* Queryable after startup, not just logged. */
+		g_free(nv->isolate_mode_active);
+		nv->isolate_mode_active = g_strdup(cfg_desc);
+		object_property_add_str(OBJECT(dev), "isolate-mode-active",
+					nvkvm_get_isolate_mode_active, NULL);
+	}
+
 	/* #66 admin subdevice (lazy; for GET_PID_INFO per-process VRAM) */
 	pthread_mutex_init(&nv->admin_lock, NULL);
 	nv->admin_ctl_fd = -1;
@@ -1302,6 +1375,9 @@ static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 	/* Tear down isolates and handles before shared memory */
 	nvkvm_isolate_table_fini(&nv->isolates);
 	nvkvm_handle_table_fini(&nv->handles);
+
+	g_free(nv->isolate_mode_active);
+	nv->isolate_mode_active = NULL;
 
 	/* #66 admin subdevice: closing the fds frees its RM objects. */
 	if (nv->admin_ctl_fd >= 0) close(nv->admin_ctl_fd);
