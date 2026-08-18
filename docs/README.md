@@ -23,6 +23,7 @@ value is), or rationale (why it is that way).
 |---|---|
 | [ABI profiles](reference/abi-profiles.md) | the version-keyed table, how it is measured, how it reaches all three components |
 | [Supported drivers and GPUs](reference/supported-drivers.md) | which profile rows have actually been booted, and which have only been measured |
+- [Correctness and known issues](reference/correctness.md) — what is known to be wrong, how far it is traced, and how to reproduce it
 | [Allowlists](reference/allowlists.md) | all six default-deny gates, their contents and provenance |
 | [Virtio protocol](reference/virtio-protocol.md) | virtqueues, shared memory, request types, GPA windows |
 | [Device nodes](reference/device-nodes.md) | what appears in the guest, major/minor numbers, and why each one exists |

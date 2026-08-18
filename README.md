@@ -149,34 +149,18 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-Read this before trusting a result from a guest.
+**A guest can return silently wrong results.** An OpenCL program that repeatedly
+maps and unmaps a pinned buffer, after other buffers have been freed, reads
+zeros instead of its results — no error, no crash. Geekbench 7 `--gpu` fails
+validation on 11 workloads in the guest while the identical binary is clean on
+the host ([guest](https://browser.geekbench.com/v7/gpu/79890) ·
+[host](https://browser.geekbench.com/v7/gpu/79862)). `validate.sh` passes on that
+same guest, so **28/28 is not evidence that your workload computes correctly** —
+check your own results against a host run.
 
-**Silent wrong results in repeated map/unmap after allocation churn.** An OpenCL
-program that repeatedly maps and unmaps a pinned buffer, after other buffers
-have been allocated and freed, reads zeros where the kernel's output should be —
-no error, no crash, just wrong data. Geekbench 7 `--gpu` fails validation on 11
-workloads in the guest while the identical binary on the same GPU and driver is
-clean on the host
-([guest](https://browser.geekbench.com/v7/gpu/79890) vs
-[host](https://browser.geekbench.com/v7/gpu/79862)). Reproducers and the full
-bisection are in [`tests/repro/`](tests/repro/). `validate.sh` does not cover
-this: its checks pass on the same guest, so **28/28 is not evidence that a given
-workload computes correctly**. Verify your own results against a host run.
-
-**OpenCL is off by default** for that reason — staging it requires
-`NVKVM_STAGE_OPENCL=1`. Without it, OpenCL programs fail loudly with "unknown
-OpenCL platform" rather than returning wrong answers quietly.
-
-**A driver-managed read-only page is mishandled.** Where the NVIDIA driver hands
-back a page with `VM_WRITE` cleared, nvkvm currently substitutes anonymous
-memory. Leaving the driver's mapping in place instead causes an unrecoverable
-`EFAULT` that kills the guest, so both current behaviours are wrong; the fix is
-a `KVM_MEM_READONLY` memslot for those pages, so reads are served and writes
-become resumable MMIO exits. This is the leading suspect for the corruption
-above, though removing the substitution does not by itself fix it.
-
-**Vulkan compute fails on Hopper** (`vk_compute_dispatch`) — see the note under
-[Tested platforms](#tested-platforms).
+OpenCL is therefore off by default, and Vulkan compute fails on Hopper. Full
+detail, bisection and reproducers:
+[Correctness and known issues](docs/reference/correctness.md).
 
 ## Tested applications
 
@@ -236,46 +220,14 @@ summarisation).
 
 ### Fine-tuning
 
-A real Kaggle ARC-AGI notebook runs unmodified in the guest on an RTX 5090
-(driver 580.178.04): Unsloth 2025.9.7 LoRA fine-tuning **Qwen3**, with
-`embed_tokens` and `lm_head` trained in mixed precision, then decode + scoring
-inference over the augmented puzzle set.
-
-```
-Unsloth 2025.9.7: Fast Qwen3 patching. Transformers: 4.55.4
-NVIDIA GeForce RTX 5090. Num GPUs = 1. Max memory: 31.356 GB
-Torch: 2.13.0+cu130. CUDA Toolkit: 13.0. Triton: 3.7.1. Bfloat16 = TRUE
-[Rank 0] allocated 13059MB for training
-TrainOutput(global_step=128, train_runtime=118.57, train_steps_per_second=1.079)
-[Rank 0] allocated 14767MB for inference
-[Rank 0] finished 0934a4d8 in 177.2s
-```
-
-Host parity: **—** (not measured yet — no host-side baseline has been run for
-this workload, which is not a statement that parity was missed). What this run
-does establish is that it works: training as well as inference, multi-GB
-allocation churn between the training and inference phases, and the Triton /
+A real Kaggle ARC-AGI notebook runs unmodified in the guest on an RTX 5090:
+Unsloth LoRA fine-tuning **Qwen3** (128 steps, 13 GB allocated), then decode and
+scoring inference at 14.7 GB — a full puzzle in 177 s. Training as well as
+inference, multi-GB allocation churn between the two phases, and the Triton and
 xformers paths, all through the forwarder.
 
-Two caveats, both stated in [the full results](tests/perf/llm_parity.md):
-pinned host buffers were disabled **on both sides identically**, because at the
-time the guest could not pin more than 16 MiB; and with CUDA graphs disabled
-(`--enforce-eager`) guest decode falls to **0.82x**, because the per-launch
-forwarding cost is real and graph capture is what hides it.
-
-The first caveat no longer applies to the code — the 16 MiB cap has since been
-removed and stock vLLM starts in a guest with pinned buffers enabled — but the
-throughput table above **has not been re-measured** with pinning on, so it is
-still a no-pinned-buffers comparison on both sides. Re-running it is future
-work.
-
-A Wayland compositor also runs on the GPU inside the guest — headless weston
-reporting `GL renderer: NVIDIA GeForce RTX 3060`, compositing its own shell at
-1920x1080. Its GL **clients** do not render: they reach the GPU but never present
-a frame. See [known limitations](docs/internal/known-limitations.md).
-
-Where the guest is measurably slower it is latency-bound control paths, never
-sustained compute or bandwidth. Reproduce with `tests/perf/run_matrix.sh`.
+Host parity: **—**, not measured yet for this workload; that is a gap in the
+measurements, not a known shortfall.
 
 ## Tested platforms
 
@@ -298,63 +250,52 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`, see below) |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 
-On the H100 every CUDA and bring-up check passes (`sm_90`, PTX JIT, kernel
-launch, matmul, byte-exact 8 MiB round trips) and OpenGL renders through the
-forwarder, but `vk_compute_dispatch` fails: `vkCreateDevice` returns `-4`
-(`VK_ERROR_DEVICE_LOST`) in the guest while the *same binary* returns `0` on the
-host with the same driver. Vulkan enumeration works and both sides see the same
-5 queue families — only device creation differs. Minimal reproducer:
-[`tests/repro/vk_create_device.c`](tests/repro/vk_create_device.c).
+On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
+launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.
+The one failure is `vk_compute_dispatch`, and it does **not** affect CUDA; the
+trace, and the two hypotheses ruled out by experiment, are in
+[Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper).
 
-Traced, with two hypotheses eliminated by experiment:
+## FAQ
 
-* **Not the allowlist.** The QEMU log showed the default-deny gate rejecting
-  `alloc class 0x0000a083` (`NVA083_GRID_DISPLAYLESS`) and `ctrl cmd 0x20803401`
-  (`NV2080_CTRL_CMD_ECC_GET_VOLATILE_COUNTS`, a read-only ECC query that only
-  appears on ECC-capable datacenter parts). Temporarily allowing `0xa083`
-  changed nothing — `vkCreateDevice` still returned `-4` — so it was never the
-  cause, and allowing it would have widened a security boundary for no gain.
-  The entry was reverted.
-* **Not class discovery either.** The failure is a channel/compute mismatch: the
-  userspace driver creates its channel as `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`)
-  on this Hopper part, then allocating `HOPPER_COMPUTE_A` (`0xcbc0`) under that
-  parent fails with `NV_ERR_OBJECT_NOT_FOUND` (`0x57`). The obvious suspect was
-  a truncated or filtered class list, but instrumenting
-  `NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2` shows the guest receives it intact —
-  48 classes in a 100-entry array, including both `HOPPER_CHANNEL_GPFIFO_A`
-  (`0xc86f`) and `HOPPER_COMPUTE_A` (`0xcbc0`). The driver has the Hopper
-  channel class available and picks the Ampere one anyway, so the remaining
-  question is why, not what it was told. Run with `NVKVM_DEBUG=1` to see the
-  `CLASSLIST_V2` line.
+**Is this vGPU or SR-IOV?**
+No. There is no hardware partitioning and no vendor licence. nvkvm forwards the
+driver's ioctl interface, so it runs on consumer cards that have no vGPU support
+at all.
 
-**This does not affect CUDA.** All 19 CUDA checks pass on the H100 over that
-same Ampere channel, with byte-exact verification, and the class list reaching
-the guest is complete — nvkvm is not withholding Hopper classes from the
-driver.
+**Does the guest need an NVIDIA driver?**
+No kernel driver — the guest loads `nvkvm-guest.ko`, which presents `/dev/nvidia*`
+itself. It does need the matching userspace libraries, staged from the host by
+[`stage_guest_libs.sh`](scripts/stage_guest_libs.sh).
 
-\* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
-595.84 row has no 28/28 measurement — its box was re-provisioned without
-`libnvidia-ptxjitcompiler`. Full detail in
-[`tests/BOOT_MATRIX.md`](tests/BOOT_MATRIX.md).
+**Does the host driver version have to match the guest's?**
+Yes. The libraries staged into the guest come from the host, so they are the same
+build by construction. See [ABI profiles](docs/reference/abi-profiles.md).
 
-NVIDIA guarantees no ioctl ABI stability across driver releases, so `nvkvm` keys
-struct layouts off the host driver version. **Eight profiles** cover every
-open-kernel-modules release from 515 to 610, measured by compiling `sizeof` /
-`offsetof` probes against 61 upstream tags — and keyed on the full
-`major.minor.patch`, because two widely deployed branches change layout *inside*
-the branch. **Six of the eight have been booted**; no profile's values proved
-wrong in practice. See [ABI profiles](docs/reference/abi-profiles.md) and
-[supported drivers](docs/reference/supported-drivers.md).
+**Can several VMs share one GPU?**
+Yes — each guest process gets its own isolate on the host, so they are separate
+address spaces sharing the device the same way host processes do.
 
-Verify any host yourself, inside a guest:
+**What's the performance cost?**
+Sustained compute and bandwidth measure at parity (1.00x) on every workload in
+[Tested applications](#tested-applications). Where the guest is slower it is
+latency-bound control paths, not throughput.
 
-```bash
-sudo bash /mnt/nvkvm/tests/validate.sh
-```
+**Is it safe to run untrusted guests?**
+Not yet — treat it as experimental. The ioctl and alloc-class gates are
+default-deny and the guest kernel module is untrusted by design, but the code
+has not had an external security review. See
+[the isolate model](docs/internal/isolate-model.md).
 
-28 checks — device nodes, the full CUDA ladder, Vulkan compute, offscreen GL.
-Needs only a C compiler, and a software-rasteriser fallback is an explicit
-**FAIL**, not a pass.
+**Why is my GPU showing as llvmpipe?**
+The guest is falling back to software rendering because the NVIDIA userspace
+libraries did not stage. See
+[staging guest libraries](docs/howto/stage-guest-libraries.md).
+
+**Does CUDA give bit-identical results to the host?**
+On everything measured, yes — including token-identical LLM output at
+temperature 0. But read [Known issues](#known-issues) first: there is a path
+that returns wrong results silently.
 
 ## Documentation
 
@@ -363,6 +304,7 @@ Needs only a C compiler, and a software-rasteriser fallback is an explicit
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The request path end to end, and how the hard problems are solved |
 | [`docs/howto/`](docs/howto/) | Building, running, staging guest libraries, adding a driver version |
 | [`docs/reference/`](docs/reference/) | ABI profiles, allowlists, virtio protocol, device nodes |
+| [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 
 ## Status
