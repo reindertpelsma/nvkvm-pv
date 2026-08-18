@@ -569,11 +569,25 @@ open-gpu-kernel-modules defines a single `NV_CHANNEL_ALLOC_PARAMS`, aliased as
 only Hopper's *control* struct, not its own alloc params. Hopper therefore shares
 the same `chan_alloc_size` the group already uses.
 
-**It has not been booted, and cannot be on vast.ai.** Of 17 H100/H200/B200 offers
-available, **zero** have `vms_enabled` — the KVM template that every other row in
-this matrix was tested with is not offered on any datacenter-GPU host. The only
-datacenter card with VM support at all was a single Quadro RTX 6000, which is
-Turing and already covered.
+**It has not been booted, and cannot be on vast.ai.** This is not a Hopper-specific
+shortage — datacenter GPUs on vast do not offer VM support at all. Measured across
+620 single-GPU offers on 2026-08-18:
+
+| class | offers | `vms_enabled` | |
+|---|---|---|---|
+| consumer (other) | 314 | 24 | 7.6% |
+| consumer Blackwell | 129 | 9 | 7.0% |
+| consumer Ada | 108 | 7 | 6.5% |
+| **datacenter Ampere/Ada** (A100, L40, V100) | **52** | **0** | **0%** |
+| **datacenter Hopper/Blackwell** (H100, H200, B200) | **17** | **0** | **0%** |
+
+Zero of 69 datacenter offers, across two independent categories, against a ~7%
+consumer base rate — under which you would expect about five. So the KVM template
+this matrix depends on is simply not offered on datacenter hardware.
+
+Testing Hopper needs nested virtualisation plus an H100 from somewhere else: a
+bare-metal cloud instance (AWS `.metal`, GCP with nested virt enabled) or physical
+hardware.
 
 Testing Hopper needs a host with nested virtualisation and an H100 from somewhere
 other than vast — a bare-metal cloud instance, or hardware access. Recorded as an
