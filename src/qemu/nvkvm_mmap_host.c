@@ -378,7 +378,20 @@ bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 			+ sparse_size;
 
 		if (span <= limit) {
-			base = nvkvm_align_down(limit - span, NVKVM_GPA_ALIGN);
+			/*
+			 * Leave the top eighth of the address space free
+			 * rather than butting the block against the ceiling.
+			 * MEASURED: on a 46-bit host firmware placed the BAR
+			 * at 0x380000000000 -- 8 TiB below the top, i.e. one
+			 * eighth clear -- so it evidently wants room up there.
+			 * On a 39-bit host `limit - span` leaves ZERO margin
+			 * and SeaBIOS assigned no BAR at all.  Reserve the
+			 * same proportion it chooses for itself when it has
+			 * the space.
+			 */
+			uint64_t ceiling = limit - (limit / 8);
+
+			base = nvkvm_align_down(ceiling - span, NVKVM_GPA_ALIGN);
 			if (base >= floor) {
 				out->sparse_size = sparse_size;
 				out->block_base  = base;

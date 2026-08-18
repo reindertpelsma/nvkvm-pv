@@ -42,6 +42,26 @@ Deterministic.
   BARs. Check the virtio-nvgpu function instead — BAR checks against `00:07.0` are
   measuring the wrong device.
 
+## Headroom fix — CONFIRMED PROGRESS, hang persists
+
+Placing the block at `limit - span` left ZERO margin at the top. MEASURED: with
+`ceiling = limit - limit/8` the block moved 431 GiB -> 367 GiB and SeaBIOS then
+assigned the BAR immediately:
+
+```
+00:04.0 Red Hat, Inc. Device 1072
+    Region 2: Memory at 6000000000 (64-bit, prefetchable) [size=64G]
+```
+
+exactly the computed `sparse_base`. Before this it assigned NO BAR at all. The
+1/8 rule also reproduces what firmware picks unaided on a wide host: on 46-bit it
+computes 0x37dbc0000000 against the 0x380000000000 the firmware chose itself.
+
+**So "BAR is not assigned" is now RULED OUT as the cause of the hang.** The window
+is present, correctly sized and at the expected base, and the guest still hangs on
+first sustained use: log stalls at module load, QEMU 7.6% CPU state Ssl, guest SSH
+times out, GPU 0% / 33 MiB. The hang is in what happens *after* the window exists.
+
 ## Next step
 
 Trace where the guest blocks on first sustained window access. `nvkvm_sparse_ensure()`
