@@ -26,6 +26,8 @@ From a user's perspective, this is what it buys you:
 - **keep your existing container workflow** — Docker with
   `nvidia-container-toolkit` works unmodified inside the guest, so
   `docker run --gpus all` behaves as it does on the host
+- **pass several GPUs to one guest** — multiple devices are autodetected and
+  independently usable, verified concurrently on two cards
 
 It is fast because the guest is not in a hot path. Control calls are forwarded;
 the work itself is not. A kernel launch reaches the GPU as a store to a mapped
