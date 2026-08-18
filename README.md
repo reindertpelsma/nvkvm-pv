@@ -272,8 +272,10 @@ at all.
 
 **So how are resources divided between guests?**
 They are not. Nothing is partitioned: guests share VRAM, SMs and bandwidth
-dynamically, the way containers share a CPU. There is no per-guest VRAM
-reservation and no quota, so one guest can exhaust the card for the others.
+dynamically, exactly as GPU containers on one card do today. There is no
+per-guest VRAM reservation and no quota, so one guest can exhaust the card for
+the others. If you need hard partitioning, MIG sits *below* the interface nvkvm
+forwards and should compose with it — but that is untested.
 
 **Does the guest need an NVIDIA driver?**
 No kernel driver — the guest loads `nvkvm-guest.ko`, which presents `/dev/nvidia*`
@@ -300,10 +302,14 @@ has not had an external security review. See
 [the isolate model](docs/internal/isolate-model.md).
 
 **Can nvkvm itself run inside a container?**
-Yes, and much of the testing is done that way. A default `docker run` with the
-NVIDIA runtime plus `--device /dev/kvm` is enough — no `--privileged`, no added
-capabilities, default seccomp and AppArmor. Rootless Docker works on the same
-terms, as long as your user can open `/dev/kvm`.
+Yes, and much of the testing is done that way. A default container is enough:
+
+```bash
+docker run --gpus all --device /dev/kvm ...
+```
+
+No `--privileged`, no added capabilities, default seccomp and AppArmor. Rootless
+Docker works on the same terms, as long as your user can open `/dev/kvm`.
 
 This is a useful way to run it today: the isolates are weaker inside a container
 (namespaces are usually blocked, so they fall back to UID separation), but the
