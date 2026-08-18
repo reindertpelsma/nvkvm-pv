@@ -272,12 +272,24 @@ launch, matmul, byte-exact 8 MiB round trips) and OpenGL renders through the
 forwarder, but `vk_compute_dispatch` fails: `vkCreateDevice` returns `-4`
 (`VK_ERROR_DEVICE_LOST`) in the guest while the *same binary* returns `0` on the
 host with the same driver. Vulkan enumeration works and both sides see the same
-5 queue families — only device creation differs. The QEMU log shows the
-default-deny gate rejecting `alloc class 0x0000a083` and
-`ctrl cmd 0x20803401`, neither of which is in nvproxy's set. Minimal reproducer:
-[`tests/repro/vk_create_device.c`](tests/repro/vk_create_device.c). Those IDs
-need identifying against NVIDIA's open kernel modules before anything is added
-to the allowlist — it is a security boundary, not a compatibility knob.
+5 queue families — only device creation differs. Minimal reproducer:
+[`tests/repro/vk_create_device.c`](tests/repro/vk_create_device.c).
+
+Traced, with two hypotheses eliminated by experiment:
+
+* **Not the allowlist.** The QEMU log showed the default-deny gate rejecting
+  `alloc class 0x0000a083` (`NVA083_GRID_DISPLAYLESS`) and `ctrl cmd 0x20803401`
+  (`NV2080_CTRL_CMD_ECC_GET_VOLATILE_COUNTS`, a read-only ECC query that only
+  appears on ECC-capable datacenter parts). Temporarily allowing `0xa083`
+  changed nothing — `vkCreateDevice` still returned `-4` — so it was never the
+  cause, and allowing it would have widened a security boundary for no gain.
+  The entry was reverted.
+* **The real failure is a channel/compute class mismatch.** The userspace driver
+  creates its channel as `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`) on this Hopper
+  part, then allocating `HOPPER_COMPUTE_A` (`0xcbc0`) under that parent fails
+  with `NV_ERR_OBJECT_NOT_FOUND` (`0x57`). `HOPPER_CHANNEL_GPFIFO_A` (`0xc86f`)
+  is allowlisted but never requested, so the open question is why class
+  discovery steers the driver to an Ampere channel on an H100.
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
 595.84 row has no 28/28 measurement — its box was re-provisioned without

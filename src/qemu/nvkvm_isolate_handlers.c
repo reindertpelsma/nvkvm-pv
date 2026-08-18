@@ -1738,7 +1738,20 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			memcpy(&cls, (char *)param_buf + 12, 4);
 			if (!nvkvm_alloc_class_allowed(cls)) {
 				fprintf(stderr, "nvkvm: DENY alloc class 0x%08x\n", cls);
-				resp->retval     = (uint64_t)(int64_t)(-EACCES);
+				/*
+				 * Report the refusal the way RM itself reports an
+				 * unsupported class: the ioctl SUCCEEDS and the
+				 * status field carries NV_ERR_NOT_SUPPORTED.
+				 * Failing the ioctl outright (-EACCES) is a
+				 * different, far more severe signal than anything
+				 * the real driver produces, and userspace treats it
+				 * as fatal rather than falling back -- on an H100
+				 * that turned a denied NVA083_GRID_DISPLAYLESS into
+				 * vkCreateDevice returning VK_ERROR_DEVICE_LOST.
+				 * The allocation is still never forwarded; only the
+				 * error signalling changes.
+				 */
+				resp->retval     = 0;
 				resp->status     = 0;
 				resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
 				resp->fault_addr = 0;
@@ -1762,7 +1775,11 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		if (!nvkvm_ctrl_cmd_allowed(cc) || req->aux_size > (1u << 20)) {
 			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
 				"(not in allowlist / oversize)\n", cc);
-			resp->retval     = (uint64_t)(int64_t)(-EACCES);
+			/* As above: RM answers an unsupported control with a
+			 * successful ioctl carrying NV_ERR_NOT_SUPPORTED, not
+			 * with a failed ioctl.  The command is still never
+			 * forwarded. */
+			resp->retval     = 0;
 			resp->status     = 0;
 			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
 			resp->fault_addr = 0;

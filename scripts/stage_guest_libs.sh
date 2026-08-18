@@ -124,6 +124,11 @@ stage "libGLX_nvidia.so.$V"       "$SYS" "libGLX_nvidia.so.0"
 stage "libGLESv2_nvidia.so.$V"    "$SYS" "libGLESv2_nvidia.so.2"
 stage "libGLESv1_CM_nvidia.so.$V" "$SYS" "libGLESv1_CM_nvidia.so.1"
 stage "libnvidia-cfg.so.$V"       "$SYS" "libnvidia-cfg.so.1"
+# OpenCL vendor library.  Without it the OpenCL loader finds no platform and
+# apps fail with "unknown OpenCL platform" (e.g. Geekbench --gpu).  Paired with
+# the /etc/OpenCL/vendors/nvidia.icd manifest written further down, which names
+# exactly this SONAME.
+stage "libnvidia-opencl.so.$V"    "$SYS" "libnvidia-opencl.so.1"
 
 # -- EGL GBM stack (#102 modeset): GPU-accelerated GL/EGL on the virtual KMS
 # head needs THREE pieces, all of which must be present or the NVIDIA path is
@@ -309,6 +314,22 @@ sudo tee /usr/share/glvnd/egl_vendor.d/10_nvidia.json >/dev/null <<'JSON'
     }
 }
 JSON
+
+# OpenCL ICD manifest.  The OpenCL loader (libOpenCL.so.1) finds vendors only
+# through /etc/OpenCL/vendors/*.icd; with no manifest it enumerates zero
+# platforms and apps fail with "unknown OpenCL platform" (e.g. Geekbench --gpu)
+# even though libnvidia-opencl is present.  Written only when that library
+# actually staged, so a host without it does not get a manifest pointing at a
+# missing library (which would be worse than none: the loader would log an
+# error for every OpenCL app).
+if [ -e /usr/local/nvidia-guest/lib/libnvidia-opencl.so.1 ] ||
+   [ -e /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 ]; then
+    sudo mkdir -p /etc/OpenCL/vendors
+    printf 'libnvidia-opencl.so.1\n' | sudo tee /etc/OpenCL/vendors/nvidia.icd >/dev/null
+    echo "stage_guest_libs: OpenCL ICD -> /etc/OpenCL/vendors/nvidia.icd"
+else
+    echo "stage_guest_libs: libnvidia-opencl not staged -- OpenCL apps will find no platform" >&2
+fi
 
 # Vulkan ICD manifest.  The Vulkan ICD on Linux IS libGLX_nvidia.so.0 (staged
 # above).  Without this manifest the loader enumerates only Mesa's lavapipe, so

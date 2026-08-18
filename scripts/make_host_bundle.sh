@@ -42,7 +42,7 @@ REQUIRED="libcuda libnvidia-ml libnvidia-ptxjitcompiler libnvidia-nvvm"
 # Vulkan to lavapipe.  Collect what the staging script actually stages.
 OPTIONAL="libnvidia-glcore libnvidia-eglcore libnvidia-glsi libnvidia-tls \
           libnvidia-rtcore libnvidia-gpucomp libnvidia-allocator \
-          libnvidia-encode libnvcuvid libnvidia-glvkspirv \
+          libnvidia-encode libnvcuvid libnvidia-glvkspirv libnvidia-opencl \
           libEGL_nvidia libGLX_nvidia libGLESv2_nvidia libGLESv1_CM_nvidia \
           libnvidia-cfg"
 
