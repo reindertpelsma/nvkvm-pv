@@ -344,17 +344,15 @@ bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 		 * so reserve align_up(ram_top + slack, sparse_size) +
 		 * sparse_size below the block.
 		 *
-		 * Measured (SeaBIOS 1.16.3, both a 39-bit and a 46-bit host):
-		 * firmware allocates 64-bit prefetchable BARs *downward* from
-		 * the top of the addressable space, so our 128 GiB BAR lands at
-		 * limit - 128 GiB.  Because the block is packed against the top
-		 * and the sparse region is last in it, our computed
-		 * sparse_base is also exactly limit - sparse_size — the two
-		 * agree by construction, and the BAR reserves precisely the
-		 * range we were going to use.  This floor is therefore
-		 * conservative rather than load-bearing in the common case; it
-		 * is what makes the "cannot fit" answer honest when firmware
-		 * would have nowhere to put the BAR at all.
+		 * Measured with SeaBIOS 1.16.3, and deliberately NOT assumed:
+		 * on a 39-bit host the 128 GiB BAR landed at limit - 128 GiB,
+		 * i.e. exactly this computed sparse_base; on a 46-bit host it
+		 * landed at 0x380000000000 (56 TiB), 8 TiB below the top.  So
+		 * firmware's choice is not a simple function of the width, and
+		 * nvkvm_sparse_ensure() validates whatever it gets rather than
+		 * predicting it.  This floor is conservative in the common
+		 * case; what it really buys is an honest "cannot fit" answer
+		 * when there would be nowhere to put the BAR at all.
 		 */
 		floor = nvkvm_align_up(ram_top + NVKVM_GPA_ALIGN, sparse_size)
 			+ sparse_size;

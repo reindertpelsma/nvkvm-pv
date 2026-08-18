@@ -266,14 +266,34 @@ nvkvm: GPA windows: guest RAM top ~0x280000000 (10 GiB), floor 0x4000000000 -> b
 ### Interaction with the reservation BAR
 
 The sparse window is also advertised as a 64-bit prefetchable reservation BAR
-(`#55`) so guest firmware reserves the range. Measured on SeaBIOS 1.16.3,
-firmware allocates 64-bit BARs *downward* from the top of the addressable
-space, so the BAR lands at `2^bits - 128 GiB` — which is exactly the
-`sparse_base` this placement computes, since the block is packed against the
-top and the sparse region is last in it. The two agree by construction. If
-firmware ever places the BAR somewhere that crosses the GPA limit, or on top of
-the shm/mmap regions, nvkvm logs that and falls back to its own computed base
-rather than handing KVM a range it will reject.
+(`#55`), and it is the **firmware-assigned** BAR address that the window's KVM
+memslot is actually installed at; the computed `sparse_base` is the fallback
+when there is no BAR, and the override when firmware picks something unusable.
+
+Where firmware puts it is **not** predictable from the address width alone.
+Measured, SeaBIOS 1.16.3, same 128 GiB BAR:
+
+| host bits | GPA limit | computed `sparse_base` | BAR actually assigned |
+|---|---|---|---|
+| 39 | 512 GiB | `0x6000000000` (384 GiB) | `0x6000000000` — same address |
+| 46 | 64 TiB | ~63.86 TiB | `0x380000000000` (56 TiB) — 8 TiB lower |
+
+So do not assume the BAR lands at `2^bits - window`; on the 39-bit host it did
+and on the 46-bit host it did not. What matters is that both are inside the
+limit and neither overlaps the shm/mmap regions, which nvkvm now checks
+explicitly: if firmware places the BAR so that it crosses the GPA limit, or on
+top of the shm/legacy-mmap regions, nvkvm logs that and uses its own computed
+base rather than handing KVM a range it will reject or letting the window
+shadow the shm slots.
+
+One residual, untriggered risk is worth naming: the computed block is placed at
+the top of the addressable space, which on some machines is inside the range
+firmware treats as the 64-bit PCI hole. Nothing else large enough to reach it
+has been observed (firmware allocated only our own BAR up there, and lower than
+our block on the 46-bit host), and both verified hosts booted clean — but the
+block is not itself PCI-reserved, so a machine that filled its 64-bit hole to
+the top could in principle collide. Making the shm/mmap regions reservation
+BARs too would close it.
 
 ## Host kernel
 
