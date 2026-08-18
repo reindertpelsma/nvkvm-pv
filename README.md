@@ -214,6 +214,7 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 Ti | Ampere GA104 | 580.95.05 | 580 | 28/28 |
 | RTX 3060 Ti | Ampere GA104 | 595.84 | 580 | `gl_draw_pixel_check` PASS * |
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
+| RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 20/28 — enumerates, `cuCtxCreate` fails |
 
 \* These two read 27/28 until 2026-08-17: `gl_draw_pixel_check` failed with
 `GL_FRAMEBUFFER_UNSUPPORTED` on every attachment format. The cause was nvkvm's
