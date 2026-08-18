@@ -93,7 +93,10 @@ struct nvkvm_abi_profile {
 
 	/* RM_ALLOC class-specific alloc-param sizes (the guest forwards exactly
 	 * this many bytes of libcuda's p_alloc_parms). */
-	unsigned chan_alloc_size;    /* {TURING,AMPERE,HOPPER}_CHANNEL_GPFIFO_A   */
+	unsigned chan_alloc_size;    /* {TURING,AMPERE,HOPPER}_CHANNEL_GPFIFO_A
+				      * + BLACKWELL_CHANNEL_GPFIFO_A/B: one
+				      * NV_CHANNEL_ALLOC_PARAMS for every GPFIFO
+				      * class, so all of them share this size.   */
 	unsigned vaspace_alloc_size; /* FERMI_VASPACE_A                           */
 	unsigned mem_alloc_size;     /* NV50_MEMORY_VIRTUAL / LOCAL_USER / SYSTEM */
 	unsigned nv00de_alloc_size;  /* RM_USER_SHARED_DATA                       */

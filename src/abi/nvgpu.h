@@ -58,6 +58,21 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define TURING_CHANNEL_GPFIFO_A             0x0000C46FU
 #define AMPERE_CHANNEL_GPFIFO_A             0x0000C56FU
 #define HOPPER_CHANNEL_GPFIFO_A             0x0000C86FU
+/* Blackwell GPFIFO.  MEASURED: on an RTX 5090 (GB202, sm_120, driver 580.178.04)
+ * libcuda allocates 0xC96F as the last RM_ALLOC of cuCtxCreate, with
+ * nvos64.alloc_parms_size = 0 (it relies on the driver to size the buffer by
+ * hClass).  Both ids are already in QEMU's alloc allowlist, so the alloc was
+ * forwarded but — with no case in the guest's size-by-hClass switches — carried
+ * 0 bytes of params, and the host RM answered NV_ERR_INVALID_ARGUMENT (0x1f),
+ * surfacing as cuCtxCreate -> CUDA_ERROR_INVALID_VALUE (#101).
+ * Ids confirmed against open-gpu-kernel-modules 580.95.05
+ * (sdk/nvidia/inc/class/clc96f.h, clca6f.h).  Both take the SAME
+ * NV_CHANNEL_ALLOC_PARAMS as the Turing/Ampere/Hopper GPFIFO classes —
+ * alloc_channel.h defines exactly one struct and aliases it as
+ * NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS for every GPFIFO class — so they
+ * belong in the same nvkvm_prof()->chan_alloc_size group, not a new one. */
+#define BLACKWELL_CHANNEL_GPFIFO_A          0x0000C96FU
+#define BLACKWELL_CHANNEL_GPFIFO_B          0x0000CA6FU
 /* Compute objects (hClass verified against the 575 open-driver SDK class
  * headers; the prior 0x*B1 codes were bogus). Use NV_GR_ALLOCATION_PARAMETERS. */
 #define VOLTA_COMPUTE_A                     0x0000C3C0U
@@ -82,7 +97,16 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define AMPERE_DMA_COPY_A                   0x0000C6B5U
 #define AMPERE_DMA_COPY_B                   0x0000C7B5U
 #define HOPPER_DMA_COPY_A                   0x0000C8B5U
-#define BLACKWELL_DMA_COPY_A                0x0000CBB5U
+/* Blackwell copy engines.  BLACKWELL_DMA_COPY_A was previously recorded here as
+ * 0xCBB5, which is not a class NVIDIA ships: there is no clcbb5.h in
+ * open-gpu-kernel-modules, and 0xCBB5 is absent from QEMU's alloc allowlist
+ * while 0xC9B5/0xCAB5 are present.  Corrected against OGKM 580.95.05
+ * (sdk/nvidia/inc/class/clc9b5.h, clcab5.h).  The wrong id left the real
+ * classes with no entry in the size-by-hClass switches — the same
+ * allowlisted-but-unsized trap as BLACKWELL_CHANNEL_GPFIFO_A above, waiting on
+ * the copy-engine alloc rather than the channel alloc (#101). */
+#define BLACKWELL_DMA_COPY_A                0x0000C9B5U
+#define BLACKWELL_DMA_COPY_B                0x0000CAB5U
 
 /* NVB0B5_ALLOCATION_PARAMETERS — alloc params for all *_DMA_COPY_* classes
  * above.  libcuda passes engineType here to select a specific copy-engine

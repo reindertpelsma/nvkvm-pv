@@ -1709,6 +1709,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case TURING_CHANNEL_GPFIFO_A:
 			case AMPERE_CHANNEL_GPFIFO_A:
 			case HOPPER_CHANNEL_GPFIFO_A:
+			case BLACKWELL_CHANNEL_GPFIFO_A:
+			case BLACKWELL_CHANNEL_GPFIFO_B:
+				/* 0xc96f/0xca6f: Blackwell reuses NV_CHANNEL_ALLOC_PARAMS
+				 * unchanged, so it shares chan_alloc_size (368 on 580).
+				 * MEASURED on an RTX 5090: libcuda allocs 0xc96f with
+				 * alloc_parms_size=0 as the last step of cuCtxCreate;
+				 * without these cases we copy 0 bytes -> host RM returns
+				 * NV_ERR_INVALID_ARGUMENT (0x1f) and cuCtxCreate fails
+				 * CUDA_ERROR_INVALID_VALUE (1) (#101). */
 				ap_size = nvkvm_prof()->chan_alloc_size;    /* #81: base / V570 +8 */
 				break;
 			case NV01_EVENT_OS_EVENT:
@@ -1727,6 +1736,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case AMPERE_DMA_COPY_B:
 			case HOPPER_DMA_COPY_A:
 			case BLACKWELL_DMA_COPY_A:
+			case BLACKWELL_DMA_COPY_B:
+				/* 0xc9b5/0xcab5: both Blackwell copy-engine classes take
+				 * NVB0B5_ALLOCATION_PARAMETERS like every other _DMA_COPY_.
+				 * _A's id was wrong (0xcbb5) until #101, so neither real
+				 * class had an entry here. */
 				ap_size = sizeof(struct nvb0b5_allocation_parameters);
 				break;
 			case GT200_DEBUGGER:
@@ -1834,6 +1848,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case TURING_CHANNEL_GPFIFO_A:
 				case AMPERE_CHANNEL_GPFIFO_A:
 				case HOPPER_CHANNEL_GPFIFO_A:
+				case BLACKWELL_CHANNEL_GPFIFO_A:
+				case BLACKWELL_CHANNEL_GPFIFO_B:
+					/* 0xc96f/0xca6f: same NV_CHANNEL_ALLOC_PARAMS as the
+					 * older GPFIFO classes. This is the path libcuda
+					 * actually takes on Blackwell (nvos64, size=0) and the
+					 * one whose absence broke cuCtxCreate (#101); see the
+					 * nvos21 switch above. */
 					ap_size = nvkvm_prof()->chan_alloc_size;    /* #81 */
 					break;
 				case NV01_EVENT_OS_EVENT:
@@ -1852,6 +1873,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case AMPERE_DMA_COPY_B:
 				case HOPPER_DMA_COPY_A:
 				case BLACKWELL_DMA_COPY_A:
+				case BLACKWELL_DMA_COPY_B:
+					/* 0xc9b5/0xcab5: see the nvos21 switch above (#101). */
 					ap_size = sizeof(struct nvb0b5_allocation_parameters);
 					break;
 				case GT200_DEBUGGER:
