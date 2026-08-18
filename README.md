@@ -203,6 +203,29 @@ At temperature 0 the guest produced **token-id identical** output to the host on
 all three tasks (long-chain reasoning, C11 lock-free ring codegen, 8k-token
 summarisation).
 
+### Fine-tuning
+
+A real Kaggle ARC-AGI notebook runs unmodified in the guest on an RTX 5090
+(driver 580.178.04): Unsloth 2025.9.7 LoRA fine-tuning **Qwen3**, with
+`embed_tokens` and `lm_head` trained in mixed precision, then decode + scoring
+inference over the augmented puzzle set.
+
+```
+Unsloth 2025.9.7: Fast Qwen3 patching. Transformers: 4.55.4
+NVIDIA GeForce RTX 5090. Num GPUs = 1. Max memory: 31.356 GB
+Torch: 2.13.0+cu130. CUDA Toolkit: 13.0. Triton: 3.7.1. Bfloat16 = TRUE
+[Rank 0] allocated 13059MB for training
+TrainOutput(global_step=128, train_runtime=118.57, train_steps_per_second=1.079)
+[Rank 0] allocated 14767MB for inference
+[Rank 0] finished 0934a4d8 in 177.2s
+```
+
+Host parity: **—** (not measured yet — no host-side baseline has been run for
+this workload, which is not a statement that parity was missed). What this run
+does establish is that it works: training as well as inference, multi-GB
+allocation churn between the training and inference phases, and the Triton /
+xformers paths, all through the forwarder.
+
 Two caveats, both stated in [the full results](tests/perf/llm_parity.md):
 pinned host buffers were disabled **on both sides identically**, because at the
 time the guest could not pin more than 16 MiB; and with CUDA graphs disabled
@@ -240,6 +263,7 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
+| RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
 595.84 row has no 28/28 measurement — its box was re-provisioned without
