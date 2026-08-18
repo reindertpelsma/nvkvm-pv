@@ -62,6 +62,37 @@ is present, correctly sized and at the expected base, and the guest still hangs 
 first sustained use: log stalls at module load, QEMU 7.6% CPU state Ssl, guest SSH
 times out, GPU 0% / 33 MiB. The hang is in what happens *after* the window exists.
 
+## Confirmed working with NVKVM_DEBUG=1
+
+```
+nvkvm_sparse_init:   64 GiB VMM buffer 0x7b28e4000000 (memslot deferred to BAR base)
+nvkvm_sparse_ensure: 64 GiB at GPA=0x6000000000 slot=64
+GPU 0: NVIDIA GeForce RTX 3050 Laptop GPU (UUID: GPU-69998bd6-b034-9fe1-a839-b2d779142c60)
+```
+
+So on a 39-bit host the window is now allocated, BAR-assigned, memslot-installed at
+the resolved base, and `nvidia-smi -L` returns a real UUID. **Light queries work.**
+
+## The remaining bug
+
+Sustained use still hangs, with `error: kvm run failed Bad address` at **CPL=3** —
+the fault is in guest *userspace*, not the kernel:
+
+```
+CPL=3  CR2=0x60ece2b43000  RDI=0x200224000
+Code=... 48 c1 ee 20 <89> 07 ...      (faulting insn is a store, mov %eax,(%rdi))
+```
+
+Preceded by four `nvkvm: DENY ctrl cmd 0x00730102 (not in allowlist / oversize)` —
+an NV0073 display-class control, believed pre-existing and benign on a headless
+guest (the Blackwell bring-up saw the same DENY with no ill effect), but it has NOT
+been ruled out as related.
+
+So: the window exists and is backed, light RM queries succeed, and guest userspace
+faults on a *store* into a mapping derived from it. That points at the mapping
+handed to userspace rather than the memslot itself — the GPA is right, what is
+mapped on top of it is not.
+
 ## Next step
 
 Trace where the guest blocks on first sustained window access. `nvkvm_sparse_ensure()`
@@ -71,4 +102,8 @@ whether the BAR base it finds is sane on a shrunk/narrow layout, is the untested
 QEMU at ~8% CPU with no guest response suggests a spin or an uncompleted forwarded
 op rather than a QEMU deadlock.
 
-Last known faulting address before the BAR cap: `CR2=0x5af8dad1e000`.
+Reproduce with `NVKVM_DEBUG=1` (env var read at `virtio_nvgpu.c:1116`) — that is
+what surfaced the sparse_init/sparse_ensure lines above and is the fastest way in.
+
+Faulting addresses seen: `CR2=0x5af8dad1e000` (before the BAR cap),
+`CR2=0x60ece2b43000` (after both fixes). Both userspace VAs, both on a store.
