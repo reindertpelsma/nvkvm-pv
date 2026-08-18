@@ -93,17 +93,30 @@ faults on a *store* into a mapping derived from it. That points at the mapping
 handed to userspace rather than the memslot itself — the GPA is right, what is
 mapped on top of it is not.
 
-## IMPORTANT reframing — it is not a hang
+## Reframing — probably a fault, NOT CONFIRMED
 
-`error: kvm run failed Bad address` is `KVM_RUN` returning **EFAULT**. QEMU exits
-the VM, dumps the CPU state, and that vCPU stops. So:
+`error: kvm run failed Bad address` with a register dump is unambiguously QEMU's
+`KVM_RUN` error path, so an EFAULT definitely occurred. **The rest of this section
+is inference and was NOT verified — treat it as the leading theory, not fact.**
 
-- the guest is **not** deadlocked and CUDA is **not** spinning
-- guest SSH dies because the VM stopped making progress, not because of GPU load
-- QEMU's residual CPU% is other threads, not a spin
+Not established:
+- that the fault and the unreachability happened at the same moment (the fault may
+  have occurred earlier and the guest hung separately)
+- that the whole VM stopped. The guest has **4 vCPUs**; one returning EFAULT does
+  not necessarily stop the others, and QEMU's behaviour here was assumed, not observed
+- QEMU's residual 7-13% CPU is consistent with *either* other threads running or a
+  vCPU spinning. It does not discriminate.
 
-**Do not look for a lock.** Look for why KVM cannot use the host userspace address
-behind a guest GPA. EFAULT from `KVM_RUN` means the GPA resolved to a
+**Confirm it first, with the QEMU monitor — one command, before any code work:**
+
+```
+info status     # running / paused / internal-error
+info cpus       # per-vCPU state: all four halted, or one?
+```
+
+If it reports `running` with live vCPUs, this is a DEADLOCK and the theory below is
+wrong. Only if the VM is stopped should you look for why KVM cannot use the host
+userspace address behind a guest GPA. EFAULT from `KVM_RUN` means the GPA resolved to a
 `userspace_addr` in the memslot that the kernel could not access — a hole in the
 window mapping, an unmapped extent, or an extent whose `MAP_FIXED` install did not
 land where the memslot claims.
