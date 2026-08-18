@@ -93,11 +93,23 @@ faults on a *store* into a mapping derived from it. That points at the mapping
 handed to userspace rather than the memslot itself — the GPA is right, what is
 mapped on top of it is not.
 
-## Reframing — probably a fault, NOT CONFIRMED
+## CONFIRMED: it is a fault, not a deadlock
 
-`error: kvm run failed Bad address` with a register dump is unambiguously QEMU's
-`KVM_RUN` error path, so an EFAULT definitely occurred. **The rest of this section
-is inference and was NOT verified — treat it as the leading theory, not fact.**
+**VERIFIED 2026-08-18 by comparing QEMU thread states across the transition:**
+
+```
+BEFORE (healthy)  4x vCPU thread  wchan = kvm_vcpu_block    <- inside KVM, running guest
+AFTER  (hung)     4x vCPU thread  wchan = futex_do_wait     <- left KVM, blocked on BQL
+                  kvm run failed  count = 1
+```
+
+Every vCPU has left `kvm_vcpu_block` and come to rest in `futex_do_wait`. They are
+neither spinning nor executing guest code: QEMU stopped the machine after the
+`KVM_RUN` EFAULT and the remaining vCPUs parked on the lock. Guest SSH dies because
+nothing is executing.
+
+This also rules out a guest-kernel deadlock: that would leave the vCPUs *in*
+`kvm_vcpu_block`, running guest code that never progresses. They are not there.
 
 Not established:
 - that the fault and the unreachability happened at the same moment (the fault may
@@ -107,15 +119,15 @@ Not established:
 - QEMU's residual 7-13% CPU is consistent with *either* other threads running or a
   vCPU spinning. It does not discriminate.
 
-**Confirm it first, with the QEMU monitor — one command, before any code work:**
+Cheap way to re-check this on any future run, no monitor socket needed:
 
 ```
-info status     # running / paused / internal-error
-info cpus       # per-vCPU state: all four halted, or one?
+ps -L -o tid,stat,pcpu,wchan:20,comm -p $(pgrep -f qemu-system-x86_64 | head -1)
 ```
 
-If it reports `running` with live vCPUs, this is a DEADLOCK and the theory below is
-wrong. Only if the VM is stopped should you look for why KVM cannot use the host
+`kvm_vcpu_block` = running the guest. `futex_do_wait` on every vCPU = VM stopped.
+
+So: look for why KVM cannot use the host
 userspace address behind a guest GPA. EFAULT from `KVM_RUN` means the GPA resolved to a
 `userspace_addr` in the memslot that the kernel could not access — a hole in the
 window mapping, an unmapped extent, or an extent whose `MAP_FIXED` install did not
