@@ -460,9 +460,42 @@ static int nvkvm_drm_forward(struct drm_file *file, unsigned int cmd, void *data
 					  struct drm_file *file)	\
 	{ (void)dev; return nvkvm_drm_forward(file, (CMD), data); }
 
-NVKVM_DRM_FWD(get_dev_info,
-	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
-		       struct drm_nvidia_get_dev_info_params))
+/*
+ * GET_DEV_INFO (0x03): forward, then OVERWRITE primary_index with OUR primary
+ * minor.  The host field is the HOST's DRM card number, and NVIDIA's userspace
+ * turns it straight into a path: libEGL stats "/dev/dri/card<primary_index>"
+ * while deciding whether it can drive a display connection.
+ *
+ * On any host where the NVIDIA GPU is not card0 — an iGPU laptop, the common
+ * case; measured here as card2 — the guest was told primary_index=2, stat'd
+ * /dev/dri/card2, got ENOENT, and NVIDIA's EGL declined the platform:
+ *
+ *   ioctl(renderD128, 'd' nr 0x43 = GET_DEV_INFO) = 0   -> primary_index=2
+ *   newfstatat("/dev/dri/card2") = -1 ENOENT
+ *   eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND) = EGL_NO_DISPLAY
+ *
+ * so every Wayland GL client silently fell back to Mesa/llvmpipe (which is what
+ * "GL_RENDERER: llvmpipe" in the old realapp_matrix runs actually was), and a
+ * client forced to the NVIDIA vendor died at "failed to initialize EGL display".
+ *
+ * This is the primary-node twin of the renderD128-vs-renderD129 fix: the guest
+ * must be told about ITS OWN nodes.  Our KMS head lives on this same drm_device
+ * (DRIVER_MODESET above), so dev->primary->index is exactly the card the guest
+ * has.  It also stops a host DRM minor number leaking into the guest.
+ */
+static int nvkvm_drm_fwd_get_dev_info(struct drm_device *dev, void *data,
+				      struct drm_file *file)
+{
+	struct drm_nvidia_get_dev_info_params *p = data;
+	int r = nvkvm_drm_forward(file,
+				  DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
+					   struct drm_nvidia_get_dev_info_params),
+				  data);
+
+	if (r == 0 && dev && dev->primary)
+		p->primary_index = dev->primary->index;
+	return r;
+}
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
 /*
  * GET_DRM_FILE_UNIQUE_ID (0x18): the gbm backend reads this before allocating

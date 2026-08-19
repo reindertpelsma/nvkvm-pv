@@ -5,7 +5,9 @@ buffer to a compositor. Each guest process gets its own isolate (host process)
 with its own RM client, which is what makes this hard: an RM object minted in
 stub A is meaningless in stub B.
 
-**Status: the path works, verified by bytes.** This page records the design, the
+**Status: the path works, verified by bytes**, and as of 2026-08-19 it carries a
+real Wayland GL client's frames to a compositor — see "RESOLVED" below for the
+one missing render-node ioctl that had been stopping the *export* half. This page records the design, the
 evidence, and the parts that are still open. Every claim below is either
 MEASURED on the box named at the bottom, or explicitly marked as not run.
 
@@ -197,50 +199,88 @@ them. The client gets a **real NVIDIA context** — which supersedes the
 output. Reported as a failure precisely because the renderer string alone would
 have looked like a pass.
 
----
-
-## Still open: `eglExportDMABUFImageMESA` → `EGL_BAD_MATCH`
-
-This, not the import path, is what stops a GL client from presenting.
-
-```
-== 5. eglExportDMABUFImageQueryMESA  <-- the primitive under test ==
-    fourcc=0x34324241 ('AB24') planes=1 modifier=0x300000000e08014
-== 6. eglExportDMABUFImageMESA (actually get the fd) ==
-RESULT: FAIL eglExportDMABUFImageMESA EGL_BAD_MATCH
-```
-
-Query succeeds, export fails. The client therefore never produces a buffer to
-attach, which is exactly the observed "binds `zwp_linux_dmabuf_v1`, gets
-feedback, never emits `buffer_params.create`" symptom.
-
-**Two standing hypotheses in this tree are now falsified by measurement.** Both
-`nvkvm_fe_alloc_allowlist.h` and `nvkvm_drm_allowlist.h` attribute the missing
-dma-buf export to their own default-deny (the removed `NV_ESC_EXPORT_TO_DMABUF_FD`
-and `GEM_EXPORT_DMABUF_MEMORY` entries). Running the probe with tracing on:
-
-- guest `dmesg` contains **no** `nvkvm: AUDIT unknown ioctl` line — libEGL never
-  issues an ioctl the guest module rejects;
-- the QEMU log contains **zero** `DENY` lines of any kind.
-
-An `rmdump` trace of the failing call shows the ioctls it *does* issue all
-succeeding — `RM nr=0xd4 ... ret=0`, then `RM_CONTROL cmd=0x00003d05 ...
-status=0x0 ret=0`. So `EGL_BAD_MATCH` is decided **inside NVIDIA's userspace
-EGL**, before or independently of any kernel call that nvkvm gates. Re-adding
-either allowlist entry would not, on this evidence, change the result.
-
-(Separately, and worth fixing regardless: `src/abi/nvgpu.h` defines
-`NV_ESC_EXPORT_TO_DMABUF_FD` as `0x70`. Upstream it is `NV_IOCTL_BASE + 17` =
-`0xd9`, and the matching struct in that header is a 40-byte single-handle form
-where upstream uses a 128-handle batch. Neither is on a live path today, but the
-constant is wrong if anyone re-enables it.)
-
-What was **not** determined: why libEGL declines. Distinguishing "the EGLImage
-was created from a texture rather than a native buffer" from "the driver refuses
-export on this device type" needs a host A/B of the same probe under the same
-EGL client-side conditions.
+**Superseded 2026-08-19 — both halves now pass.** The zero-pixel half had two
+independent guest-side causes, neither of them an allowlist problem; see
+"RESOLVED" below and `known-limitations.md`. A client now emits
+`zwp_linux_buffer_params.create` and cycles three dma-buf `wl_buffer`s, and
+`weston-screenshooter` captures a populated client window (glmark2's Horse
+scene, from a client reporting `GL_RENDERER: NVIDIA GeForce RTX 3050`). What is
+still open is *sustained* presentation: the stream stalls after the first
+burst.
 
 ---
+
+## RESOLVED 2026-08-19: `eglExportDMABUFImageMESA` → `EGL_BAD_MATCH`
+
+The section this replaces concluded that `EGL_BAD_MATCH` was "decided **inside**
+NVIDIA's userspace EGL, before or independently of any kernel call that nvkvm
+gates", on the evidence that no ioctl was denied and none was unknown. Both
+observations were correct. The conclusion drawn from them was not.
+
+It named the missing experiment itself — "needs a host A/B of the same probe
+under the same EGL client-side conditions" — and that experiment settles it.
+Same box (RTX 3050 Laptop, 580.173.02), same
+`tests/perf/apps/egl_dmabuf_export_probe.c`:
+
+| | host | guest |
+|---|---|---|
+| `eglExportDMABUFImageQueryMESA` | ok | ok |
+| `eglExportDMABUFImageMESA` | **PASS**, fd=24 | **FAIL** `EGL_BAD_MATCH` |
+
+A host PASS means it is not the driver refusing on principle; it is the guest
+being different. `strace` on both narrows the difference to one syscall:
+
+```
+host:  ioctl(9 /*renderD128*/, _IOWR('d', 0x41, 32)) = 0
+       ioctl(9, DRM_IOCTL_PRIME_HANDLE_TO_FD) = 0      -> the dma-buf fd
+       ioctl(9, DRM_IOCTL_GEM_CLOSE) = 0
+guest: ioctl(9 /*renderD128*/, _IOWR('d', 0x41, 32)) = -1 EINVAL
+```
+
+`nr 0x41` = `DRM_COMMAND_BASE + 0x01` = `GEM_IMPORT_NVKMS_MEMORY`: wrap an RM
+memory object in a GEM object so PRIME can export it. `nvkvm_drm_ioctls[]` had
+no `[0x01]` entry, so `drm_ioctl()` in the **DRM core** returned `-EINVAL` for a
+driver ioctl outside the table — before nvkvm's dispatch, before QEMU, before
+any allowlist. That is precisely why there was no `AUDIT unknown ioctl` and no
+`DENY`: those absences meant the call never reached us, not that it was never
+made.
+
+The struct layout was recovered from an `LD_PRELOAD` ioctl interposer on the
+host rather than guessed (32 bytes: `mem_size` @0, `nvkms_params_ptr` @8,
+`nvkms_params_size` @16, OUT `handle` @24; the pointee's first field is
+`{ int memFd }` — the same shape 0x09 carries). So it is the exact mirror of
+`GEM_EXPORT_NVKMS_MEMORY` (0x09), and is implemented as one: same aux
+marshalling, plus the OUT-handle proxying that 0x0b already does.
+
+Guest, after: `RESULT: PASS dma-buf export works (fd=25)`.
+
+The keystone this unblocks is visible in QEMU's own log — every client
+swapchain buffer goes straight from the new ioctl into the cross-isolate broker
+that Rung 2 proved byte-exact:
+
+```
+isolate=3 cmd=0xc0206441 ret=0
+nvkvm xiso: owner(iso=3 gem=0x3) -> importer(iso=1) gem=0x2
+isolate=3 cmd=0xc0206441 ret=0
+nvkvm xiso: owner(iso=3 gem=0x4) -> importer(iso=1) gem=0x3
+isolate=3 cmd=0xc0206441 ret=0
+nvkvm xiso: owner(iso=3 gem=0x5) -> importer(iso=1) gem=0x4
+```
+
+Rung 4 (a GL client under headless weston) is now met on both halves: real
+NVIDIA renderer **and** real pixels. See `known-limitations.md` for the full
+before/after, for the second root cause found alongside it (`GET_DEV_INFO`
+handing the guest the host's `primary_index`, which is what had been putting
+every Wayland client on llvmpipe), and for the two things that are still broken
+past this point — frame updates stalling after the first burst, and an
+intermittent guest-fatal `kvm run failed Bad address` in the mmap/WINMAP window
+path.
+
+(The stale-constant note stands and is still worth fixing: `src/abi/nvgpu.h`
+defines `NV_ESC_EXPORT_TO_DMABUF_FD` as `0x70` where upstream is
+`NV_IOCTL_BASE + 17` = `0xd9`, with a 40-byte single-handle struct where
+upstream uses a 128-handle batch. It is not on a live path — the live export
+path is the DRM one above — but the constant is wrong if anyone re-enables it.)
 
 ## Also fixed on this branch
 

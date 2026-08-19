@@ -91,6 +91,37 @@ inside NVIDIA's closed `libnvidia-egl-gbm` scanout-present path, which is
 coupled to `nvidia-modeset` — a host-global, privileged display device that
 `nvkvm` deliberately does not drive.
 
+Re-measured 2026-08-19 on an RTX 3050 / 580.173.02, *after* the two Wayland
+client fixes below — unchanged, and now with a stack. `weston
+--backend=drm-backend.so --renderer=gl` gets **further** than the old note
+suggests: it enumerates the virtual head, lists all 23 modes, reports
+`Output 'Virtual-1' enabled with head(s) Virtual-1`, and launches
+`weston-desktop-shell`. Then the main thread wedges forever:
+
+```
+Thread 1 (weston):
+#0  poll(nfds=1, timeout=-1)
+#1  libnvidia-eglcore.so.580.173.02
+#2  libEGL_nvidia.so.0
+#3  libEGL_nvidia.so.0
+#4  libEGL_nvidia.so.0
+#5  libnvidia-egl-gbm.so.1
+#6  libnvidia-egl-gbm.so.1
+#7  drm-backend.so
+#8  drm-backend.so
+#9  drm-backend.so
+```
+
+An unbounded `poll` on one fd inside `eglcore`, entered from
+`libnvidia-egl-gbm`, entered from the drm-backend's scanout path: it is waiting
+for a completion that only `nvidia-modeset` produces. Clients never get
+serviced. Nothing on the nvkvm side of the boundary is reached, so there is no
+ioctl to allow, no index to correct, and no marshalling to add — the fix would
+be to forward `nvidia-modeset`, which is a host-global privileged display device
+and a deliberate non-goal. **Judgement: not worth attacking. The
+headless-compositor + capture route is the viable one**, and it is the one that
+now carries real client pixels.
+
 > WHY: a DRM-backend compositor on NVIDIA hangs in libnvidia-egl-gbm's
 > scanout-present path (coupled to nvidia-modeset, which we don't forward). A
 > HEADLESS GL compositor renders the desktop offscreen with no KMS scanout and
@@ -125,64 +156,141 @@ weston's own log reports `EGL vendor: NVIDIA`, `GL version: OpenGL ES 3.2 NVIDIA
 If you want a virtual monitor, this is not that. Treat the head as a capture
 surface.
 
-### GL clients under Wayland render on the GPU but present nothing — open
+### GL clients under Wayland presented nothing — TWO ROOT CAUSES FIXED 2026-08-19
 
-**Re-measured 2026-08-17 on 575.51.03: the llvmpipe half of this entry no longer
-reproduces.** With the full host bundle staged (`stage_guest_libs.sh`) and the
-NVIDIA GBM backend in place (`stage_gbm_backend.sh` — whose default bundle path
-was broken until this date, silently leaving the backend as Mesa), a Wayland GL
-client reports `GL_RENDERER: NVIDIA GeForce RTX 3060/PCIe/SSE2`. The client gets
-a real NVIDIA context.
+**Both were guest-side gaps, and neither was an allowlist problem.** The entry
+below used to say the failure was decided inside NVIDIA's closed userspace. That
+was wrong, and the reason it looked right is worth keeping: both bugs produced a
+failure with *no* denied ioctl and *no* unknown ioctl, so every "check the
+allowlist" reflex came back clean and the conclusion "it must be NVIDIA's
+userspace" followed. The decisive move in both cases was a **host/guest A/B of
+the same binary**, which turns "the driver refuses" into "the guest is
+different, here is the syscall where".
 
-What it still does not do is put pixels on screen.
-`verify_client_window_differential.sh` with `glmark2-wayland`:
+Measured on an RTX 3050 Laptop, driver 580.173.02, guest Ubuntu 24.04.
+
+#### Cause 1 — `GET_DEV_INFO` handed the guest the HOST's DRM card number
+
+`nvkvm_drm_fwd_get_dev_info` forwarded the whole
+`drm_nvidia_get_dev_info_params` struct back verbatim, including
+`primary_index` — the host's DRM primary minor. NVIDIA's userspace turns that
+field straight into a path. On this host the NVIDIA GPU is `card2`, so:
 
 ```
-    GL_RENDERER:    NVIDIA GeForce RTX 3060/PCIe/SSE2
-  A(no client) vs B(client): 0/518400 sampled px differ (0.00%)  -> IDENTICAL
-  B(client) vs C(client+1s): 0/518400 sampled px differ (0.00%)  -> IDENTICAL
+ioctl(renderD128, 'd' nr 0x43 = GET_DEV_INFO) = 0      -> primary_index = 2
+newfstatat("/dev/dri/card2")                 = -1 ENOENT
+eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND)  = EGL_NO_DISPLAY
 ```
 
-The renderer string alone would have read as a pass here; the differential is
-what shows it is not one. The client never presents a buffer because it cannot
-export one — `eglExportDMABUFImageMESA` returns `EGL_BAD_MATCH` while
-`eglExportDMABUFImageQueryMESA` succeeds, and that failure involves **no denied
-and no unknown ioctl** (measured: zero `DENY` in the QEMU log, no
-`nvkvm: AUDIT unknown ioctl` in guest `dmesg`). See
-[`cross-isolate-sharing.md`](cross-isolate-sharing.md) for the traces and for
-the two allowlist-blame hypotheses this falsifies.
+The guest has `card0`. So NVIDIA's EGL declined the Wayland platform, GLVND fell
+through to Mesa, and **every Wayland GL client silently landed on llvmpipe** —
+which is exactly the `GL_RENDERER: llvmpipe (LLVM 20.1.2)` that the old
+`realapp_matrix.md` runs recorded, and exactly why forcing the NVIDIA vendor
+gave "failed to initialize EGL display" instead of a working context. This is
+the primary-node twin of the `renderD128`-vs-`renderD129` fix above: the guest
+must be told about *its own* nodes. Now overwritten with `dev->primary->index`
+(our KMS head is on the same drm_device), which also stops a host DRM minor
+leaking into the guest.
 
-Cross-isolate *import* — a compositor importing a client-allocated GPU bo — is
-separately confirmed working byte-exact; it is not what blocks this.
+After: a Wayland client with **default** vendor selection reports
 
-The original observation is kept below for history:
+```
+GL_VENDOR:   NVIDIA Corporation
+GL_RENDERER: NVIDIA GeForce RTX 3050 Laptop GPU/PCIe/SSE2
+GL_VERSION:  4.6.0 NVIDIA 580.173.02
+```
 
-The compositor renders on the GPU. Its clients currently do not.
+#### Cause 2 — the guest DRM driver had no `GEM_IMPORT_NVKMS_MEMORY`
 
-> **GL *clients* rendering through nvkvm: DID NOT REPRODUCE.** Wayland GL
-> clients land on Mesa software rendering: `glmark2-wayland` reports
-> `GL_RENDERER: llvmpipe (LLVM 20.1.2)`, and es2gears_wayland maps a window that
-> composites entirely BLACK. Forcing the NVIDIA EGL vendor
-> (`__EGL_VENDOR_LIBRARY_FILENAMES=.../10_nvidia.json`) fails at
-> `eglGetDisplay()` with `0x3003` (EGL_BAD_ALLOC); `eglinfo` shows the Wayland
-> platform bound to "Mesa Project" while the device platform binds NVIDIA.
->
-> — `tests/perf/realapp_matrix.md`
+With clients finally on NVIDIA, the documented `eglExportDMABUFImageMESA` ->
+`EGL_BAD_MATCH` reproduced. `tests/perf/apps/egl_dmabuf_export_probe.c` run on
+the host and in the guest, same box, same driver:
 
-One contributing factor has since been identified and fixed on the tooling side:
-`libnvidia-egl-wayland` is not driver-versioned, so every staging loop that
-globbed `$lib.so.$DRIVER_VERSION` skipped it silently. `make_host_bundle.sh` now
-collects it by resolving the `.so.1` SONAME link instead
-(`scripts/make_host_bundle.sh:37-47, 62-71`). That closes the *staging* gap; it
-does not close this one. The last recorded observation with the external
-platform present is in the same paragraph of the matrix:
+| | host | guest (before) |
+|---|---|---|
+| `eglExportDMABUFImageQueryMESA` | ok, `AB24`, mod `0x300000000e08014` | same |
+| `eglExportDMABUFImageMESA` | **PASS**, fd | **FAIL** `EGL_BAD_MATCH` |
 
-> staging the NVIDIA EGL Wayland external platform turned the black window into
-> no window at all, while the desktop kept looking correct either way. Always
-> pair a capture with the client's renderer string.
+`strace` localises it to exactly one call:
 
-Under investigation. Do not assume a screenshot proves anything here — check the
-client's `GL_RENDERER`.
+```
+host:  ioctl(renderD128, _IOWR('d', 0x41, 32)) = 0
+       -> DRM_IOCTL_PRIME_HANDLE_TO_FD -> dma-buf fd -> DRM_IOCTL_GEM_CLOSE
+guest: ioctl(renderD128, _IOWR('d', 0x41, 32)) = -1 EINVAL
+```
+
+`nr 0x41` is `DRM_COMMAND_BASE + 0x01`, `GEM_IMPORT_NVKMS_MEMORY` — the ioctl
+that wraps an RM memory object in a GEM object so it can be PRIME-exported. It
+is the whole of `eglExportDMABUFImageMESA`'s kernel work. `nvkvm_drm_ioctls[]`
+had no `[0x01]`, so the **DRM core** rejected it with `-EINVAL` before nvkvm's
+dispatch ran — which is why guest dmesg had no `AUDIT unknown ioctl` and the
+QEMU log had no `DENY`. Both absences were evidence the call never reached us.
+
+Wired as the exact mirror of `GEM_EXPORT_NVKMS_MEMORY` (0x09), which was already
+implemented for the import direction: same aux marshalling of the embedded
+`{ int memFd }` blob, then the returned stub GEM handle proxied into the guest
+DRM core sized to `mem_size`. Layout verified byte-for-byte against an
+`LD_PRELOAD` ioctl trace on the host. Also added to the QEMU render-node
+allowlist and to the stub's offset-8 pointer substitution / memFd resolution /
+post-ioctl pointer scrub.
+
+#### Evidence that the whole client path now runs
+
+`egl_dmabuf_export_probe` in the guest: `RESULT: PASS dma-buf export works`.
+
+QEMU's own log, one line per client swapchain buffer — each
+`GEM_IMPORT_NVKMS_MEMORY` immediately followed by that buffer being brokered
+from the client's isolate to the compositor's:
+
+```
+isolate=3 cmd=0xc0206441 ret=0
+nvkvm xiso: owner(iso=3 gem=0x3) -> importer(iso=1) gem=0x2
+isolate=3 cmd=0xc0206441 ret=0
+nvkvm xiso: owner(iso=3 gem=0x4) -> importer(iso=1) gem=0x3
+isolate=3 cmd=0xc0206441 ret=0
+nvkvm xiso: owner(iso=3 gem=0x5) -> importer(iso=1) gem=0x4
+```
+
+`WAYLAND_DEBUG` on the client shows a healthy triple-buffered dma-buf present
+loop — `zwp_linux_buffer_params.create`, then `attach`/`damage`/`commit` cycling
+`wl_buffer@31/32/33` at ~25 ms — where before it emitted no `create` at all.
+
+And pixels: `weston-screenshooter` on headless weston captures the composited
+desktop with a **populated** client window — es2gears' gears, and glmark2's
+Horse scene from a client reporting `GL_RENDERER: NVIDIA GeForce RTX 3050`.
+Those windows were black.
+
+`tests/validate.sh` stays **28/28**.
+
+#### What is still broken — the next wall
+
+Two things, both only reachable now that the NVIDIA client path actually runs.
+Neither reproduced before, because before this the client was llvmpipe.
+
+1. **Frames stop updating after the first few.** The client presents correctly
+   for a while and then stops committing; captures taken afterwards are
+   byte-identical. Measured: `commits before=62 after 2s=62`, and in another run
+   the client was still committing at t=10 s — so it is non-deterministic, in
+   the tens-to-hundreds-of-frames range, not a fixed frame count. The prime
+   suspect is the un-marshalled sync fd: `SEMSURF_FENCE_CREATE` (0x15) returns
+   `p->fd`, a **stub-local** sync fd, straight to the guest — the guest source
+   already flags this ("cross-boundary sync-fd passback is a separate
+   milestone", `src/guest/nvkvm_drm.c`). A number that means nothing in the
+   guest is exactly the shape of a lost frame-completion wakeup. **Not
+   confirmed** — no experiment in this round isolated it.
+2. **Intermittent guest-fatal `kvm run failed Bad address`.** Within roughly
+   10-60 s of a GL client running, QEMU dies with an unserviceable guest access
+   at CPL=3 inside NVIDIA userspace: `mov ecx,[rdx+0x84]` where `rdx` is a
+   page-aligned pointer loaded out of a driver struct — i.e. a mapped GPU page
+   whose backing the host could not resolve. Reproduced four times with the same
+   faulting instruction bytes at different ASLR bases; the last operations
+   before it are always a burst of `SEMSURF_FENCE_CREATE` plus `RM_MAP_MEMORY` /
+   `WINMAP` window mappings. This looks like the mmap/WINMAP window path, not
+   the dma-buf path, and it is **not** diagnosed.
+
+Do not read this entry as "Wayland clients work". Read it as: they get a real
+NVIDIA context, they produce and hand over real GPU buffers, the compositor
+composites those buffers, and then the stream stalls.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
