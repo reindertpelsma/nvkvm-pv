@@ -112,6 +112,50 @@ sub-slot, so reads are served and writes become resumable MMIO exits.
 **Vulkan compute fails on Hopper** (`vk_compute_dispatch`) — see the note under
 [Tested platforms](#tested-platforms).
 
+## Two CUDA checks fail on driver 595.84 — open
+
+Measured 2026-08-19 on an RTX 4070, host driver **595.84**, current `main`,
+inside the shipped container. `tests/validate.sh` is **26/28, deterministic
+across runs**: `cuda_kernel_launch` and `cuda_matmul` both fail `setup rc=1`.
+Every other check passes, including `cuda_ptx_jit` immediately before them and
+the 8 MiB byte-exact round trip.
+
+The same code is 28/28 on 580.173.02 (RTX 3050) and 580.95.05 (GTX 1660
+SUPER) the same day, so this is specific to 595.84 (or to that GPU/host).
+
+**The old explanation for this driver row was wrong.** It blamed a box
+provisioned without `libnvidia-ptxjitcompiler`. That library is present — in
+the host bundle *and* staged in the guest — and the failure happens anyway.
+
+What is established:
+
+- **The context is dead, not one call.** Instrumenting the suite shows all six
+  setup calls — three `cuMemAlloc`, two `cuMemcpyHtoD`, one `cuMemsetD8` —
+  return `CUDA_ERROR_INVALID_VALUE`, not just one of them.
+- **libcuda rejects them internally.** An `LD_PRELOAD` ioctl interposer in the
+  guest logs no failing NVIDIA ioctl and no denied control anywhere near the
+  failure. The only RM statuses in the whole run are four tolerated ones
+  (`0x2080012f`, `0x20801357`, `0x20800157` returning `NOT_SUPPORTED`, and
+  `0x2080014b` returning `OBJECT_NOT_FOUND`), none adjacent to the failing
+  calls. So it is decided above the driver boundary.
+
+What was ruled out, so nobody repeats it:
+
+- Not the PTX JIT compiler being absent (it is staged).
+- Not a denied control — our deny path returns `NOT_SUPPORTED` (`0x56`) and
+  nothing is denied at the failure point.
+- Not the v1/v2 CUDA ABI: the suite resolves `_v2` symbols, and a probe using
+  the same `_v2` symbols passes.
+- **Not reproducible standalone.** A probe replicating the suite's sequence —
+  8 MiB alloc/HtoD/memset warmup, `cuModuleLoadData` of the same PTX,
+  `cuModuleGetFunction`, then the identical three 4 MiB allocations — passes
+  every call. Something else in the suite's longer sequence is the trigger and
+  has not been isolated.
+
+The next step is to bisect `tests/validate.sh` itself by removing earlier
+checks until the failure disappears. Until then this is a real, reproducible
+gap on the newest driver branch, not a packaging artefact.
+
 ## Vulkan compute on Hopper
 
 On the H100 every CUDA and bring-up check passes (`sm_90`, PTX JIT, kernel
@@ -149,8 +193,9 @@ the guest is complete — nvkvm is not withholding Hopper classes from the
 driver.
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
-595.84 row has no 28/28 measurement — its box was re-provisioned without
-`libnvidia-ptxjitcompiler`. Full detail in
+595.84 row had no 28/28 measurement.  **That footnote used to blame a box
+re-provisioned without `libnvidia-ptxjitcompiler`; that explanation is wrong**
+— see below. Full detail in
 [`tests/BOOT_MATRIX.md`](tests/BOOT_MATRIX.md).
 
 NVIDIA guarantees no ioctl ABI stability across driver releases, so `nvkvm` keys

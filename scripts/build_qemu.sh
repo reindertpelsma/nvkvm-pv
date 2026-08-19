@@ -10,9 +10,22 @@
 set -euo pipefail
 
 QEMU_VERSION="9.2.0"
-QEMU_SRC="/opt/qemu-src"
-QEMU_PREFIX="/opt/qemu-nvkvm"
 REPO_ROOT="$(realpath "$(dirname "$0")/..")"
+
+# Where the QEMU tree is cloned and the binary installed.  /opt when we can
+# write it (the container case, and the historical default); otherwise a
+# per-user prefix, so the whole build works rootless.  Override either
+# explicitly with NVKVM_QEMU_SRC / NVKVM_QEMU_PREFIX.
+nvkvm_default_prefix() {
+    if [ -w /opt ] || [ "$(id -u)" -eq 0 ]; then
+        echo "/opt"
+    else
+        echo "${XDG_DATA_HOME:-$HOME/.local/share}/nvkvm"
+    fi
+}
+NVKVM_BASE="$(nvkvm_default_prefix)"
+QEMU_SRC="${NVKVM_QEMU_SRC:-$NVKVM_BASE/qemu-src}"
+QEMU_PREFIX="${NVKVM_QEMU_PREFIX:-$NVKVM_BASE/qemu-nvkvm}"
 
 # ── Guard: already built ───────────────────────────────────────────────────
 # --force rebuilds even when the binary exists.  You need this after editing
@@ -23,12 +36,19 @@ REPO_ROOT="$(realpath "$(dirname "$0")/..")"
 # The QEMU source tree and ninja build dir are reused, so a forced rebuild is
 # incremental — minutes, not the full ~20.
 NVKVM_FORCE=0
+NVKVM_ARG_INSTALL_DEPS=0
 for arg in "$@"; do
     case "$arg" in
         -f|--force) NVKVM_FORCE=1 ;;
+        --install-deps) NVKVM_ARG_INSTALL_DEPS=1 ;;
         -h|--help)
-            echo "usage: $0 [--force]"
-            echo "  --force   rebuild even if the binary already exists"
+            echo "usage: $0 [--force] [--install-deps]"
+            echo "  --force          rebuild even if the binary already exists"
+            echo "  --install-deps   install missing build deps (needs root)"
+            echo ""
+            echo "env: NVKVM_QEMU_PREFIX  install path (default /opt/qemu-nvkvm,"
+            echo "                        or ~/.local/share/nvkvm when /opt is not writable)"
+            echo "     NVKVM_QEMU_SRC     QEMU source tree path"
             exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
     esac
@@ -49,29 +69,107 @@ echo "Source tree  : $QEMU_SRC"
 echo "Install path : $QEMU_PREFIX"
 echo ""
 
-# ── 1. Install build dependencies ─────────────────────────────────────────
-echo "[1/9] Installing build dependencies..."
-apt-get update -q
-apt-get install -y \
-    ninja-build \
-    meson \
-    libglib2.0-dev \
-    libpixman-1-dev \
-    python3 \
-    `# QEMU 9.2 meson/configure needs these (rebuild fix 2026-07-04)` \
-    python3-venv \
-    python3-tomli \
-    git \
-    libslirp-dev \
-    pkg-config \
-    libattr1-dev \
-    `# modeset present path (#102): OpenGL + headless EGL scanout` \
-    libepoxy-dev \
-    libgbm-dev \
-    libegl-dev \
-    libdrm-dev \
-    `# the isolate stub is embedded via xxd -i (bench-rebuild fix 2026-07-29)` \
-    xxd
+# ── 1. Build dependencies ─────────────────────────────────────────────────
+#
+# This script does NOT install anything by default.  It is a convenience
+# wrapper around an ordinary QEMU build (docs/howto/build.md walks the same
+# steps by hand), and a build helper that silently runs a package manager as
+# root is both surprising and Debian-only, which is what this used to be.
+#
+# So: probe for what the build actually needs, and if something is missing say
+# exactly what, with the package names for the distro we appear to be on.
+# --install-deps opts back in to installing them.
+echo "[1/9] Checking build dependencies..."
+
+nvkvm_distro() {
+    if [ -r /etc/os-release ]; then . /etc/os-release; echo "${ID_LIKE:-$ID}"; fi
+}
+
+# Each entry: "<probe-kind>:<probe-arg>".  cmd = an executable on PATH,
+# pc = a pkg-config module (which is what QEMU's configure actually looks for).
+NVKVM_DEPS="cmd:git cmd:ninja cmd:meson cmd:pkg-config cmd:python3 cmd:xxd
+pc:glib-2.0 pc:pixman-1 pc:slirp pc:epoxy pc:gbm pc:egl pc:libdrm"
+
+nvkvm_missing() {
+    local miss="" kind arg
+    for d in $NVKVM_DEPS; do
+        kind="${d%%:*}"; arg="${d#*:}"
+        case "$kind" in
+            cmd) command -v "$arg" >/dev/null 2>&1 || miss="$miss $arg" ;;
+            pc)  pkg-config --exists "$arg" 2>/dev/null || miss="$miss $arg(dev)" ;;
+        esac
+    done
+    echo "$miss"
+}
+
+# Best-effort package names.  Distros rename things; the probe list above is
+# the authority on WHAT is needed, this is a convenience for the common cases.
+nvkvm_pkg_hint() {
+    case "$(nvkvm_distro)" in
+        *debian*|*ubuntu*)
+            echo "apt install ninja-build meson libglib2.0-dev libpixman-1-dev \\
+     python3 python3-venv python3-tomli git libslirp-dev pkg-config \\
+     libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd" ;;
+        *fedora*|*rhel*|*centos*)
+            echo "dnf install ninja-build meson glib2-devel pixman-devel python3 \\
+     git libslirp-devel pkgconf-pkg-config libattr-devel libepoxy-devel \\
+     mesa-libgbm-devel mesa-libEGL-devel libdrm-devel vim-common" ;;
+        *arch*)
+            echo "pacman -S ninja meson glib2 pixman python git libslirp \\
+     pkgconf attr libepoxy mesa libdrm xxd base-devel" ;;
+        *suse*)
+            echo "zypper install ninja meson glib2-devel libpixman-1-0-devel \\
+     python3 git libslirp-devel pkg-config libattr-devel libepoxy-devel \\
+     Mesa-libgbm-devel Mesa-libEGL-devel libdrm-devel vim" ;;
+        *)  echo "(unrecognised distro -- install the equivalents of: ninja meson \\
+     glib2 pixman slirp epoxy gbm egl libdrm pkg-config python3 git xxd)" ;;
+    esac
+}
+
+NVKVM_INSTALL_DEPS=0
+case "${NVKVM_BUILD_INSTALL_DEPS:-0}" in 1|yes|true) NVKVM_INSTALL_DEPS=1 ;; esac
+[ "${NVKVM_ARG_INSTALL_DEPS:-0}" -eq 1 ] && NVKVM_INSTALL_DEPS=1
+
+MISSING="$(nvkvm_missing)"
+if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ]; then
+    echo "  installing:$MISSING"
+    case "$(nvkvm_distro)" in
+        *debian*|*ubuntu*) apt-get update -q && apt-get install -y \
+            ninja-build meson libglib2.0-dev libpixman-1-dev python3 \
+            python3-venv python3-tomli git libslirp-dev pkg-config \
+            libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd ;;
+        *fedora*|*rhel*|*centos*) dnf install -y \
+            ninja-build meson glib2-devel pixman-devel python3 git \
+            libslirp-devel pkgconf-pkg-config libattr-devel libepoxy-devel \
+            mesa-libgbm-devel mesa-libEGL-devel libdrm-devel vim-common ;;
+        *arch*) pacman -S --noconfirm --needed ninja meson glib2 pixman python \
+            git libslirp pkgconf attr libepoxy mesa libdrm base-devel ;;
+        *suse*) zypper install -y ninja meson glib2-devel libpixman-1-0-devel \
+            python3 git libslirp-devel pkg-config libattr-devel \
+            libepoxy-devel Mesa-libgbm-devel Mesa-libEGL-devel libdrm-devel vim ;;
+        *) echo "ERROR: --install-deps: unrecognised distro" >&2; exit 1 ;;
+    esac
+    MISSING="$(nvkvm_missing)"
+fi
+
+if [ -n "$MISSING" ]; then
+    cat >&2 <<EOF
+
+ERROR: missing build dependencies:$MISSING
+
+Install them and re-run, or pass --install-deps to have this script do it
+(which needs root).  On this system that is roughly:
+
+  $(nvkvm_pkg_hint)
+
+The build itself needs no root: it installs to
+  $QEMU_PREFIX
+Set NVKVM_QEMU_PREFIX to change that.  docs/howto/build.md does the same
+steps by hand if you would rather not run this script at all.
+EOF
+    exit 1
+fi
+echo "  all present"
 
 # ── 1b. Build the isolate STUB and its embed header ───────────────────────
 # Bench-rebuild fix 2026-07-29: this step did not exist, and its absence is
@@ -89,9 +187,18 @@ apt-get install -y \
 # which is what rules out the pivot_root / dev-dirfd path as the cause.
 echo "[1b/9] Building the isolate stub (nvkvm_stub + nvkvm_stub_bin.h)..."
 make -C "$REPO_ROOT/src/stub"
-install -d /usr/lib/nvkvm
-install -m 0755 "$REPO_ROOT/src/stub/nvkvm_stub" /usr/lib/nvkvm/nvkvm_stub
-echo "  stub installed at /usr/lib/nvkvm/nvkvm_stub (runtime fallback)"
+# The stub is EMBEDDED in the QEMU binary (nvkvm_stub_bin.h, below), so this
+# copy is only the runtime fallback for a QEMU built without the embed.  Skip
+# it rather than fail when /usr/lib is not writable -- that is the whole
+# difference between "needs root" and "does not".
+if install -d /usr/lib/nvkvm 2>/dev/null &&
+   install -m 0755 "$REPO_ROOT/src/stub/nvkvm_stub" /usr/lib/nvkvm/nvkvm_stub 2>/dev/null; then
+    echo "  stub installed at /usr/lib/nvkvm/nvkvm_stub (runtime fallback)"
+else
+    echo "  /usr/lib/nvkvm not writable — skipping the fallback copy."
+    echo "  Harmless: the stub is embedded in the QEMU binary. Set"
+    echo "  NVKVM_STUB_PATH=$REPO_ROOT/src/stub/nvkvm_stub if you ever need it."
+fi
 
 # ── 2. Clone QEMU 9.2 stable ──────────────────────────────────────────────
 if [ ! -d "$QEMU_SRC" ]; then
