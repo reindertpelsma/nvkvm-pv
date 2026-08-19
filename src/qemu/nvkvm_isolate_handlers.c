@@ -45,6 +45,8 @@ struct nvkvm_iso_mmap_entry {
 	size_t   len;
 	int      kvm_slot;   /* KVM memory slot (-1 if none) */
 	uint64_t gpa;
+	uint32_t handle_id;  /* frontend handle the mapping was made from, so a
+			      * close can tear the window extent down; 0 = none */
 };
 
 static struct nvkvm_iso_mmap_entry iso_mmap_tbl[NVKVM_ISO_MMAP_MAX];
@@ -53,7 +55,7 @@ static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 				size_t len, int kvm_slot, uint64_t gpa,
-				bool stub_mirrored)
+				bool stub_mirrored, uint32_t handle_id)
 {
 	pthread_mutex_lock(&iso_mmap_lock);
 	for (uint32_t i = 0; i < NVKVM_ISO_MMAP_MAX - 1; i++) {
@@ -68,6 +70,7 @@ static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 			iso_mmap_tbl[tok].len           = len;
 			iso_mmap_tbl[tok].kvm_slot      = kvm_slot;
 			iso_mmap_tbl[tok].gpa           = gpa;
+			iso_mmap_tbl[tok].handle_id     = handle_id;
 			pthread_mutex_unlock(&iso_mmap_lock);
 			return tok;
 		}
@@ -501,12 +504,19 @@ int nvkvm_req_copy_handle_to_isolate(VirtIONvgpu *nv,
 	return 0;
 }
 
+/* Defined below, next to the other iso_mmap reapers. */
+static int nvkvm_iso_mmap_reap_handle(VirtIONvgpu *nv, uint32_t isolate_id,
+				      uint32_t handle_id);
+
 int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
 				       struct nvkvm_req_close_handle_on_isolate *req,
 				       struct nvkvm_resp_close_handle_on_isolate *resp)
 {
 	/* U-6: see nvkvm_req_close_handle. */
 	nvkvm_uvm_va_purge_handle(req->handle_id);
+	/* Drop any window extent this handle still owns before the fd goes, so
+	 * the guest cannot keep writing into memory the driver has recycled. */
+	nvkvm_iso_mmap_reap_handle(nv, req->isolate_id, req->handle_id);
 	int ret = nvkvm_isolate_close_handle(&nv->isolates, &nv->handles,
 					     req->isolate_id, req->handle_id);
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
@@ -2544,7 +2554,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	/* Record for future MUNMAP_ON_ISOLATE */
 	uint32_t token = iso_mmap_alloc(req->isolate_id, req->gva, qva,
 					len, kvm_slot, gpa,
-					do_stub_mirror);
+					do_stub_mirror, req->handle_id);
 	if (token == 0) {
 		/*
 		 * Table full: we cannot track this mapping for later teardown, so
@@ -2633,6 +2643,62 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 
 	resp->status = 0;
 	return 0;
+}
+
+/*
+ * Tear down every window mapping made from one frontend handle.
+ *
+ * A guest that frees an RM memory object closes its handle, but never sends
+ * MUNMAP_ON_ISOLATE for the mappings made from it: before this, every window
+ * extent survived until the isolate exited.  The driver then recycles that
+ * device memory for the next allocation while the guest is still writing into
+ * the stale extent -- the CPU reads back its own writes and the GPU reads
+ * zeros, silently wrong results with no error anywhere.  See
+ * docs/reference/correctness.md.
+ */
+static int nvkvm_iso_mmap_reap_handle(VirtIONvgpu *nv, uint32_t isolate_id,
+				      uint32_t handle_id)
+{
+	int reaped = 0;
+	if (!handle_id)
+		return 0;
+	pthread_mutex_lock(&iso_mmap_lock);
+	for (uint32_t i = 1; i < NVKVM_ISO_MMAP_MAX; i++) {
+		if (!iso_mmap_tbl[i].used ||
+		    iso_mmap_tbl[i].isolate_id != isolate_id ||
+		    iso_mmap_tbl[i].handle_id  != handle_id)
+			continue;
+		struct nvkvm_iso_mmap_entry e = iso_mmap_tbl[i];
+		iso_mmap_tbl[i].used = false;
+		pthread_mutex_unlock(&iso_mmap_lock);
+
+		NVKVM_DBG("nvkvm: REAP_HANDLE handle=%u gpa=0x%llx len=%lu\n",
+			  handle_id, (unsigned long long)e.gpa,
+			  (unsigned long)e.len);
+
+		if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT) {
+			if (e.qva)
+				nvkvm_window_restore_anon(e.qva, e.len);
+		} else {
+			if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
+				struct nvkvm_kvm_mem_region mr = {
+					.slot        = (uint32_t)e.kvm_slot,
+					.memory_size = 0,
+				};
+				ioctl(nvkvm_kvm_vm_fd,
+				      KVM_SET_USER_MEMORY_REGION, &mr);
+				nvkvm_kvm_slot_release(e.kvm_slot);
+			}
+			if (e.qva)
+				munmap(e.qva, e.len);
+		}
+		if (e.gpa)
+			nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+		reaped++;
+		pthread_mutex_lock(&iso_mmap_lock);
+	}
+	pthread_mutex_unlock(&iso_mmap_lock);
+	return reaped;
 }
 
 /*
@@ -3093,7 +3159,8 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	 * Previously this allocation was never tracked or freed → unprivileged
 	 * guest realize churn exhausted the 128 GiB window (VM-wide GPU DoS). */
 	(void)iso_mmap_alloc(req->isolate_id, gpa, /*qva=*/NULL, (size_t)len,
-			     NVKVM_IN_WINDOW_SLOT, gpa, /*stub_mirrored=*/false);
+			     NVKVM_IN_WINDOW_SLOT, gpa, /*stub_mirrored=*/false,
+			     /*handle_id=*/0);
 
 	resp->gpa_base      = gpa;
 	resp->length        = len;

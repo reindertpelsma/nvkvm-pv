@@ -35,10 +35,20 @@ Eliminated by experiment, so that the next attempt does not re-tread them:
 - **not** pinned vs device memory (`ALLOC_HOST_PTR` and plain device buffers
   fail identically), and **not** the buffer's `CL_MEM_READ_ONLY`/`READ_WRITE` flags
 
-*Fix direction:* window mappings carry no RM memory handle today, so a free
-cannot find them. The `fd` recorded by `RM_MAP_MEMORY` bridges the two; teaching
-the mapping table that association would let `NV_ESC_RM_FREE` tear the extent
-down, so the next mapping is established against the new object.
+*Host side, done:* window mappings now record the frontend handle they were
+made from, and closing that handle tears the extent down (`REAP_HANDLE` in a
+`NVKVM_DEBUG=1` log). That closes a real hole — a freed object's device memory
+no longer stays mapped into the guest's GPA space where the driver may have
+handed it to another client — **but it does not fix the corruption**: the
+reproducer still fails with the reap in place.
+
+*What is left, guest side:* the guest keeps using a **cached** mapping for the
+new buffer instead of asking for a fresh one, so the application's pointer still
+refers to the old GPA. That is why the CPU sees its own writes (they land in
+whatever now backs that GPA) while the GPU reads the new allocation. The fix
+belongs in `src/guest/`: invalidate the module's mapping cache for a handle when
+the object behind it is freed, so the next map goes through a new
+`MMAP_ON_ISOLATE`.
 
 **OpenCL is off by default** for that reason — staging it requires
 `NVKVM_STAGE_OPENCL=1`. Without it, OpenCL programs fail loudly with "unknown
