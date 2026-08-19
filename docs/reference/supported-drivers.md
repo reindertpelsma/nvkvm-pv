@@ -104,13 +104,34 @@ cmdType allowlist, captured on a 575-era session, denied the `cmdType=60` that
 branches 595+ issue per offscreen surface. With 60 allowed both branches pass
 `gl_draw_pixel_check` and 610.43.02 is a clean 28/28.
 
-Turing is the floor in practice, not by an explicit check: the alloc-class
-allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`) carries the Volta,
-Turing, Ampere, Ada, Hopper and Blackwell channel/compute/DMA-copy classes, and
-the channel-alloc sizing in the guest handles `TURING_CHANNEL_GPFIFO_A`,
-`AMPERE_CHANNEL_GPFIFO_A` and `HOPPER_CHANNEL_GPFIFO_A`
-(`src/guest/nvkvm_main.c:1709-1713`). A pre-Volta card would need its classes
-added to the allowlist.
+## Turing is the floor, and we are not moving it
+
+The alloc-class allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`) carries
+the Volta, Turing, Ampere, Ada, Hopper and Blackwell channel/compute/DMA-copy
+classes, and the guest's channel-alloc sizing handles
+`TURING_CHANNEL_GPFIFO_A`, `AMPERE_CHANNEL_GPFIFO_A` and
+`HOPPER_CHANNEL_GPFIFO_A` (`src/guest/nvkvm_main.c:1709-1713`). Pascal's classes
+are absent, so a pre-Volta card would need them added.
+
+That is deliberate, and it is a supported claim rather than an untested
+assumption — a GTX 1080 was measured (see the README's platform table). Three
+reasons not to chase pre-Turing:
+
+- **The open kernel module cannot drive Pascal at all.** It refuses to probe:
+  `not supported by open nvidia.ko because it does not include the required GPU
+  System Processor (GSP)`. Pascal predates GSP. Any host on the open module —
+  increasingly the default — has no driver for the card, with or without nvkvm.
+- **Upstream support ends anyway.** NVIDIA has confirmed the 580 branch is the
+  last to support Maxwell, Pascal and Volta; 590 moves them to
+  maintenance/security only. Work here would target a frozen ABI.
+- **nvproxy draws the same line.** gVisor's nvproxy lists T4 (Turing), A100/A10G,
+  L4 and H100 as supported, with no Pascal or Volta. Our allowlists track
+  nvproxy for parity, so keeping the same floor keeps that parity meaningful.
+
+With the proprietary module a GTX 1080 does get part-way — the guest's
+`nvidia-smi` reports the card and 15 checks pass — but `cuInit` returns 999 and
+no gate denies anything, so the remaining work is of unknown depth. Not worth
+it for hardware whose driver line ends at 580.
 
 ## Multi-GPU
 

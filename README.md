@@ -326,8 +326,11 @@ things stop Pascal, and only the first is absolute:
    and Vulkan and the GL FBO check fail. No allowlist denies anything during the
    attempt, so this is not the default-deny gates refusing a Pascal class.
 
-So **Turing or newer** stands, and pre-Turing is not simply "untested" — it
-enumerates and then fails at CUDA init.
+So **Turing or newer** is a hard requirement, not an untested assumption, and we
+are not planning to move it: NVIDIA's 580 branch is the last to support Pascal
+at all, and gVisor's nvproxy — which our allowlists track for parity — draws the
+same line at Turing. The reasoning is in
+[supported drivers](docs/reference/supported-drivers.md).
 
 ## FAQ
 
