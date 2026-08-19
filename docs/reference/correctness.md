@@ -42,13 +42,27 @@ no longer stays mapped into the guest's GPA space where the driver may have
 handed it to another client — **but it does not fix the corruption**: the
 reproducer still fails with the reap in place.
 
-*What is left, guest side:* the guest keeps using a **cached** mapping for the
-new buffer instead of asking for a fresh one, so the application's pointer still
-refers to the old GPA. That is why the CPU sees its own writes (they land in
-whatever now backs that GPA) while the GPU reads the new allocation. The fix
-belongs in `src/guest/`: invalidate the module's mapping cache for a handle when
-the object behind it is freed, so the next map goes through a new
-`MMAP_ON_ISOLATE`.
+*What is left, guest side:* `nvkvm_cpu_page_migrate()` in
+[`src/guest/nvkvm_mmap.c`](../../src/guest/nvkvm_mmap.c) keys its "already
+mapped?" cache on the **guest virtual address alone**, and nothing ever
+invalidates it while the fd stays open. Freeing an OpenCL buffer and allocating
+another gives back the same GVA, the cache reports "already mapped", and the new
+buffer is never published to the device — so the CPU writes into its own memory
+while the GPU reads whatever the previous migration left.
+
+Two invalidation points were tried and neither is the right one, so don't repeat
+them:
+
+- **Page identity** (re-`gup` the GVA and compare with the cached `struct page`)
+  does not trigger: the allocator hands back the *same* physical pages, so the
+  entry looks valid while the device-side mapping behind it is gone.
+- **Handle close** does not trigger either: the guest closes a handle only when
+  the `/dev/nvidia*` fd is released, not when an RM object is freed.
+
+The invalidation point therefore has to be the `NV_ESC_RM_FREE` ioctl itself,
+which means associating cpu-page migrations with the RM memory handle they
+belong to — an association neither side records today. That is the next piece of
+work, and it is a design change rather than a patch.
 
 **OpenCL is off by default** for that reason — staging it requires
 `NVKVM_STAGE_OPENCL=1`. Without it, OpenCL programs fail loudly with "unknown
