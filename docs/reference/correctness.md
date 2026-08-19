@@ -5,29 +5,59 @@ reproduce it yourself. Every claim here was measured by running the **same
 binary** on the host and in the guest; a difference is the finding, agreement
 means the behaviour belongs to the GPU or the driver rather than to nvkvm.
 
-**Silent wrong results in repeated map/unmap after allocation churn.** An OpenCL
-program that repeatedly maps and unmaps a pinned buffer, after other buffers
-have been allocated and freed, reads zeros where the kernel's output should be —
-no error, no crash, just wrong data. Geekbench 7 `--gpu` fails validation on 11
-workloads in the guest while the identical binary on the same GPU and driver is
-clean on the host
-([guest](https://browser.geekbench.com/v7/gpu/79890) vs
-[host](https://browser.geekbench.com/v7/gpu/79862)). Reproducers and the full
-bisection are in [`tests/repro/`](tests/repro/). `validate.sh` does not cover
-this: its checks pass on the same guest, so **28/28 is not evidence that a given
-workload computes correctly**. Verify your own results against a host run.
+**Silent wrong results after a mapped buffer is freed.** The guest CPU and the
+GPU stop seeing the same memory: the CPU reads back its own writes correctly,
+while the GPU reads zeros, so a kernel computes from an all-zero input and no
+error is reported anywhere. Geekbench 7 `--gpu` fails validation on 11 workloads
+in the guest while the identical binary on the same GPU and driver is clean on
+the host ([guest](https://browser.geekbench.com/v7/gpu/79890) vs
+[host](https://browser.geekbench.com/v7/gpu/79862)). `validate.sh` does not
+cover it — 28/28 passes on a guest that computes this wrong — so **verify your
+own results against a host run**.
+
+*Root cause, bisected 2026-08-19 on an RTX 3060:* the trigger is an RM memory
+object being **freed while nvkvm still holds its window mapping**. Releasing a
+buffer produces no unmap: every window extent in a run is torn down at process
+exit, never when the object is freed. The driver then recycles that device
+memory for the next allocation, and the guest keeps writing into the stale
+extent — which is why the CPU sees its own writes and the GPU does not.
+
+`tests/repro/opencl_input_visibility.c` isolates it to one variable: churn
+buffers that are mapped, written and *released* corrupt the next buffer
+(`./clvis 3 20 1 1`); the same buffers *not* released do not (`./clvis 3 20 1 3`).
+
+Eliminated by experiment, so that the next attempt does not re-tread them:
+
+- **not** the read-only page substitution below — removing it entirely leaves
+  the corruption unchanged
+- **not** GPA extent recycling — no window GPA is reused during a failing run
+- **not** the ioctl/alloc allowlists — no gate denies anything during the run
+- **not** pinned vs device memory (`ALLOC_HOST_PTR` and plain device buffers
+  fail identically), and **not** the buffer's `CL_MEM_READ_ONLY`/`READ_WRITE` flags
+
+*Fix direction:* window mappings carry no RM memory handle today, so a free
+cannot find them. The `fd` recorded by `RM_MAP_MEMORY` bridges the two; teaching
+the mapping table that association would let `NV_ESC_RM_FREE` tear the extent
+down, so the next mapping is established against the new object.
 
 **OpenCL is off by default** for that reason — staging it requires
 `NVKVM_STAGE_OPENCL=1`. Without it, OpenCL programs fail loudly with "unknown
 OpenCL platform" rather than returning wrong answers quietly.
 
-**A driver-managed read-only page is mishandled.** Where the NVIDIA driver hands
-back a page with `VM_WRITE` cleared, nvkvm currently substitutes anonymous
-memory. Leaving the driver's mapping in place instead causes an unrecoverable
-`EFAULT` that kills the guest, so both current behaviours are wrong; the fix is
-a `KVM_MEM_READONLY` memslot for those pages, so reads are served and writes
-become resumable MMIO exits. This is the leading suspect for the corruption
-above, though removing the substitution does not by itself fix it.
+**A driver-managed read-only page is mishandled** *(fixed 2026-08-19 for the
+common case).* In-window device mappings used to be forced to `PROT_READ|
+PROT_WRITE` regardless of what the guest asked for. When the guest requested a
+read-only mapping the driver honoured it with a read-only VMA, the forced
+writable `mprotect` probe then failed, and the page was replaced with anonymous
+zeroes — so whatever the driver publishes there never reached the guest. nvkvm
+now honours the requested protection and only probes for writability when the
+guest actually asked to write.
+
+What remains is the narrower conflict: the guest requests **write** and the
+driver returns a read-only VMA anyway. That still falls back to anonymous
+memory, because leaving the driver's mapping in place causes an unrecoverable
+`EFAULT` that kills the guest. The fix for that case is a `KVM_MEM_READONLY`
+sub-slot, so reads are served and writes become resumable MMIO exits.
 
 **Vulkan compute fails on Hopper** (`vk_compute_dispatch`) — see the note under
 [Tested platforms](#tested-platforms).

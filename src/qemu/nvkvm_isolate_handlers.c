@@ -2375,17 +2375,25 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			return 0;
 		}
 		/*
-		 * Map RW regardless of req->prot.  Inside the window the VA sits
-		 * under the sparse KVM memslot, and KVM resolves a memslot HVA
-		 * with get_user_pages()/hva_to_pfn_remapped(): on a device VMA
-		 * (VM_IO|VM_PFNMAP) that lacks VM_READ or VM_WRITE it cannot
-		 * produce a PFN and fails KVM_RUN with EFAULT -- unrecoverable,
-		 * not a resumable MMIO exit, so the guest dies on the access.
-		 * Narrowing the host VMA buys no isolation anyway: the memslot
-		 * already exposes [gpa, gpa+len) to the guest read-write, and
-		 * the guest's own PTE permissions still come from its mapping.
+		 * Honour what the guest asked for.  KVM resolves a memslot HVA
+		 * with get_user_pages()/hva_to_pfn_remapped(), and on a device
+		 * VMA (VM_IO|VM_PFNMAP) that cannot produce a PFN it fails
+		 * KVM_RUN with EFAULT -- unrecoverable, not a resumable MMIO
+		 * exit.  But that is a *write* problem: a read fault only needs
+		 * gup(write=0), which a read-only device VMA satisfies.
+		 *
+		 * This used to force PROT_READ|PROT_WRITE for every mapping,
+		 * which broke read-only ones.  The driver honours a PROT_READ
+		 * request with a read-only VMA; the forced-RW mprotect probe
+		 * below then failed on it and the page was replaced with
+		 * anonymous zeroes -- so whatever the driver publishes there
+		 * (notifier/semaphore words the runtime polls) never reached the
+		 * guest, and OpenCL read stale buffer contents with no error.
+		 * See docs/reference/correctness.md.
 		 */
-		qva = mmap(target, len, PROT_READ | PROT_WRITE,
+		const bool want_write = (req->prot & PROT_WRITE) != 0;
+		qva = mmap(target, len,
+			   want_write ? (PROT_READ | PROT_WRITE) : PROT_READ,
 			   MAP_SHARED | MAP_FIXED, h->fd, (off_t)req->offset);
 		if (qva == MAP_FAILED) {
 			int se = errno;
@@ -2439,7 +2447,12 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			for (size_t o = 0; o < len; o += 4096)
 				(void)p[o];
 		}
-		if (mprotect(qva, len, PROT_READ | PROT_WRITE) != 0) {
+		/*
+		 * Only a mapping the guest wants to WRITE needs a writable host
+		 * VMA.  For a read-only request there is nothing to probe: keep
+		 * the real device page so its contents reach the guest.
+		 */
+		if (want_write && mprotect(qva, len, PROT_READ | PROT_WRITE) != 0) {
 			NVKVM_DBG("nvkvm: WINMAP gpa=0x%llx len=%lu is "
 				  "driver-readonly (%s) -- falling back to "
 				  "anonymous window backing\n",
@@ -2612,6 +2625,9 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 
 	/* #80/H-1: return the GPA extent to the window free-list so a
 	 * mmap/munmap loop recycles window space instead of leaking it. */
+	NVKVM_DBG("nvkvm: WINUNMAP token=%u gpa=0x%llx len=%lu slot=%d\n",
+		  req->mmap_token, (unsigned long long)e.gpa,
+		  (unsigned long)e.len, e.kvm_slot);
 	if (e.gpa)
 		nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
 

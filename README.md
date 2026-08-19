@@ -203,9 +203,10 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-**A guest can return silently wrong results.** An OpenCL program that repeatedly
-maps and unmaps a pinned buffer, after other buffers have been freed, reads
-zeros instead of its results — no error, no crash. Geekbench 7 `--gpu` fails
+**A guest can return silently wrong results.** After an OpenCL buffer that was
+mapped is freed, the guest CPU and the GPU stop seeing the same memory: the CPU
+reads back its own writes, the GPU reads zeros, and a kernel computes from an
+all-zero input — no error, no crash. Geekbench 7 `--gpu` fails
 validation on 11 workloads in the guest while the identical binary is clean on
 the host ([guest](https://browser.geekbench.com/v7/gpu/79890) ·
 [host](https://browser.geekbench.com/v7/gpu/79862)). `validate.sh` passes on that
