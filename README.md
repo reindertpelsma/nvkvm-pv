@@ -373,9 +373,18 @@ Yes — each guest process gets its own isolate on the host, so they are separat
 address spaces sharing the device the same way host processes do.
 
 **What's the performance cost?**
-Sustained compute and bandwidth measure at parity (1.00x) on every workload in
-[Tested applications](#tested-applications). Where the guest is slower it is
-latency-bound control paths, not throughput.
+Close to nothing on throughput, and a real cost on latency. Sustained compute
+and bandwidth measure at parity (1.00x) on every workload in
+[Tested applications](#tested-applications), and Geekbench 7 GPU — an
+independent benchmark, both runs public — scores
+[99.9% of bare metal](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862).
+
+What costs is any workload dominated by small serialized control calls, because
+each one is a forwarded round trip. The sharpest measured case is LLM prefill on
+a *tiny* (~5-token) prompt: 0.71x, which is launch latency rather than prefill
+compute — on a realistic long prompt the same measurement is 0.98x. Alloc churn
+behaves the same way. If your workload is a stream of tiny GPU calls rather than
+sustained work, budget for that; otherwise you will not notice.
 
 **Is it safe to run untrusted guests?**
 Not yet — treat it as experimental. The ioctl and alloc-class gates are
