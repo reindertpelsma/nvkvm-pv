@@ -312,7 +312,9 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 | Ampere GA106 | 550.54.14 | 550 | 28/28 |
 | RTX 3060 Ti | Ampere GA104 | 580.95.05 | 580 | 28/28 |
 | RTX 3060 Ti | Ampere GA104 | 595.84 | 580 | `gl_draw_pixel_check` PASS * |
-| RTX 4070 | Ada AD104 | 595.84 | 580 | 26/28 — two CUDA checks fail, see below ** |
+| RTX 4070 | Ada AD104 | 595.84 | 580 | 28/28 (26/28 before the UVM_FREE fix **) |
+| RTX 4070 Ti SUPER | Ada AD103 | 595.84 | 580 | 28/28 (reproduced + fixed the above) |
+| RTX 3080 | Ampere GA102 | 595.84 | 580 | 28/28 |
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
@@ -326,13 +328,12 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 4090 | Ada AD102 | 580.95.05 | 580 | 28/28 |
 | RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
 
-\*\* The two 595.84 failures are deterministic and are **not** the missing
-`libnvidia-ptxjitcompiler` story that row used to carry — that library is
-staged and the failure happens anyway. All six CUDA setup calls return
-`INVALID_VALUE` with no failing ioctl and no denied control, so libcuda refuses
-above the driver boundary; it has not yet been reduced to a standalone
-reproducer. Detail and what was ruled out:
-[Correctness](docs/reference/correctness.md).
+\*\* nvkvm refused a legitimate `UVM_FREE` — the ioctl names its range by base
+alone and sends length 0, and the ownership check rejected the zero length. The
+range stayed live and every later CUDA call in that context returned
+`INVALID_VALUE`. Fixed; the check now uses the length nvkvm recorded for that
+base and still fails closed on an unrecorded one.
+[Detail](docs/reference/correctness.md).
 
 On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
 launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.

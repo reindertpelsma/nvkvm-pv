@@ -767,6 +767,31 @@ static bool uvm_va_covers(uint32_t handle_id, uint64_t base, uint64_t length)
 	return found;
 }
 
+/*
+ * Length of the range this handle recorded starting EXACTLY at `base`, or 0 if
+ * it has no such range.
+ *
+ * UVM_FREE names a range by its base and leaves length 0 -- the driver looks
+ * the range up by start address -- so there is no length in the ioctl to
+ * validate against.  Recovering our own recorded length lets the ownership
+ * check and the drop below run unchanged, and keeps the U-6 property: a base
+ * we never recorded for this handle returns 0 and is refused exactly as before.
+ */
+static uint64_t uvm_va_len_at(uint32_t handle_id, uint64_t base)
+{
+	uint64_t len = 0;
+	pthread_mutex_lock(&uvm_va_lock);
+	for (uint32_t i = 0; i < NVKVM_UVM_VA_MAX; i++) {
+		if (uvm_va_tbl[i].handle_id == handle_id &&
+		    uvm_va_tbl[i].base == base) {
+			len = uvm_va_tbl[i].length;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&uvm_va_lock);
+	return len;
+}
+
 /* Drop every entry of this handle fully inside the freed range. */
 static void uvm_va_drop(uint32_t handle_id, uint64_t base, uint64_t length)
 {
@@ -1325,6 +1350,23 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				}
 				memcpy(&va_base, (char *)param_buf + off, 8);
 				memcpy(&va_len,  (char *)param_buf + off + 8, 8);
+				/*
+				 * UVM_FREE identifies the range by base alone;
+				 * libcuda sends length 0 and the driver looks it
+				 * up by start address.  Measured on an RTX 4070 Ti
+				 * SUPER with driver 595.84: refusing that as a
+				 * "malformed VA range" made the free fail, the
+				 * range stayed live, and every later CUDA call in
+				 * that context returned INVALID_VALUE -- surfacing
+				 * as cuda_kernel_launch / cuda_matmul "setup rc=1"
+				 * in tests/validate.sh.  Substitute the length we
+				 * recorded for that base; an unrecorded base still
+				 * yields 0 and is still refused.
+				 */
+				if (d->va_mode == NVKVM_UVM_VA_FREE &&
+				    va_len == 0 && va_base != 0)
+					va_len = uvm_va_len_at(req->handle_id,
+							       va_base);
 				/*
 				 * (0,0) is the "no VA range" form — measured on
 				 * UVM_REGISTER_CHANNEL, which libcuda issues both

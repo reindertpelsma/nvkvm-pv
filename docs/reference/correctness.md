@@ -112,11 +112,12 @@ sub-slot, so reads are served and writes become resumable MMIO exits.
 **Vulkan compute fails on Hopper** (`vk_compute_dispatch`) — see the note under
 [Tested platforms](#tested-platforms).
 
-## Two CUDA checks fail on driver 595.84 — open
+## Two CUDA checks failed on Ada + driver 595.84 — FIXED 2026-08-19
 
-Measured 2026-08-19 on an RTX 4070, host driver **595.84**, current `main`,
-inside the shipped container. `tests/validate.sh` is **26/28, deterministic
-across runs**: `cuda_kernel_launch` and `cuda_matmul` both fail `setup rc=1`.
+*Root cause: nvkvm refused a legitimate `UVM_FREE`. Fix below.*
+
+First seen on an RTX 4070, host driver **595.84**, current `main`, inside the
+shipped container: `tests/validate.sh` was **26/28**: `cuda_kernel_launch` and `cuda_matmul` both fail `setup rc=1`.
 Every other check passes, including `cuda_ptx_jit` immediately before them and
 the 8 MiB byte-exact round trip.
 
@@ -127,34 +128,46 @@ SUPER) the same day, so this is specific to 595.84 (or to that GPU/host).
 provisioned without `libnvidia-ptxjitcompiler`. That library is present — in
 the host bundle *and* staged in the guest — and the failure happens anyway.
 
-What is established:
+**Root cause.** `UVM_FREE` (UVM cmd 34) names the range to free by its **base
+alone** — libcuda sends `length = 0` and the driver looks the range up by start
+address. The U-6 ownership check called `uvm_va_sane(base, len)`, which rejects
+`length == 0` outright, so nvkvm refused the free with `NV_ERR_INVALID_ADDRESS`.
+The range was never freed, the UVM address space stayed wedged, and **every
+later CUDA call in that context returned `INVALID_VALUE`** — which is why all
+six setup calls failed rather than one, and why it read as a dead context.
 
-- **The context is dead, not one call.** Instrumenting the suite shows all six
-  setup calls — three `cuMemAlloc`, two `cuMemcpyHtoD`, one `cuMemsetD8` —
-  return `CUDA_ERROR_INVALID_VALUE`, not just one of them.
-- **libcuda rejects them internally.** An `LD_PRELOAD` ioctl interposer in the
-  guest logs no failing NVIDIA ioctl and no denied control anywhere near the
-  failure. The only RM statuses in the whole run are four tolerated ones
-  (`0x2080012f`, `0x20801357`, `0x20800157` returning `NOT_SUPPORTED`, and
-  `0x2080014b` returning `OBJECT_NOT_FOUND`), none adjacent to the failing
-  calls. So it is decided above the driver boundary.
+The fix (`src/qemu/nvkvm_isolate_handlers.c`) substitutes the length nvkvm
+itself recorded for that base instead of trusting the caller's zero. The
+security property is unchanged and still fails closed: a base that was never
+recorded for this handle yields 0 and is refused exactly as before.
+`tests/security/u3_u6_gate_test.c` still passes, `MIGRATE(unowned)` included.
 
-What was ruled out, so nobody repeats it:
+*Measured*, RTX 4070 Ti SUPER on 595.84, same box, QEMU rebuilt between runs:
 
-- Not the PTX JIT compiler being absent (it is staged).
-- Not a denied control — our deny path returns `NOT_SUPPORTED` (`0x56`) and
-  nothing is denied at the failure point.
-- Not the v1/v2 CUDA ABI: the suite resolves `_v2` symbols, and a probe using
-  the same `_v2` symbols passes.
-- **Not reproducible standalone.** A probe replicating the suite's sequence —
-  8 MiB alloc/HtoD/memset warmup, `cuModuleLoadData` of the same PTX,
-  `cuModuleGetFunction`, then the identical three 4 MiB allocations — passes
-  every call. Something else in the suite's longer sequence is the trigger and
-  has not been isolated.
+| | `tests/validate.sh` |
+|---|---|
+| before | 26/28, 27/28, 27/28 |
+| after | **28/28, 28/28, 28/28** |
 
-The next step is to bisect `tests/validate.sh` itself by removing earlier
-checks until the failure disappears. Until then this is a real, reproducible
-gap on the newest driver branch, not a packaging artefact.
+**Why it hid for so long**, since each of these misled an earlier attempt:
+
+- The guest sees **no failing ioctl** — a refused UVM command comes back as a
+  *status*, so the ioctl itself succeeds.
+- It is **not reproducible standalone**. A probe replicating the suite's CUDA
+  sequence — warmup, the same PTX load, the identical allocations — passes
+  every call, because it never frees a UVM range.
+- It is **not deterministic**: one or both checks fail depending on whether a
+  by-base free happens in that run.
+- An `LD_PRELOAD` ioctl interposer in the guest showed nothing, because it
+  traced RM controls (`'F' 0x2a`) and this is a **UVM** ioctl on another
+  device. The silence was from looking at the wrong surface.
+- The old footnote blamed a missing `libnvidia-ptxjitcompiler`. That library is
+  staged; the explanation was simply wrong.
+
+Ada + 595.84 is the combination that exposed it — RTX 3080 on the same driver
+is 28/28, and the same Ada part on 580.95.05 is 28/28 — but **nothing in the
+check is architecture-specific**. It was latent for any guest whose libcuda
+takes the by-base free path.
 
 ## Vulkan compute on Hopper
 
