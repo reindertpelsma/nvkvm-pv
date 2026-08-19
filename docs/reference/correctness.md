@@ -32,7 +32,7 @@ Entries created under a different address space are left alone: an fd shared
 with another process gives an `mm` in which those addresses mean nothing.
 
 *Measured*, same guest and libraries, modules swapped back to back on an RTX
-3050 laptop:
+3050 laptop (Ampere, host driver 580.173.02):
 
 | check | before | after |
 |---|---|---|
@@ -40,6 +40,13 @@ with another process gives an `mm` in which those addresses mean nothing.
 | `tests/repro/opencl_input_visibility.c 3 20 1 1` | GPU view 1048576 wrong (`0.0`) | clean |
 | `tests/repro/opencl_correctness.c` | FAIL (1 failed) | PASS |
 | `tests/validate.sh` | 28/28 | 28/28 |
+
+Confirmed on a second architecture and a second driver branch: on an **RTX 2080
+Ti (Turing TU102, host driver 575.51.03)**, the same A/B with the pre-fix module
+returns `1048576/1048576 WRONG, got -999.0` and the fixed module is clean, with
+`validate.sh` 28/28 on both the ring and virtqueue paths. So this was never
+specific to the laptop's 39-bit physical address space, which was the standing
+suspicion while it was unsolved.
 
 The independent check is Geekbench 7 `--gpu` (OpenCL), which is what surfaced
 the bug at scale in the first place: the guest used to fail validation on
