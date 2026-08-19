@@ -83,7 +83,7 @@ static void nvkvm_force_range_wb(struct mm_struct *mm,
 		pud = pud_offset(p4d, a);
 		if (pud_none(*pud))
 			continue;
-		if (pud_large(*pud)) {
+		if (pud_leaf(*pud)) {
 			v = pud_val(*pud);
 			set_pud(pud, __pud(v & ~(_PAGE_PCD | _PAGE_PWT |
 						 _PAGE_PAT_LARGE)));
@@ -93,7 +93,7 @@ static void nvkvm_force_range_wb(struct mm_struct *mm,
 		pmd = pmd_offset(pud, a);
 		if (pmd_none(*pmd))
 			continue;
-		if (pmd_large(*pmd)) {
+		if (pmd_leaf(*pmd)) {
 			v = pmd_val(*pmd);
 			set_pmd(pmd, __pmd(v & ~(_PAGE_PCD | _PAGE_PWT |
 						 _PAGE_PAT_LARGE)));
@@ -446,7 +446,7 @@ static unsigned long nvkvm_gva_pfn(struct mm_struct *mm, unsigned long gva)
 	pud = pud_offset(p4d, gva);
 	if (pud_none(*pud))
 		return 0;
-	if (pud_large(*pud)) {
+	if (pud_leaf(*pud)) {
 		v = pud_val(*pud);
 		if (!(v & _PAGE_PRESENT))
 			return 0;
@@ -456,7 +456,7 @@ static unsigned long nvkvm_gva_pfn(struct mm_struct *mm, unsigned long gva)
 	pmd = pmd_offset(pud, gva);
 	if (pmd_none(*pmd))
 		return 0;
-	if (pmd_large(*pmd)) {
+	if (pmd_leaf(*pmd)) {
 		v = pmd_val(*pmd);
 		if (!(v & _PAGE_PRESENT))
 			return 0;
@@ -1284,7 +1284,22 @@ chunk_fail_h:
 		 * remap covering the entire VMA — never the case for a chunk of
 		 * a larger range.
 		 */
-		zap_page_range_single(vma, cbase, clen, NULL);
+		/* Check the precondition ourselves, because the failure is
+		 * silent: zap_vma_ptes() returns void and zaps NOTHING unless
+		 * the VMA is VM_PFNMAP/VM_MIXEDMAP.  The whole-range conversion
+		 * above makes it VM_PFNMAP so this cannot fire, but if it ever
+		 * did, remap_pfn_range() would meet non-empty PTEs and BUG_ON,
+		 * and a skipped zap would leave the guest reading its old anon
+		 * pages while the GPU reads the memfd — the exact silent
+		 * divergence this driver already had once.  Bail instead. */
+		if (!(vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))) {
+			mmap_write_unlock(mm);
+			pr_warn("nvkvm: refusing to migrate 0x%lx: VMA is not PFNMAP (flags 0x%lx)\n",
+				cbase, (unsigned long)vma->vm_flags);
+			ret = -EINVAL;
+			goto chunk_fail_mapped;
+		}
+		nvkvm_zap_range(vma, cbase, clen);
 		ret = remap_pfn_range(vma, cbase,
 				      (unsigned long)(gpa >> PAGE_SHIFT),
 				      clen, vma->vm_page_prot);

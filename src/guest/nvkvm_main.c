@@ -105,7 +105,7 @@ const struct file_operations nvkvm_fops = {   /* F-4: non-static so embedded-fd 
  */
 #define NV_NVIDIA_MAJOR 195
 
-static char *nvkvm_devnode(const struct device *dev, umode_t *mode)
+static char *nvkvm_devnode(NVKVM_DEVNODE_DEV dev, umode_t *mode)
 {
 	if (mode)
 		*mode = 0666;
@@ -117,7 +117,7 @@ static int __init register_devices(void)
 	int ret, i, detected;
 	dev_t devno;
 
-	nvkvm.class = class_create("nvkvm");
+	nvkvm.class = nvkvm_class_create("nvkvm");
 	if (IS_ERR(nvkvm.class))
 		return PTR_ERR(nvkvm.class);
 	nvkvm.class->devnode = nvkvm_devnode;

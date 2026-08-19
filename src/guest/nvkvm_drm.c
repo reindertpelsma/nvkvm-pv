@@ -775,7 +775,7 @@ static const struct drm_driver nvkvm_drm_driver = {
 	/* VERSION values — driver-constant, verified against host nvidia-drm. */
 	.name            = "nvidia-drm",
 	.desc            = "NVIDIA DRM driver",
-	.date            = "20160202",
+	NVKVM_DRM_DRIVER_DATE
 	.major           = 0,
 	.minor           = 0,
 	.patchlevel      = 0,

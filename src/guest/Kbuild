@@ -9,6 +9,11 @@ nvkvm-guest-objs := nvkvm_main.o \
 
 ccflags-y := -I$(src)/.. -I$(src)/../..
 
+# Kernels before 5.18 build modules as gnu89, where a declaration inside a for()
+# initialiser is an error.  The tree uses them throughout, so ask for gnu11
+# explicitly; on newer kernels this matches what they already pass.
+ccflags-y += -std=gnu11 -Wno-declaration-after-statement
+
 # Graphics/display layer (DRM render node + virtual KMS head). Compiled in only
 # for the graphics module version (NVKVM_GRAPHICS=1, the default). A compute-only
 # build (NVKVM_GRAPHICS=0) drops these objects and the -DNVKVM_GRAPHICS define so

@@ -7,6 +7,7 @@
 #define NVKVM_H
 
 #include <linux/cdev.h>
+#include "nvkvm_compat.h"
 #include <linux/idr.h>
 #include <linux/mutex.h>
 #include <linux/wait.h>

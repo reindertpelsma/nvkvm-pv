@@ -274,8 +274,8 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	if (!kms)
 		return -ENOMEM;
 
-	hrtimer_init(&kms->vblank, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	kms->vblank.function = nvkvm_vblank_fn;
+	nvkvm_hrtimer_setup(&kms->vblank, nvkvm_vblank_fn,
+			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	kms->period = ns_to_ktime(NSEC_PER_SEC / NVKVM_KMS_HZ);
 
 	drm_connector_helper_add(&kms->conn, &nvkvm_conn_helper_funcs);

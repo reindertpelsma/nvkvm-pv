@@ -632,6 +632,31 @@ int nvkvm_negotiate_version(struct nvkvm_state *state)
 	return 0;
 }
 
+/*
+ * virtio_find_vqs() moved its parallel callbacks[]/names[] arrays into one
+ * array of struct virtqueue_info.  Same three queues either way; only the
+ * shape of the argument changed.  See nvkvm_compat.h for the house rule.
+ */
+static int nvkvm_find_vqs(struct virtio_device *vdev, unsigned int nvqs,
+			  struct virtqueue *vqs[], vq_callback_t *cbs[],
+			  const char * const names[])
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+	return virtio_find_vqs(vdev, nvqs, vqs, cbs, names, NULL);
+#else
+	struct virtqueue_info info[NVKVM_NUM_VQS] = { };
+	unsigned int i;
+
+	if (nvqs > NVKVM_NUM_VQS)
+		return -EINVAL;
+	for (i = 0; i < nvqs; i++) {
+		info[i].name     = names[i];
+		info[i].callback = cbs[i];
+	}
+	return virtio_find_vqs(vdev, nvqs, vqs, info, NULL);
+#endif
+}
+
 /* ── Virtio device init/fini ─────────────────────────────────────────────── */
 
 int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
@@ -661,7 +686,7 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	/* Mark slot 0 (ctrl) as permanently allocated */
 	set_bit(NVKVM_SHM_CTRL_SLOT, state->slot_bitmap);
 
-	ret = virtio_find_vqs(vdev, NVKVM_NUM_VQS, vqs, cbs, names, NULL);
+	ret = nvkvm_find_vqs(vdev, NVKVM_NUM_VQS, vqs, cbs, names);
 	if (ret) {
 		dev_err(&vdev->dev, "nvkvm: find_vqs failed: %d\n", ret);
 		return ret;
