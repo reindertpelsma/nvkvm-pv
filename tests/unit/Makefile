@@ -10,18 +10,22 @@ DISPATCH_SRCS = test_dispatch.c \
                 ../../src/qemu/nvkvm_objects.c \
                 ../../src/qemu/nvkvm_dispatch.c \
                 ../../src/qemu/nvkvm_handle.c \
-                frontend_stubs.c
+                frontend_stubs.c \
+                unit_stubs.c
 
 FRONTEND_SRCS = test_frontend.c \
                 ../../src/qemu/nvkvm_frontend.c \
-                ../../src/qemu/nvkvm_objects.c
+                ../../src/qemu/nvkvm_objects.c \
+                unit_stubs.c
 
 HANDLE_SRCS   = test_handle.c \
-                ../../src/qemu/nvkvm_handle.c
+                ../../src/qemu/nvkvm_handle.c \
+                unit_stubs.c
 
 ISOLATE_SRCS  = test_isolate.c \
                 ../../src/qemu/nvkvm_isolate.c \
-                ../../src/qemu/nvkvm_handle.c
+                ../../src/qemu/nvkvm_handle.c \
+                unit_stubs.c
 
 TABLES_SRCS   = test_tables.c \
                 ../../src/qemu/nvkvm_tables.c
@@ -47,7 +51,7 @@ mock_stub: mock_stub.c
 	$(CC) $(CFLAGS) -o $@ mock_stub.c
 
 test_isolate: $(ISOLATE_SRCS) mock_stub
-	$(CC) $(CFLAGS) -o $@ $(ISOLATE_SRCS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ $(ISOLATE_SRCS) $(LDFLAGS)
 
 test_tables: $(TABLES_SRCS)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -DNVKVM_TABLES_NO_KVM -o $@ $(TABLES_SRCS) $(LDFLAGS)
@@ -58,6 +62,11 @@ test_open_scm: $(OPEN_SCM_SRCS)
 test_ctrl_gate: $(CTRL_GATE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(CTRL_GATE_SRCS)
 
+# NOTE: test_isolate currently fails 5 of its 7 cases at RUNTIME (every ioctl
+# against a spawned isolate returns -ENOENT).  That is API drift between the
+# test and the isolate table, not a build problem -- all seven binaries compile
+# and the other six suites pass.  Fixing it needs someone to re-derive what
+# isolate id the table hands back; until then `make run` exits non-zero.
 run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate
 	./test_dispatch
 	./test_frontend

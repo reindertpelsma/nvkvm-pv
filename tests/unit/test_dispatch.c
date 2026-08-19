@@ -95,7 +95,12 @@ int main(void) {
 /* ── Stub for nvkvm_dispatch.c dependency ────────────────────────────────── */
 
 /* We only need the size table function here, not the full dispatch. */
-extern size_t nvkvm_ioctl_expected_param_size(unsigned int cmd);
+/* The helper grew an ABI-profile argument (struct layouts are keyed on the
+ * host driver version).  Pin these expectations to one profile so the numbers
+ * below stay meaningful; NVKVM_ABI_570 is the reference the dispatch layer
+ * itself falls back to. */
+#define nvkvm_ioctl_expected_param_size(cmd) \
+	nvkvm_ioctl_expected_param_size((cmd), nvkvm_abi_by_id(NVKVM_ABI_570))
 
 /* ── Tests: param size table ─────────────────────────────────────────────── */
 
