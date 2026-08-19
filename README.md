@@ -85,7 +85,7 @@ Not yet for untrusted multi-tenant hosting — see below.
 |---|---|
 | Host | Linux with KVM, an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
 | Guest | Linux (tested on Ubuntu 24.04, kernel 6.8) |
-| GPU | Turing or newer (see [Tested platforms](#tested-platforms)) |
+| GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Build | QEMU 9.2 is built from source by the provided script |
 
@@ -304,12 +304,30 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
 | H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`, see below) |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
+| RTX 2080 Ti | Turing TU102 | 575.51.03 | 570 | 28/28 |
+| GTX 1080 | **Pascal GP104** | 580.173.02 | 580 | 15/28 — see below |
 
 On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
 launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.
 The one failure is `vk_compute_dispatch`, and it does **not** affect CUDA; the
 trace, and the two hypotheses ruled out by experiment, are in
 [Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper).
+
+The GTX 1080 row is the lower bound, measured rather than assumed. Two separate
+things stop Pascal, and only the first is absolute:
+
+1. The **open** kernel module refuses to probe it at all — `NVRM: ... not
+   supported by open nvidia.ko because it does not include the required GPU
+   System Processor (GSP)`. Pascal predates GSP, so any host running the open
+   module has no driver for the card, nvkvm or not.
+2. With the **proprietary** module the card comes up and forwarding partly
+   works: the guest's `nvidia-smi` reports the GTX 1080 and 15 checks pass. But
+   `cuInit` returns 999 (`CUDA_ERROR_UNKNOWN`), which skips all ten CUDA checks,
+   and Vulkan and the GL FBO check fail. No allowlist denies anything during the
+   attempt, so this is not the default-deny gates refusing a Pascal class.
+
+So **Turing or newer** stands, and pre-Turing is not simply "untested" — it
+enumerates and then fails at CUDA init.
 
 ## FAQ
 
