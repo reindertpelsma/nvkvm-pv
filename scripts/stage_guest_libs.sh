@@ -133,17 +133,16 @@ stage "libGLX_nvidia.so.$V"       "$SYS" "libGLX_nvidia.so.0"
 stage "libGLESv2_nvidia.so.$V"    "$SYS" "libGLESv2_nvidia.so.2"
 stage "libGLESv1_CM_nvidia.so.$V" "$SYS" "libGLESv1_CM_nvidia.so.1"
 stage "libnvidia-cfg.so.$V"       "$SYS" "libnvidia-cfg.so.1"
-# OpenCL vendor library -- OPT-IN, off by default.  Staging it makes the OpenCL
-# loader find a platform, but OpenCL through nvkvm currently returns WRONG
-# RESULTS: Geekbench 7 --gpu fails validation on 12+ workloads in the guest
-# (e.g. Particle Physics "similarity is 0%", Feature Matching "difference is
-# > 10%", every Photo Filter output unvalidated) while the same binary is clean
-# on the host.  A platform that silently computes wrong answers is worse than
-# no platform at all: without it apps fail loudly with "unknown OpenCL
-# platform", which is honest.  Set NVKVM_STAGE_OPENCL=1 to stage it anyway for
-# investigation.  Re-enable by default only once a correctness suite passes.
-if [ "${NVKVM_STAGE_OPENCL:-0}" = "1" ]; then
-    echo "stage_guest_libs: WARNING staging OpenCL -- known to return incorrect results" >&2
+# OpenCL vendor library.  This was opt-in and off by default from 2026-08-16 to
+# 2026-08-19, because OpenCL through nvkvm returned WRONG RESULTS: Geekbench 7
+# --gpu failed validation on 11 workloads in the guest while the same binary was
+# clean on the host.  That was never an OpenCL bug -- it was a guest-side
+# migration cache keyed on a virtual address that a freed buffer had given back
+# (docs/reference/correctness.md), and CUDA hit it too.  With that fixed the
+# same Geekbench run completes every workload with zero validation failures, and
+# tests/repro/opencl_correctness.c passes, so OpenCL is staged by default again.
+# Set NVKVM_STAGE_OPENCL=0 to leave it out.
+if [ "${NVKVM_STAGE_OPENCL:-1}" = "1" ]; then
     stage "libnvidia-opencl.so.$V"    "$SYS" "libnvidia-opencl.so.1"
 fi
 
@@ -339,7 +338,7 @@ JSON
 # actually staged, so a host without it does not get a manifest pointing at a
 # missing library (which would be worse than none: the loader would log an
 # error for every OpenCL app).
-if [ "${NVKVM_STAGE_OPENCL:-0}" = "1" ] &&
+if [ "${NVKVM_STAGE_OPENCL:-1}" = "1" ] &&
    { [ -e /usr/local/nvidia-guest/lib/libnvidia-opencl.so.1 ] ||
      [ -e /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 ]; }; then
     sudo mkdir -p /etc/OpenCL/vendors

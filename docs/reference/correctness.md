@@ -5,90 +5,77 @@ reproduce it yourself. Every claim here was measured by running the **same
 binary** on the host and in the guest; a difference is the finding, agreement
 means the behaviour belongs to the GPU or the driver rather than to nvkvm.
 
-> **2026-08-19: this is not OpenCL-only. It reproduces through the plain CUDA
-> driver API** (`cuMemHostAlloc` → write → `cuMemcpyHtoD`), with no OpenCL
-> involved: after pinned host buffers are allocated, written and freed, the GPU
-> reads the *previous* buffer's contents. `tests/repro/cuda_host_churn.c`,
-> guest, GTX 1660 SUPER — `churn=0` clean, `churn=3` returns `-999.0` (the
-> churn buffer's fill value) for all 1,048,576 elements. The host is clean.
-> Do not describe CUDA as unaffected.
+**Silent wrong results after a mapped buffer was freed** *(fixed 2026-08-19,
+commit `ca6d496`).* The guest CPU and the GPU stopped seeing the same memory:
+the CPU read back its own writes correctly while the GPU read the *previous*
+buffer's contents, so a kernel computed from stale input and no error was
+reported anywhere. It was never OpenCL-specific — plain CUDA
+(`cuMemHostAlloc` → write → `cuMemcpyHtoD`) reached it too.
 
-**Silent wrong results after a mapped buffer is freed.** The guest CPU and the
-GPU stop seeing the same memory: the CPU reads back its own writes correctly,
-while the GPU reads zeros, so a kernel computes from an all-zero input and no
-error is reported anywhere. Geekbench 7 `--gpu` fails validation on 11 workloads
-in the guest while the identical binary on the same GPU and driver is clean on
-the host ([guest](https://browser.geekbench.com/v7/gpu/79890) vs
-[host](https://browser.geekbench.com/v7/gpu/79862)). `validate.sh` does not
-cover it — 28/28 passes on a guest that computes this wrong — so **verify your
-own results against a host run**.
+*Root cause.* Both CPU-memory migration paths in
+[`src/guest/nvkvm_mmap.c`](../../src/guest/nvkvm_mmap.c) remembered a guest
+virtual address and treated a later request for the same address as already
+done. A virtual address is not a stable name for a buffer. Free a pinned host
+buffer and allocate another, and libcuda hands back the same address — at which
+point the tracking entry named a mapping belonging to a buffer that no longer
+existed, and the isolate still had the *old* buffer's memory mapped there. The
+dedup fired, no migration happened, and the GPU read the dead buffer. The guest
+meanwhile read its own fresh anonymous pages and saw exactly what it had just
+written, which is why the two views disagreed silently.
 
-*Root cause, bisected 2026-08-19 on an RTX 3060:* the trigger is an RM memory
-object being **freed while nvkvm still holds its window mapping**. Releasing a
-buffer produces no unmap: every window extent in a run is torn down at process
-exit, never when the object is freed. The driver then recycles that device
-memory for the next allocation, and the guest keeps writing into the stale
-extent — which is why the CPU sees its own writes and the GPU does not.
+*Fix.* Stop trusting the address; ask the guest page tables whether the mapping
+we recorded is still installed — the leaf PTE still on the memfd's GPA for a
+range entry, the address still translating to the pinned page for a per-page
+entry — and reap the entries that fail before either dedup runs. A reaped entry
+releases its isolate mapping and its memfd, so the next access re-migrates.
+Entries created under a different address space are left alone: an fd shared
+with another process gives an `mm` in which those addresses mean nothing.
 
-`tests/repro/opencl_input_visibility.c` isolates it to one variable: churn
-buffers that are mapped, written and *released* corrupt the next buffer
-(`./clvis 3 20 1 1`); the same buffers *not* released do not (`./clvis 3 20 1 3`).
+*Measured*, same guest and libraries, modules swapped back to back on an RTX
+3050 laptop:
 
-Eliminated by experiment, so that the next attempt does not re-tread them:
+| check | before | after |
+|---|---|---|
+| `tests/repro/cuda_host_churn.c 3 20` | 1048576/1048576 wrong (`-999.0`) | clean |
+| `tests/repro/opencl_input_visibility.c 3 20 1 1` | GPU view 1048576 wrong (`0.0`) | clean |
+| `tests/repro/opencl_correctness.c` | FAIL (1 failed) | PASS |
+| `tests/validate.sh` | 28/28 | 28/28 |
 
-- **not** the read-only page substitution below — removing it entirely leaves
-  the corruption unchanged
-- **not** GPA extent recycling — no window GPA is reused during a failing run
-- **not** the ioctl/alloc allowlists — no gate denies anything during the run
-- **not** pinned vs device memory (`ALLOC_HOST_PTR` and plain device buffers
-  fail identically), and **not** the buffer's `CL_MEM_READ_ONLY`/`READ_WRITE` flags
+The independent check is Geekbench 7 `--gpu` (OpenCL), which is what surfaced
+the bug at scale in the first place: the guest used to fail validation on
+**11 workloads** — Photo Filter, Face Tracking, Super Resolution, Horizon
+Detection, Feature Matching, Path Tracer, Particle Physics, Fluid Simulation
+among them — while the identical binary on the same GPU was clean on the host
+([old guest](https://browser.geekbench.com/v7/gpu/79890) ·
+[host](https://browser.geekbench.com/v7/gpu/79862)). The same run on the same
+guest with this fix completes **every workload with zero validation failures**
+([guest](https://browser.geekbench.com/v7/gpu/81189)).
 
-*Host side, done:* window mappings now record the frontend handle they were
-made from, and closing that handle tears the extent down (`REAP_HANDLE` in a
-`NVKVM_DEBUG=1` log). That closes a real hole — a freed object's device memory
-no longer stays mapped into the guest's GPA space where the driver may have
-handed it to another client — **but it does not fix the corruption**: the
-reproducer still fails with the reap in place.
+`validate.sh` passing 28/28 on *both* sides is still the point worth keeping:
+the suite never covered this, so a green 28/28 was not evidence of correct
+results and still is not. Check your own workload against a host run.
 
-*2026-08-19, the architectural finding:* the ioctls this workload uses take the
-**SPSC ring fast path**, which `goto forwarded`s past the whole tail of the slow
-path — including `nvkvm_cpu_pages_writeback()` and the new
-`nvkvm_cpu_pages_refresh()`. Instrumented on an RTX 3050 guest, refresh is
-called **zero** times during a failing run. So CPU-page migrations are neither
-refreshed before the GPU reads them nor written back after, whenever the ring is
-used.
+Three earlier suspects were eliminated by experiment and are recorded so nobody
+re-treads them: it was not the read-only page substitution (removing it changed
+nothing), not GPA extent recycling (no window GPA is reused during a failing
+run), and not the ioctl/alloc allowlists (no gate denies anything during the
+run). A fourth — re-`gup`ing the address and comparing `struct page` — is part
+of the fix but was not sufficient alone: the buffers that corrupt take the
+*range* path, whose entries have no `struct page` to compare, and are
+identified by their PTE instead.
 
-That is the same path [U-1](../internal/audit-guest-pointers.md) reports the
-allowlist is not wired into. One gap, two symptoms: a security check that does
-not run, and a memory-coherency step that does not run. Fixing either properly
-probably means making the ring path share the slow path's pre/post hooks rather
-than patching each omission separately.
+*Host side, also done:* window mappings now record the frontend handle they
+were made from, and closing that handle tears the extent down (`REAP_HANDLE` in
+a `NVKVM_DEBUG=1` log) — a freed object's device memory no longer stays mapped
+into the guest's GPA space. That was a real hole, though it was not this bug.
 
-*What is left, guest side:* `nvkvm_cpu_page_migrate()` in
-[`src/guest/nvkvm_mmap.c`](../../src/guest/nvkvm_mmap.c) keys its "already
-mapped?" cache on the **guest virtual address alone**, and nothing ever
-invalidates it while the fd stays open. Freeing an OpenCL buffer and allocating
-another gives back the same GVA, the cache reports "already mapped", and the new
-buffer is never published to the device — so the CPU writes into its own memory
-while the GPU reads whatever the previous migration left.
-
-Two invalidation points were tried and neither is the right one, so don't repeat
-them:
-
-- **Page identity** (re-`gup` the GVA and compare with the cached `struct page`)
-  does not trigger: the allocator hands back the *same* physical pages, so the
-  entry looks valid while the device-side mapping behind it is gone.
-- **Handle close** does not trigger either: the guest closes a handle only when
-  the `/dev/nvidia*` fd is released, not when an RM object is freed.
-
-The invalidation point therefore has to be the `NV_ESC_RM_FREE` ioctl itself,
-which means associating cpu-page migrations with the RM memory handle they
-belong to — an association neither side records today. That is the next piece of
-work, and it is a design change rather than a patch.
-
-**OpenCL is off by default** for that reason — staging it requires
-`NVKVM_STAGE_OPENCL=1`. Without it, OpenCL programs fail loudly with "unknown
-OpenCL platform" rather than returning wrong answers quietly.
+**The SPSC ring fast path still skips the allowlist.** Flat RM_CONTROLs ride a
+shared-memory ring that `goto forwarded`s past the front of the slow path. The
+tail — writeback, VALIDATE caching, pid/fd restoration — does still run; an
+earlier note here claimed writeback was skipped and that was wrong. What is
+genuinely skipped is guest-side pre-forward work, and separately the host-side
+allowlist is not wired into the ring at all. That is
+[U-1](../internal/audit-guest-pointers.md), and it remains open.
 
 **A driver-managed read-only page is mishandled** *(fixed 2026-08-19 for the
 common case).* In-window device mappings used to be forced to `PROT_READ|

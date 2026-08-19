@@ -203,20 +203,22 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-**A guest can return silently wrong results, including through CUDA.** After
-pinned host memory is allocated, written and freed, a later allocation at the
-same address is not republished to the device: the CPU reads back its own
-writes, the GPU reads the *previous* buffer's contents, and the work computes
-from the wrong input — no error, no crash. Found via OpenCL, but it reproduces
-through the plain CUDA driver API (`cuMemHostAlloc` + `cuMemcpyHtoD`) as well. Geekbench 7 `--gpu` fails
-validation on 11 workloads in the guest while the identical binary is clean on
-the host ([guest](https://browser.geekbench.com/v7/gpu/79890) ·
-[host](https://browser.geekbench.com/v7/gpu/79862)). `validate.sh` passes on that
-same guest, so **28/28 is not evidence that your workload computes correctly** —
+**Fixed 2026-08-19: a guest could return silently wrong results.** After pinned
+host memory was allocated, written and freed, a later allocation at the same
+address was not republished to the device: the CPU read back its own writes, the
+GPU read the *previous* buffer's contents, and the work computed from the wrong
+input with no error and no crash. It reached both OpenCL and plain CUDA.
+Geekbench 7 `--gpu` failed validation on 11 workloads in the guest and now
+completes all of them with none
+([before](https://browser.geekbench.com/v7/gpu/79890) ·
+[after](https://browser.geekbench.com/v7/gpu/81189) ·
+[host](https://browser.geekbench.com/v7/gpu/79862)).
+
+Worth keeping either way: `validate.sh` passed 28/28 on the guest that computed
+this wrong, so **28/28 is not evidence that your workload computes correctly** —
 check your own results against a host run.
 
-OpenCL is therefore off by default, and Vulkan compute fails on Hopper. Full
-detail, bisection and reproducers:
+Vulkan compute still fails on Hopper. Full detail, root cause and reproducers:
 [Correctness and known issues](docs/reference/correctness.md).
 
 ## Tested applications
@@ -404,8 +406,8 @@ libraries did not stage. See
 
 **Does CUDA give bit-identical results to the host?**
 On everything measured, yes — including token-identical LLM output at
-temperature 0. But read [Known issues](#known-issues) first: there is a path
-that returns wrong results silently.
+temperature 0. A path that returned wrong results silently was fixed on
+2026-08-19; see [Known issues](#known-issues).
 
 ## Documentation
 
