@@ -17,10 +17,28 @@ Steps 1 and 2 are one script. Step 3 is done by cloud-init on first guest boot.
   (`src/qemu/virtio_nvgpu.c:1152-1158`).
 - Unprivileged user namespaces enabled — the isolate sandbox uses
   `CLONE_NEWUSER` plus `pivot_root` (`src/qemu/nvkvm_isolate.c:124-231`).
-- Root, for `apt-get` and for writing `/opt` and `/usr/lib/nvkvm`.
+- **No root.** The build installs to `/opt` when that is writable and to
+  `${XDG_DATA_HOME:-~/.local/share}/nvkvm` otherwise; override either path with
+  `NVKVM_QEMU_PREFIX` / `NVKVM_QEMU_SRC`. Verified by building the whole thing
+  as an unprivileged user with no sudo available to it.
+- **Any distro.** The build needs the dependencies below by capability, not by
+  package name; nothing in it is Debian-specific.
 
-`scripts/build_qemu.sh` installs its own dependencies
-(`scripts/build_qemu.sh:55-74`):
+`scripts/build_qemu.sh` does **not** install anything unless you ask it to. It
+probes, and names what is missing plus the package line for your distro
+(Debian/Ubuntu, Fedora/RHEL, Arch and openSUSE are recognised). Pass
+`--install-deps` to have it install them, which is the only step that wants
+root.
+
+What it probes for — these are the real requirements:
+
+| kind | needs |
+|---|---|
+| on `PATH` | `git`, `ninja`, `meson`, `pkg-config`, `python3`, `xxd` |
+| `pkg-config` modules | `glib-2.0`, `pixman-1`, `slirp`, `epoxy`, `gbm`, `egl`, `libdrm` |
+
+The EGL/GBM/DRM three are for the host present path; `xxd` is how the stub gets
+embedded. On Debian/Ubuntu that is:
 
 ```
 ninja-build meson libglib2.0-dev libpixman-1-dev python3 python3-venv
@@ -29,17 +47,25 @@ libepoxy-dev libgbm-dev libegl-dev libdrm-dev
 xxd
 ```
 
-The EGL/GBM/DRM four are for the host present path; `xxd` is how the stub gets
-embedded.
+### Building without the script
+
+The script is a convenience, not the mechanism — everything below it is an
+ordinary QEMU build, and the numbered steps in the rest of this document are
+what it runs, in order. If you would rather not run it: install the
+dependencies above, then follow those steps by hand. The only nvkvm-specific
+parts are step 1b (build `src/stub`, which generates the embed header) and
+steps 3–5 (copy `src/qemu` + `src/abi` + `src/common` into `hw/misc/` and fix
+the include paths); the rest is `configure` and `ninja`.
 
 ## Build the stub and QEMU
 
 ```bash
-sudo bash scripts/build_qemu.sh
+bash scripts/build_qemu.sh                 # rootless if /opt is not writable
+bash scripts/build_qemu.sh --install-deps  # + install missing deps (needs root)
 ```
 
-Guarded, not idempotent-in-the-useful-sense: it exits 0 immediately if
-`/opt/qemu-nvkvm/bin/qemu-system-x86_64` already exists
+Guarded, not idempotent-in-the-useful-sense: it exits 0 immediately if the
+QEMU binary already exists under the chosen prefix
 (`scripts/build_qemu.sh:37-41`). **A plain re-run after editing anything under
 `src/qemu/` or `src/common/` is therefore a silent no-op** — you keep testing the
 old binary against new guest code, which surfaces as a confusing mismatch rather
@@ -62,7 +88,9 @@ matter (`src/stub/Makefile:11-18`): `-nostdlib -static -fPIE -ffreestanding
 -fno-stack-protector -fno-builtin`, linked `-nostdlib -static -pie
 -Wl,-z,relro,-z,now` against `-lgcc` only. Then `strip --strip-all` and
 `xxd -i` to produce the embed header. The binary is also installed to
-`/usr/lib/nvkvm/nvkvm_stub` as the runtime fallback path.
+`/usr/lib/nvkvm/nvkvm_stub` as the runtime fallback path — skipped with a note
+when that directory is not writable, which is harmless because the stub is
+embedded in the QEMU binary anyway (`NVKVM_STUB_PATH` overrides it).
 
 This step is load-bearing and its absence is silent — the script's own comment
 (`scripts/build_qemu.sh:77-89`):
