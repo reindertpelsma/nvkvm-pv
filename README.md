@@ -203,22 +203,26 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-**Fixed 2026-08-19: a guest could return silently wrong results.** After pinned
-host memory was allocated, written and freed, a later allocation at the same
-address was not republished to the device: the CPU read back its own writes, the
-GPU read the *previous* buffer's contents, and the work computed from the wrong
-input with no error and no crash. It reached both OpenCL and plain CUDA.
-Geekbench 7 `--gpu` failed validation on 11 workloads in the guest and now
-completes all of them with none
+**Vulkan compute fails on Hopper.** `vkCreateDevice` returns
+`VK_ERROR_DEVICE_LOST` in the guest on an H100 while the same binary is clean on
+the host; every CUDA check on that part passes. Traced to a channel/compute
+class mismatch, with two hypotheses eliminated —
+[detail](docs/reference/correctness.md#vulkan-compute-on-hopper).
+
+**28/28 is not evidence that your workload computes correctly.** `validate.sh`
+passed on a guest that was silently returning wrong results for two days (see
+below), because the suite did not cover the path that was broken. Check your own
+results against a host run.
+
+*Recently fixed — 2026-08-19:* after pinned host memory was allocated, written
+and freed, a later allocation at the same address was not republished to the
+device, so the CPU read back its own writes while the GPU read the *previous*
+buffer's contents and the work computed from the wrong input, with no error and
+no crash. It reached both OpenCL and plain CUDA. Geekbench 7 `--gpu` failed
+validation on 11 workloads in the guest and now completes all of them with none
 ([before](https://browser.geekbench.com/v7/gpu/79890) ·
 [after](https://browser.geekbench.com/v7/gpu/81189) ·
-[host](https://browser.geekbench.com/v7/gpu/79862)).
-
-Worth keeping either way: `validate.sh` passed 28/28 on the guest that computed
-this wrong, so **28/28 is not evidence that your workload computes correctly** —
-check your own results against a host run.
-
-Vulkan compute still fails on Hopper. Full detail, root cause and reproducers:
+[host](https://browser.geekbench.com/v7/gpu/79862)). Root cause and reproducers:
 [Correctness and known issues](docs/reference/correctness.md).
 
 ## Tested applications
