@@ -28,6 +28,25 @@ static inline bool nvkvm_drm_nr_allowed(unsigned nr)
 	case 0x00: /* DRM_IOCTL_VERSION (synthesized guest-side) */
 	case 0x09: /* DRM_IOCTL_GEM_CLOSE */
 	/* nvidia private (DRM_COMMAND_BASE + DRM_NVIDIA_*) */
+	/*
+	 * GEM_IMPORT_NVKMS_MEMORY (0x01): the counterpart of
+	 * GEM_EXPORT_NVKMS_MEMORY (0x09) and the kernel half of
+	 * eglExportDMABUFImageMESA — NVIDIA's EGL parks an RM memory object on a
+	 * freshly-opened /dev/nvidiactl fd and calls this to wrap it in a GEM
+	 * object it can PRIME_HANDLE_TO_FD.  Without it a Wayland GL client can
+	 * never produce a buffer to attach and its window stays black.
+	 * DRM_RENDER_ALLOW; the kernel impl (nv_drm_gem_import_nvkms_memory_ioctl
+	 * -> nvKms->importMemory) does no display programming, and allocates
+	 * nothing new — it re-wraps memory the stub already owns, accounted to
+	 * the stub and freed on GEM_CLOSE, same resource class as 0x0b.
+	 * Its one embedded guest VA (nvkms_params_ptr -> a blob whose first field
+	 * is { int memFd }) is marshalled via the aux slot exactly as 0x09: the
+	 * ptr is zeroed guest-side and the stub substitutes a host VA at offset
+	 * 8, and the memFd inside is guest->handle_id->stub-local-fd translated.
+	 * So, like 0x09 and unlike the G-3-excluded MAP_OFFSET / EXPORT_DMABUF,
+	 * it leaks no stub-heap address.
+	 */
+	case NVKVM_DRM_COMMAND_BASE + 0x01: /* GEM_IMPORT_NVKMS_MEMORY */
 	case NVKVM_DRM_COMMAND_BASE + 0x03: /* GET_DEV_INFO (enumeration key) */
 	case NVKVM_DRM_COMMAND_BASE + 0x04: /* FENCE_SUPPORTED */
 	case NVKVM_DRM_COMMAND_BASE + 0x05: /* PRIME_FENCE_CONTEXT_CREATE */

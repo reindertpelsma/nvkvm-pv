@@ -880,9 +880,11 @@ static void worker_thread(void *arg)
 		unsigned job_type = (job.cmd >> 8) & 0xff;
 		unsigned job_nr   = job.cmd & 0xff;
 		/* Embedded ptr at offset 8 (not 16): the NVKMS wrapper, the DRM
-		 * SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54) and DRM
-		 * GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110) all carry
-		 * their single user ptr (nvkms_params_ptr) there. */
+		 * SEMSURF_FENCE_CTX_CREATE (type 'd', nr 0x54), DRM
+		 * GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110) and DRM
+		 * GEM_IMPORT_NVKMS_MEMORY (type 'd', nr 0x41, the dma-buf EXPORT
+		 * half of #110) all carry their single user ptr
+		 * (nvkms_params_ptr) there. */
 		/*
 		 * U-2 (docs/internal/audit-guest-pointers.md) — FAIL CLOSED.
 		 *
@@ -911,7 +913,8 @@ static void worker_thread(void *arg)
 		int ptr_off = -1;
 		if ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
 		     job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
-		    (job_type == 'd' && (job_nr == 0x54 || job_nr == 0x49) &&
+		    (job_type == 'd' &&
+		     (job_nr == 0x54 || job_nr == 0x49 || job_nr == 0x41) &&
 		     job.param_size >= 16)) {
 			ptr_off = NVKVM_NVKMS_ADDR_OFF;
 		} else if (job_type == 'F' && (job_nr == 0x2a || job_nr == 0x2b) &&
@@ -970,15 +973,17 @@ static void worker_thread(void *arg)
 		}
 
 		/*
-		 * DRM GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49, #110): the aux
-		 * blob is { int memFd } at offset 0, carrying our handle_id; map
-		 * it to the stub's local fd so the kernel exports the bo's RM
-		 * memory onto a real fd in this process (exactly the
-		 * EXPORT_OBJECT_TO_FD path).  Restore the handle_id after.
+		 * DRM GEM_EXPORT_NVKMS_MEMORY (type 'd', nr 0x49) and
+		 * GEM_IMPORT_NVKMS_MEMORY (type 'd', nr 0x41), #110: the aux blob
+		 * starts with { int memFd } at offset 0, carrying our handle_id;
+		 * map it to the stub's local fd so the kernel exports the bo's RM
+		 * memory onto a real fd in this process (0x49, exactly the
+		 * EXPORT_OBJECT_TO_FD path), or finds the RM object parked on it
+		 * (0x41, the dma-buf export half).  Restore the handle_id after.
 		 */
 		int     drm_export_fd_off = -1;
 		int32_t drm_export_fd_hid = 0;
-		if (job_type == 'd' && job_nr == 0x49 &&
+		if (job_type == 'd' && (job_nr == 0x49 || job_nr == 0x41) &&
 		    job.aux_size >= sizeof(int32_t)) {
 			int32_t hid;
 			__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
@@ -1417,7 +1422,8 @@ static void worker_thread(void *arg)
 		    ((job.cmd == NVKVM_NVKMS_IOCTL_CMD &&
 		      job.param_size >= NVKVM_NVKMS_PARAMS_SIZE) ||
 		     (((job.cmd >> 8) & 0xff) == 'd' &&
-		      (job.cmd & 0xff) == 0x54 && job.param_size >= 16))) {
+		      ((job.cmd & 0xff) == 0x54 || (job.cmd & 0xff) == 0x41) &&
+		      job.param_size >= 16))) {
 			uint64_t zero = 0;
 			__builtin_memcpy((char *)job.param_buf + NVKVM_NVKMS_ADDR_OFF,
 					 &zero, sizeof(uint64_t));
