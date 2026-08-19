@@ -5,6 +5,14 @@ reproduce it yourself. Every claim here was measured by running the **same
 binary** on the host and in the guest; a difference is the finding, agreement
 means the behaviour belongs to the GPU or the driver rather than to nvkvm.
 
+> **2026-08-19: this is not OpenCL-only. It reproduces through the plain CUDA
+> driver API** (`cuMemHostAlloc` → write → `cuMemcpyHtoD`), with no OpenCL
+> involved: after pinned host buffers are allocated, written and freed, the GPU
+> reads the *previous* buffer's contents. `tests/repro/cuda_host_churn.c`,
+> guest, GTX 1660 SUPER — `churn=0` clean, `churn=3` returns `-999.0` (the
+> churn buffer's fill value) for all 1,048,576 elements. The host is clean.
+> Do not describe CUDA as unaffected.
+
 **Silent wrong results after a mapped buffer is freed.** The guest CPU and the
 GPU stop seeing the same memory: the CPU reads back its own writes correctly,
 while the GPU reads zeros, so a kernel computes from an all-zero input and no
