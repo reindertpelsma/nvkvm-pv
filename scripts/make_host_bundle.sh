@@ -16,9 +16,27 @@ set -euo pipefail
 OUT_ROOT="${1:-$(cd "$(dirname "$0")/.." && pwd)}"
 SYSLIB="${SYSLIB:-/usr/lib/x86_64-linux-gnu}"
 
-command -v nvidia-smi >/dev/null || { echo "make_host_bundle: nvidia-smi not found -- is the driver installed?" >&2; exit 1; }
-V="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1 | tr -d '[:space:]')"
-[ -n "$V" ] || { echo "make_host_bundle: could not read the host driver version" >&2; exit 1; }
+# Driver version.  nvidia-smi is the obvious source but it is not always
+# usable: inside a container the NVIDIA runtime injects the libraries and the
+# device nodes, yet NVML can still fail to initialise ("Unknown Error"), which
+# used to leave V holding an error message.  The injected library filename
+# carries the same version and is always there, so fall back to it.
+V="${NVKVM_DRIVER_VERSION:-}"
+if [ -z "$V" ] && command -v nvidia-smi >/dev/null; then
+    V="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null \
+         | head -1 | tr -d '[:space:]')"
+fi
+case "$V" in
+    [0-9]*.[0-9]*) ;;                       # looks like a version, keep it
+    *) V="$(ls "$SYSLIB"/libnvidia-ml.so.*.* 2>/dev/null | head -1 \
+            | sed 's#.*/libnvidia-ml\.so\.##')" ;;
+esac
+case "$V" in
+    [0-9]*.[0-9]*) ;;
+    *) echo "make_host_bundle: could not determine the host driver version." >&2
+       echo "                  Pass it explicitly: NVKVM_DRIVER_VERSION=580.173.02 $0" >&2
+       exit 1 ;;
+esac
 
 DEST="$OUT_ROOT/host-libs-$V"
 mkdir -p "$DEST"

@@ -1,0 +1,45 @@
+# nvkvm in a container.  See the Dockerfile header and the README FAQ.
+#
+#   docker compose up --build
+#   ssh -p 2222 ubuntu@127.0.0.1        # into the guest, once it has booted
+services:
+  nvkvm:
+    build: .
+    image: nvkvm:local
+    # No privileged mode and no added capabilities: the default set is enough.
+    devices:
+      - /dev/kvm
+    # GPU forwarding needs the NVIDIA container runtime -- the compose spelling
+    # of `--gpus all`.  Drop this block to boot the VM without a GPU.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              # graphics/display are what make the GL and Vulkan libraries
+              # appear in the container -- without them the guest gets a
+              # compute-only driver and Vulkan silently falls back to llvmpipe.
+              capabilities: [gpu, utility, compute, graphics, display, video]
+    environment:
+      # Guest sizing, same defaults as scripts/run_test_vm.sh.  Raise VM_MEM
+      # for LLM work -- a model that does not fit is disk-bound, not slow.
+      VM_MEM: ${VM_MEM:-16G}
+      VM_SMP: ${VM_SMP:-4}
+      # Bring your own guest image (any cloud-init capable Linux; only the
+      # default Ubuntu 24.04 is tested).
+      NVKVM_GUEST_IMAGE_URL: ${NVKVM_GUEST_IMAGE_URL:-}
+    volumes:
+      # The 20 GB guest disk lives here so it survives an image rebuild.
+      - nvkvm-guest:/opt/nvkvm-guest
+      # Shared folder, visible inside the guest at /data.
+      - ./data:/data
+    # Bound to loopback on purpose: the guest's SSH should not be reachable
+    # from the network just because the container is running.
+    ports:
+      - "127.0.0.1:2222:2222"
+    stdin_open: true    # -serial stdio: keep the guest console attached
+    tty: true
+
+volumes:
+  nvkvm-guest:

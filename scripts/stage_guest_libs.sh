@@ -74,7 +74,16 @@ stage(){ # $1 basename-in-bundle  $2 destdir  [$3.. extra symlink names]
         MISSING_LIBS="$MISSING_LIBS $f"
         return 1
     fi
-    sudo cp -f "$GFXBUNDLE/$f" "$dest/" || { echo "stage_guest_libs: COPY FAILED: $f" >&2; return 1; }
+    if [ -n "${NVKVM_LINK_LIBS:-}" ]; then
+        # Link mode.  The driver payload stays where it is -- normally a
+        # read-only 9p share from the host or container -- and only the link
+        # lands in the guest filesystem.  A guest `apt upgrade` then cannot
+        # overwrite a driver library, because the guest has no driver library
+        # to overwrite: it has a symlink into a read-only mount.
+        sudo ln -sf "$GFXBUNDLE/$f" "$dest/$f" || { echo "stage_guest_libs: LINK FAILED: $f" >&2; return 1; }
+    else
+        sudo cp -f "$GFXBUNDLE/$f" "$dest/" || { echo "stage_guest_libs: COPY FAILED: $f" >&2; return 1; }
+    fi
     local l; for l in "$@"; do sudo ln -sf "$f" "$dest/$l"; done
     STAGED_N=$((STAGED_N+1))
     return 0

@@ -56,7 +56,26 @@ if [ ! -f "$SEED" ]; then
     exit 1
 fi
 
+# ── Optional extra 9p exports ────────────────────────────────────────────
+# NVKVM_HOSTLIBS_DIR: the host's NVIDIA userspace, exported READ-ONLY.  The
+# guest links against it instead of copying it in, so `apt upgrade` inside the
+# guest cannot replace a driver library -- and the guest cannot write to the
+# host's copy either.
+# NVKVM_SHARE_DIR: a plain shared folder, read-write, for moving data in and out.
+HOSTLIBS_ARG=""
+if [ -n "${NVKVM_HOSTLIBS_DIR:-}" ] && [ -d "${NVKVM_HOSTLIBS_DIR}" ]; then
+    HOSTLIBS_ARG="-virtfs local,path=${NVKVM_HOSTLIBS_DIR},mount_tag=nvkvm_libs,security_model=none,readonly=on"
+fi
+SHARE_ARG=""
+if [ -n "${NVKVM_SHARE_DIR:-}" ] && [ -d "${NVKVM_SHARE_DIR}" ]; then
+    # passthrough, not mapped: a shared folder is only useful if files the
+    # guest writes are readable on the host as themselves.  mapped stores the
+    # ownership in xattrs and the guest cannot write as its own uid at all.
+    SHARE_ARG="-virtfs local,path=${NVKVM_SHARE_DIR},mount_tag=nvkvm_data,security_model=passthrough"
+fi
+
 echo "Starting nvkvm test VM..."
+
 echo "QEMU         : $QEMU"
 echo "Disk image   : $IMG"
 echo "Seed ISO     : $SEED"
@@ -84,6 +103,8 @@ exec "$QEMU" \
     -device nvkvm-gpu,addr=7 \
     \
     -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped \
+    $HOSTLIBS_ARG \
+    $SHARE_ARG \
     \
     -serial stdio \
     -display none \

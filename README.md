@@ -105,6 +105,39 @@ V=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
 bash scripts/make_host_bundle.sh    # collects host-libs-$V/ from the installed driver
 ```
 
+### With Docker
+
+```bash
+docker compose up --build       # builds QEMU, prepares a guest, boots it
+ssh -p 2222 ubuntu@127.0.0.1    # into the guest -- nvidia-smi already works
+```
+
+That is the whole setup. The image builds from this repository alone (QEMU 9.2
+and the Ubuntu cloud image are fetched during the build and on first run), and
+the guest comes up with the module loaded and the GPU present — no manual
+staging step.
+
+- **Requirements:** `/dev/kvm` and, for the GPU, the
+  [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
+  Both are already in [`docker-compose.yml`](docker-compose.yml). No
+  `--privileged`, no added capabilities.
+- **The driver userspace is mounted read-only, not copied in.** The container
+  hands the guest the host's NVIDIA libraries over a read-only 9p share and the
+  guest links against them, so `apt upgrade` inside the guest cannot replace a
+  driver library — there is none in its filesystem to replace.
+- **`./data` is shared with the guest** at `/data`, read-write, for moving work
+  in and out.
+- **The guest disk is a named volume**, so rebuilding the image does not
+  re-download it, and the GPU comes back on every boot (a systemd unit rebuilds
+  the module against the running kernel).
+- **Sizing and image:** `VM_MEM`, `VM_SMP`, and `NVKVM_GUEST_IMAGE_URL` to bring
+  your own cloud image — any cloud-init capable Linux that can build an
+  out-of-tree module should work, though only the default Ubuntu 24.04 is tested.
+
+Verified end to end on an RTX 3060: cold `docker compose up` to `nvidia-smi`
+inside the guest, surviving a guest reboot and a guest `apt` install of a
+conflicting NVIDIA package.
+
 ## First result
 
 ```bash
@@ -322,7 +355,9 @@ has not had an external security review. See
 [the isolate model](docs/internal/isolate-model.md).
 
 **Can nvkvm itself run inside a container?**
-Yes, and much of the testing is done that way. A default container is enough:
+Yes, and much of the testing is done that way — there is a
+[`Dockerfile`](Dockerfile) and a [`docker-compose.yml`](docker-compose.yml) for
+exactly this. A default container is enough:
 
 ```bash
 docker run --gpus all --device /dev/kvm ...

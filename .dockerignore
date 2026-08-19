@@ -1,0 +1,5 @@
+.git
+docs/img/*.gif
+*.qcow2
+*.img
+*.iso

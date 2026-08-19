@@ -13,7 +13,11 @@ REPO_ROOT="$(realpath "$(dirname "$0")/..")"
 
 # Source image (Noble Numbat / 24.04).  The filename uses the Ubuntu codename
 # "noble" but the user-facing label is 24.04.
-CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+# Overridable so you can bring your own cloud image.  Anything that runs
+# cloud-init and can build an out-of-tree module works in principle; only the
+# Ubuntu 24.04 image below is tested, and a distro whose kernel headers package
+# is named differently will need the runcmd below adjusted.
+CLOUD_IMG_URL="${NVKVM_GUEST_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
 CLOUD_IMG_RAW="$GUEST_DIR/noble-server-cloudimg-amd64.img"
 QCOW2_IMG="$GUEST_DIR/ubuntu-24.04.qcow2"
 SEED_ISO="$GUEST_DIR/seed.iso"
@@ -24,9 +28,16 @@ echo "Disk image      : $QCOW2_IMG"
 echo ""
 
 # ── Prerequisite tools ────────────────────────────────────────────────────
-echo "[prereq] Installing required host tools..."
-apt-get update -q
-apt-get install -y wget qemu-utils genisoimage
+# Skipped when the tools are already there, so this works in a container
+# image that ships them and on a host with no network.
+if command -v wget >/dev/null && command -v qemu-img >/dev/null \
+   && command -v genisoimage >/dev/null; then
+    echo "[prereq] Required host tools already present — skipping apt."
+else
+    echo "[prereq] Installing required host tools..."
+    apt-get update -q
+    apt-get install -y wget qemu-utils genisoimage
+fi
 
 # ── 1. Create guest directory ─────────────────────────────────────────────
 echo "[1/6] Creating $GUEST_DIR..."
@@ -78,6 +89,33 @@ chpasswd:
     ubuntu:ubuntu
 
 package_update: true
+write_files:
+  # The GPU has to come back on every boot, not just the first one.
+  # cloud-init runcmd runs ONCE per instance, so a guest that was set up here
+  # and then rebooted used to come up with no module loaded, no /dev/nvidia*
+  # and an nvidia-smi that says the driver is not running -- which reads like a
+  # broken forward rather than "nothing loaded it".  A unit rebuilds against
+  # the running kernel (so a guest kernel upgrade is survivable too) and
+  # re-stages, both idempotent.
+  - path: /etc/systemd/system/nvkvm-guest.service
+    permissions: '0644'
+    content: |
+      [Unit]
+      Description=Build and load the nvkvm guest module, stage NVIDIA userspace
+      After=local-fs.target network.target
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko; }'
+      # `|| true`: stage_guest_libs.sh exits non-zero when an OPTIONAL library
+      # is absent from the bundle (the Wayland/GBM EGL platform libraries are
+      # not part of the driver, so a headless host legitimately has none).
+      # That must not leave the unit in a failed state when compute is fine --
+      # the warnings are in the journal either way.
+      ExecStart=/bin/bash -c 'if ls /opt/nvidia-host/libcuda.so.* >/dev/null 2>&1; then NVKVM_LINK_LIBS=1 bash /mnt/nvkvm/scripts/stage_guest_libs.sh /opt/nvidia-host; elif ls -d /mnt/nvkvm/host-libs-* >/dev/null 2>&1; then bash /mnt/nvkvm/scripts/stage_guest_libs.sh; fi || true'
+      [Install]
+      WantedBy=multi-user.target
+
 packages:
   - build-essential
   - git
@@ -101,13 +139,22 @@ runcmd:
   # the host driver) the mount would otherwise be missing and everything
   # under /mnt/nvkvm -- the module source, stage_guest_libs.sh, the test
   # suite -- would silently not be there.
-  - mkdir -p /mnt/nvkvm
+  - mkdir -p /mnt/nvkvm /opt/nvidia-host /data
   - mount -t 9p -o trans=virtio,version=9p2000.L nvkvm_src /mnt/nvkvm
   - grep -q nvkvm_src /etc/fstab || echo 'nvkvm_src /mnt/nvkvm 9p trans=virtio,version=9p2000.L,nofail 0 0' >> /etc/fstab
-  # Build the guest kernel module against the running guest kernel.
-  - cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build
-  # Load the module.
-  - insmod /mnt/nvkvm/src/guest/nvkvm-guest.ko
+  # Read-only share holding the host's NVIDIA userspace, when the host or
+  # container exported one (tag nvkvm_libs).  Linking against it rather than
+  # copying it in is what keeps a guest `apt upgrade` from replacing a driver
+  # library: there is no driver library in the guest filesystem to replace.
+  - bash -c 'mount -t 9p -o trans=virtio,version=9p2000.L,ro nvkvm_libs /opt/nvidia-host 2>/dev/null || true'
+  - bash -c 'grep -q nvkvm_libs /etc/fstab || echo "nvkvm_libs /opt/nvidia-host 9p trans=virtio,version=9p2000.L,ro,nofail 0 0" >> /etc/fstab'
+  # Shared folder for moving data in and out of the guest (tag nvkvm_data).
+  - bash -c 'mount -t 9p -o trans=virtio,version=9p2000.L nvkvm_data /data 2>/dev/null || true'
+  - bash -c 'grep -q nvkvm_data /etc/fstab || echo "nvkvm_data /data 9p trans=virtio,version=9p2000.L,nofail 0 0" >> /etc/fstab'
+  # Build, load and stage -- last, because it needs the mounts above, and via
+  # a unit so the same thing happens on every later boot rather than only this one.
+  - systemctl daemon-reload
+  - systemctl enable --now nvkvm-guest.service
 CLOUDINIT
 
 # ── 5. Create cloud-init meta-data ────────────────────────────────────────
