@@ -11,7 +11,7 @@ parity on three GPU architectures; see `tests/perf/realapp_matrix.md`.
 
 ## Display and graphics
 
-### The guest DRM node does not open under the hardened isolate — OPEN
+### The guest DRM node does not open under the hardened isolate — FIXED 2026-08-19
 
 The isolate drops to an unprivileged per-VM uid with no supplementary groups,
 and the host's DRM render node is mode 0660 owned by `root:render`. So the stub
@@ -30,12 +30,22 @@ anything that needs the DRM node itself: compositors, `kmscube`, `modetest`,
 and therefore the whole virtual-KMS/present path. `tests/validate.sh` passes
 28/28 throughout, because nothing in it opens the DRM node.
 
-The fix is to stop having the stub open it by name. QEMU is already the
-privileged component and already parks a `/dev` dirfd for the stub before the
-uid drop; the render node can be opened the same way, pre-drop, and parked at a
-known fd. Granting the isolate uid the `render` group instead would work but is
-strictly broader — it would reach every render node on the host, not the one
-this VM is entitled to.
+Fixed by not having the stub open it by name. QEMU is already the privileged
+component and already parks a `/dev` dirfd for the stub before the uid drop; the
+render node is now opened the same way, pre-drop, and parked at `NVKVM_DRM_FD(k)`
+(`src/common/nvkvm_isolate_proto.h`). The stub `dup`s it per handle, so one guest
+process closing its DRM fd cannot take the node from the others, and falls back
+to opening by name when nothing was parked. Granting the isolate uid the
+`render` group instead would have worked but is strictly broader — it would
+reach every render node on the host, not the one this VM is entitled to.
+
+The only sandbox widening is `fcntl` restricted to `F_DUPFD_CLOEXEC` by a BPF
+argument check; duplicating an fd the process already holds grants no new reach.
+
+With both this and the render-minor fix, on the default `auto` (→ `uid+chroot`)
+mode: the guest opens `card0` and `modetest` enumerates the head — `Virtual-1`
+connected, 1920x1080, 23 modes. `tests/validate.sh` stays 28/28 and the
+correctness reproducers stay clean on both the ring and virtqueue paths.
 
 ### The render node is not always minor 128 — FIXED 2026-08-19
 

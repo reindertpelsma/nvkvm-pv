@@ -38,6 +38,9 @@
 #include "../common/nvkvm_ring.h"
 #include "../common/nvkvm_ring_ioctl.h"
 #include "../common/nvkvm_abi.h"
+
+/* fcntl(2) F_DUPFD_CLOEXEC — not pulled in by the freestanding headers. */
+#define NVKVM_F_DUPFD_CLOEXEC 1030
 /*
  * U-1: the ring path needs the same default-deny control allowlist QEMU
  * applies on the virtqueue path.  The table is generated data with no QEMU
@@ -1731,11 +1734,26 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 		return;
 	} else {
 		char path[24];
-		if (dev_id_to_path(cmd->dev_id, path, sizeof(path)) < 0) {
-			send_open_device_resp(cmd->txn_id, -EINVAL, -1);
-			return;
+		fd = -EBADF;
+		/*
+		 * DRM render node: use the fd QEMU parked before dropping our
+		 * privileges — we cannot open the node ourselves any more (0660
+		 * root:render, and we hold no groups).  A private dup per handle,
+		 * so one guest process closing its DRM fd does not take the node
+		 * away from the others.  Falls through to opening by name when
+		 * nothing was parked, which is the un-hardened spawn.
+		 */
+		if (cmd->dev_id >= 32 && cmd->dev_id < 32 + NVKVM_DRM_FD_MAX)
+			fd = (int)sc3(__NR_fcntl,
+				      NVKVM_DRM_FD(cmd->dev_id - 32),
+				      NVKVM_F_DUPFD_CLOEXEC, 0);
+		if (fd < 0) {
+			if (dev_id_to_path(cmd->dev_id, path, sizeof(path)) < 0) {
+				send_open_device_resp(cmd->txn_id, -EINVAL, -1);
+				return;
+			}
+			fd = (int)stub_open_dev(path, (int)cmd->flags | O_CLOEXEC);
 		}
-		fd = (int)stub_open_dev(path, (int)cmd->flags | O_CLOEXEC);
 	}
 
 	if (fd < 0) {
@@ -2646,6 +2664,25 @@ static long apply_seccomp(void)
  * in the guest), so no runtime mapping ever needs PROT_EXEC.  Deny it outright.
  * prot is args[2]; on no-match we fall through with nr still loaded.
  */
+/*
+ * Allow nr_val only when args[1] equals want.  Used for fcntl: the stub needs
+ * exactly one command, F_DUPFD_CLOEXEC, to hand out private copies of the DRM
+ * render-node fds QEMU parked for it (NVKVM_DRM_FD).  Every other fcntl --
+ * including anything that changes file status flags or takes a lock -- stays
+ * denied.  Duplicating an fd the process already holds grants no new reach,
+ * which is why this is a safe thing to open up and F_SETFL would not be.
+ */
+#define ALLOW_IF_ARG1_EQ(nr_val, want) do { \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 4)); \
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
+		      offsetof(struct seccomp_data, args[1]))); \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (want), 1, 0)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
+		      offsetof(struct seccomp_data, nr))); \
+} while (0)
+
 #define ALLOW_IF_NO_EXEC(nr_val) do { \
 	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 5)); \
 	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
@@ -2684,6 +2721,7 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_eventfd2);
 	ALLOW_IF(__NR_gettid);
 	ALLOW_IF(__NR_tgkill);   /* post SIGUSR1 to interrupt a worker's ioctl (#73) */
+	ALLOW_IF_ARG1_EQ(__NR_fcntl, NVKVM_F_DUPFD_CLOEXEC);
 	/* R2-L1: dropped vestigial entries with no freestanding caller —
 	 * clone (clone3 is used), set_robust_list, madvise, lseek, pread64,
 	 * readlinkat — to shrink the post-RCE syscall surface. */
@@ -2691,6 +2729,7 @@ static long apply_seccomp(void)
 	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM));
 
 #undef ALLOW_IF
+#undef ALLOW_IF_ARG1_EQ
 #undef EMIT
 
 	struct sock_fprog prog = {

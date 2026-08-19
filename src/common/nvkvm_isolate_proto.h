@@ -388,4 +388,23 @@ struct isolate_resp_xiso_import {
  */
 #define NVKVM_DEV_DIRFD 4
 
+/*
+ * DRM render nodes are parked the same way, at NVKVM_DRM_FD(k) for the k-th
+ * NVIDIA GPU, and for a different reason: permissions, not visibility.
+ *
+ * The node is mode 0660 root:render.  The isolate drops to an unprivileged
+ * per-VM uid with no supplementary groups, so it cannot open the node itself
+ * however the path is spelled — every DRM-dependent guest path (compositors,
+ * kmscube, modetest, the virtual KMS head) failed at open() before any ioctl
+ * was forwarded.  QEMU is already the privileged component, so it opens the
+ * node before the uid drop and hands the fd down, exactly as it does for /dev.
+ *
+ * The stub dup()s these rather than handing the parked fd out directly, so one
+ * guest process closing its DRM fd cannot take the node away from the rest.  A
+ * dup that fails means nothing was parked (un-hardened spawn), and the stub
+ * falls back to opening by name.
+ */
+#define NVKVM_DRM_FD_MAX 8
+#define NVKVM_DRM_FD(k)  (NVKVM_DEV_DIRFD + 1 + (k))
+
 #endif /* NVKVM_ISOLATE_PROTO_H */

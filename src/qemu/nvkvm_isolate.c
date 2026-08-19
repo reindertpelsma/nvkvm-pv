@@ -47,6 +47,13 @@
 #ifndef NVKVM_DEV_DIRFD
 #define NVKVM_DEV_DIRFD 4
 #endif
+/* Same guard, same reason: the DRM render-node fds parked for the stub. */
+#ifndef NVKVM_DRM_FD_MAX
+#define NVKVM_DRM_FD_MAX 8
+#endif
+#ifndef NVKVM_DRM_FD
+#define NVKVM_DRM_FD(k)  (NVKVM_DEV_DIRFD + 1 + (k))
+#endif
 
 #ifndef PR_CAP_AMBIENT
 #define PR_CAP_AMBIENT            47
@@ -207,6 +214,41 @@ static int nvkvm_map_child_userns(pid_t pid, uid_t extra_uid, gid_t extra_gid)
  *
  * Returns child pid (>0) / 0 in child / -1 on error, like fork().
  */
+/*
+ * Open the host's NVIDIA render nodes and park them at NVKVM_DRM_FD(k), while
+ * the child still has the privileges to do it.
+ *
+ * Must run BEFORE the mount-namespace pivot or the chroot (the nodes are
+ * addressed by their real path here) and before the uid drop (afterwards the
+ * isolate has no group that can open a 0660 root:render node).  The fds are
+ * deliberately NOT O_CLOEXEC: surviving the exec into the stub is the point.
+ *
+ * Returns how many were parked, so the caller can keep closefrom() off them.
+ */
+static unsigned nvkvm_child_park_drm_fds(void)
+{
+	unsigned k;
+
+	for (k = 0; k < NVKVM_DRM_FD_MAX; k++) {
+		char node[64];
+		int fd;
+
+		if (!nvkvm_nvidia_render_path(k, node, sizeof(node)))
+			break;                    /* no k-th NVIDIA GPU */
+		fd = open(node, O_RDWR);
+		if (fd < 0)
+			break;                    /* graphics-only; non-fatal */
+		if (fd != NVKVM_DRM_FD(k)) {
+			if (dup2(fd, NVKVM_DRM_FD(k)) < 0) {
+				close(fd);
+				break;
+			}
+			close(fd);
+		}
+	}
+	return k;
+}
+
 static pid_t nvkvm_isolate_spawn(unsigned mode)
 {
 	if (!(mode & NVKVM_ISO_LAYER_NS))
@@ -1177,6 +1219,10 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 					}
 				}
 			}
+			/* DRM render nodes, opened while still privileged and
+			 * parked for the stub (see NVKVM_DRM_FD).  Before the
+			 * pivot/chroot, which take the real paths away. */
+			unsigned drm_n = use_uid ? nvkvm_child_park_drm_fds() : 0;
 			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
 			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -1185,8 +1231,19 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 * must precede both drops below. */
 			if (use_chroot && nvkvm_iso_enter_chroot(NVKVM_DEV_DIRFD) < 0)
 				_exit(124);
-			nvkvm_isolate_closefrom((use_ns || use_chroot)
-						? NVKVM_DEV_DIRFD + 1 : 4);
+			{
+				int keep = (use_ns || use_chroot)
+					   ? NVKVM_DEV_DIRFD + 1 : 4;
+				if (drm_n) {
+					/* Keep the parked DRM fds.  When this mode
+					 * parked no dirfd, close it here so raising
+					 * the floor does not leak it. */
+					if (!(use_ns || use_chroot))
+						close(NVKVM_DEV_DIRFD);
+					keep = NVKVM_DRM_FD(drm_n - 1) + 1;
+				}
+				nvkvm_isolate_closefrom(keep);
+			}
 			/* no_new_privs + bounding set, while CAP_SETPCAP is still
 			 * held; then the uid drop (needs CAP_SETUID, which it then
 			 * removes); then the rest of the cap teardown. */
@@ -1258,12 +1315,27 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 					if (dn > 3) close(dn);
 				}
 			}
+			/* DRM render nodes, opened while still privileged and
+			 * parked for the stub (see NVKVM_DRM_FD).  Before the
+			 * pivot/chroot, which take the real paths away. */
+			unsigned drm_n = use_uid ? nvkvm_child_park_drm_fds() : 0;
 			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
 			if (use_chroot && nvkvm_iso_enter_chroot(NVKVM_DEV_DIRFD) < 0)
 				_exit(124);
-			nvkvm_isolate_closefrom((use_ns || use_chroot)
-						? NVKVM_DEV_DIRFD + 1 : 4);
+			{
+				int keep = (use_ns || use_chroot)
+					   ? NVKVM_DEV_DIRFD + 1 : 4;
+				if (drm_n) {
+					/* Keep the parked DRM fds.  When this mode
+					 * parked no dirfd, close it here so raising
+					 * the floor does not leak it. */
+					if (!(use_ns || use_chroot))
+						close(NVKVM_DEV_DIRFD);
+					keep = NVKVM_DRM_FD(drm_n - 1) + 1;
+				}
+				nvkvm_isolate_closefrom(keep);
+			}
 			if (harden)
 				nvkvm_drop_caps_pre();
 			/* setgroups is left at its default "allow" for combined
