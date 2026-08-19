@@ -209,28 +209,23 @@ the host; every CUDA check on that part passes. Traced to a channel/compute
 class mismatch, with two hypotheses eliminated —
 [detail](docs/reference/correctness.md#vulkan-compute-on-hopper).
 
-**28/28 is not evidence that your workload computes correctly.** `validate.sh`
-passed on a guest that was silently returning wrong results for two days (see
-below), because the suite did not cover the path that was broken. Check your own
-results against a host run.
-
-*Recently fixed — 2026-08-19:* after pinned host memory was allocated, written
-and freed, a later allocation at the same address was not republished to the
-device, so the CPU read back its own writes while the GPU read the *previous*
-buffer's contents and the work computed from the wrong input, with no error and
-no crash. It reached both OpenCL and plain CUDA. Geekbench 7 `--gpu` failed
-validation on 11 workloads in the guest; it now completes all of them, and
-scores **99.9% of the bare-metal host** on the same GPU and driver — 48335 in
-the guest vs 48395 on the host, every individual workload between 98.4% and
-101.2%
-([guest vs host](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
-· [before the fix](https://browser.geekbench.com/v7/gpu/79890)). Root cause and
-reproducers: [Correctness and known issues](docs/reference/correctness.md).
+**28/28 is not evidence that your workload computes correctly.** The suite
+covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL — it does not
+cover everything, and a real correctness bug has passed it before
+([what it was](docs/reference/correctness.md)). Check your own results against a
+host run.
 
 ## Tested applications
 
-Guest vs host, one statically-linked binary run on both sides, RTX 3060, host
-driver 575.51.03, strictly serial on one GPU.
+An independent third-party benchmark first, because it is the easiest to check:
+**Geekbench 7 GPU (OpenCL) scores 99.9% of bare metal** — 48335 in the guest vs
+48395 on the host, with all eleven workloads between 98.4% and 101.2%, on one
+RTX 3050 Laptop GPU and one driver
+([side by side](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)).
+Both runs are public; neither is ours to edit.
+
+The rest is guest vs host, one statically-linked binary run on both sides, RTX
+3060, host driver 575.51.03, strictly serial on one GPU.
 
 | workload | host | guest | ratio |
 |---|---|---|---|
@@ -412,8 +407,9 @@ libraries did not stage. See
 
 **Does CUDA give bit-identical results to the host?**
 On everything measured, yes — including token-identical LLM output at
-temperature 0. A path that returned wrong results silently was fixed on
-2026-08-19; see [Known issues](#known-issues).
+temperature 0, and Geekbench 7 GPU at 99.9% of bare metal with every workload
+validating. Verify your own workload against a host run all the same; see
+[Known issues](#known-issues).
 
 ## Documentation
 
