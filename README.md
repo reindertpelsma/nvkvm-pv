@@ -219,11 +219,13 @@ and freed, a later allocation at the same address was not republished to the
 device, so the CPU read back its own writes while the GPU read the *previous*
 buffer's contents and the work computed from the wrong input, with no error and
 no crash. It reached both OpenCL and plain CUDA. Geekbench 7 `--gpu` failed
-validation on 11 workloads in the guest and now completes all of them with none
-([before](https://browser.geekbench.com/v7/gpu/79890) ·
-[after](https://browser.geekbench.com/v7/gpu/81189) ·
-[host](https://browser.geekbench.com/v7/gpu/79862)). Root cause and reproducers:
-[Correctness and known issues](docs/reference/correctness.md).
+validation on 11 workloads in the guest; it now completes all of them, and
+scores **99.9% of the bare-metal host** on the same GPU and driver — 48335 in
+the guest vs 48395 on the host, every individual workload between 98.4% and
+101.2%
+([guest vs host](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
+· [before the fix](https://browser.geekbench.com/v7/gpu/79890)). Root cause and
+reproducers: [Correctness and known issues](docs/reference/correctness.md).
 
 ## Tested applications
 

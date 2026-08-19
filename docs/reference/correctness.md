@@ -55,8 +55,13 @@ Detection, Feature Matching, Path Tracer, Particle Physics, Fluid Simulation
 among them — while the identical binary on the same GPU was clean on the host
 ([old guest](https://browser.geekbench.com/v7/gpu/79890) ·
 [host](https://browser.geekbench.com/v7/gpu/79862)). The same run on the same
-guest with this fix completes **every workload with zero validation failures**
-([guest](https://browser.geekbench.com/v7/gpu/81189)).
+guest with this fix completes **every workload with zero validation failures**,
+and lands at **99.9% of the host score** — 48335 guest vs 48395 host, with each
+of the eleven workloads between 98.4% and 101.2%
+([side by side](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)).
+That parity is the useful part: it says the workloads are not merely returning
+*valid* answers now, they are returning them at the speed the bare-metal host
+does, so nothing was traded away to fix them.
 
 `validate.sh` passing 28/28 on *both* sides is still the point worth keeping:
 the suite never covered this, so a green 28/28 was not evidence of correct
