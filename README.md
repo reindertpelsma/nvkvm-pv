@@ -209,6 +209,15 @@ the host; every CUDA check on that part passes. Traced to a channel/compute
 class mismatch, with two hypotheses eliminated —
 [detail](docs/reference/correctness.md#vulkan-compute-on-hopper).
 
+**Graphics: GL clients now render, but the display path is not stable.** As of
+2026-08-19 a Wayland GL client inside the guest gets a real NVIDIA context and
+puts real pixels in its window — before this it silently ran on llvmpipe. Two
+defects remain open and neither is fixed: frames stall after an initial burst,
+and a GL client can take the whole guest down with `kvm run failed Bad address`
+roughly 10–60 s in. Compute is unaffected. Treat guest graphics as
+work-in-progress, not a feature —
+[detail](docs/internal/known-limitations.md).
+
 **28/28 is not evidence that your workload computes correctly.** The suite
 covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL — it does not
 cover everything, and a real correctness bug has passed it before
