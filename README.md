@@ -84,7 +84,7 @@ Not yet for untrusted multi-tenant hosting — see below.
 | | |
 |---|---|
 | Host | Linux with KVM, an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
-| Guest | Linux (tested on Ubuntu 24.04, kernel 6.8) |
+| Guest | Linux, kernel **6.4–6.10** (tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Build | QEMU 9.2 is built from source by the provided script |
@@ -359,10 +359,19 @@ itself. It does need the matching userspace libraries, staged from the host by
 [`stage_guest_libs.sh`](scripts/stage_guest_libs.sh).
 
 **Which guest distros are supported?**
-Any Linux that can load an out-of-tree kernel module and run NVIDIA's userspace.
-`nvkvm-guest.ko` builds against the guest's own headers, so the distro is not
-special — Ubuntu 24.04 is simply what gets tested. Windows guests are not
-supported.
+The distro does not matter; the **kernel version** does, and the current range
+is narrow. `nvkvm-guest.ko` is built against the guest's own headers and uses
+in-kernel APIs that changed on both sides of 6.8. Measured: Ubuntu 24.04 (6.8)
+builds; Ubuntu 22.04 (5.15) and Debian 12 (6.1) fail on `class_create`, and
+Debian 13 (6.12), Ubuntu 25.04 (6.14), Fedora (6.17, 6.19) and 7.0 all fail on
+`virtio_find_vqs`. By where those two API changes landed the buildable range is
+**6.4–6.10**, though only 6.8 has actually been built and run. Full table and a
+one-command harness that needs no GPU:
+[guest kernels](docs/reference/guest-kernels.md).
+
+So: pick a guest whose kernel is in range — Ubuntu 24.04 is the tested one —
+rather than any distro you like. Widening this is ordinary compat work, not a
+design limit. Windows guests are not supported.
 
 **Does the host driver version have to match the guest's?**
 Yes. The libraries staged into the guest come from the host, so they are the same
@@ -428,6 +437,7 @@ validating. Verify your own workload against a host run all the same; see
 | [`docs/howto/`](docs/howto/) | Building, running, staging guest libraries, adding a driver version |
 | [`docs/reference/`](docs/reference/) | ABI profiles, allowlists, virtio protocol, device nodes |
 | [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |
+| [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 
 ## Status
