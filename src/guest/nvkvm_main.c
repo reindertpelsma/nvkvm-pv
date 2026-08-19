@@ -2061,6 +2061,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			goto forwarded;
 		}
 
+		/* Re-upload already-migrated CPU pages before the GPU reads
+		 * them: the slot may still hold a previous buffer's bytes if
+		 * this address was reused.  Symmetric with the writeback below. */
+		nvkvm_cpu_pages_refresh(ctx);
+
 #define NVKVM_MAX_EFAULT_RETRIES 128
 		for (retries = 0; retries < NVKVM_MAX_EFAULT_RETRIES; retries++) {
 			fault_addr = 0;

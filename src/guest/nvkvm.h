@@ -488,6 +488,7 @@ extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx);
 int  nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr);
+void nvkvm_cpu_pages_refresh(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_writeback(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
 /* Eagerly migrate every guest page in [gva, gva+len) onto memfds shared with

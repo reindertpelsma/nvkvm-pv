@@ -615,6 +615,78 @@ int nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr)
 }
 
 /*
+ * nvkvm_cpu_pages_refresh — re-upload every migrated CPU page before the GPU
+ * reads it.
+ *
+ * A migration is a COPY: the guest page is copied into a shared slot that the
+ * host driver reads.  cpu_page_migrate then remembers the GVA and returns
+ * early next time, which is correct only while that GVA keeps holding the same
+ * data.  It does not: free a pinned host buffer and allocate another, the
+ * allocator hands back the same address, and the slot still holds the previous
+ * buffer's bytes.  The GPU then computes from stale data with no error --
+ * cuMemcpyHtoD returning a freed buffer's contents, an OpenCL kernel reading an
+ * all-zero input.  See docs/reference/correctness.md.
+ *
+ * So refresh before forwarding, exactly mirroring the writeback afterwards:
+ * upload guest -> slot here, download slot -> guest there.  Uncapped on
+ * purpose, unlike writeback's batch of 64 -- a partial upload is a wrong
+ * answer, not a slow one.
+ */
+void nvkvm_cpu_pages_refresh(struct nvkvm_fd_ctx *ctx)
+{
+	struct nvkvm_cpu_page *cp;
+	struct { __u32 handle_id; struct page *page; } *batch;
+	int n = 0, cap = 0;
+
+	mutex_lock(&ctx->cpu_pages_lock);
+	list_for_each_entry(cp, &ctx->cpu_pages, list)
+		if (cp->page)
+			cap++;
+	mutex_unlock(&ctx->cpu_pages_lock);
+	if (!cap)
+		return;
+
+	batch = kmalloc_array(cap, sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return;
+
+	mutex_lock(&ctx->cpu_pages_lock);
+	list_for_each_entry(cp, &ctx->cpu_pages, list) {
+		/* Range entries (page==NULL) are mapped, not copied: the guest
+		 * VMA points at the memfd GPA, so there is nothing to re-upload. */
+		if (!cp->page || n >= cap)
+			continue;
+		get_page(cp->page);
+		batch[n].handle_id = cp->handle_id;
+		batch[n].page      = cp->page;
+		n++;
+	}
+	mutex_unlock(&ctx->cpu_pages_lock);
+
+	for (int i = 0; i < n; i++) {
+		int shm_slot = nvkvm_slot_alloc(&nvkvm);
+		if (shm_slot < 0)
+			goto put;
+		{
+			void *slot_ptr = nvkvm_slot_addr(&nvkvm, shm_slot);
+			if (slot_ptr) {
+				void *kaddr = kmap_local_page(batch[i].page);
+				memcpy(slot_ptr, kaddr, PAGE_SIZE);
+				kunmap_local(kaddr);
+				wmb();
+				nvkvm_virtio_write_memory_handle(batch[i].handle_id,
+								 0, shm_slot,
+								 PAGE_SIZE);
+			}
+		}
+		nvkvm_slot_free(&nvkvm, shm_slot);
+put:
+		put_page(batch[i].page);
+	}
+	kfree(batch);
+}
+
+/*
  * nvkvm_cpu_pages_writeback — for every writable migrated CPU page, read the
  * current memfd content back into the original guest physical page.
  *

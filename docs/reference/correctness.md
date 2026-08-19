@@ -50,6 +50,20 @@ no longer stays mapped into the guest's GPA space where the driver may have
 handed it to another client — **but it does not fix the corruption**: the
 reproducer still fails with the reap in place.
 
+*2026-08-19, the architectural finding:* the ioctls this workload uses take the
+**SPSC ring fast path**, which `goto forwarded`s past the whole tail of the slow
+path — including `nvkvm_cpu_pages_writeback()` and the new
+`nvkvm_cpu_pages_refresh()`. Instrumented on an RTX 3050 guest, refresh is
+called **zero** times during a failing run. So CPU-page migrations are neither
+refreshed before the GPU reads them nor written back after, whenever the ring is
+used.
+
+That is the same path [U-1](../internal/audit-guest-pointers.md) reports the
+allowlist is not wired into. One gap, two symptoms: a security check that does
+not run, and a memory-coherency step that does not run. Fixing either properly
+probably means making the ring path share the slow path's pre/post hooks rather
+than patching each omission separately.
+
 *What is left, guest side:* `nvkvm_cpu_page_migrate()` in
 [`src/guest/nvkvm_mmap.c`](../../src/guest/nvkvm_mmap.c) keys its "already
 mapped?" cache on the **guest virtual address alone**, and nothing ever
