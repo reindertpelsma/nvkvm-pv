@@ -17,6 +17,7 @@
  */
 #include "qemu/osdep.h"
 #include "virtio_nvgpu.h"   /* NVKVM_QEMU_GRAPHICS compile-time gate */
+#include "nvkvm_drm_node.h"
 
 #if defined(CONFIG_OPENGL) && NVKVM_QEMU_GRAPHICS
 #include "ui/console.h"
@@ -46,8 +47,16 @@ static bool nvkvm_present_egl_ensure(void)
     }
 
     Error *err = NULL;
+    char nodebuf[64];
+    const char *node = nvkvm_nvidia_render_path(0, nodebuf, sizeof(nodebuf));
+
+    if (!node) {
+        fprintf(stderr, "nvkvm present: no NVIDIA DRM render node on this host\n");
+        nvkvm_egl_state = 0;
+        return false;
+    }
     /* Headless: GBM rendernode platform, surfaceless context (no X needed). */
-    if (!egl_init("/dev/dri/renderD128", DISPLAY_GL_MODE_ON, &err)) {
+    if (!egl_init(node, DISPLAY_GL_MODE_ON, &err)) {
         fprintf(stderr, "nvkvm present: egl_init failed: %s\n",
                 err ? error_get_pretty(err) : "(unknown)");
         error_free(err);

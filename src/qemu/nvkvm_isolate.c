@@ -13,6 +13,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "nvkvm_drm_node.h"
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -270,15 +271,27 @@ static int nvkvm_child_enter_mount_ns(void)
 			return -1;                /* nvidiactl is mandatory */
 	}
 	/* nvidia-drm render node(s) for graphics (Vulkan) live under dri/.
-	 * Create the subdir in the sandbox /dev and bind each present
-	 * renderD12{8..} node.  Graphics-only — absence is non-fatal. */
+	 * Create the subdir in the sandbox /dev and bind the NVIDIA nodes in.
+	 *
+	 * RENUMBER them while binding: the k-th NVIDIA node on the host, whatever
+	 * minor it landed on, appears in the sandbox as renderD(128+k).  The stub
+	 * resolves NVKVM_DEV_DRM_RD(k) to exactly that name, so this is what makes
+	 * the guest's k-th render node mean "the k-th NVIDIA GPU" rather than
+	 * "host minor 128+k".  Those differ on any machine where another GPU
+	 * probes first — a hybrid-graphics laptop is the common case — and there
+	 * the guest's DRM node used to fail to open with ENOENT while CUDA and
+	 * headless EGL kept working, so nothing caught it.  Graphics-only;
+	 * absence is non-fatal. */
 	mkdir("/proc/dev/dri", 0755);
-	for (int n = 128; n < 128 + 8; n++) {
-		int fd;
-		snprintf(src, sizeof(src), "/dev/dri/renderD%d", n);
+	for (unsigned k = 0; k < 8; k++) {
+		int fd, minor = nvkvm_nvidia_render_minor(k);
+
+		if (minor < 0)
+			break;                    /* no k-th NVIDIA node */
+		snprintf(src, sizeof(src), "/dev/dri/renderD%d", minor);
 		if (access(src, F_OK) != 0)
 			continue;
-		snprintf(dst, sizeof(dst), "/proc/dev/dri/renderD%d", n);
+		snprintf(dst, sizeof(dst), "/proc/dev/dri/renderD%u", 128 + k);
 		fd = open(dst, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
 		if (fd >= 0)
 			close(fd);
@@ -1036,6 +1049,37 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	 * all — including the bare 'seccomp' rung, whose TSYNC filter REQUIRES
 	 * no_new_privs on every thread. */
 	const bool harden     = (layers != 0);
+
+	/*
+	 * Make the NVIDIA render node reachable under the name the stub asks
+	 * for, once per process.  In namespace mode the sandbox bind-mounts it;
+	 * without a mount namespace (the default unprivileged-container case)
+	 * only a symlink in the container's own /dev can do it.  Harmless when
+	 * the node is already at renderD128, which is the single-GPU case.
+	 */
+	if (!use_ns) {
+		static bool aliased;
+		if (!aliased) {
+			aliased = true;
+			for (unsigned k = 0; k < 8; k++) {
+				int rc = nvkvm_drm_node_alias(k);
+				if (rc > 0)
+					fprintf(stderr,
+						"nvkvm: /dev/dri/renderD%u -> the NVIDIA node "
+						"(host minor %d); the guest DRM node needs "
+						"this name\n",
+						128 + k, nvkvm_nvidia_render_minor(k));
+				else if (rc < 0)
+					fprintf(stderr,
+						"nvkvm: warning: /dev/dri/renderD%u is taken by "
+						"another device, so the guest's DRM render node "
+						"%u will not open (CUDA and headless EGL are "
+						"unaffected)\n", 128 + k, k);
+				if (nvkvm_nvidia_render_minor(k) < 0)
+					break;
+			}
+		}
+	}
 
 	/*
 	 * UID-separation mode: derive this isolate's unique host uid/gid from its

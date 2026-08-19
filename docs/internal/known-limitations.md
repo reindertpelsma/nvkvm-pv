@@ -11,6 +11,48 @@ parity on three GPU architectures; see `tests/perf/realapp_matrix.md`.
 
 ## Display and graphics
 
+### The guest DRM node does not open under the hardened isolate — OPEN
+
+The isolate drops to an unprivileged per-VM uid with no supplementary groups,
+and the host's DRM render node is mode 0660 owned by `root:render`. So the stub
+cannot open it, and every DRM-dependent path in the guest fails at `open()`
+before any ioctl is forwarded. Measured on an RTX 3050 laptop container,
+2026-08-19, holding everything else constant:
+
+| `NVKVM_ISOLATE_MODE` | guest `open("/dev/dri/card0")` |
+|---|---|
+| default (`auto` → `uid+chroot`) | fails |
+| `seccomp` (no uid drop) | succeeds |
+
+CUDA, Vulkan compute and offscreen EGL are unaffected — they reach the GPU
+through `/dev/nvidia*`, which the isolate does have. What is blocked is
+anything that needs the DRM node itself: compositors, `kmscube`, `modetest`,
+and therefore the whole virtual-KMS/present path. `tests/validate.sh` passes
+28/28 throughout, because nothing in it opens the DRM node.
+
+The fix is to stop having the stub open it by name. QEMU is already the
+privileged component and already parks a `/dev` dirfd for the stub before the
+uid drop; the render node can be opened the same way, pre-drop, and parked at a
+known fd. Granting the isolate uid the `render` group instead would work but is
+strictly broader — it would reach every render node on the host, not the one
+this VM is entitled to.
+
+### The render node is not always minor 128 — FIXED 2026-08-19
+
+DRM hands out render minors in probe order, so on any host where another GPU
+probes first — an iGPU on a hybrid-graphics laptop, the common case — the
+NVIDIA node is `renderD129` or higher. The stub resolves
+`NVKVM_DEV_DRM_RD(k)` to the fixed name `renderD(128+k)`, so on those hosts the
+guest's DRM node failed to open with `ENOENT` while CUDA and headless EGL kept
+working, and nothing noticed.
+
+Now resolved from sysfs (`src/qemu/nvkvm_drm_node.h`): the k-th *NVIDIA* node,
+whatever minor it landed on, is bind-mounted onto `renderD(128+k)` in namespace
+mode, or aliased by a symlink in `/dev` when there is no mount namespace to
+rewrite. Verified by A/B on the same VM in the same isolate mode — with the
+alias the guest opens `card0` and `modetest` enumerates the head (Virtual-1
+connected, 1920x1080, 23 modes); with it removed the open returns `ENOENT`.
+
 ### There is no scanout path — intrinsic
 
 `nvkvm` presents a virtual KMS head to the guest (`src/guest/nvkvm_kms.c`), and
