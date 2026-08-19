@@ -346,6 +346,23 @@ per-guest VRAM reservation and no quota, so one guest can exhaust the card for
 the others. If you need hard partitioning, MIG sits *below* the interface nvkvm
 forwards and should compose with it — but that is untested.
 
+**Will my GPU work?**
+If it is **Turing or newer** (GTX 16xx, RTX 20/30/40/50, and the datacenter
+parts), yes — that is a hard requirement, not a guess. Pascal and older are out:
+the open kernel module will not even probe them, and NVIDIA's 580 branch is the
+last to support them at all. A card of the same architecture as one in
+[Tested platforms](#tested-platforms) is expected to behave the same — the
+forwarded interface is per-architecture, not per-die — so an untested RTX 4080
+should match the tested RTX 4070. See
+[supported drivers](docs/reference/supported-drivers.md) for the reasoning.
+
+**Which host driver versions are covered?**
+Eight ABI profiles span every published open-driver release; six of them have
+been booted here, including all the ones in common use (535 LTS, 545, 550–565,
+570/575, 580–595, 610). The two unbooted ones cover 515–530, whose drivers no
+longer build against a modern kernel. Full matrix, and what "unbooted" means for
+your risk, in [supported drivers](docs/reference/supported-drivers.md).
+
 **Does the guest need an NVIDIA driver?**
 No kernel driver — the guest loads `nvkvm-guest.ko`, which presents `/dev/nvidia*`
 itself. It does need the matching userspace libraries, staged from the host by
