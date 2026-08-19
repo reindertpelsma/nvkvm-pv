@@ -6,7 +6,31 @@ services:
   nvkvm:
     build: .
     image: nvkvm:local
-    # No privileged mode and no added capabilities: the default set is enough.
+    # Capabilities: drop everything, then add back only what the isolate needs
+    # to reach its STRONGEST sandbox rung.  This is not the same as dropping
+    # everything -- `cap_drop: [ALL]` alone makes nvkvm WEAKER, not safer:
+    # NVKVM_ISOLATE_MODE=auto probes the ladder by attempting each rung, and
+    # without these four it silently falls back from uid+chroot to seccomp-only,
+    # which is no uid separation and no chroot (src/qemu/nvkvm_isolate.c).
+    #
+    #   SETUID/SETGID  per-VM uid separation -- each isolate runs as its own uid
+    #   SETPCAP        drop the bounding set before the uid drop
+    #   SYS_CHROOT     the chroot("/dev") confinement
+    #
+    # Everything else in Docker's ~14-cap default goes: NET_RAW, MKNOD, CHOWN,
+    # FOWNER, FSETID, KILL, NET_BIND_SERVICE, SYS_CHROOT's neighbours, and the
+    # rest.  A VMM needs none of them once it holds /dev/kvm and the GPU nodes.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - SETPCAP
+      - SYS_CHROOT
+    # The stub sets no_new_privs on itself and its seccomp TSYNC filter requires
+    # it, so this matches what the process already does rather than fighting it.
+    security_opt:
+      - no-new-privileges:true
     devices:
       - /dev/kvm
     # GPU forwarding needs the NVIDIA container runtime -- the compose spelling
