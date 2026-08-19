@@ -426,6 +426,148 @@ err_unlock:
 }
 
 /*
+ * nvkvm_gva_pfn — the PFN currently mapped at a guest VA, or 0 if nothing is.
+ *
+ * Same leaf walk as nvkvm_force_range_wb() above.  We cannot use gup here:
+ * the mappings we need to identify are exactly the VM_PFNMAP ones that gup
+ * refuses.  Caller must hold mmap_read_lock.
+ */
+static unsigned long nvkvm_gva_pfn(struct mm_struct *mm, unsigned long gva)
+{
+	pgd_t *pgd; p4d_t *p4d; pud_t *pud; pmd_t *pmd; pte_t *pte;
+	unsigned long v;
+
+	pgd = pgd_offset(mm, gva);
+	if (pgd_none(*pgd) || pgd_bad(*pgd))
+		return 0;
+	p4d = p4d_offset(pgd, gva);
+	if (p4d_none(*p4d) || p4d_bad(*p4d))
+		return 0;
+	pud = pud_offset(p4d, gva);
+	if (pud_none(*pud))
+		return 0;
+	if (pud_large(*pud)) {
+		v = pud_val(*pud);
+		if (!(v & _PAGE_PRESENT))
+			return 0;
+		return ((v & PTE_PFN_MASK) >> PAGE_SHIFT) +
+		       ((gva & ~PUD_MASK) >> PAGE_SHIFT);
+	}
+	pmd = pmd_offset(pud, gva);
+	if (pmd_none(*pmd))
+		return 0;
+	if (pmd_large(*pmd)) {
+		v = pmd_val(*pmd);
+		if (!(v & _PAGE_PRESENT))
+			return 0;
+		return ((v & PTE_PFN_MASK) >> PAGE_SHIFT) +
+		       ((gva & ~PMD_MASK) >> PAGE_SHIFT);
+	}
+	pte = pte_offset_kernel(pmd, gva);
+	if (!pte)
+		return 0;
+	v = pte_val(*pte);
+	if (!(v & _PAGE_PRESENT))
+		return 0;
+	return (v & PTE_PFN_MASK) >> PAGE_SHIFT;
+}
+
+/*
+ * nvkvm_cpu_page_entry_live — is this tracking entry still describing the
+ * mapping it was created for?
+ *
+ * Both migration paths remember a GVA and then treat a later request for the
+ * same GVA as already done.  A GVA is not a stable name for a buffer: free a
+ * pinned host buffer and allocate another and the allocator hands back the
+ * same address, at which point the entry names a mapping that belongs to a
+ * buffer that no longer exists.  Nothing downstream notices — the isolate
+ * still has the previous buffer's memory mapped there, so the GPU reads the
+ * previous buffer's bytes and returns them as this buffer's result.
+ *
+ * So check the guest page tables rather than trusting the address:
+ *
+ *   range entry (page == NULL) — the VA was remapped onto the memfd's GPA, so
+ *     it is still ours exactly while the leaf PTE still points at that GPA.
+ *   copy entry  (page != NULL) — the VA was left as ordinary memory and its
+ *     page pinned, so it is still ours exactly while the VA still translates
+ *     to the page we pinned.
+ *
+ * Lock order: callers hold cpu_pages_lock and this takes mmap_read_lock under
+ * it.  No path takes them the other way round.
+ */
+static bool nvkvm_cpu_page_entry_live(struct nvkvm_cpu_page *cp)
+{
+	struct mm_struct *mm = current->mm;
+	bool live;
+
+	if (!mm)
+		return true;   /* no user context to check against; leave it */
+
+	/*
+	 * Only the address space that created an entry can judge it.  An fd
+	 * shared with another process (a fork, or an explicit SCM_RIGHTS pass)
+	 * gives us a different mm in which these GVAs mean nothing, and every
+	 * entry would look dead.  Compare the pointer; never dereference it.
+	 */
+	if (cp->mm && cp->mm != mm)
+		return true;
+
+	if (!cp->page) {
+		unsigned long pfn;
+
+		mmap_read_lock(mm);
+		pfn = nvkvm_gva_pfn(mm, cp->gva);
+		mmap_read_unlock(mm);
+		return pfn && pfn == (unsigned long)(cp->gpa >> PAGE_SHIFT);
+	}
+
+	{
+		struct page *cur = NULL;
+
+		if (get_user_pages_fast(cp->gva, 1, 0, &cur) != 1)
+			return false;
+		live = (cur == cp->page);
+		put_page(cur);
+	}
+	return live;
+}
+
+/*
+ * nvkvm_cpu_pages_reap_stale — drop every tracking entry whose guest mapping
+ * has gone away, releasing the isolate mapping and the memfd with it.
+ *
+ * Called before either migration path consults its "already migrated?" cache,
+ * so that a reused address re-migrates instead of inheriting the mapping of
+ * whatever used to live there.  The list holds one entry per migrated page or
+ * 2 MiB chunk of a live registration, so this is a short walk on a cold path.
+ */
+void nvkvm_cpu_pages_reap_stale(struct nvkvm_fd_ctx *ctx)
+{
+	struct nvkvm_cpu_page *cp, *tmp;
+	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
+	LIST_HEAD(dead);
+
+	mutex_lock(&ctx->cpu_pages_lock);
+	list_for_each_entry_safe(cp, tmp, &ctx->cpu_pages, list)
+		if (!nvkvm_cpu_page_entry_live(cp))
+			list_move_tail(&cp->list, &dead);
+	mutex_unlock(&ctx->cpu_pages_lock);
+
+	list_for_each_entry_safe(cp, tmp, &dead, list) {
+		if (isolate_id) {
+			nvkvm_virtio_munmap_on_isolate(isolate_id, cp->mmap_token);
+			nvkvm_virtio_close_handle_on_isolate(cp->handle_id,
+							     isolate_id);
+		}
+		nvkvm_virtio_close_handle(cp->handle_id);
+		if (cp->page)
+			put_page(cp->page);
+		list_del(&cp->list);
+		kfree(cp);
+	}
+}
+
+/*
  * nvkvm_cpu_page_migrate — pin a guest physical page and upload it to a
  * memfd so the isolate can access it at the same GVA via MAP_FIXED.
  *
@@ -445,7 +587,11 @@ int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	__u32 mmap_token;
 	int ret;
 
-	/* Already mapped? */
+	/* Already mapped?  Reap first, so an entry left over from a buffer that
+	 * has since been freed cannot answer for this address (see
+	 * nvkvm_cpu_page_entry_live). */
+	nvkvm_cpu_pages_reap_stale(ctx);
+
 	mutex_lock(&ctx->cpu_pages_lock);
 	list_for_each_entry(cp, &ctx->cpu_pages, list) {
 		if (cp->gva == page_gva) {
@@ -532,6 +678,7 @@ int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 		return 0;
 	}
 	cp->page        = page;
+	cp->mm          = current->mm;
 	cp->gva         = page_gva;
 	cp->gpa         = gpa_base;
 	cp->handle_id   = handle_id;
@@ -924,7 +1071,15 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		return -ENOMEM;
 
 	/* Dedup: if the start page is already migrated (range re-registered),
-	 * the VMA is already VM_PFNMAP and gup would fail — treat as done. */
+	 * the VMA is already VM_PFNMAP and gup would fail — treat as done.
+	 *
+	 * Only entries whose mapping is still installed may answer, so reap the
+	 * stale ones first.  libcuda re-uses the address of a freed pinned host
+	 * buffer for the next one, and without this the second buffer dedups
+	 * against the first and inherits its memory: the GPU then reads the
+	 * freed buffer's bytes.  See nvkvm_cpu_page_entry_live(). */
+	nvkvm_cpu_pages_reap_stale(ctx);
+
 	mutex_lock(&ctx->cpu_pages_lock);
 	list_for_each_entry(cpdup, &ctx->cpu_pages, list)
 		if (cpdup->gva == start) { mutex_unlock(&ctx->cpu_pages_lock); return 0; }
@@ -1149,6 +1304,7 @@ chunk_fail_h:
 		cp = kzalloc(sizeof(*cp), GFP_KERNEL);
 		if (cp) {
 			cp->page       = NULL;
+			cp->mm         = mm;
 			cp->gva        = cbase;
 			cp->gpa        = gpa;
 			cp->handle_id  = handle;

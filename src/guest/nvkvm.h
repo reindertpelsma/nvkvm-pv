@@ -136,6 +136,8 @@ struct nvkvm_cpu_page {
 	__u32           handle_id; /* QEMU memory handle wrapping the memfd     */
 	__u32           mmap_token;/* token for MUNMAP_ON_ISOLATE cleanup       */
 	__u32           prot;      /* PROT_* flags (read/write)                 */
+	struct mm_struct *mm;      /* mm the GVA belongs to (compared, never
+				    * dereferenced — see cpu_page_entry_live)  */
 	struct list_head list;
 };
 
@@ -488,6 +490,7 @@ extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx);
 int  nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr);
+void nvkvm_cpu_pages_reap_stale(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_refresh(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_writeback(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
