@@ -45,6 +45,20 @@ doorbell page, so there is no per-operation cost to pay:
 > Seventeen other workloads — PyTorch, ResNet-50, BERT, Vulkan compute — land
 > between 0.95x and 1.00x. [See the numbers](#tested-applications).
 
+## Where it's useful
+
+- **A workstation you don't want to give up** — GPU work inside a VM while the
+  host keeps the display and the same card.
+- **One GPU, several VMs** — a homelab or shared dev box where every VM gets
+  GPU access, with no card each and no `vfio-pci` rebind between starts.
+- **Disposable environments** — CI runners or per-task VMs that come and go;
+  attaching costs under a second and needs no device reset.
+- **Kernel and driver work** — boot an experimental guest kernel without
+  rebooting the host or losing the GPU.
+- **Consumer GeForce** — cards that vGPU does not cover at all, with no licence.
+
+Not yet for untrusted multi-tenant hosting — see below.
+
 ## What it is not
 
 - **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
@@ -281,6 +295,12 @@ forwards and should compose with it — but that is untested.
 No kernel driver — the guest loads `nvkvm-guest.ko`, which presents `/dev/nvidia*`
 itself. It does need the matching userspace libraries, staged from the host by
 [`stage_guest_libs.sh`](scripts/stage_guest_libs.sh).
+
+**Which guest distros are supported?**
+Any Linux that can load an out-of-tree kernel module and run NVIDIA's userspace.
+`nvkvm-guest.ko` builds against the guest's own headers, so the distro is not
+special — Ubuntu 24.04 is simply what gets tested. Windows guests are not
+supported.
 
 **Does the host driver version have to match the guest's?**
 Yes. The libraries staged into the guest come from the host, so they are the same
