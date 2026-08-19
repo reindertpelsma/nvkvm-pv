@@ -2,12 +2,12 @@
 
 ## Status at a glance
 
-Severities below are **as first assessed**. Four findings have since been fixed;
+Severities below are **as first assessed**. Five findings have since been fixed;
 the rest are open. Read this table before the detail.
 
 | finding | severity as found | status |
 |---|---|---|
-| U-1 | re-rated MEDIUM | open — the allowlist is not wired into the ring path |
+| U-1 | re-rated MEDIUM | **fixed** — the ring path applies the same default-deny gate (`src/qemu/nvkvm_ctrl_allowlist.h`) |
 | U-2 | CRITICAL | **fixed** — rewrite sites fail closed (`nvkvm_stub.c`, `U-2` markers) |
 | U-3 | CRITICAL | **fixed** — default-deny gate on `NVOS32.function`, only `ALLOC_SIZE` allowed |
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
@@ -225,7 +225,25 @@ it lands in QEMU, where the mitigation does not apply.**
 
 ---
 
-### U-1 — RE-RATED: MEDIUM — see maintainer note — The SPSC ring path forwards `NVOS54.params` with no host mediation whatsoever
+### U-1 — FIXED 2026-08-19 — RE-RATED: MEDIUM — see maintainer note — The SPSC ring path forwarded `NVOS54.params` with no host mediation whatsoever
+
+> **Fixed.** The bounded fix the maintainer note below prescribes is the one
+> that landed: the default-deny control gate moved from
+> `nvkvm_isolate_handlers.c` into `src/qemu/nvkvm_ctrl_allowlist.h`, next to the
+> table it reads, and `ring_ctrl_must_punt()` in `src/stub/nvkvm_stub.c` now
+> calls it. A command the gate refuses is **punted**, not answered in the stub,
+> so the slow path makes the denial and reports it the way RM does — one policy,
+> one decision point, no second copy to drift.
+>
+> The inner control cmd is now read before the `aux_size == 0` early return,
+> which is what let a record with no inner params skip the block entirely.
+>
+> `tests/unit/test_ctrl_gate.c` pins the policy: every table entry allowed, both
+> rule-based passthroughs allowed, unlisted commands denied. Measured on an RTX
+> 3050 guest with `ring_enable=1`, `tests/validate.sh` is 28/28 and
+> `opencl_correctness` passes — nothing legitimate was relying on the ungated
+> path.
+
 
 > **Maintainer note (re-rating).** This entry over-rated the allowlist's role. The
 > ring bypasses the *control* allowlist, but object **allocation** still passes

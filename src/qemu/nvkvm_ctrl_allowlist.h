@@ -241,4 +241,26 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 #define NVKVM_CTRL_ALLOWLIST_N \
 	(sizeof(nvkvm_ctrl_allowlist) / sizeof(nvkvm_ctrl_allowlist[0]))
 
+/*
+ * The gate itself, next to the table it reads, because TWO host-side
+ * components apply it: QEMU on the virtqueue path, and the isolate stub on the
+ * command-buffer ring (U-1).  It lived only in QEMU until 2026-08-19, which is
+ * exactly why the ring path had no gate at all.  One definition, one place to
+ * change, no copy to drift.
+ *
+ * Returns non-zero if the command may be forwarded.  `int` and not `bool`: the
+ * stub is freestanding and does not pull in <stdbool.h>.
+ */
+static inline int nvkvm_ctrl_cmd_allowed(uint32_t cmd)
+{
+	if (cmd & 0x8000u)                       /* RM_GSS_LEGACY_MASK */
+		return 1;
+	if (((cmd >> 16) & 0xffffu) == 0x2081u)  /* NV2081_BINAPI class */
+		return 1;
+	for (unsigned i = 0; i < NVKVM_CTRL_ALLOWLIST_N; i++)
+		if (nvkvm_ctrl_allowlist[i] == cmd)
+			return 1;
+	return 0;
+}
+
 #endif /* NVKVM_CTRL_ALLOWLIST_H */

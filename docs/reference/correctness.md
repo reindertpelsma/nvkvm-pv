@@ -69,13 +69,18 @@ were made from, and closing that handle tears the extent down (`REAP_HANDLE` in
 a `NVKVM_DEBUG=1` log) — a freed object's device memory no longer stays mapped
 into the guest's GPA space. That was a real hole, though it was not this bug.
 
-**The SPSC ring fast path still skips the allowlist.** Flat RM_CONTROLs ride a
-shared-memory ring that `goto forwarded`s past the front of the slow path. The
-tail — writeback, VALIDATE caching, pid/fd restoration — does still run; an
-earlier note here claimed writeback was skipped and that was wrong. What is
-genuinely skipped is guest-side pre-forward work, and separately the host-side
-allowlist is not wired into the ring at all. That is
-[U-1](../internal/audit-guest-pointers.md), and it remains open.
+**The SPSC ring fast path now applies the allowlist too** *(fixed 2026-08-19).*
+Flat RM_CONTROLs ride a shared-memory ring consumed directly by the isolate
+stub, which is how they used to reach the host driver without passing QEMU's
+default-deny control gate — [U-1](../internal/audit-guest-pointers.md). The gate
+now lives in the header next to its table and both host-side components call it;
+a refused command is punted to the slow path, which makes the denial. Measured
+with `ring_enable=1`: 28/28 and `opencl_correctness` PASS, so nothing legitimate
+was relying on the ungated path.
+
+An earlier note here claimed the ring also skipped
+`nvkvm_cpu_pages_writeback()`. That was wrong — the `goto forwarded` lands in
+front of it. What the ring skips is guest-side pre-forward work.
 
 **A driver-managed read-only page is mishandled** *(fixed 2026-08-19 for the
 common case).* In-window device mappings used to be forced to `PROT_READ|

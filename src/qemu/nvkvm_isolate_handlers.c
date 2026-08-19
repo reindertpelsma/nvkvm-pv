@@ -823,23 +823,10 @@ static void nvkvm_client_allow_add(VirtIONvgpu *nv, uint32_t hc)
 }
 
 /*
- * #76 — is this RM control command allowed?  Default-deny (nvproxy parity):
- * the static allowlist covers the CUDA-compute surface; two rule-based
- * passthroughs cover GSP-routed cmds with no app pointers (legacy mask + the
- * NV2081_BINAPI class).  Everything else is denied.  This is a host/cross-VM
- * attack-surface control, so it lives in QEMU (the guest module is untrusted).
+ * #76 — is this RM control command allowed?  Default-deny (nvproxy parity).
+ * The gate now lives in nvkvm_ctrl_allowlist.h next to its table, because the
+ * isolate stub applies the same one on the ring path (U-1).
  */
-static bool nvkvm_ctrl_cmd_allowed(uint32_t cmd)
-{
-	if (cmd & 0x8000u)                       /* RM_GSS_LEGACY_MASK */
-		return true;
-	if (((cmd >> 16) & 0xffffu) == 0x2081u)  /* NV2081_BINAPI class */
-		return true;
-	for (size_t i = 0; i < NVKVM_CTRL_ALLOWLIST_N; i++)
-		if (nvkvm_ctrl_allowlist[i] == cmd)
-			return true;
-	return false;
-}
 
 /* #76b — frontend-ioctl NR allowlist (nvproxy parity, default-deny). */
 static bool nvkvm_fe_nr_allowed(unsigned nr)

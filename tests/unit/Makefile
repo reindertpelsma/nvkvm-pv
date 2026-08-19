@@ -28,9 +28,11 @@ TABLES_SRCS   = test_tables.c \
 
 OPEN_SCM_SRCS = test_open_scm.c
 
+CTRL_GATE_SRCS = test_ctrl_gate.c
+
 .PHONY: all clean run
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -53,13 +55,17 @@ test_tables: $(TABLES_SRCS)
 test_open_scm: $(OPEN_SCM_SRCS)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ $(OPEN_SCM_SRCS) $(LDFLAGS)
 
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm
+test_ctrl_gate: $(CTRL_GATE_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(CTRL_GATE_SRCS)
+
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate
 	./test_dispatch
 	./test_frontend
 	./test_handle
 	./test_isolate
 	./test_tables
 	./test_open_scm
+	./test_ctrl_gate
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate

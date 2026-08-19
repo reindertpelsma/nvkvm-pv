@@ -38,6 +38,13 @@
 #include "../common/nvkvm_ring.h"
 #include "../common/nvkvm_ring_ioctl.h"
 #include "../common/nvkvm_abi.h"
+/*
+ * U-1: the ring path needs the same default-deny control allowlist QEMU
+ * applies on the virtqueue path.  The table is generated data with no QEMU
+ * dependencies, so both host-side components include it directly rather than
+ * keeping two copies that can drift.
+ */
+#include "../qemu/nvkvm_ctrl_allowlist.h"
 
 /* ── Constants we'd otherwise pull from libc headers ─────────────────────── */
 
@@ -2315,14 +2322,24 @@ static int ring_ctrl_must_punt(uint32_t cmd, const void *param,
 	/* Only flat NV_ESC_RM_CONTROL (nvos54, 32B) rides the ring. */
 	if (type != 'F' || nr != 0x2a || param_size < 32)
 		return 1;
+
+	/* Inner control cmd lives at param offset 8 (nvos54.cmd).  Read it
+	 * before anything else: the allowlist decision does not depend on
+	 * whether there are inner params, and a record with aux_size == 0 used
+	 * to skip this block entirely and run ungated (U-1).  A denied cmd is
+	 * punted rather than answered here, so the denial is decided in one
+	 * place — QEMU's gate on the slow path — and reported to the guest the
+	 * way RM reports it. */
+	uint32_t inner;
+	__builtin_memcpy(&inner, (const uint8_t *)param + 8, sizeof(inner));
+	if (!nvkvm_ctrl_cmd_allowed(inner))
+		return 1;
+
 	if (aux_size == 0)
 		return 0;                 /* no inner params → trivially flat   */
 	if (aux_size > NVKVM_RING_MAX_AUX || param_size > NVKVM_RING_MAX_PARAM)
 		return 1;
 
-	/* Inner control cmd lives at param offset 8 (nvos54.cmd). */
-	uint32_t inner;
-	__builtin_memcpy(&inner, (const uint8_t *)param + 8, sizeof(inner));
 	if (nvkvm_ctrl_list_entry_size(inner))   /* InfoList/Caps family        */
 		return 1;
 	if (inner == 0x00000101U)                /* GET_BUILD_VERSION (str ptrs)*/
