@@ -378,6 +378,40 @@ struct drm_nvidia_gem_export_nvkms_memory_params {   /* 24 bytes */
 };
 
 /*
+ * GEM_IMPORT_NVKMS_MEMORY (0x01) — #110 dma-buf EXPORT keystone (the mirror of
+ * 0x09 above, and the one that was missing).
+ *
+ * This is the ioctl NVIDIA's EGL uses to turn an RM memory object into a GEM
+ * object it can then PRIME_HANDLE_TO_FD.  It is the whole of
+ * eglExportDMABUFImageMESA's kernel work, and therefore the whole of a Wayland
+ * GL client's ability to hand a rendered buffer to a compositor.  Measured
+ * sequence on the host (LD_PRELOAD ioctl trace, RTX 3050 / 580.173.02):
+ *
+ *   open("/dev/nvidiactl")                    -> memFd
+ *   ioctl(memFd, 'F' nr 0xd4)                 -> RM object parked on that fd
+ *   ioctl(renderD128, 'd' nr 0x41, 32 bytes)  -> GEM handle   <-- THIS
+ *   ioctl(renderD128, DRM_IOCTL_PRIME_HANDLE_TO_FD)  -> dma-buf fd
+ *   ioctl(renderD128, DRM_IOCTL_GEM_CLOSE)
+ *
+ * Without an entry in nvkvm_drm_ioctls[] the DRM *core* rejects it with
+ * -EINVAL before nvkvm sees it at all — which is why the failure showed up as
+ * EGL_BAD_MATCH with no `AUDIT unknown ioctl` and no QEMU `DENY` line.
+ *
+ * Layout MUST match host nvidia-drm-ioctl.h; verified byte-for-byte from the
+ * host trace (mem_size=0x40000 for a 256x256 RGBA image, ptr@8, size@16=28,
+ * handle@24 written 0->1 by the call).  nvkms_params_ptr points at an
+ * NvKmsKapiPrivImportMemoryParams whose first field is { int memFd } — the same
+ * shape 0x09 carries, so it is marshalled the same way.
+ */
+struct drm_nvidia_gem_import_nvkms_memory_params { /* 32 bytes */
+	__u64 mem_size;             /* IN  size of the RM allocation */
+	__u64 nvkms_params_ptr;     /* IN  -> { int memFd; ... } */
+	__u64 nvkms_params_size;    /* IN  */
+	__u32 handle;               /* OUT GEM handle in the stub's DRM file */
+	__u32 __pad;
+};
+
+/*
  * GEM_IDENTIFY_OBJECT (0x0e): NVIDIA's EGL/gbm calls this right after
  * PRIME_FD_TO_HANDLE to learn the imported object's type (NVKMS / DMABUF /
  * USERMEMORY).  PRIME export+import already round-trip through the DRM core to
@@ -426,9 +460,42 @@ static int nvkvm_drm_forward(struct drm_file *file, unsigned int cmd, void *data
 					  struct drm_file *file)	\
 	{ (void)dev; return nvkvm_drm_forward(file, (CMD), data); }
 
-NVKVM_DRM_FWD(get_dev_info,
-	      DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
-		       struct drm_nvidia_get_dev_info_params))
+/*
+ * GET_DEV_INFO (0x03): forward, then OVERWRITE primary_index with OUR primary
+ * minor.  The host field is the HOST's DRM card number, and NVIDIA's userspace
+ * turns it straight into a path: libEGL stats "/dev/dri/card<primary_index>"
+ * while deciding whether it can drive a display connection.
+ *
+ * On any host where the NVIDIA GPU is not card0 — an iGPU laptop, the common
+ * case; measured here as card2 — the guest was told primary_index=2, stat'd
+ * /dev/dri/card2, got ENOENT, and NVIDIA's EGL declined the platform:
+ *
+ *   ioctl(renderD128, 'd' nr 0x43 = GET_DEV_INFO) = 0   -> primary_index=2
+ *   newfstatat("/dev/dri/card2") = -1 ENOENT
+ *   eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND) = EGL_NO_DISPLAY
+ *
+ * so every Wayland GL client silently fell back to Mesa/llvmpipe (which is what
+ * "GL_RENDERER: llvmpipe" in the old realapp_matrix runs actually was), and a
+ * client forced to the NVIDIA vendor died at "failed to initialize EGL display".
+ *
+ * This is the primary-node twin of the renderD128-vs-renderD129 fix: the guest
+ * must be told about ITS OWN nodes.  Our KMS head lives on this same drm_device
+ * (DRIVER_MODESET above), so dev->primary->index is exactly the card the guest
+ * has.  It also stops a host DRM minor number leaking into the guest.
+ */
+static int nvkvm_drm_fwd_get_dev_info(struct drm_device *dev, void *data,
+				      struct drm_file *file)
+{
+	struct drm_nvidia_get_dev_info_params *p = data;
+	int r = nvkvm_drm_forward(file,
+				  DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
+					   struct drm_nvidia_get_dev_info_params),
+				  data);
+
+	if (r == 0 && dev && dev->primary)
+		p->primary_index = dev->primary->index;
+	return r;
+}
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
 /*
  * GET_DRM_FILE_UNIQUE_ID (0x18): the gbm backend reads this before allocating
@@ -642,6 +709,91 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 }
 
 /*
+ * GEM_IMPORT_NVKMS_MEMORY (0x01): same marshalling as 0x09 (zero the guest VA,
+ * stage the { int memFd } blob in the aux slot with the guest fd swapped for
+ * our handle_id), plus the OUT half of 0x0b (proxy the stub GEM handle into the
+ * guest DRM core so the caller's PRIME_HANDLE_TO_FD / GEM_CLOSE resolve).
+ *
+ * The proxy is sized to mem_size, which is what makes the resulting guest
+ * dma-buf a correctly-sized carrier for the cross-isolate broker: the
+ * compositor PRIME-imports it, hits nvkvm_gem_resolve_fwd, and QEMU re-homes
+ * the real bo into the compositor's stub.  That import half is already proven
+ * byte-exact (tests/perf/apps/xiso_bytes_probe.c); this is the export half.
+ */
+static int nvkvm_drm_fwd_gem_import_nvkms_memory(struct drm_device *dev,
+						 void *data,
+						 struct drm_file *file)
+{
+	struct drm_nvidia_gem_import_nvkms_memory_params *p = data;
+	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x01,
+				    struct drm_nvidia_gem_import_nvkms_memory_params);
+	__u64 mem_size = p->mem_size;
+	__u64 orig_ptr = p->nvkms_params_ptr;
+	__u64 orig_size = p->nvkms_params_size;
+	void *aux = NULL;
+	size_t aux_sz = 0;
+	__s32 orig_memfd = 0;
+	bool have_memfd = false;
+	__u64 fault = 0;
+	long r;
+
+	(void)dev;
+	if (!ctx)
+		return -EBADF;
+
+	if (orig_ptr && orig_size >= sizeof(__s32) &&
+	    orig_size <= NVKVM_SHM_SLOT_DEFAULT_SIZE) {
+		aux_sz = orig_size;
+		aux = kzalloc(aux_sz, GFP_KERNEL);
+		if (!aux)
+			return -ENOMEM;
+		if (copy_from_user(aux, (void __user *)(uintptr_t)orig_ptr,
+				   aux_sz)) {
+			kfree(aux);
+			return -EFAULT;
+		}
+		/* { int memFd } at offset 0 -> swap for our handle_id. */
+		memcpy(&orig_memfd, aux, sizeof(orig_memfd));
+		have_memfd = true;
+		if (orig_memfd >= 0) {
+			__s32 hid = guest_fd_to_handle_id(orig_memfd);
+			if (hid >= 0)
+				memcpy(aux, &hid, sizeof(hid));
+		}
+		p->nvkms_params_ptr = 0;   /* stub fills a host VA at offset 8 */
+	}
+
+	r = nvkvm_virtio_ioctl_on_isolate(ctx, cmd, data, sizeof(*p),
+					  aux, aux_sz, 0, &fault);
+
+	/* memFd is IN and unchanged by the call; never let a stub-local fd or
+	 * our handle_id be visible in the caller's params buffer. */
+	if (have_memfd && aux)
+		memcpy(aux, &orig_memfd, sizeof(orig_memfd));
+	if (r >= 0 && aux &&
+	    copy_to_user((void __user *)(uintptr_t)orig_ptr, aux, aux_sz))
+		r = -EFAULT;
+	/* IN fields: restore whatever the stub's pointer-scrubbing wrote back. */
+	p->mem_size          = mem_size;
+	p->nvkms_params_ptr  = orig_ptr;
+	p->nvkms_params_size = orig_size;
+	kfree(aux);
+	if (r < 0)
+		return (int)r;
+
+	if (p->handle) {
+		__u32 guest_handle = 0;
+		int gret = nvkvm_gem_proxy_create(file, ctx, p->handle,
+						  mem_size, &guest_handle);
+		if (gret)
+			return gret;
+		p->handle = guest_handle;
+	}
+	return 0;
+}
+
+/*
  * GEM_ALLOC_NVKMS_MEMORY (0x0b): the NVIDIA gbm backend's scanout-buffer
  * allocation.  Flat scalar params (no embedded pointer) — forward as-is; the
  * host allocates a real bo on the stub's render node and writes its GEM handle
@@ -686,6 +838,10 @@ static int nvkvm_drm_fwd_gem_alloc_nvkms_memory(struct drm_device *dev,
 /* Indexed by (DRM_NVIDIA_* number) = (nr - DRM_COMMAND_BASE).  Gaps have a NULL
  * .func, which the DRM core rejects with -EINVAL (default-deny here too). */
 static const struct drm_ioctl_desc nvkvm_drm_ioctls[] = {
+	[0x01] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x01,
+				   struct drm_nvidia_gem_import_nvkms_memory_params),
+		   .func = nvkvm_drm_fwd_gem_import_nvkms_memory,
+		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_GEM_IMPORT_NVKMS_MEMORY" },
 	[0x03] = { .cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
 				   struct drm_nvidia_get_dev_info_params),
 		   .func = nvkvm_drm_fwd_get_dev_info,
