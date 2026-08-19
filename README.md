@@ -305,32 +305,17 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`, see below) |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 | RTX 2080 Ti | Turing TU102 | 575.51.03 | 570 | 28/28 |
-| GTX 1080 | **Pascal GP104** | 580.173.02 | 580 | 15/28 — see below |
+| RTX 3080 | Ampere GA102 | 580.95.05 | 580 | 28/28 |
+| RTX 3090 | Ampere GA102 | 580.95.05 | 580 | 28/28 |
+| RTX 4060 | Ada AD107 | 580.95.05 | 580 | 28/28 |
+| RTX 4090 | Ada AD102 | 580.95.05 | 580 | 28/28 |
+| RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
 
 On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
 launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.
 The one failure is `vk_compute_dispatch`, and it does **not** affect CUDA; the
 trace, and the two hypotheses ruled out by experiment, are in
 [Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper).
-
-The GTX 1080 row is the lower bound, measured rather than assumed. Two separate
-things stop Pascal, and only the first is absolute:
-
-1. The **open** kernel module refuses to probe it at all — `NVRM: ... not
-   supported by open nvidia.ko because it does not include the required GPU
-   System Processor (GSP)`. Pascal predates GSP, so any host running the open
-   module has no driver for the card, nvkvm or not.
-2. With the **proprietary** module the card comes up and forwarding partly
-   works: the guest's `nvidia-smi` reports the GTX 1080 and 15 checks pass. But
-   `cuInit` returns 999 (`CUDA_ERROR_UNKNOWN`), which skips all ten CUDA checks,
-   and Vulkan and the GL FBO check fail. No allowlist denies anything during the
-   attempt, so this is not the default-deny gates refusing a Pascal class.
-
-So **Turing or newer** is a hard requirement, not an untested assumption, and we
-are not planning to move it: NVIDIA's 580 branch is the last to support Pascal
-at all, and gVisor's nvproxy — which our allowlists track for parity — draws the
-same line at Turing. The reasoning is in
-[supported drivers](docs/reference/supported-drivers.md).
 
 ## FAQ
 

@@ -128,10 +128,34 @@ reasons not to chase pre-Turing:
   L4 and H100 as supported, with no Pascal or Volta. Our allowlists track
   nvproxy for parity, so keeping the same floor keeps that parity meaningful.
 
-With the proprietary module a GTX 1080 does get part-way — the guest's
-`nvidia-smi` reports the card and 15 checks pass — but `cuInit` returns 999 and
-no gate denies anything, so the remaining work is of unknown depth. Not worth
-it for hardware whose driver line ends at 580.
+### The GTX 1080 measurement
+
+Measured 2026-08-19 rather than assumed, which is why the floor is stated as a
+fact rather than a guess.
+
+On a stock KVM rental box the open module refuses the card outright:
+
+```
+NVRM: The NVIDIA GPU 0000:00:07.0 (PCI ID: 10de:1b80) installed in this system
+NVRM: is not supported by open nvidia.ko because it does not include the
+NVRM: required GPU System Processor (GSP).
+```
+
+Swapping to the proprietary module (`nvidia-driver-580-server`, 580.173.02) the
+card initialises and forwarding partly works — the guest's `nvidia-smi` reports
+the GTX 1080 and `validate.sh` gives **15 pass / 3 fail / 10 skip**:
+
+| check | result |
+|---|---|
+| device/NVML/bring-up checks | pass (15) |
+| `cuda_init` | **FAIL** — `cuInit rc=999 (CUDA_ERROR_UNKNOWN)` |
+| the ten CUDA checks behind it | skipped, `cuInit failed` |
+| `vk_compute_dispatch` | FAIL — `vkCreateDevice rc=-3` |
+| `gl_draw_pixel_check` | FAIL — `FBO incomplete: status=0x8CDD` |
+
+No allowlist denies anything during the attempt, so this is not default-deny
+refusing a Pascal class — the remaining work is of unknown depth, for hardware
+whose driver line ends at 580. Not worth it.
 
 ## Multi-GPU
 
