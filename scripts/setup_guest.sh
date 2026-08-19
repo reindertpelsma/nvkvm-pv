@@ -106,7 +106,7 @@ write_files:
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko; }'
+      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko; }'
       # `|| true`: stage_guest_libs.sh exits non-zero when an OPTIONAL library
       # is absent from the bundle (the Wayland/GBM EGL platform libraries are
       # not part of the driver, so a headless host legitimately has none).
@@ -120,7 +120,6 @@ packages:
   - build-essential
   - git
   - python3
-  - linux-headers-virtual
   # Vendor-neutral loaders only, so tests/validate.sh can exercise the
   # graphics rungs. These are the ICD/vendor dispatch layers (libglvnd, the
   # Vulkan loader); the actual drivers behind them are the NVIDIA libraries
@@ -130,9 +129,26 @@ packages:
   # succeed against that is not the GPU.
   - libvulkan1
   - libegl1
+  # libGLX_nvidia.so.0 -- which IS the NVIDIA Vulkan ICD -- links against
+  # libXext.  Minimal cloud images do not all ship it (Debian's does not), and
+  # without it the Vulkan loader silently cannot load the ICD and falls back to
+  # llvmpipe: measured on a Debian 12 guest as vk_device_is_nvidia FAIL with
+  # "SOFTWARE RASTERISER", every other check passing.
+  - libxext6
+  - libx11-6
   - libgles2
 
 runcmd:
+  # Kernel headers for building nvkvm-guest.ko, by whatever name this distro
+  # uses.  NOT in packages: above, because that list is distro-agnostic and
+  # this name is not -- "linux-headers-virtual" is Ubuntu-only and fails the
+  # whole cloud-init packages module on Debian.  The exact-version form works
+  # on both; the others are fallbacks.
+  - >-
+    apt-get install -y "linux-headers-$(uname -r)"
+    || apt-get install -y linux-headers-amd64
+    || apt-get install -y linux-headers-generic
+    || apt-get install -y linux-headers-virtual
   # Mount the shared 9p virtfs (nvkvm repo root).
   # Also record it in fstab: cloud-init runcmd runs ONCE per instance, so on
   # any later boot of the same image (e.g. re-running the VM after changing

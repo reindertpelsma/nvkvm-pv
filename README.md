@@ -84,7 +84,7 @@ Not yet for untrusted multi-tenant hosting — see below.
 | | |
 |---|---|
 | Host | Linux with KVM, an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
-| Guest | Linux, kernel **6.4–6.10** (tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
+| Guest | Linux, kernel 5.15 – 6.19 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Build | QEMU 9.2 is built from source by the provided script |
@@ -359,19 +359,18 @@ itself. It does need the matching userspace libraries, staged from the host by
 [`stage_guest_libs.sh`](scripts/stage_guest_libs.sh).
 
 **Which guest distros are supported?**
-The distro does not matter; the **kernel version** does, and the current range
-is narrow. `nvkvm-guest.ko` is built against the guest's own headers and uses
-in-kernel APIs that changed on both sides of 6.8. Measured: Ubuntu 24.04 (6.8)
-builds; Ubuntu 22.04 (5.15) and Debian 12 (6.1) fail on `class_create`, and
-Debian 13 (6.12), Ubuntu 25.04 (6.14), Fedora (6.17, 6.19) and 7.0 all fail on
-`virtio_find_vqs`. By where those two API changes landed the buildable range is
-**6.4–6.10**, though only 6.8 has actually been built and run. Full table and a
-one-command harness that needs no GPU:
+The distro does not matter; the **kernel version** does. `nvkvm-guest.ko` is
+built against the guest's own headers, and it builds on **5.15, 6.1, 6.6, 6.8,
+6.12, 6.14 and 6.19** — every LTS in the range NVIDIA's driver supports, plus
+current stable — in both the graphics and compute-only variants. Verify any
+kernel yourself with `bash tests/kernel_matrix.sh`, which needs Docker and
+nothing else. Table and the API differences it papers over:
 [guest kernels](docs/reference/guest-kernels.md).
 
-So: pick a guest whose kernel is in range — Ubuntu 24.04 is the tested one —
-rather than any distro you like. Widening this is ordinary compat work, not a
-design limit. Windows guests are not supported.
+Caveat worth stating: those are **build** results. Ubuntu 24.04 (6.8) is the
+one that gets booted and run through `validate.sh`; a compile pass says the API
+surface matches, not that the module behaves. Windows guests are not
+supported.
 
 **Does the host driver version have to match the guest's?**
 Yes. The libraries staged into the guest come from the host, so they are the same
