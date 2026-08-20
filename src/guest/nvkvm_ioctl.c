@@ -113,7 +113,26 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return nvkvm_prof()->uvm_sem_pool_size;
 	}
 
-	/* Frontend ioctls — dispatch on IOC_NR only */
+	/*
+	 * Frontend ioctls dispatch on IOC_NR — so gate on the TYPE first.
+	 *
+	 * nvkvm_sanitize_ioctl_params() below refuses to touch anything whose
+	 * _IOC_TYPE is not 'F' (it has to: bare UVM NRs collide with frontend
+	 * NRs).  Without the SAME gate here the two disagree: this table would
+	 * say "that is a frontend struct, here is its size" while the sanitizer
+	 * says "not my type, I am not clearing its pointers", and the ioctl is
+	 * accepted and forwarded with its embedded guest VAs intact.  The NR
+	 * spaces overlap numerically (NV_ESC_RM_IDLE_CHANNELS 0x41 is also
+	 * DRM_COMMAND_BASE + 0x01), the host's DRM branch is consulted before
+	 * its non-'F' default-deny, and the NVIDIA frontend dispatches on NR
+	 * while ignoring type — so the mismatch reaches the driver.
+	 *
+	 * UVM and NVKMS are matched on the FULL command word above, so they are
+	 * unaffected by this gate.
+	 */
+	if (_IOC_TYPE(cmd) != 'F')
+		return (size_t)-1;
+
 	switch (NV_IOC_NR(cmd)) {
 	case NV_ESC_CARD_INFO:
 		/*

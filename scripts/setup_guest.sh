@@ -79,7 +79,11 @@ users:
     # claims the device, and clients silently fall back to llvmpipe software
     # rendering — which looks like "the GPU does not work" rather than a
     # permissions problem.  cloud-init's default user is NOT in these groups.
-    groups: [video, render]
+    # video/render own /dev/dri/card0 and renderD128; input owns /dev/input/event*
+    # (root:input 0660).  Without input the compositor comes up fine and the
+    # virtio keyboard/tablet are simply dead, which reads as "input is broken"
+    # rather than as a permissions problem.
+    groups: [video, render, input]
 
 # ssh_pwauth is a TOP-LEVEL cloud-config key. Nested under the users: entry it is
 # silently ignored, sshd keeps PasswordAuthentication no, and the documented
@@ -175,6 +179,56 @@ runcmd:
   - bash -c 'grep -q nvkvm_data /etc/fstab || echo "nvkvm_data /data 9p trans=virtio,version=9p2000.L,nofail 0 0" >> /etc/fstab'
   # Build, load and stage -- last, because it needs the mounts above, and via
   # a unit so the same thing happens on every later boot rather than only this one.
+  # ── Let the desktop session run as `ubuntu` rather than root ──────────
+  #
+  # THESE MUST STAY IN runcmd (first boot), NOT move to image-build time.
+  # A cloud image has no `ubuntu` user until cloud-init creates it, so a
+  # usermod/passwd run under virt-customize silently succeeds and does
+  # NOTHING -- measured: video/render/input come out with empty member
+  # lists and the guest ships the exact "input is dead and snaps cannot
+  # connect" failure these lines exist to prevent. cloud-init runs the
+  # users module before runcmd, so here the user exists.
+  # Verify on any built image with: grep -E '^(video|render|input):' /etc/group
+  # Snaps (Firefox, Chromium on Ubuntu) refuse to run as root, and snapd's
+  # Wayland proxy dies on `mkdir /run/user/0: Permission denied` long before
+  # it ever reaches the GPU.  Running the compositor as root therefore breaks
+  # exactly the applications most worth demoing.  Two things a non-root
+  # compositor needs that root was silently supplying:
+  #
+  # 1. A seat.  weston's built-in seatd needs root to open the DRM node, so a
+  #    non-root compositor needs the real seatd daemon.  The group owning the
+  #    socket is NOT portable, and the documented names are wrong for Ubuntu:
+  #    upstream says `seat`, Debian packaging suggests `_seatd`, and the
+  #    measured value on Ubuntu 24.04 is `video`.  Read it off the socket
+  #    rather than hardcoding any of the three.
+  #
+  #    NOTE: this covers the seat, but it is NOT what unblocks snap apps.
+  #    snapd's AppArmor profile permits only /run/user/[0-9]*/wayland-[0-9]*,
+  #    so the compositor must also be started with --socket=wayland-0 or
+  #    Firefox/Chromium fail with a bare "Permission denied" no matter how
+  #    correct the seat, groups and runtime dir are.  See
+  #    docs/howto/run.md#running-the-guest-desktop-in-a-window.
+  - bash -c 'apt-get install -y seatd || true'
+  # XWayland: without it any X-only client dies at startup, and it does not
+  # die politely.  The Minecraft launcher (GTK) takes a SIGSEGV inside
+  # libX11 -- XOpenDisplay() returns NULL with no X server and the caller
+  # dereferences it unchecked -- while its stderr prints "OK", so the failure
+  # looks like "nvkvm cannot render it" rather than a missing package.
+  # Xwayland spawns lazily on the first X client, so `pgrep Xwayland`
+  # returning nothing before then is NOT a failure.
+  - bash -c 'apt-get install -y xwayland || true'
+  - bash -c 'systemctl enable --now seatd 2>/dev/null || true'
+  - bash -c 'G=$(stat -c %G /run/seatd.sock 2>/dev/null); [ -n "$G" ] && [ "$G" != UNKNOWN ] && usermod -aG "$G" ubuntu || true'
+  # 2. A real XDG_RUNTIME_DIR.  Creating /run/user/1000 by hand is not enough:
+  #    snapd and systemd both want a logind-managed one.  enable-linger starts
+  #    user@1000.service at boot, which creates it with the right owner and
+  #    mode and keeps it alive when no ssh session is attached -- so a
+  #    compositor launched over ssh does not lose it at logout.
+  - bash -c 'loginctl enable-linger ubuntu || true'
+  # Belt and braces on the groups above: cloud-init's users module does not
+  # re-apply `groups:` to a user that already exists in the image, and the
+  # Ubuntu cloud image ships `ubuntu`.  Same class of trap as the password.
+  - bash -c 'usermod -aG video,render,input ubuntu || true'
   - systemctl daemon-reload
   - systemctl enable --now nvkvm-guest.service
 CLOUDINIT

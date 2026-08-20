@@ -330,54 +330,158 @@ measured box they get a real NVIDIA context, produce real GPU buffers, the
 compositor composites them, and the frames now reach a host window and keep
 coming.
 
-### The guest flips a buffer nothing renders into — OPEN, localized 2026-08-20
+### Display work needs nvidia-drm.modeset=1 on the host (2026-08-20)
 
-A compositor runs on the GPU in the guest and flips at ~640 fps; QEMU receives
-every frame; the window is black. Measured on RTX 4070 / 595.84.
+Compute and offscreen GL need only `EGL_EXT_platform_device`.  The
+display/compositor path additionally needs the **GBM** platform, and NVIDIA only
+provides GBM when its DRM module is loaded with `modeset=1`.  Without it,
+libgbm silently falls back to Mesa and every compositor lands on llvmpipe --
+inside the guest that is indistinguishable from an nvkvm bug.
 
-**Buffer sharing works.** This was checked rather than assumed, with a host-side
-CPU mapping of the exported dma-buf (`NVKVM_PRESENT_PROBE=2`):
+Measured on a vast.ai RTX 3060 (driver 580.159.04), same probe before and after:
 
 ```
-RW control: wrote 0xA5A5F00D -> read back 0xa5a5f00d   -> mapping IS real memory
-next flip, same gem=0x2: nonzero_px=1/2073600 px[0]=0xa5a5f00d
+                     modeset=N (default)     modeset=Y
+gbm backend name     drm    <- Mesa          nvidia
+EGL vendor           Mesa Project            NVIDIA
+GL_RENDERER          llvmpipe                NVIDIA GeForce RTX 3060/PCIe/SSE2
 ```
 
-A byte written on the host survived into a later flip of the same bo. So the
-host mapping is genuine persistent memory, and host and guest are addressing
-the *same* allocation. Export and identity are correct. Sizes agree too: a bo
-whose guest dma-buf is 8323072 bytes exports as 8323072 on the host (an earlier
-apparent mismatch was two different bos being compared, not a bug).
+The host showed this with nvkvm not involved at all, and the guest inherited it:
+the guest's GBM only reaches NVIDIA once the **host** module has modeset on.
 
-**What is actually wrong:** nothing writes to the buffer that gets flipped.
-Apart from that sentinel the buffer is all zeros while the guest renders, and
-the sentinel was *not* overwritten -- at 640 fps a real compositing target
-would be clobbered within milliseconds. Two independent read paths agree the
-buffer is otherwise empty (GL import + `glGetTexImage`, and plain CPU mmap).
+Fix on the host:
 
-So the guest renders into one allocation and flips another. The remaining
-question is guest-side buffer plumbing -- which host allocation the guest's
-GL/GBM actually targets, versus which stub handle ends up on the
-`drm_framebuffer` -- not the present path, not EGL, and not the export.
+```
+rmmod nvidia_drm && modprobe nvidia_drm modeset=1     # or nvidia-drm.modeset=1 on the kernel cmdline
+cat /sys/module/nvidia_drm/parameters/modeset          # expect Y
+```
 
-This is a bug, not an architectural limit: the sentinel proves guest and host
-can share the very buffer in question.
+Triage before any display debugging on a new host -- run a GBM probe on the
+**host** first, because if the host cannot do NVIDIA GBM the guest never will:
 
-Things ruled out along the way, each by measurement:
+```
+gbm backend name=nvidia + EGL vendor=NVIDIA  -> usable
+gbm backend name=drm    + EGL vendor=Mesa    -> check modeset before suspecting nvkvm
+```
 
-- *tiling/modifiers* -- a block-linear buffer read as linear gives garbage
-  (confirmed by a `kmsgrab` capture of the host's own scanout, which comes back
-  striped). We get pure black, and forcing LINEAR-only scanout modifiers
-  changed nothing.
-- *the display path* -- real bugs were found and fixed there (external-only
-  EGLImages needing `glEGLImageTargetTexStorageEXT`; per-frame image churn
-  killing the driver; a `DisplaySurface` use-after-free), and the window is
-  still black, because the pixels were never there to show.
-- *wrong isolate* -- `isolate_id` is the owning session's, read in
-  `nvkvm_virtio_present`.
+Note this is easy to misread as an environment limitation.  It is not: the box
+is fully usable for display work once modeset is on.  `tests/validate.sh` is
+28/28 there either way, because compute and offscreen GL go through
+`EGL_EXT_platform_device` and never touch GBM.
 
-Do not read the "637 frames/s presented" figure as "the display works". It
-counts handovers, not pixels.
+### Wayland desktops render — FIXED 2026-08-20 (drm_crtc_vblank_on)
+
+A full Wayland desktop now runs in the guest on the GPU and is displayed in a
+QEMU window on the host, interactively, confirmed on a physical RTX 4070.
+
+**The cause was vblank bookkeeping, not rendering.** We never called
+`drm_crtc_vblank_on/off`, so the vblank sequence and timestamps the core reports
+to userspace never advanced.  Flips still *completed* -- `nvkvm_pipe_update()`
+falls back to `drm_crtc_send_vblank_event()` when `drm_crtc_vblank_get()` fails
+-- which is exactly why this hid for so long: compositors kept flipping and the
+screen stayed black.
+
+weston's own scene graph named it:
+
+```
+Layer 0 (pos 0xffffffff):
+  View 0 (desktop shell fade surface): (0,0) -> (1920,1080)
+    [fully opaque] solid-colour buffer [R 0 G 0 B 0 A 1]
+```
+
+weston was compositing correctly the entire time -- it was animating its
+desktop-shell fade against a clock that never moved, so an opaque black overlay
+sat above the panel and every client.  Every "weston renders nothing" reading
+was really "weston renders the fade overlay".
+
+Two further fixes were needed to get compositors that far, both in the same
+area:
+
+- **`8e499a4`** — `drm_simple_display_pipe_init()` builds the plane's IN_FORMATS
+  blob using the helper's own LINEAR-only `format_mod_supported`, so every
+  block-linear modifier we listed was filtered out before our override existed.
+  Compositors were offered exactly `XRGB8888 + LINEAR`, and NVIDIA cannot use a
+  LINEAR dma-buf as an EGLImage render target (measured: `GL_INVALID_OPERATION`
+  on bind, incomplete FBO).  wlroots said so outright ("EGLImage not supported"
+  / "Failed to create FBO"); weston failed silently.  The blob is now rebuilt
+  after our callback is installed.
+- **`f4201ff`** — advertise only modifiers the driver really implements.  Once
+  the blob reached clients, the 16 hand-rolled BL2D guesses became harmful: a
+  client that picks an invented modifier gets a buffer the driver cannot render
+  into.  Xorg/glamor died with "Failed to create pixmap" (a *different* glamor
+  failure from the open `GL_OUT_OF_MEMORY` one below — this one is fixed).  Only
+  `0x0300000000606014` (SCANOUT|RENDERING) is published; LINEAR is still
+  *accepted* for cursors, just not offered.
+
+**Measured on the physical RTX 4070 (595.84):** guest flip deltas 16.4–18.1 ms,
+median 16.7 ms = **59.9 Hz**, with the desktop displayed in a QEMU GTK window.
+
+**RESOLVED 2026-08-20: there was no ceiling.  The "~21 presents/s" was an
+artifact of counting log lines, which only some paths emit.**  Re-measured with
+per-frame counters compiled into the present path:
+
+| stage | rate |
+|---|---|
+| guest KMS flips | 59.9 Hz |
+| host submits | 60.0/s |
+| host window swaps | 60.0/s |
+| dropped | 0 |
+
+Every one of 60 consecutive one-second samples was exactly 60 frames, and it
+holds at 60.0/s with 8 concurrent EGL clients (`glmark2` 58.0/s windowed, 60.0/s
+fullscreen).  The pipeline is display-refresh-bound, not overhead-bound.
+
+The leading suspect at the time — a per-present `nvkvm_isolate_present_export()`
+IPC round-trip plus `PRIME_HANDLE_TO_FD`, uncached — was **measured at 0.07 ms**
+and cannot cap 60 to 21.  The planned export cache was therefore *not* built: it
+would have been a patch for a problem that did not exist.  The two earlier A/B
+results below stand as real (the `glReadPixels` removal genuinely moved 10 → 21
+by the old metric), but the "21" endpoint was never a true rate.
+
+| change | host rate (old log-line metric) |
+|---|---|
+| per-frame `glReadPixels` removed (GL zero-copy, `2e9413f`) | 10/s → 21/s |
+| present send made non-blocking in the guest (workqueue, `8b0592c`) | 21/s → 21/s (guest reached 60 Hz) |
+| present send made fully fire-and-forget | 21/s → 22/s (noise; not landed) |
+
+**Count frames with a counter, not with log lines.**  A separate "2.5 fps with
+4.8-second freezes" reading from the same session was the kernel's printk
+ratelimiter — 291 suppressed callbacks per 5 s window is itself ~60/s.  Both
+looked like real performance bugs; neither was.
+
+**Measurement traps that produced false findings here, all confirmed:**
+
+- `import fd=` only logs on a cache *miss*, so a healthy cached pipeline shows
+  "N presents, 0 imports" and looks dead.  This produced a false "gfx_update
+  never fires" root cause on two separate boxes.
+- A compositor that stops flipping when nothing changes is *correct*.  Any flip
+  or present count taken without a verified-animating client is meaningless.
+- `rmmod` fails silently while a compositor holds the DRM node (refcount seen at
+  177) and the following `insmod` reports `File exists` while the OLD module
+  stays resident.  Verify the loaded module by symbol
+  (`grep -c <new_symbol> /proc/kallsyms`) before trusting any kernel-side
+  measurement, and reboot the guest to swap modules reliably.
+- QEMU's stderr is block-buffered when redirected to a file, so per-second
+  bucket counts read zero.
+
+### X11 renders correctly but the host only sees the first frame (2026-08-20)
+
+Xorg with the modesetting driver renders a live desktop on our KMS node — an
+in-guest X root capture shows xclock ticking and a working xterm.  But it logs
+
+```
+modeset(0): Using 24bpp hw front buffer with 32bpp shadow
+```
+
+i.e. it modesets once and then blits damage straight into the front buffer,
+never issuing a plane update and never requesting vblank.  Our present path is
+driven by `nvkvm_pipe_update()` (page flips), so the host receives the modeset
+frame and then a frozen picture over a live desktop.
+
+An attempt to fix this by tracking the scanned-out fb and re-exporting it from
+the vblank tick regressed Xorg startup (`Failed to create pixmap`) and was
+reverted.  Re-add the pieces one at a time rather than together.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
@@ -600,6 +704,43 @@ Do not put untrusted tenants behind this.
 
 ## Functional gaps worth knowing
 
+### X11 clients: Xwayland's glamor cannot allocate through nvkvm — OPEN, unconfirmed
+
+Wayland clients work; **X11 clients under `weston --xwayland` do not get a window.**
+Observed on the RTX 4070 box, driver 595.84, guest weston with `--xwayland`:
+
+```
+118x glamor0: GL_OUT_OF_MEMORY ... Failed to allocate memory for texture.
+ 98x glamor0: GL_OUT_OF_MEMORY ... Failed to acquire the EGL Image memory.
+```
+
+4,949 `(EE)` lines in one weston log, every backtrace through
+`libnvidia-eglcore.so.595.84`, the first firing seconds after Xwayland starts.
+Xwayland does **not** exit — it runs, but its glamor acceleration cannot
+allocate textures or EGLImages through the forwarded driver, so no client
+window is ever mapped (`xwininfo` sees the root plus a 10x10 stub).
+
+**Scope: this is not app-specific.** Every X11 client goes through the same
+glamor path, so expect it to affect X apps generally — plausibly including
+GNOME-on-Xwayland. The present path is a *different* code path and is
+unaffected: it measures 60.0 swaps/s with zero drops in the same session. The
+distinguishing feature is that Xwayland is a **second** GL consumer allocating
+while the compositor already holds the GPU.
+
+**What is NOT established**, and should not be repeated as if it were:
+whether the OOM is genuine allocation exhaustion or an unimplemented/limited
+path in the forwarding; and whether it is what makes the one launcher tested
+(Minecraft, which embeds Chromium/CEF) die with `std::bad_function_call`. The
+two co-occur, but that launcher created its browser window *before* crashing,
+its binary is stripped, and there is no core — so the link is unproven.
+
+**The cheapest decisive test, when a GPU box is available:** run a trivial X
+client — `glxgears`, or `xterm` — under `weston --xwayland`. If it hits the
+same glamor `GL_OUT_OF_MEMORY`, the application is irrelevant and this is a
+pure nvkvm EGLImage-allocation bug, which is worth more than any individual
+app. Do that before investigating any specific application.
+
+
 ### `NV_ESC_RM_IDLE_CHANNELS` degrades to single-channel
 
 The multi-channel form carries three guest-userspace pointers to handle arrays,
@@ -652,6 +793,39 @@ The guest synthesises an opaque per-fd id instead
   shm, 1.5 TB mmap, 2 TB sparse); a VM with ≥1 TB RAM would overlap and silently
   corrupt, so realize fails loudly instead
   (`src/qemu/virtio_nvgpu.c:1239-1254`).
+
+### The compute-only build configuration is not exercised by anyone
+
+`src/qemu/` has four meaningful build configurations, and the default build
+covers exactly one of them:
+
+| config | selected by |
+|---|---|
+| A | graphics + `CONFIG_OPENGL` — the default, and the only one normally built |
+| B | `-DNVKVM_QEMU_GRAPHICS=0` |
+| C | `!CONFIG_OPENGL` |
+| D | both |
+
+B, C and D compile a different arm of every `#if defined(CONFIG_OPENGL) &&
+NVKVM_QEMU_GRAPHICS` in the present path — including the no-op stubs. Because
+nothing builds them routinely, those stubs drift from the header they are
+supposed to satisfy and nobody notices. This is not hypothetical: during the
+2026-08-20 audit, config B was found **already broken** —
+
+```
+nvkvm_present_egl.c:659:6: error: conflicting types for 'nvkvm_present_submit'
+```
+
+— a stub whose signature had fallen behind its own declaration. It was repaired
+in `53e3a96`, and all four configurations were then compiled clean across all 11
+nvkvm translation units under QEMU's full warning set.
+
+There is no CI in this repo. Until there is, **build B/C/D by hand before
+touching the present path**, or the compute-only deployment breaks silently
+while every local build stays green. For C and D the `!CONFIG_OPENGL` arm has to
+be selected genuinely — a `config-host.h` shim ahead of the build dir on the
+`-iquote` path — rather than approximated through the graphics gate, or the arm
+you think you are testing is not the one that compiles.
 
 ### Dead code you may trip over while reading
 

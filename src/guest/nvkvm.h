@@ -134,11 +134,21 @@ struct nvkvm_cpu_page {
 	struct page    *page;      /* pinned guest physical page                */
 	unsigned long   gva;       /* page-aligned GVA mapped in the isolate    */
 	__u64           gpa;       /* GPA the memfd page lives at in our window */
+	unsigned long   length;    /* bytes this entry covers: PAGE_SIZE for a
+				    * copy entry, one migration chunk for a
+				    * range entry.  Audit H-9 needs the extent,
+				    * not just its first page, to take the
+				    * guest PTEs down before the GPA is freed. */
 	__u32           handle_id; /* QEMU memory handle wrapping the memfd     */
 	__u32           mmap_token;/* token for MUNMAP_ON_ISOLATE cleanup       */
 	__u32           prot;      /* PROT_* flags (read/write)                 */
-	struct mm_struct *mm;      /* mm the GVA belongs to (compared, never
-				    * dereferenced — see cpu_page_entry_live)  */
+	struct mm_struct *mm;      /* mm the GVA belongs to.  Held by an
+				    * mmgrab() taken when the entry was
+				    * recorded (audit H-9), so the struct stays
+				    * allocated and may be passed to
+				    * mmget_not_zero(); the ADDRESS SPACE is
+				    * only alive while that succeeds.  Compared,
+				    * never walked, in cpu_page_entry_live.    */
 	struct list_head list;
 };
 

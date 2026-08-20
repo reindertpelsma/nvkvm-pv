@@ -9,11 +9,16 @@
  * =====================
  * Each isolate has a dedicated reader thread that demultiplexes IOCTL
  * responses by txn_id onto per-caller condvars (stack-allocated by callers).
- * Non-IOCTL (sync) commands serialize via sync_lock + sync_cond.
+ * Non-IOCTL (sync) commands are gated one-at-a-time by sync_cmd_lock and
+ * handed off via sync_lock + sync_cond (audit F3-1; ENTER_LOOP, PRESENT and
+ * XISO_IMPORT each have their own slot instead).
  * All socket writes are serialized by write_lock.
  *
- * Lock order: sync_lock > write_lock > lock
+ * Lock order: sync_cmd_lock > sync_lock > write_lock > lock
  * (Never hold a later lock while trying to acquire an earlier one.)
+ * present_lock > present_sync_lock and xiso_lock > xiso_sync_lock and
+ * loop_lock > loop_sync_lock are independent chains that only ever nest
+ * write_lock beneath them, never sync_lock.
  */
 
 #ifndef NVKVM_ISOLATE_H
@@ -76,8 +81,26 @@ struct nvkvm_isolate {
 
 	/*
 	 * Sync command slot — one non-IOCTL command at a time.
-	 * sync_lock serializes senders; reader signals sync_cond.
+	 *
+	 * Audit F3-1 (hang/correlation audit 2026-08): sync_lock does NOT
+	 * actually deliver the "one at a time" this comment claims, because
+	 * pthread_cond_wait drops it: a second sender could walk in while the
+	 * first was parked, clear sync_done (erasing the parked waiter's
+	 * wakeup) and then collect a reply that belonged to its predecessor.
+	 * None of the shared response slots below (sync_open_fd,
+	 * sync_mmap_retval, sync_realize_*, sync_ring_probe) carries a
+	 * correlation tag, and the wire responses that use them (RESP_OK /
+	 * RESP_ERROR / RESP_MMAP / RESP_RING_READY) have no txn_id field to
+	 * add one to without a protocol change, so the fix is a real gate
+	 * rather than a tag: sync_cmd_lock is held across the WHOLE round-trip
+	 * (it is never released by the cond wait), so only one shared-slot
+	 * command is ever live.  ENTER_LOOP — the one sync command that both
+	 * runs off the TX thread and legitimately blocks for an unbounded time,
+	 * i.e. the one that made this reachable — was moved to its own
+	 * dedicated slot below so it cannot queue behind (or be starved by)
+	 * the short commands.
 	 */
+	pthread_mutex_t sync_cmd_lock;
 	pthread_mutex_t sync_lock;
 	pthread_cond_t  sync_cond;
 	bool        sync_done;
@@ -92,8 +115,21 @@ struct nvkvm_isolate {
 	uint32_t    sync_realize_rm_status;
 	/* SETUP_RING probe echo — reader fills before signaling. */
 	uint64_t    sync_ring_probe;
-	/* ENTER_LOOP result — reader fills before signaling. */
-	uint64_t    sync_loop_head;
+
+	/*
+	 * ENTER_LOOP slot (audit F3-1) — DEDICATED, for the same reason present
+	 * and xiso are: it is issued from QEMU's thread pool and stays in flight
+	 * for the whole consumer-loop lifetime, so sharing the sync_* slot with
+	 * the short TX-thread commands is exactly the two-live-commands race.
+	 * loop_lock serializes ENTER_LOOP callers (held across the round-trip);
+	 * loop_sync_lock + loop_cond are the reader handoff.
+	 */
+	pthread_mutex_t loop_lock;
+	pthread_mutex_t loop_sync_lock;
+	pthread_cond_t  loop_cond;
+	bool        loop_done;
+	int         loop_error;
+	uint64_t    loop_head;
 
 	/*
 	 * Present-export slot (#106) — DEDICATED, independent of the sync_* slot

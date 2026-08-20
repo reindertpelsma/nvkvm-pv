@@ -130,6 +130,22 @@ NVKVM_INSTALL_DEPS=0
 case "${NVKVM_BUILD_INSTALL_DEPS:-0}" in 1|yes|true) NVKVM_INSTALL_DEPS=1 ;; esac
 [ "${NVKVM_ARG_INSTALL_DEPS:-0}" -eq 1 ] && NVKVM_INSTALL_DEPS=1
 
+# The window backends need their own dev packages.  NVKVM_QEMU_UI=1 turns on
+# --enable-gtk/--enable-sdl below, and without these the configure step dies
+# with `Dependency "sdl2" not found` on an otherwise perfectly prepared box --
+# measured on a clean Ubuntu 22.04.  Only pulled in when the UI is requested,
+# so headless deployments keep their smaller dependency set.
+NVKVM_UI_DEPS_DEB=""
+NVKVM_UI_DEPS_RPM=""
+NVKVM_UI_DEPS_ARCH=""
+NVKVM_UI_DEPS_SUSE=""
+if [ "${NVKVM_QEMU_UI:-0}" = "1" ]; then
+    NVKVM_UI_DEPS_DEB="libgtk-3-dev libsdl2-dev"
+    NVKVM_UI_DEPS_RPM="gtk3-devel SDL2-devel"
+    NVKVM_UI_DEPS_ARCH="gtk3 sdl2"
+    NVKVM_UI_DEPS_SUSE="gtk3-devel libSDL2-devel"
+fi
+
 MISSING="$(nvkvm_missing)"
 if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ]; then
     echo "  installing:$MISSING"
@@ -137,16 +153,20 @@ if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ]; then
         *debian*|*ubuntu*) apt-get update -q && apt-get install -y \
             ninja-build meson libglib2.0-dev libpixman-1-dev python3 \
             python3-venv python3-tomli git libslirp-dev pkg-config \
-            libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd ;;
+            libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd \
+            $NVKVM_UI_DEPS_DEB ;;
         *fedora*|*rhel*|*centos*) dnf install -y \
             ninja-build meson glib2-devel pixman-devel python3 git \
             libslirp-devel pkgconf-pkg-config libattr-devel libepoxy-devel \
-            mesa-libgbm-devel mesa-libEGL-devel libdrm-devel vim-common ;;
+            mesa-libgbm-devel mesa-libEGL-devel libdrm-devel vim-common \
+            $NVKVM_UI_DEPS_RPM ;;
         *arch*) pacman -S --noconfirm --needed ninja meson glib2 pixman python \
-            git libslirp pkgconf attr libepoxy mesa libdrm base-devel ;;
+            git libslirp pkgconf attr libepoxy mesa libdrm base-devel \
+            $NVKVM_UI_DEPS_ARCH ;;
         *suse*) zypper install -y ninja meson glib2-devel libpixman-1-0-devel \
             python3 git libslirp-devel pkg-config libattr-devel \
-            libepoxy-devel Mesa-libgbm-devel Mesa-libEGL-devel libdrm-devel vim ;;
+            libepoxy-devel Mesa-libgbm-devel Mesa-libEGL-devel libdrm-devel vim \
+            $NVKVM_UI_DEPS_SUSE ;;
         *) echo "ERROR: --install-deps: unrecognised distro" >&2; exit 1 ;;
     esac
     MISSING="$(nvkvm_missing)"
@@ -338,6 +358,54 @@ print("  virtio.c patched successfully (after VIRTIO_ID_GPIO).")
 PYEOF
 else
     echo "  virtio.c already contains virtio-nvgpu entry — skipping patch."
+fi
+
+# ── 6b. Patch ui/egl-helpers.c: import dma-bufs with TexStorage ───────────
+#
+# QEMU's egl_dmabuf_import_texture() binds an imported dma-buf with
+# glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, ...).  NVIDIA hands the guest's
+# scanout buffers out as *external-only* EGLImages and rejects that call:
+# measured on an RTX 4070 / 595.84, the 2D bind returns GL_INVALID_OPERATION
+# (0x0502) while glEGLImageTargetTexStorageEXT (GL_EXT_EGL_image_storage)
+# succeeds on the very same image.  Without this, -display gtk,gl=on imports
+# every frame, drops it, and shows a black window -- so the only usable path is
+# NVKVM_PRESENT_MODE=readback, which costs a full ~8MB glReadPixels per frame on
+# the main loop and cannot reach 60fps at 1080p.
+#
+# Same fix as nvkvm_import_dmabuf_tex() in src/qemu/nvkvm_present_egl.c.
+echo "[6b/9] Patching ui/egl-helpers.c for TexStorage dma-buf import..."
+if grep -q "glEGLImageTargetTexStorageEXT" "$QEMU_SRC/ui/egl-helpers.c"; then
+    echo "  egl-helpers.c already patched -- skipping."
+else
+    python3 - "$QEMU_SRC/ui/egl-helpers.c" <<'EGLPATCH'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = """    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    eglDestroyImageKHR(qemu_egl_display, image);"""
+new = """    {
+        /* nvkvm: NVIDIA rejects the legacy OES bind for external-only
+         * dma-buf images (GL_INVALID_OPERATION); EXT_EGL_image_storage
+         * takes the same image as immutable GL_TEXTURE_2D storage. */
+        static PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC nvkvm_tex_storage;
+        static bool nvkvm_looked_up;
+        if (!nvkvm_looked_up) {
+            nvkvm_looked_up = true;
+            nvkvm_tex_storage = (PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC)
+                eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+        }
+        if (nvkvm_tex_storage) {
+            nvkvm_tex_storage(GL_TEXTURE_2D, (GLeglImageOES)image, NULL);
+        } else {
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+        }
+    }
+    eglDestroyImageKHR(qemu_egl_display, image);"""
+if old not in src:
+    sys.exit("egl-helpers.c: expected bind sequence not found")
+open(path, 'w').write(src.replace(old, new, 1))
+print("  ui/egl-helpers.c patched.")
+EGLPATCH
 fi
 
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────

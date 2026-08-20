@@ -297,11 +297,53 @@ track each other with no mouse grab.
 
 Inside the guest, run a compositor on the **DRM backend** so it composites to
 the virtual KMS head (the headless backend renders to an offscreen buffer that
-never reaches the window):
+never reaches the window). Run it as the unprivileged `ubuntu` user, **not**
+as root:
 
 ```bash
-sudo -E env XDG_RUNTIME_DIR=/run/user/1000 weston --backend=drm --renderer=gl
+# as ubuntu, not root -- see below
+env XDG_RUNTIME_DIR=/run/user/1000 LIBSEAT_BACKEND=seatd \
+    weston --backend=drm --renderer=gl --socket=wayland-0 --idle-time=0 \
+            --xwayland
 ```
+
+Four details here are load-bearing, and each one fails in a way that does not
+look like its cause:
+
+- **`--socket=wayland-0`, not an arbitrary name.** snapd's AppArmor profile
+  permits only `/run/user/[0-9]*/wayland-[0-9]*`. With any other socket name,
+  snap applications -- which on Ubuntu includes Firefox and Chromium -- fail
+  with a bare `Permission denied`, and the guest log shows
+  `apparmor DENIED name="/run/user/1000/wl-f"`. No amount of group or
+  permission fixing helps; the name itself is the block.
+
+- **Run as `ubuntu`, not root.** Snaps refuse to run as root, and snapd's
+  Wayland proxy dies on `mkdir /run/user/0: Permission denied` long before it
+  reaches the GPU. Running the compositor as root therefore breaks exactly the
+  applications most worth demoing, and it fails as `we don't have any display`
+  rather than as a permissions error. `scripts/setup_guest.sh` provisions the
+  seat, the runtime dir and the groups this needs.
+
+- **`LIBSEAT_BACKEND=seatd`.** weston's built-in seatd needs root to open the
+  DRM node, so a non-root compositor needs the real daemon. Note the group
+  owning `/run/seatd.sock` is **`video`** on Ubuntu, not the `_seatd` or `seat`
+  that upstream documentation suggests -- read it off the socket rather than
+  assuming.
+
+- **`--idle-time=0`** for anything unattended. weston's default is 300s, after
+  which it blanks the output; a benchmark left running longer than that reports
+  a frozen frame counter that looks exactly like a pipeline stall.
+
+- **`--xwayland`** for X-only clients, with the `xwayland` package installed.
+  Without it they do not fail politely: the Minecraft launcher (GTK) takes a
+  `SIGSEGV` inside `libX11` because `XOpenDisplay()` returns NULL and the
+  caller dereferences it unchecked, while its stderr prints `OK` and the real
+  error goes to `~/.minecraft/bootstrap_log.txt`. Xwayland spawns lazily on the
+  first X client, so `pgrep Xwayland` finding nothing beforehand is not a
+  failure.
+
+`weston-screenshooter` additionally needs weston started with `--debug`, or it
+returns `Output capture error: unauthorized`.
 
 ### Present modes
 
@@ -326,8 +368,26 @@ guest weston on the DRM backend with glmark2 running:
 
 ```
 nvkvm present: window mode=GL-zerocopy (console_has_gl=1)
-frames presented: ~637/s at 1920x1080, triple-buffered, 0 import errors
 ```
+
+| stage                        | rate    |
+|------------------------------|---------|
+| guest KMS flips              | 59.9 Hz |
+| host submits                 | 60.0/s  |
+| host window swaps            | 60.0/s  |
+| dropped frames               | 0       |
+
+Measured with per-frame counters compiled into the present path
+(`NVKVM_PRESENT_TIMING=1`), over 60 consecutive one-second samples of which
+every single one was exactly 60 frames; it holds at 60.0/s with 8 concurrent
+EGL clients, and `glmark2` scores 58.0/s windowed and 60.0/s fullscreen. The
+per-present PRIME export costs 0.07 ms, so it is nowhere near being the limit.
+
+**Count frames with a counter, not with log lines.** An earlier figure of
+~21/s here was an artifact of counting log messages that only some paths emit;
+a "2.5 fps with 4.8-second freezes" reading was likewise the kernel's printk
+ratelimiter (291 suppressed callbacks per 5 s window is itself ~60/s). Both
+looked like real performance bugs and neither was.
 
 ### Known gap: sync-fd passback
 

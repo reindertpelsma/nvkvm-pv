@@ -16,6 +16,18 @@
  * structures are protected by their own mutexes for future multi-threaded
  * dispatch. Currently we hold the QEMU BQL across dispatch for simplicity
  * and will relax this later.
+ *
+ * Audit F1-1 (hang audit 2026-08) — read this before adding a new request
+ * type that talks to an isolate.  "We hold the BQL across dispatch" means a
+ * blocking stub round-trip issued from here stalls the main loop, QMP, timers
+ * and every vCPU for its whole duration.  Only NVKVM_REQ_IOCTL_ON_ISOLATE and
+ * NVKVM_REQ_ENTER_LOOP are offloaded to the thread pool; everything else —
+ * MMAP/MUNMAP/PRESENT/XISO_IMPORT/CLOSE_HANDLE/POLL/UNPOLL/COPY_HANDLE/
+ * SETUP_RING/REALIZE — runs inline right here.  Those round-trips are no
+ * longer able to block forever (nvkvm_isolate.c gives every one of them a
+ * deadline and declares an unresponsive isolate dead), but the RESIDUAL RISK
+ * is unchanged in kind: a wedged isolate still freezes the VM for up to that
+ * deadline.  Removing that needs the offload, not a shorter timeout.
  */
 
 #include "qemu/osdep.h"

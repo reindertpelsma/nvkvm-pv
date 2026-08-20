@@ -618,8 +618,11 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 	return base;
 }
 
+static void nvkvm_gpa_quar_purge(VirtIONvgpu *nv);   /* H-9, defined below */
+
 void nvkvm_sparse_fini(VirtIONvgpu *nv)
 {
+	nvkvm_gpa_quar_purge(nv);   /* H-9: forget extents held back for this nv */
 	if (!nv->sparse_vmm_va) return;
 	if (nv->sparse_kvm_slot >= 0) kvm_remove_memory_region(nv->sparse_kvm_slot);
 	munmap(nv->sparse_vmm_va, nv->sparse_size);
@@ -687,6 +690,71 @@ uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 }
 
 /*
+ * ─── Audit H-9: quarantine before re-handing-out a window GPA ─────────────
+ *
+ * The real fix for the cross-process aliasing this guards against is in the
+ * guest (src/guest/nvkvm_mmap.c: a released range entry now has its PTEs
+ * zapped before MUNMAP_ON_ISOLATE/CLOSE_HANDLE let the extent come back here).
+ * This is the backstop for the case that fix cannot reach — a guest that never
+ * ran the fixed module, or a stale PTE we failed to take down and warned
+ * about.  Callers already re-establish fresh anonymous zero pages over the
+ * window VA (nvkvm_window_restore_anon) at free time, so a surviving guest PTE
+ * reads zeroes; what turns that into a cross-process read is nvkvm_sparse_gpa_-
+ * alloc()'s immediate first-fit reuse handing the same GPA to another isolate.
+ * Delaying reuse costs that race its determinism.
+ *
+ * It is deliberately a delay and NOT a hold: a quarantine that never drains is
+ * a slow denial of service on a finite window.  Two caps bound it, and the
+ * queue self-drains oldest-first the moment either is exceeded:
+ *
+ *   - NVKVM_GPA_QUAR_MAX extents, so a burst of frees cannot pile up; and
+ *   - NVKVM_GPA_QUAR_BYTES of window, so a LARGE extent is never held at all
+ *     (a 2 GiB registration blows the byte cap on its own and passes straight
+ *     through).  That is the intended trade: the guest-side zap is what covers
+ *     the big mappings, and reserving gigabytes of window here to cover them
+ *     twice would be the DoS.
+ *
+ * State is file-static rather than a VirtIONvgpu field so this stays contained
+ * to the allocator it guards; each entry carries its own `nv` so a multi-device
+ * VM stays correct, and nvkvm_sparse_fini() purges the ones it owns before the
+ * window goes away.  Lock discipline: quarantine entries are copied out and the
+ * quarantine lock DROPPED before nvkvm_sparse_gpa_release() takes
+ * nv->sparse_lock, so the two locks are never held at once.
+ */
+#define NVKVM_GPA_QUAR_MAX     64
+#define NVKVM_GPA_QUAR_BYTES   (64ULL << 20)
+
+struct nvkvm_gpa_quar_ent {
+	VirtIONvgpu *nv;
+	uint64_t     gpa;
+	uint64_t     len;
+};
+
+static struct nvkvm_gpa_quar_ent nvkvm_gpa_quar[NVKVM_GPA_QUAR_MAX + 1];
+static uint32_t        nvkvm_gpa_quar_n;
+static uint64_t        nvkvm_gpa_quar_bytes;
+static pthread_mutex_t nvkvm_gpa_quar_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nvkvm_sparse_gpa_release(VirtIONvgpu *nv, uint64_t gpa, size_t size);
+
+/* Drop, without releasing, every extent held for `nv` — its window (and the
+ * free-list the release would have touched) is being torn down. */
+static void nvkvm_gpa_quar_purge(VirtIONvgpu *nv)
+{
+	pthread_mutex_lock(&nvkvm_gpa_quar_lock);
+	for (uint32_t i = 0; i < nvkvm_gpa_quar_n; ) {
+		if (nvkvm_gpa_quar[i].nv != nv) {
+			i++;
+			continue;
+		}
+		nvkvm_gpa_quar_bytes -= nvkvm_gpa_quar[i].len;
+		memmove(&nvkvm_gpa_quar[i], &nvkvm_gpa_quar[i + 1],
+			(--nvkvm_gpa_quar_n - i) * sizeof(nvkvm_gpa_quar[0]));
+	}
+	pthread_mutex_unlock(&nvkvm_gpa_quar_lock);
+}
+
+/*
  * #80/H-1: return [gpa, gpa+size) to the window free-list.  Coalesces with the
  * bump watermark (fast path for LIFO free, keeps the free-list empty under
  * same-size churn) and with an adjacent free extent; otherwise appends.  If the
@@ -716,7 +784,45 @@ int nvkvm_window_restore_anon(void *qva, size_t len)
 	return 0;
 }
 
+/*
+ * H-9 front end: hold the extent in the quarantine FIFO, then push whatever no
+ * longer fits under the caps through to the real free.  The public contract
+ * (extent is no longer in use; it will become allocatable again) is unchanged —
+ * only the instant at which it becomes allocatable moves.
+ */
 void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size)
+{
+	struct nvkvm_gpa_quar_ent drain[NVKVM_GPA_QUAR_MAX + 1];
+	uint32_t ndrain = 0;
+
+	if (!nv || !size) return;
+	size = (size + 4095) & ~4095ULL;
+
+	pthread_mutex_lock(&nvkvm_gpa_quar_lock);
+	/* Append; the array has one spare slot so the append always fits and
+	 * the drain below is what enforces the caps. */
+	nvkvm_gpa_quar[nvkvm_gpa_quar_n].nv  = nv;
+	nvkvm_gpa_quar[nvkvm_gpa_quar_n].gpa = gpa;
+	nvkvm_gpa_quar[nvkvm_gpa_quar_n].len = size;
+	nvkvm_gpa_quar_n++;
+	nvkvm_gpa_quar_bytes += size;
+
+	while (nvkvm_gpa_quar_n > 0 &&
+	       (nvkvm_gpa_quar_n > NVKVM_GPA_QUAR_MAX ||
+		nvkvm_gpa_quar_bytes > NVKVM_GPA_QUAR_BYTES)) {
+		drain[ndrain++] = nvkvm_gpa_quar[0];
+		nvkvm_gpa_quar_bytes -= nvkvm_gpa_quar[0].len;
+		memmove(&nvkvm_gpa_quar[0], &nvkvm_gpa_quar[1],
+			(--nvkvm_gpa_quar_n) * sizeof(nvkvm_gpa_quar[0]));
+	}
+	pthread_mutex_unlock(&nvkvm_gpa_quar_lock);
+
+	for (uint32_t i = 0; i < ndrain; i++)
+		nvkvm_sparse_gpa_release(drain[i].nv, drain[i].gpa,
+					 drain[i].len);
+}
+
+static void nvkvm_sparse_gpa_release(VirtIONvgpu *nv, uint64_t gpa, size_t size)
 {
 	if (!nv->sparse_vmm_va || !nv->sparse_free) return;
 	if (gpa < nv->sparse_gpa_base) return;

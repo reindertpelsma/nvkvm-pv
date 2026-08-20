@@ -64,6 +64,7 @@
 #define EINVAL   22
 #define ENODEV   19
 #define ENOSYS   38
+#define E2BIG     7
 #endif
 #ifndef ENOTSUP
 #define ENOTSUP  95  /* EOPNOTSUPP */
@@ -2280,6 +2281,11 @@ union stub_cmd {
 #define MSG_DONTWAIT 0x40
 #endif
 #define NVKVM_RING_IDLE_DEFAULT   2000u   /* idle spin iterations before exit  */
+/*
+ * Audit F1-2: records executed between two forced control-socket polls while
+ * the ring stays non-empty.  See the rationale at the use site.
+ */
+#define NVKVM_RING_SOCKET_POLL_EVERY 64u
 #define NVKVM_RING_IDLE_MAX       1000000u /* hard cap so a huge idle_us can't
                                            * wedge guest teardown (kthread_stop
                                            * blocks on the in-flight enter_loop) */
@@ -2495,6 +2501,7 @@ static uint64_t ring_consumer_loop(uint32_t idle_us)
 
 	uint32_t idle_budget = idle_us ? idle_us : NVKVM_RING_IDLE_DEFAULT;
 	uint32_t idle = 0;
+	uint32_t since_poll = 0;
 
 	/* Cap the idle window: enter_loop stays in flight for the whole budget,
 	 * and the guest pump's kthread_stop blocks on it during teardown — an
@@ -2512,12 +2519,40 @@ static uint64_t ring_consumer_loop(uint32_t idle_us)
 			ring_exec_one(pay, len);
 			nvkvm_ring_pop(g_req_ring, total);
 			idle = 0;
+			/*
+			 * Audit F1-2: the ONLY socket-service edge used to be the
+			 * empty-ring branch below, so a guest that kept the ring
+			 * continuously fed never let this loop reach it.  Nothing
+			 * in the stub is harmed by that — but QEMU is: every
+			 * synchronous VMM->stub command (CLOSE_HANDLE, MMAP,
+			 * MUNMAP, POLL, UNPOLL, PRESENT_EXPORT, XISO_IMPORT,
+			 * REALIZE_UVM_FD, EXIT) is answered from this socket and
+			 * dispatches inline on QEMU's virtio TX thread with the
+			 * BQL held, so "the stub never reads its socket" is
+			 * literally "an unprivileged guest process freezes the
+			 * whole VMM".  Servicing on a record cadence closes that.
+			 *
+			 * Cadence, not per-record: this is the measured fast path,
+			 * and ring_loop_poll_socket() costs a recvmsg syscall even
+			 * when nothing is pending.  One extra syscall per
+			 * NVKVM_RING_SOCKET_POLL_EVERY records — each of which
+			 * already performs an ioctl syscall of its own — is well
+			 * under 2% of the loop's syscall count, while bounding the
+			 * service gap to a handful of flat RM controls (single-
+			 * digit microseconds each).
+			 */
+			if (++since_poll >= NVKVM_RING_SOCKET_POLL_EVERY) {
+				since_poll = 0;
+				if (ring_loop_poll_socket())
+					stub_exit(0);   /* EXIT mid-drain */
+			}
 			continue;
 		}
 		if (rc == NVKVM_RING_BAD)
 			stub_exit(140);            /* corrupt ring → tear down */
 
 		/* Ring empty → service the socket, then consider exiting. */
+		since_poll = 0;
 		if (ring_loop_poll_socket())
 			stub_exit(0);              /* EXIT during loop */
 		/* A dispatched command may have produced new ring work; re-check
@@ -2651,14 +2686,33 @@ static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
  * Apply the seccomp allowlist filter to the stub.  Permits only the syscalls
  * we use; everything else returns EPERM (or SIGSYS on arch mismatch).
  */
+/* Instruction capacity of the filter buffer below (audit F8-1). */
+#define NVKVM_SECCOMP_FILTER_MAX 96
 static long apply_seccomp(void)
 {
-	struct sock_filter filter[96];
+	/*
+	 * Audit F8-1: EMIT used to do an unchecked filter[n++] into a bare
+	 * [96] array.  Today the filter is 57 instructions (59 before the
+	 * clone3 entry went), so there are 39 slots of headroom and nothing is
+	 * wrong — but the failure mode if somebody adds ~20 more allowlist
+	 * entries is a stack smash inside the
+	 * function that BUILDS the sandbox, which is about the worst place in
+	 * the tree to discover an off-by-N.  A _Static_assert cannot see `n`
+	 * (it is a runtime counter over macro expansions), so the check is a
+	 * runtime one that fails CLOSED: overflow stops writing, apply_seccomp
+	 * returns non-zero, and main() treats any non-zero as fatal and exits.
+	 * A stub that cannot build its own filter must not run unfiltered.
+	 */
+	struct sock_filter filter[NVKVM_SECCOMP_FILTER_MAX];
 	int n = 0;
+	int overflow = 0;
 
 #define EMIT(...) do { \
 	struct sock_filter _f = __VA_ARGS__; \
-	filter[n++] = _f; \
+	if (n < (int)(sizeof(filter) / sizeof(filter[0]))) \
+		filter[n++] = _f; \
+	else \
+		overflow = 1; \
 } while (0)
 #define ALLOW_IF(nr_val) do { \
 	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 1)); \
@@ -2725,7 +2779,17 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_rt_sigaction);
 	ALLOW_IF(__NR_rt_sigreturn);
 	ALLOW_IF(__NR_futex);
-	ALLOW_IF(__NR_clone3);
+	/*
+	 * Audit F6-1: __NR_clone3 used to be allowed here and is deliberately
+	 * gone.  Its only caller is the worker-spawn loop in main(), which
+	 * finishes BEFORE apply_seccomp() runs (as does its clone(2) fallback,
+	 * which this list already omits), so the entry permitted a syscall the
+	 * stub never makes again — while leaving a compromised stub the one
+	 * process-creation primitive it had.  Nothing in the tree caps process
+	 * count (no RLIMIT_NPROC, no pids cgroup), and a PID namespace does not
+	 * cap it either, so that primitive was an unbounded fork bomb against
+	 * the host.  Same class of vestigial entry as the R2-L1 cleanup below.
+	 */
 	ALLOW_IF(__NR_openat);
 	ALLOW_IF(__NR_eventfd2);
 	ALLOW_IF(__NR_gettid);
@@ -2740,6 +2804,10 @@ static long apply_seccomp(void)
 #undef ALLOW_IF
 #undef ALLOW_IF_ARG1_EQ
 #undef EMIT
+
+	/* F8-1: fail closed — a truncated allowlist is not a sandbox. */
+	if (overflow || n <= 0)
+		return -E2BIG;
 
 	struct sock_fprog prog = {
 		.len    = (unsigned short)n,
@@ -2974,11 +3042,17 @@ int main(int argc, char **argv)
 	 * Apply the seccomp allowlist before entering the main loop.  After
 	 * this point only the explicitly-allowed syscalls work; anything
 	 * else returns -EPERM (or, for the arch-mismatch case, kills the
-	 * process).  Audit C6/M-3: the allowlist blocks execve, ptrace, fork,
-	 * prctl, init_module, etc. — the dangerous escape primitives — and the
+	 * process).  Audit C6/M-3: the allowlist blocks execve, ptrace, prctl,
+	 * init_module, etc. — the dangerous escape primitives — and the
 	 * mmap/mprotect entries now enforce W^X (no PROT_WRITE|PROT_EXEC), so a
 	 * compromised stub cannot map RWX to inject code.  (openat remains bounded
 	 * by the post-pivot /dev dirfd sandbox, which seccomp can't path-filter.)
+	 *
+	 * Audit F6-1: it now blocks PROCESS CREATION too, which this comment
+	 * used to claim while __NR_clone3 sat in the allowlist — clone3 is a
+	 * superset of fork, so the claim was false.  fork/vfork/clone/clone3 are
+	 * all absent, and every legitimate clone in this process (the worker
+	 * pool, a few lines above) has already happened by the time we get here.
 	 *
 	 * The NVKVM_STUB_NO_SECCOMP env hatch was dropped along with libc:
 	 * the parent calls clearenv() before exec so there is no environment

@@ -23,6 +23,7 @@
 #include <linux/ktime.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#include <linux/sched/mm.h>   /* mmgrab/mmdrop/mmget_not_zero — audit H-9 */
 #include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
@@ -473,6 +474,178 @@ static unsigned long nvkvm_gva_pfn(struct mm_struct *mm, unsigned long gva)
 }
 
 /*
+ * ─── Audit H-9: releasing a window extent must unmap it from the guest ─────
+ *
+ * nvkvm_cpu_pages_migrate_range() converts an ORDINARY ANONYMOUS VMA to
+ * VM_PFNMAP and remap_pfn_range()s it onto a sparse-window GPA handed out by
+ * QEMU.  That VMA holds no reference on any nvkvm file — it is plain anon
+ * memory that we retyped in place — so the invariant the GPU mmap regions rely
+ * on ("a live VMA keeps the fd open, so nvkvm_mmap_release_fd() cannot run
+ * before the last VMA is gone") DOES NOT HOLD on this path.  A process can
+ * close its /dev/nvidia* fds, or merely trip the staleness reaper, while the
+ * buffer is still mapped and still being written through.
+ *
+ * Both release paths then send MUNMAP_ON_ISOLATE + CLOSE_HANDLE, QEMU returns
+ * the extent to its VM-global window free list, and nvkvm_sparse_gpa_alloc()
+ * hands the very same GPA to the next isolate that asks.  The first process's
+ * surviving PTEs now alias a DIFFERENT guest process's GPU/pinned memory —
+ * readable and writable — which breaks intra-VM process isolation outright.
+ *
+ * So: every path that releases a range entry takes the guest's PTEs down
+ * FIRST, via nvkvm_cpu_page_unmap_guest() below.  Two details decide whether
+ * that is a real fix or a decoration:
+ *
+ *  - zap_vma_ptes() (nvkvm_zap_range) returns void and zaps NOTHING unless the
+ *    VMA is VM_PFNMAP/VM_MIXEDMAP — the same silent no-op the install path
+ *    guards against further down this file.  We check the precondition here
+ *    too and shout if it ever fails, rather than reporting an unmap we did not
+ *    perform.
+ *  - A GVA is not a stable name for our mapping (that is the whole reason
+ *    nvkvm_cpu_page_entry_live() exists).  Userspace may have munmap()ped part
+ *    of the range and mapped something unrelated there.  So we zap only pages
+ *    whose leaf PTE still resolves INTO THIS ENTRY'S EXTENT, coalesced into
+ *    runs, and leave everything else strictly alone.  That page-granular check
+ *    is also what makes the reap path safe: it cannot damage a neighbour's
+ *    mapping even when the liveness probe misjudged the entry.
+ */
+
+/*
+ * nvkvm_zap_entry_ptes — zap the leaf PTEs in [start,end) that still point at
+ * [pfn_lo, pfn_hi).  Returns the number of BYTES that pointed at the extent
+ * but could not be zapped (VMA not PFNMAP/MIXEDMAP), i.e. still-aliasing.
+ *
+ * Caller holds mmap_write_lock and has taken the per-VMA write lock.
+ */
+static unsigned long nvkvm_zap_entry_ptes(struct mm_struct *mm,
+					  struct vm_area_struct *vma,
+					  unsigned long start, unsigned long end,
+					  unsigned long pfn_lo,
+					  unsigned long pfn_hi)
+{
+	bool can_zap = !!(vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP));
+	unsigned long a, run = 0, stuck = 0;
+
+	for (a = start; a < end; a += PAGE_SIZE) {
+		unsigned long pfn = nvkvm_gva_pfn(mm, a);
+
+		if (pfn >= pfn_lo && pfn < pfn_hi) {
+			if (!run)
+				run = a;
+			if (!can_zap)
+				stuck += PAGE_SIZE;
+			continue;
+		}
+		if (run && can_zap)
+			nvkvm_zap_range(vma, run, a - run);
+		run = 0;
+	}
+	if (run && can_zap)
+		nvkvm_zap_range(vma, run, end - run);
+	return stuck;
+}
+
+/*
+ * nvkvm_cpu_page_unmap_guest — drop the guest mapping of a range entry before
+ * its window extent is handed back to QEMU.  See the H-9 block above.
+ *
+ * Copy entries (page != NULL) are skipped: they were never remapped, their GVA
+ * still translates to the pinned anon page, and no window GPA of theirs is in
+ * the guest's page tables at all — only in the isolate's.
+ *
+ * Locking.  The lock order in this file is cpu_pages_lock -> mmap_lock (see
+ * nvkvm_cpu_page_entry_live); nothing takes them the other way.  Both callers
+ * have already unlinked the entry onto a private list and dropped
+ * cpu_pages_lock, so we take mmap_lock with no nvkvm lock held.  Neither
+ * caller is ever reached with mmap_lock already held:
+ *
+ *   nvkvm_cpu_pages_reap_stale() runs from the two migration entry points —
+ *   nvkvm_efault_resolve() drops mmap_read_lock before calling
+ *   nvkvm_cpu_page_migrate(), and nvkvm_cpu_pages_migrate_range() reaps before
+ *   it takes mmap_write_lock itself.
+ *
+ *   nvkvm_cpu_pages_free() runs only from nvkvm_fd_ctx_destroy(), i.e. from
+ *   ->release (fput() defers the last put to task_work, so it never fires
+ *   under the munmap/exit_mmap mmap_write_lock) or from a proxy-GEM /
+ *   dma-buf put, none of which hold mmap_lock.
+ *
+ * Lifetime.  cp->mm is pinned by the mmgrab() taken when the entry was
+ * recorded, so the struct is guaranteed to still be there.  mmget_not_zero()
+ * then asks the separate question of whether the ADDRESS SPACE still exists:
+ * if it does not, exit_mmap() has already unmapped every VMA and there are by
+ * construction no PTEs left to zap — the common process-exit case, where
+ * current->mm is NULL anyway because exit_mm() precedes exit_files().
+ */
+static void nvkvm_cpu_page_unmap_guest(struct nvkvm_cpu_page *cp)
+{
+	struct mm_struct *mm = cp->mm;
+	struct vm_area_struct *vma;
+	unsigned long start, end, pfn_lo, pfn_hi, stuck = 0;
+
+	if (cp->page || !mm || !cp->length)
+		return;
+
+	start  = cp->gva;
+	end    = cp->gva + cp->length;
+	if (end <= start)                      /* overflow paranoia */
+		return;
+	pfn_lo = (unsigned long)(cp->gpa >> PAGE_SHIFT);
+	pfn_hi = pfn_lo + (cp->length >> PAGE_SHIFT);
+
+	if (!mmget_not_zero(mm))
+		return;
+
+	mmap_write_lock(mm);
+	vma = find_vma(mm, start);
+	while (vma && vma->vm_start < end) {
+		unsigned long s = max(start, vma->vm_start);
+		unsigned long e = min(end,   vma->vm_end);
+
+		if (s < e) {
+			/*
+			 * Same reason the install path takes it: mmap_lock
+			 * alone does not exclude a fault holding only the
+			 * per-VMA read lock (CONFIG_PER_VMA_LOCK).
+			 */
+			vma_start_write(vma);
+			stuck += nvkvm_zap_entry_ptes(mm, vma, s, e,
+						      pfn_lo, pfn_hi);
+		}
+		vma = find_vma(mm, vma->vm_end);
+	}
+	mmap_write_unlock(mm);
+	mmput(mm);
+
+	if (stuck)
+		pr_warn("nvkvm: H-9: %lu bytes of GPA 0x%llx still mapped at 0x%lx under a non-PFNMAP VMA; extent released while aliased\n",
+			stuck, (unsigned long long)cp->gpa, start);
+}
+
+/*
+ * nvkvm_cpu_page_release — common tail for both release paths: unmap from the
+ * guest, unmap from the isolate, close the handle, drop the pin, free.
+ *
+ * The ORDER is the fix (audit H-9): the guest's PTEs must be gone BEFORE
+ * MUNMAP_ON_ISOLATE/CLOSE_HANDLE lets QEMU recycle the GPA.  Caller must not
+ * hold cpu_pages_lock, and the entry must already be off ctx->cpu_pages.
+ */
+static void nvkvm_cpu_page_release(struct nvkvm_cpu_page *cp, __u32 isolate_id)
+{
+	nvkvm_cpu_page_unmap_guest(cp);
+
+	if (isolate_id) {
+		nvkvm_virtio_munmap_on_isolate(isolate_id, cp->mmap_token);
+		nvkvm_virtio_close_handle_on_isolate(cp->handle_id, isolate_id);
+	}
+	nvkvm_virtio_close_handle(cp->handle_id);
+	if (cp->page)            /* range entries are page==NULL */
+		put_page(cp->page);
+	if (cp->mm)              /* the mmgrab() from the migrate path */
+		mmdrop(cp->mm);
+	list_del(&cp->list);
+	kfree(cp);
+}
+
+/*
  * nvkvm_cpu_page_entry_live — is this tracking entry still describing the
  * mapping it was created for?
  *
@@ -536,6 +709,19 @@ static bool nvkvm_cpu_page_entry_live(struct nvkvm_cpu_page *cp)
  * nvkvm_cpu_pages_reap_stale — drop every tracking entry whose guest mapping
  * has gone away, releasing the isolate mapping and the memfd with it.
  *
+ * Audit H-9: releasing goes through nvkvm_cpu_page_release(), which zaps the
+ * entry's surviving window PTEs first.  That also disarms the sharp edge in
+ * nvkvm_cpu_page_entry_live() below — it probes only cp->gva, so overmapping
+ * just the FIRST page of a multi-page chunk declares the whole chunk dead and
+ * lands it here with real, live PTEs still in it.  The probe is deliberately
+ * left as-is: it only decides whether to re-migrate, and making it stickier
+ * (any page still ours => live) would resurrect the stale-buffer aliasing it
+ * was written to fix, while making it stricter (every page ours => live) just
+ * moves the false verdict around.  Since the release now unmaps the extent
+ * page by page, a wrong verdict costs the process its mapping (it faults, and
+ * a re-registration re-migrates) instead of costing another process its
+ * isolation.
+ *
  * Called before either migration path consults its "already migrated?" cache,
  * so that a reused address re-migrates instead of inheriting the mapping of
  * whatever used to live there.  The list holds one entry per migrated page or
@@ -553,18 +739,8 @@ void nvkvm_cpu_pages_reap_stale(struct nvkvm_fd_ctx *ctx)
 			list_move_tail(&cp->list, &dead);
 	mutex_unlock(&ctx->cpu_pages_lock);
 
-	list_for_each_entry_safe(cp, tmp, &dead, list) {
-		if (isolate_id) {
-			nvkvm_virtio_munmap_on_isolate(isolate_id, cp->mmap_token);
-			nvkvm_virtio_close_handle_on_isolate(cp->handle_id,
-							     isolate_id);
-		}
-		nvkvm_virtio_close_handle(cp->handle_id);
-		if (cp->page)
-			put_page(cp->page);
-		list_del(&cp->list);
-		kfree(cp);
-	}
+	list_for_each_entry_safe(cp, tmp, &dead, list)
+		nvkvm_cpu_page_release(cp, isolate_id);
 }
 
 /*
@@ -681,9 +857,17 @@ int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	cp->mm          = current->mm;
 	cp->gva         = page_gva;
 	cp->gpa         = gpa_base;
+	cp->length      = PAGE_SIZE;
 	cp->handle_id   = handle_id;
 	cp->mmap_token  = mmap_token;
 	cp->prot        = (__u32)prot;
+	/* H-9: pin the mm_struct for the entry's lifetime so the release path
+	 * may pass it to mmget_not_zero() instead of only comparing it.  A copy
+	 * entry has no guest window PTEs to take down, but the ref keeps the
+	 * field's meaning — and its mmdrop() — uniform across both entry
+	 * kinds.  Released in nvkvm_cpu_page_release(). */
+	if (cp->mm)
+		mmgrab(cp->mm);
 
 	mutex_lock(&ctx->cpu_pages_lock);
 	list_add_tail(&cp->list, &ctx->cpu_pages);
@@ -886,7 +1070,10 @@ put:
 
 /*
  * nvkvm_cpu_pages_free — clean up all CPU page migrations for this fd.
- * Unmaps each page from the isolate, closes the handle, and releases the pin.
+ * Unmaps each range from the GUEST (audit H-9 — the anon-derived VM_PFNMAP
+ * VMAs of migrate_range hold no reference on this fd, so we can get here with
+ * the buffer still mapped), then from the isolate, closes the handle, and
+ * releases the pin.
  */
 void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx)
 {
@@ -898,18 +1085,8 @@ void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx)
 	list_splice_init(&ctx->cpu_pages, &to_free);
 	mutex_unlock(&ctx->cpu_pages_lock);
 
-	list_for_each_entry_safe(cp, tmp, &to_free, list) {
-		if (isolate_id) {
-			nvkvm_virtio_munmap_on_isolate(isolate_id, cp->mmap_token);
-			nvkvm_virtio_close_handle_on_isolate(cp->handle_id,
-							     isolate_id);
-		}
-		nvkvm_virtio_close_handle(cp->handle_id);
-		if (cp->page)            /* range entries are page==NULL */
-			put_page(cp->page);
-		list_del(&cp->list);
-		kfree(cp);
-	}
+	list_for_each_entry_safe(cp, tmp, &to_free, list)
+		nvkvm_cpu_page_release(cp, isolate_id);
 }
 
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
@@ -1322,9 +1499,16 @@ chunk_fail_h:
 			cp->mm         = mm;
 			cp->gva        = cbase;
 			cp->gpa        = gpa;
+			cp->length     = clen;
 			cp->handle_id  = handle;
 			cp->mmap_token = token;
 			cp->prot       = (__u32)prot;
+			/* H-9: record the whole chunk, not just its first
+			 * page, and pin the mm — the release paths have to
+			 * zap [gva, gva+length) before this extent can be
+			 * recycled by another isolate.  mmdrop() in
+			 * nvkvm_cpu_page_release(). */
+			mmgrab(mm);
 			mutex_lock(&ctx->cpu_pages_lock);
 			list_add_tail(&cp->list, &ctx->cpu_pages);
 			mutex_unlock(&ctx->cpu_pages_lock);

@@ -312,6 +312,19 @@ typedef struct NvkvmPresent {
     QemuDmaBuf *cur_buf;
 
     uint32_t key;            /* guest scanout bo this frame came from */
+    uint32_t owner;          /* isolate that exported it (S-4) */
+
+    /*
+     * S-4: isolates whose cached imports are due to be dropped.  Isolate death
+     * is reported from a virtio worker thread, but EGLImages and textures may
+     * only be touched on the main loop with our context current, so the worker
+     * records the id here and nvkvm_present_gfx_update() does the work.
+     * `dead_all` is the overflow answer: forget everything rather than keep a
+     * dead isolate's import alive because the list was full.
+     */
+    uint32_t dead[16];
+    unsigned ndead;
+    bool     dead_all;
 
     /*
      * Imported-buffer cache.  A compositor cycles a handful of scanout bos
@@ -328,6 +341,16 @@ typedef struct NvkvmPresent {
      */
     struct {
         bool        valid;
+        /*
+         * S-4: `key` is a GEM handle out of the OWNING stub's own drm_file
+         * IDR, so it is unique per isolate and nothing more -- it starts at 1
+         * in every one of them.  With the virtual head fixed at a single mode
+         * and two modifiers, two compositors collide on key 1 with identical
+         * geometry as a matter of course, not as a rare coincidence, and the
+         * newcomer's frames then resolve to its predecessor's EGLImage.  The
+         * owning isolate is the missing half of the identity.
+         */
+        uint32_t    owner;
         uint32_t    key, w, h, stride, fourcc;
         uint64_t    mod;
         EGLImageKHR image;
@@ -419,7 +442,8 @@ static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
 
 /* Look the frame's bo up in the import cache, importing it on a miss.
  * Returns the GL texture, or 0.  Never destroys anything on the hot path. */
-static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t key, int fd,
+static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
+                                       uint32_t key, int fd,
                                        uint32_t w, uint32_t h, uint32_t stride,
                                        uint32_t fourcc, uint64_t mod)
 {
@@ -432,7 +456,7 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t key, int fd,
             }
             continue;
         }
-        if (p->cache[i].key == key) {
+        if (p->cache[i].owner == owner && p->cache[i].key == key) {
             /* Same bo id, but the compositor may have reallocated it at a new
              * geometry -- then the cached import describes the wrong memory. */
             if (p->cache[i].w == w && p->cache[i].h == h &&
@@ -462,7 +486,8 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t key, int fd,
         return 0;
     }
     p->cache[free_slot] = (typeof(p->cache[0])){
-        .valid = true, .key = key, .w = w, .h = h, .stride = stride,
+        .valid = true, .owner = owner, .key = key, .w = w, .h = h,
+        .stride = stride,
         .fourcc = fourcc, .mod = mod, .image = image, .tex = tex,
     };
     return tex;
@@ -470,7 +495,8 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t key, int fd,
 
 /* Import the pending frame on our private NVIDIA EGL context, read it back to a
  * CPU surface, and push it to the 2D display.  Works for any host display GPU. */
-static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t key,
+static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
+                                   uint32_t key,
                                    uint32_t w, uint32_t h, uint32_t stride,
                                    uint32_t fourcc, uint64_t mod)
 {
@@ -484,8 +510,8 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t key,
         return;
     }
 
-    GLuint tex = nvkvm_present_cached_tex(p, key, fd, w, h, stride, fourcc,
-                                          mod);
+    GLuint tex = nvkvm_present_cached_tex(p, owner, key, fd, w, h, stride,
+                                          fourcc, mod);
     if (!tex) {
         goto out_ctx;
     }
@@ -507,6 +533,21 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t key,
         goto out_ctx;
     }
     egl_fb_read(ds, &p->fb);               /* glReadPixels texture -> CPU BGRA */
+    /*
+     * NVKVM_PRESENT_DUMP=<path>: write what the window is about to show, as a
+     * PPM.  On a headless host, or one whose compositor refuses screenshots,
+     * this is the only way to answer "is there a picture" without asking a
+     * human to look at the screen -- and a frame counter cannot answer it.
+     */
+    {
+        const char *dump = getenv("NVKVM_PRESENT_DUMP");
+        if (dump) {
+            static unsigned dn;
+            if ((dn++ % 120) == 0) {
+                nvkvm_write_ppm(dump, ds);
+            }
+        }
+    }
     dpy_gfx_update(p->con, 0, 0, w, h);
 
 out_ctx:
@@ -515,10 +556,80 @@ out_ctx:
     close(fd);                             /* readback owns + consumes the fd */
 }
 
+/*
+ * S-4: drop the cached imports of isolates that have died.  Main loop only --
+ * eglDestroyImageKHR/glDeleteTextures need our context current, which is also
+ * why this cannot run where the death is noticed.
+ *
+ * Until this existed nothing ever invalidated on isolate death, so a dead
+ * compositor's EGLImage held its dma-buf -- and the VRAM behind it -- pinned
+ * for the life of the VM, and its cache slot went on answering for whatever
+ * bo id the next isolate happened to reuse.
+ *
+ * p->cur_buf (the GL zero-copy path's live scanout) is deliberately left
+ * alone: it is one most-recent frame rather than an accumulating pin, and
+ * pulling it out from under the UI mid-scanout is a worse failure than showing
+ * a stale frame until the next flip replaces it.
+ */
+static void nvkvm_present_reap_dead(NvkvmPresent *p)
+{
+    uint32_t dead[16];
+    unsigned ndead;
+    bool     all, any = false;
+
+    pthread_mutex_lock(&p->lock);
+    ndead = p->ndead;
+    all   = p->dead_all;
+    memcpy(dead, p->dead, ndead * sizeof(dead[0]));
+    p->ndead   = 0;
+    p->dead_all = false;
+    pthread_mutex_unlock(&p->lock);
+
+    if (!ndead && !all) {
+        return;
+    }
+    for (int i = 0; i < NVKVM_PRESENT_CACHE; i++) {
+        any = any || p->cache[i].valid;
+    }
+    if (!any) {
+        return;   /* nothing imported yet -- EGL may not even be up */
+    }
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        qemu_egl_rn_ctx)) {
+        return;
+    }
+    bool dropped = false;
+    for (int i = 0; i < NVKVM_PRESENT_CACHE; i++) {
+        if (!p->cache[i].valid) {
+            continue;
+        }
+        bool drop = all;
+        for (unsigned k = 0; !drop && k < ndead; k++) {
+            drop = (p->cache[i].owner == dead[k]);
+        }
+        if (!drop) {
+            continue;
+        }
+        glDeleteTextures(1, &p->cache[i].tex);
+        eglDestroyImageKHR(qemu_egl_display, p->cache[i].image);
+        p->cache[i].valid = false;
+        dropped = true;
+    }
+    if (dropped) {
+        /* The FBO may still name a texture we just deleted; the next frame
+         * re-runs egl_fb_setup_for_tex anyway. */
+        egl_fb_destroy(&p->fb);
+    }
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+}
+
 /* GraphicHwOps.gfx_update — main loop, BQL held.  Drain the slot and present. */
 static void nvkvm_present_gfx_update(void *opaque)
 {
     NvkvmPresent *p = opaque;
+
+    nvkvm_present_reap_dead(p);      /* S-4, before anything is presented */
 
     pthread_mutex_lock(&p->lock);
     if (!p->dirty || p->fd < 0) {
@@ -529,6 +640,7 @@ static void nvkvm_present_gfx_update(void *opaque)
     uint32_t w      = p->w,  h = p->h, stride = p->stride, fourcc = p->fourcc;
     uint64_t mod    = p->modifier;
     uint32_t key    = p->key;
+    uint32_t owner  = p->owner;
     p->fd    = -1;            /* take ownership of this frame's fd */
     p->dirty = false;
     pthread_mutex_unlock(&p->lock);
@@ -536,7 +648,7 @@ static void nvkvm_present_gfx_update(void *opaque)
     if (nvkvm_present_decide_mode(p) == 1) {
         nvkvm_present_gl(p, fd, w, h, stride, fourcc, mod);
     } else {
-        nvkvm_present_readback(p, fd, key, w, h, stride, fourcc, mod);
+        nvkvm_present_readback(p, fd, owner, key, w, h, stride, fourcc, mod);
     }
 }
 
@@ -598,7 +710,7 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
 }
 
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
-                          uint32_t buf_key,
+                          uint32_t owner_isolate_id, uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,
                           uint32_t fourcc, uint64_t modifier)
 {
@@ -612,6 +724,7 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
         close(p->fd);        /* drop the frame the display hasn't taken yet */
     }
     p->fd       = dmabuf_fd;
+    p->owner    = owner_isolate_id;   /* S-4: half of the cache identity */
     p->key      = buf_key;
     p->w        = width;
     p->h        = height;
@@ -623,6 +736,36 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
 
     qemu_bh_schedule(p->bh);
     return true;
+}
+
+void nvkvm_present_forget_isolate(struct VirtIONvgpu *nv, uint32_t isolate_id)
+{
+    NvkvmPresent *p = nv->present_ctx;
+    if (!p || isolate_id == 0) {
+        return;
+    }
+
+    pthread_mutex_lock(&p->lock);
+    /*
+     * A frame this isolate submitted that the display has not drained yet
+     * describes memory whose owner is gone -- retire it here rather than
+     * import it after the fact.
+     */
+    if (p->fd >= 0 && p->owner == isolate_id) {
+        close(p->fd);
+        p->fd    = -1;
+        p->dirty = false;
+    }
+    if (p->ndead < ARRAY_SIZE(p->dead)) {
+        p->dead[p->ndead++] = isolate_id;
+    } else {
+        p->dead_all = true;   /* rather over-forget than keep a dead import */
+    }
+    pthread_mutex_unlock(&p->lock);
+
+    if (p->bh) {
+        qemu_bh_schedule(p->bh);   /* reaped on the main loop, see gfx_update */
+    }
 }
 
 #else /* !CONFIG_OPENGL || !NVKVM_QEMU_GRAPHICS */
@@ -642,11 +785,17 @@ int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
 }
 void nvkvm_present_console_fini(struct VirtIONvgpu *nv) { (void)nv; }
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+                          uint32_t owner_isolate_id, uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,
                           uint32_t fourcc, uint64_t modifier)
 {
-    (void)nv; (void)dmabuf_fd; (void)width; (void)height;
+    (void)nv; (void)dmabuf_fd; (void)owner_isolate_id; (void)buf_key;
+    (void)width; (void)height;
     (void)stride; (void)fourcc; (void)modifier;
     return false;            /* not accepted → caller closes the fd */
+}
+void nvkvm_present_forget_isolate(struct VirtIONvgpu *nv, uint32_t isolate_id)
+{
+    (void)nv; (void)isolate_id;
 }
 #endif

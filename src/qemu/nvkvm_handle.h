@@ -26,6 +26,18 @@ struct nvkvm_handle {
 	uint32_t    session_id;   /* owning session */
 	int         dev_id;       /* for TYPE_NVIDIA: NVKVM_DEV_*         */
 	uint32_t    isolate_refcount;  /* # isolates that hold this handle */
+	/*
+	 * S-1 (oob-map): the object's size in bytes, recorded at creation.
+	 * TYPE_MEMORY: the length the memfd was ftruncate()d to — the ONLY
+	 * record of how big the object is, without which no (offset, length)
+	 * a guest names can ever be bounds-checked against the thing it names
+	 * (an out-of-range mmap of a memfd faults SIGBUS on first touch, and
+	 * MMAP_ON_ISOLATE prefaults every page inside the VMM).
+	 * TYPE_NVIDIA: 0 — a device fd has no meaningful length and `offset`
+	 * there is an RM mapping token, not a byte offset, so callers must
+	 * skip the check for those rather than treat 0 as "empty".
+	 */
+	uint64_t    size;
 	bool        poll_active;  /* handle is registered for poll        */
 	bool        in_use;
 };
