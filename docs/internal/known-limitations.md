@@ -288,9 +288,47 @@ Neither reproduced before, because before this the client was llvmpipe.
    `WINMAP` window mappings. This looks like the mmap/WINMAP window path, not
    the dma-buf path, and it is **not** diagnosed.
 
-Do not read this entry as "Wayland clients work". Read it as: they get a real
-NVIDIA context, they produce and hand over real GPU buffers, the compositor
-composites those buffers, and then the stream stalls.
+#### Both resolved 2026-08-20 (RTX 4070 / 595.84 / host kernel 7.0)
+
+**(1) confirmed and fixed.** The suspect above was right. `GET_DEV_INFO`
+forwarded the host's `supports_sync_fd = 1`, so libnvidia-egl-wayland chose the
+sync-fd presentation path and waited on a fence built from a stub-local
+descriptor number. The guest now reports `supports_sync_fd = 0` — we do not
+implement passback, so we must not claim it — and NVIDIA's userspace picks a
+path that does not need one. glmark2-wayland in the guest went from hanging on
+scene 1 (6+ minutes, 0 CPU time, main thread in `pthread_cond_wait` inside
+`libEGL_nvidia`) to completing all 20 scenes.
+
+Note the symptom on this box was a hard hang on the *first* swap, not the
+"stops after tens-to-hundreds of frames" seen earlier. Same unimplemented
+mechanism; do not assume the older observation is fully explained by it.
+
+**(2) did not reproduce.** No `kvm run failed Bad address` in any run on this
+box: glmark2 continuous for 150 s+, a full 20-scene run, and a five-minute soak
+of a live guest desktop (190,013 frames presented, 0 errors). That is **not**
+proof it is fixed — the earlier reproductions were on different hardware (RTX
+3050 laptop), and several unrelated fixes have landed since. Treat it as open
+and unreproduced rather than closed.
+
+**Two more traps found on the way in, both of which looked like "graphics does
+not work" and were neither:**
+
+- The stub dup'd `NVKVM_DRM_FD(k)` unconditionally while QEMU only parked a
+  node there in uid-drop mode. In other modes that descriptor number belonged
+  to something else — measured `/dev/nvidiactl` — and the dup *succeeded*, so
+  the open-by-name fallback never ran and every DRM ioctl went to the wrong
+  device. `GET_DEV_INFO` returned EINVAL, EGL could not associate the CUDA
+  device with a DRM node, and clients fell back to llvmpipe. A silently-wrong
+  fd is worse than a missing one: fix is QEMU parking in every mode and passing
+  `--drm-fds=N` so the stub fails closed instead of guessing.
+- cloud-init's default user is in no groups beyond its own, so the guest user
+  could not `open()` `/dev/dri/renderD128` (0660 `root:render`) at all. Plain
+  EACCES, before any of the above was reachable.
+
+Do not read this entry as "Wayland clients work" in general. Read it as: on the
+measured box they get a real NVIDIA context, produce real GPU buffers, the
+compositor composites them, and the frames now reach a host window and keep
+coming.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
