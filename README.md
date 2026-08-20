@@ -208,11 +208,14 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-**Vulkan compute fails on Hopper.** `vkCreateDevice` returns
-`VK_ERROR_DEVICE_LOST` in the guest on an H100 while the same binary is clean on
-the host; every CUDA check on that part passes. Traced to a channel/compute
-class mismatch, with two hypotheses eliminated —
-[detail](docs/reference/correctness.md#vulkan-compute-on-hopper).
+**Vulkan compute on Hopper — resolved, and it was never an nvkvm bug.** An
+H100 PCIe read 27/28 (`vk_compute_dispatch`) on driver 570.124.06. On
+**580.126.09 the same part is 28/28**, and rebuilding the *exact* tree that
+measured the failure — QEMU and guest module both — still passes on 580, so the
+defect was in the 570 driver branch and no nvkvm change was involved. The old
+"channel/compute class mismatch" diagnosis was also wrong: the bare-metal host
+allocates `HOPPER_COMPUTE_A` under an `AMPERE_CHANNEL_GPFIFO_A` channel too —
+[detail](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
 
 **Graphics: Wayland works; X11 clients do not get a window.** A full Wayland
 desktop runs on the GPU inside the guest and is interactive in a host window at
@@ -368,7 +371,8 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
-| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`, see below) |
+| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch` — a 570-branch driver bug, see below) |
+| H100 PCIe | **Hopper GH100** | 580.126.09 | 580 | 28/28 |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 | RTX 2080 Ti | Turing TU102 | 575.51.03 | 570 | 28/28 |
 | RTX 3080 | Ampere GA102 | 580.95.05 | 580 | 28/28 |
@@ -466,9 +470,9 @@ base and still fails closed on an unrecorded one.
 
 On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
 launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.
-The one failure is `vk_compute_dispatch`, and it does **not** affect CUDA; the
-trace, and the two hypotheses ruled out by experiment, are in
-[Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper).
+`vk_compute_dispatch` failed on driver 570.124.06 and **passes on 580.126.09**
+(28/28); the A/B that pins that on the driver rather than on nvkvm is in
+[Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
 
 ## FAQ
 

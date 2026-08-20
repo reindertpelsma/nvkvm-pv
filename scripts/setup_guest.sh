@@ -147,6 +147,15 @@ packages:
   - libxext6
   - libx11-6
   - libgles2
+  # OpenCL ICD *loader* (libOpenCL.so.1).  stage_guest_libs.sh stages NVIDIA's
+  # libnvidia-opencl.so.1 and writes /etc/OpenCL/vendors/nvidia.icd, but the
+  # vendor-neutral loader that reads that manifest is a distro package and the
+  # cloud image does not ship it.  Without it every OpenCL app fails with
+  # "unknown OpenCL platform" despite a correct ICD and a working driver --
+  # measured on an H100 guest, where Geekbench 7 --gpu refused to start while
+  # the same binary ran on the host.  Same class of vendor-neutral loader as
+  # libvulkan1/libegl1 above, so it belongs in the same list.
+  - ocl-icd-libopencl1
 
 runcmd:
   # Kernel headers for building nvkvm-guest.ko, by whatever name this distro
