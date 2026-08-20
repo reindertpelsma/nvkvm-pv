@@ -876,10 +876,24 @@ round** for that card. The Vulkan pass is still useful as evidence — it is wha
 eliminated the "datacenter part" theory for the Hopper failure — but it is not a
 result to celebrate, and the CUDA failure is the one that counts.
 
-### X11 clients fall back to llvmpipe — ROOT CAUSE FOUND (2026-08-20)
+### X11 clients fall back to llvmpipe on a display-less A100 — NOT AN NVKVM BUG
 
-**The EGL device does not answer `EGL_DRM_RENDER_NODE_FILE_EXT` through nvkvm,
-and everything else follows from that.** Reproduced on an A100 (GA100, Ubuntu
+**RETRACTED 2026-08-20.** This entry first claimed the EGL render-node query
+failed *through nvkvm*. It does not: the host behaves identically, so nvkvm is
+faithfully reproducing what the driver does on bare metal.
+
+```
+GUEST  device 0 (NVIDIA):  EGL_DRM_RENDER_NODE_FILE_EXT = (NULL)  err 0x300c
+HOST   device 0 (NVIDIA):  EGL_DRM_RENDER_NODE_FILE_EXT = (NULL)  err 0x300c
+```
+
+The A100 has no display engine, so its CUDA-capable EGL device carries no DRM
+association to report — on bare metal exactly as in the guest. A headless GNOME
+on a bare-metal A100 would give its X11 clients llvmpipe for the same reason.
+The behaviour below is therefore a property of that card plus this driver
+package, not a forwarding gap, and there is nothing here for nvkvm to fix.
+
+**Original observation retained**, because the chain is still worth knowing: Reproduced on an A100 (GA100, Ubuntu
 26.04, GNOME 50 headless) — a different card, compositor and OS from the RTX
 4070/weston case below, which makes it an nvkvm gap rather than anything
 app-, card- or compositor-specific.
@@ -904,10 +918,14 @@ client with type `M+C+G` holding 50 MiB. So this is specifically the
 X11-via-Xwayland path, not GL in the guest generally.
 
 The failing call is `eglQueryDeviceStringEXT(device,
-EGL_DRM_RENDER_NODE_FILE_EXT)`. That the *device* platform itself works is
-already covered by `validate.sh`'s `egl_context` check (`EGL_EXT_platform_device
-dev 0/3`), so what is missing is the render-node attribute rather than device
-support.
+EGL_DRM_RENDER_NODE_FILE_EXT)` — which fails on the host too.
+
+**How this was got wrong, since the mistake is worth more than the finding:**
+the guest was inspected, something was broken, and it was attributed to nvkvm
+without checking whether the host did the same thing. That is the third time in
+one session — the same error produced a phantom NVML bug (the unversioned
+`libnvidia-ml.so` is missing on the host as well) and a phantom staging
+no-op. **Check the host before blaming the forwarder.**
 
 **Inferred, not proven**: that the same missing attribute explains the weston
 `GL_OUT_OF_MEMORY` symptom recorded below. The two look like one cause with two
