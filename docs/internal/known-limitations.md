@@ -818,6 +818,32 @@ GA10x die. It is deliberately **not** added to the tested-platforms table, whose
 stated bar is "reached a real CUDA kernel launch": this did not.
 
 
+### Priority note: display matters on consumer and workstation parts, not datacenter
+
+Stated by the maintainer, recorded so nobody spends a night on the wrong bug.
+
+Nobody attaches a monitor to an H100 and runs nvkvm with a display on it. On
+**datacenter parts (A100, H100, and similar), display is the lowest priority
+there is** — a graphics failure on one of those is not a release blocker, and a
+graphics *pass* on one is not evidence the display path is healthy. What matters
+on those cards is CUDA.
+
+**Workstation cards are consumer for this purpose.** RTX A-series, RTX 6000 Ada,
+RTX PRO 6000 and similar go into large desktops with monitors attached, so the
+display path matters on them exactly as much as on a GeForce part. Do not group
+them with datacenter silicon just because the name looks professional.
+
+Headless display on datacenter parts may matter eventually for cloud-gaming-style
+use, where frames are captured and streamed rather than scanned out. That is a
+different feature from a physical display and is not what the entries below are
+about.
+
+Practical consequence: the A100 passing `vk_compute_dispatch`, EGL and a
+pixel-checked GL draw while failing `cuCtxCreate` is **exactly the wrong way
+round** for that card. The Vulkan pass is still useful as evidence — it is what
+eliminated the "datacenter part" theory for the Hopper failure — but it is not a
+result to celebrate, and the CUDA failure is the one that counts.
+
 ### X11 clients: Xwayland's glamor cannot allocate through nvkvm — OPEN, unconfirmed
 
 Wayland clients work; **X11 clients under `weston --xwayland` do not get a window.**
