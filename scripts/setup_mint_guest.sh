@@ -135,8 +135,10 @@ apt-get purge -y ubiquity ubiquity-casper ubiquity-frontend-gtk \
 apt-get -y autoremove --purge || true
 
 # ssh is the only thing the live image lacks that this harness needs.
+# weston is the second: see the session block below for why Cinnamon's own
+# session cannot drive the nvkvm head yet.
 apt-get update
-apt-get install -y --no-install-recommends openssh-server
+apt-get install -y --no-install-recommends openssh-server weston
 
 # A real user, replacing the live 'mint' autologin account.
 id -u $GUEST_USER >/dev/null 2>&1 || adduser --disabled-password --gecos "" $GUEST_USER
@@ -145,18 +147,92 @@ usermod -aG sudo,adm,video,render $GUEST_USER
 echo "$GUEST_USER ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/90-$GUEST_USER
 chmod 440 /etc/sudoers.d/90-$GUEST_USER
 
-# Autologin straight into Cinnamon: the point of this guest is a desktop on the
-# physical display, and a greeter asking for a password is in the way.
-mkdir -p /etc/lightdm/lightdm.conf.d
-cat > /etc/lightdm/lightdm.conf.d/90-autologin.conf <<LD
-[Seat:*]
-autologin-user=$GUEST_USER
-autologin-user-timeout=0
-user-session=cinnamon
-LD
-systemctl enable lightdm  || true
-systemctl enable ssh      || true
-systemctl set-default graphical.target || true
+# ── Graphical session ────────────────────────────────────────────────────
+# NOT lightdm, and NOT Cinnamon's own session.  Both are blocked today:
+#
+#   * lightdm's GREETER is itself an Xorg server on the nvkvm head, so it hits
+#     the glamor bug (drmmode_set_pixmap_bo -> glamor_egl_create_textured_
+#     pixmap_from_gbm_bo -> "Failed to create pixmap" -> "failed to create
+#     screen resources") and dies before any session starts.  Left enabled it
+#     restart-loops indefinitely.
+#
+#   * Cinnamon's own Wayland session (cinnamon-wayland.desktop) gets much
+#     further -- muffin brings up KMS on the nvkvm head fine -- but then calls
+#     drmModeSetCursor, which fails with ENXIO because nvkvm exposes no cursor
+#     plane, and muffin SEGVs inside its own disable_hw_cursor_for_crtc()
+#     fallback.  See docs/internal/mint-guest-desktop.md.
+#
+# weston drives the same head, composites its own cursor, and is the path this
+# repo already exercises.  With --xwayland every Mint GTK app runs on it.
+mkdir -p /etc/systemd/system/getty@tty1.service.d
+cat > /etc/systemd/system/getty@tty1.service.d/autologin.conf <<AL
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $GUEST_USER --noclear %I \$TERM
+AL
+
+# Swappable so the Cinnamon session can be retried without re-editing the
+# login path once the cursor-plane gap is closed.
+cat > /home/$GUEST_USER/run-session.sh <<'RS'
+#!/bin/bash
+exec > ~/session.log 2>&1
+echo "=== $(date) session: $(cat ~/session-choice 2>/dev/null) ==="
+export XDG_SESSION_TYPE=wayland
+case "$(cat ~/session-choice 2>/dev/null)" in
+  cinnamon) exec cinnamon-session-cinnamon --wayland ;;
+  *)        exec weston --backend=drm --xwayland ;;
+esac
+RS
+chmod +x /home/$GUEST_USER/run-session.sh
+echo weston > /home/$GUEST_USER/session-choice
+
+# The guard is NOT optional.  /usr/bin/cinnamon-session is a shell wrapper that,
+# for a wayland session, re-execs itself through a LOGIN shell:
+#     exec bash -c "exec -l '$SHELL' -c '$0 -l $*'"
+# so the session inherits the user's login environment.  That login shell
+# re-reads .bash_profile -- which would start the session again.  Without the
+# guard that is an infinite exec chain: it spins at 100% CPU, never spawns a
+# compositor, and prints absolutely nothing (symptom: a 0-byte session log).
+# The guard survives because exec preserves the environment.
+cat > /home/$GUEST_USER/.bash_profile <<'BP'
+[ -f ~/.bashrc ] && . ~/.bashrc
+if [ -z "$NVKVM_SESSION_LAUNCHED" ] && [ -z "$WAYLAND_DISPLAY" ] && [ "$XDG_VTNR" = 1 ]; then
+  export NVKVM_SESSION_LAUNCHED=1
+  exec ~/run-session.sh
+fi
+BP
+chown $GUEST_USER:$GUEST_USER /home/$GUEST_USER/run-session.sh \
+      /home/$GUEST_USER/session-choice /home/$GUEST_USER/.bash_profile
+
+# Build and load the guest module at boot.  RequiresMountsFor is load-bearing:
+# the 9p fstab entries are `nofail`, which removes them from local-fs.target's
+# dependency set, so ordering After=local-fs.target guarantees nothing and the
+# unit loses the race on reboot -- leaving the guest with no DRM node and no
+# GPU.  Same bug, same fix as candidate 67a18e3 on the Ubuntu guest.
+cat > /etc/systemd/system/nvkvm-guest.service <<'NG'
+[Unit]
+Description=Build and load the nvkvm guest module
+After=local-fs.target
+RequiresMountsFor=/mnt/nvkvm
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest && exit 0; modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko'
+# Nodes created by a late insmod are root:root 0600 with no by-path links --
+# they miss the boot-time uevent flow.  Without this trigger no unprivileged
+# compositor can open the card.
+ExecStart=/bin/bash -c 'udevadm trigger --subsystem-match=drm; udevadm settle'
+
+[Install]
+WantedBy=multi-user.target
+NG
+
+systemctl disable lightdm 2>/dev/null || true
+systemctl enable nvkvm-guest || true
+systemctl enable ssh         || true
+systemctl set-default multi-user.target || true
 
 echo "mint-nvkvm" > /etc/hostname
 sed -i 's/^127.0.1.1.*/127.0.1.1\tmint-nvkvm/' /etc/hosts || echo "127.0.1.1 mint-nvkvm" >> /etc/hosts
