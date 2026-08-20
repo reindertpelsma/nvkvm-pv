@@ -74,6 +74,12 @@ users:
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
     lock_passwd: false
+    # video/render own /dev/dri/card0 and renderD128 (0660).  Without them
+    # every GL client gets EACCES opening the render node, NVIDIA's EGL never
+    # claims the device, and clients silently fall back to llvmpipe software
+    # rendering — which looks like "the GPU does not work" rather than a
+    # permissions problem.  cloud-init's default user is NOT in these groups.
+    groups: [video, render]
 
 # ssh_pwauth is a TOP-LEVEL cloud-config key. Nested under the users: entry it is
 # silently ignored, sshd keeps PasswordAuthentication no, and the documented

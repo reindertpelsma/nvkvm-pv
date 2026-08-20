@@ -1222,7 +1222,14 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			/* DRM render nodes, opened while still privileged and
 			 * parked for the stub (see NVKVM_DRM_FD).  Before the
 			 * pivot/chroot, which take the real paths away. */
-			unsigned drm_n = use_uid ? nvkvm_child_park_drm_fds() : 0;
+			/* Park in EVERY mode, not just uid-drop.  The stub
+			 * addresses the node by descriptor NUMBER, so a mode
+			 * that parked nothing left NVKVM_DRM_FD(0) pointing at
+			 * whatever unrelated fd happened to sit there — measured:
+			 * /dev/nvidiactl — and the stub dup'd that and answered
+			 * every DRM ioctl with EINVAL.  See the --drm-fds argv
+			 * below, which stops the stub guessing either way. */
+			unsigned drm_n = nvkvm_child_park_drm_fds();
 			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
 			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -1264,9 +1271,13 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 * deliberately cleared, and argv has the useful property
 			 * of being visible in ps, so a stub running without
 			 * seccomp cannot hide. */
-			const char *argv[] = { "nvkvm_stub", NULL, NULL };
+			char drmarg[24];
+			snprintf(drmarg, sizeof(drmarg), "--drm-fds=%u", drm_n);
+			const char *argv[] = { "nvkvm_stub", NULL, NULL, NULL };
+			int ai = 1;
 			if (!use_seccomp)
-				argv[1] = "--no-seccomp";
+				argv[ai++] = "--no-seccomp";
+			argv[ai++] = drmarg;
 			const char *envp[] = { NULL };  /* M6: drop QEMU env */
 			fexecve(mfd, (char *const *)argv, (char *const *)envp);
 			_exit(127);
@@ -1318,7 +1329,14 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			/* DRM render nodes, opened while still privileged and
 			 * parked for the stub (see NVKVM_DRM_FD).  Before the
 			 * pivot/chroot, which take the real paths away. */
-			unsigned drm_n = use_uid ? nvkvm_child_park_drm_fds() : 0;
+			/* Park in EVERY mode, not just uid-drop.  The stub
+			 * addresses the node by descriptor NUMBER, so a mode
+			 * that parked nothing left NVKVM_DRM_FD(0) pointing at
+			 * whatever unrelated fd happened to sit there — measured:
+			 * /dev/nvidiactl — and the stub dup'd that and answered
+			 * every DRM ioctl with EINVAL.  See the --drm-fds argv
+			 * below, which stops the stub guessing either way. */
+			unsigned drm_n = nvkvm_child_park_drm_fds();
 			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
 			if (use_chroot && nvkvm_iso_enter_chroot(NVKVM_DEV_DIRFD) < 0)
@@ -1346,9 +1364,13 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 				_exit(125);
 			if (harden)
 				nvkvm_drop_caps_post();
-			const char *argv[] = { "nvkvm_stub", NULL, NULL };
+			char drmarg[24];
+			snprintf(drmarg, sizeof(drmarg), "--drm-fds=%u", drm_n);
+			const char *argv[] = { "nvkvm_stub", NULL, NULL, NULL };
+			int ai = 1;
 			if (!use_seccomp)
-				argv[1] = "--no-seccomp";
+				argv[ai++] = "--no-seccomp";
+			argv[ai++] = drmarg;
 			const char *empty_env[] = { NULL };
 			fexecve(binfd, (char *const *)argv,
 				keep_env ? environ : (char *const *)empty_env);

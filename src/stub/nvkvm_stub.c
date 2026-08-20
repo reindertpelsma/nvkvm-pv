@@ -1726,6 +1726,8 @@ static int send_open_device_resp(uint32_t txn_id, int retval, int fd)
 	return r < 0 ? -1 : 0;
 }
 
+static unsigned stub_drm_fd_count;
+
 static void handle_open_device(struct isolate_cmd_open_device *cmd)
 {
 	int fd;
@@ -1749,7 +1751,8 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 		 * away from the others.  Falls through to opening by name when
 		 * nothing was parked, which is the un-hardened spawn.
 		 */
-		if (cmd->dev_id >= 32 && cmd->dev_id < 32 + NVKVM_DRM_FD_MAX)
+		if (cmd->dev_id >= 32 &&
+		    cmd->dev_id - 32 < stub_drm_fd_count)
 			fd = (int)sc3(__NR_fcntl,
 				      NVKVM_DRM_FD(cmd->dev_id - 32),
 				      NVKVM_F_DUPFD_CLOEXEC, 0);
@@ -2813,6 +2816,29 @@ static int stub_streq(const char *a, const char *b)
 	return *a == *b;
 }
 
+static int stub_strneq(const char *a, const char *b, unsigned n)
+{
+	for (unsigned i = 0; i < n; i++) {
+		if (a[i] != b[i])
+			return 0;
+		if (a[i] == '\0')
+			return 1;
+	}
+	return 1;
+}
+
+/*
+ * How many DRM render-node fds QEMU actually parked at NVKVM_DRM_FD(k).
+ * Fails CLOSED at 0: without this the open path dup'd NVKVM_DRM_FD(k)
+ * unconditionally, and in any mode that parked nothing that descriptor number
+ * was already taken by an unrelated device (measured: /dev/nvidiactl).  The
+ * dup then SUCCEEDED, so the open-by-name fallback never ran and every DRM
+ * ioctl went to the wrong device and came back EINVAL -- which surfaced as
+ * NVIDIA's EGL refusing to claim the render node and every GL client in the
+ * guest silently falling back to llvmpipe software rendering.
+ */
+
+
 int main(int argc, char **argv)
 {
 	/*
@@ -2826,9 +2852,18 @@ int main(int argc, char **argv)
 #ifdef NVKVM_STUB_EMBEDDED
 	apply_relocations();
 #endif
-	for (int i = 1; i < argc && argv && argv[i]; i++)
+	for (int i = 1; i < argc && argv && argv[i]; i++) {
 		if (stub_streq(argv[i], "--no-seccomp"))
 			want_seccomp = 0;
+		else if (stub_strneq(argv[i], "--drm-fds=", 10)) {
+			const char *v = argv[i] + 10;
+			unsigned n = 0;
+			for (; *v >= '0' && *v <= '9'; v++)
+				n = n * 10u + (unsigned)(*v - '0');
+			if (*v == '\0' && n <= NVKVM_DRM_FD_MAX)
+				stub_drm_fd_count = n;
+		}
+	}
 	handle_table_init();
 	job_queue_init();
 
