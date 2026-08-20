@@ -407,6 +407,14 @@ bandwidth- and compute-bound rather than launch-bound.
 Quote whichever matches your workload, and do not quote the matmul number for an
 interactive chatbot. Both runs produced byte-identical output text.
 
+OpenCL and Vulkan were checked on the same card, guest and host, and both
+enumerate the A100 identically (`OpenCL 3.0 CUDA`, driver 580.126.09; Vulkan
+`deviceName = NVIDIA A100 80GB PCIe`). Enumeration is not the interesting part:
+OpenCL through nvkvm once returned *wrong answers* rather than failing, so
+`tests/repro/opencl_correctness.c` is the check that matters. It passes on GA100
+in the guest exactly as on bare metal — `ALLOC_HOST_PTR`, `USE_HOST_PTR`, 20
+map/unmap cycles and an `UNORM_INT8` image, 6.3M values verified, 0 failed.
+
 \*\* nvkvm refused a legitimate `UVM_FREE` — the ioctl names its range by base
 alone and sends length 0, and the ownership check rejected the zero length. The
 range stayed live and every later CUDA call in that context returned
