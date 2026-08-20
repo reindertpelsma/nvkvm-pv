@@ -149,6 +149,23 @@ recorded for this handle yields 0 and is refused exactly as before.
 | before | 26/28, 27/28, 27/28 |
 | after | **28/28, 28/28, 28/28** |
 
+Then confirmed on the GPU that found it — an **RTX 4070 (AD104), driver 595.84,
+kernel 7.0**: 28/28 three times over, and a `LD_PRELOAD` interposer in the guest
+shows the path is genuinely exercised rather than merely absent. libcuda issues
+**five `UVM_FREE` calls per run, every one with `length=0x0`**, and all five now
+succeed where each was previously refused:
+
+```
+3x UVM_FREE base=0x7e411ac00000 length=0x0 rc=0 status=0x0
+1x UVM_FREE base=0x7e411b400000 length=0x0 rc=0 status=0x0
+1x UVM_FREE base=0x7e411b000000 length=0x0 rc=0 status=0x0
+```
+
+That matters for how seriously to take this: **595.84 is what a stock Ubuntu
+26.04 install selects for an Ada card**, no driver chosen by hand. Anyone
+installing the current Ubuntu LTS on a 4070 and running nvkvm would have hit
+it.
+
 **Why it hid for so long**, since each of these misled an earlier attempt:
 
 - The guest sees **no failing ioctl** — a refused UVM command comes back as a

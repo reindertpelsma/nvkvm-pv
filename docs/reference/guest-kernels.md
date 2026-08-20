@@ -42,6 +42,9 @@ stable.
 | Ubuntu 24.04 | 6.8 | **28/28** |
 | Debian 12 | 6.1 | **28/28** |
 
+and the **host** side has now run on kernel 7.0 as well (Ubuntu 26.04, RTX
+4070) — previously 7.0 was a compile result only.
+
 The Debian run is the one that matters — 6.1 could not be compiled at all
 before this work, and it exercises the shimmed paths (`zap_vma_ptes`,
 `pud_leaf`, the `vm_next` VMA walk, `class_create`) on real hardware rather

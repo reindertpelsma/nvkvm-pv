@@ -312,7 +312,7 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 3060 | Ampere GA106 | 550.54.14 | 550 | 28/28 |
 | RTX 3060 Ti | Ampere GA104 | 580.95.05 | 580 | 28/28 |
 | RTX 3060 Ti | Ampere GA104 | 595.84 | 580 | `gl_draw_pixel_check` PASS * |
-| RTX 4070 | Ada AD104 | 595.84 | 580 | 28/28 (26/28 before the UVM_FREE fix **) |
+| RTX 4070 | Ada AD104 | 595.84 | 580 | 28/28 on kernel 7.0 (26/28 before the UVM_FREE fix **) |
 | RTX 4070 Ti SUPER | Ada AD103 | 595.84 | 580 | 28/28 (reproduced + fixed the above) |
 | RTX 3080 | Ampere GA102 | 595.84 | 580 | 28/28 |
 | RTX 3060 | Ampere GA106 | 610.43.02 | 610 | 28/28 * |
