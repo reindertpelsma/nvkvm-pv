@@ -432,6 +432,38 @@ Every one of 60 consecutive one-second samples was exactly 60 frames, and it
 holds at 60.0/s with 8 concurrent EGL clients (`glmark2` 58.0/s windowed, 60.0/s
 fullscreen).  The pipeline is display-refresh-bound, not overhead-bound.
 
+**Re-validated 2026-08-20 on the security branch, on the same physical RTX 4070.**
+The 15-fix boundary-audit commit (`53e3a96`) had only ever been compile-tested;
+it changed the isolate liveness/timeout paths, the GPA-window teardown, the
+mmap/munmap ownership checks, the S-4 present import-cache keying and the
+default-deny gates, all of which sit under this measurement. Re-run against the
+known-good desktop workload, with the frame counters now in-tree
+(`NVKVM_PRESENT_TIMING=1`):
+
+| load | rate | dropped |
+|---|---|---|
+| desktop + 4 concurrent `weston-simple-egl` | 60.0/s | 0 |
+| the above + Firefox on a live Wikipedia article | 60.0/s | 0 |
+
+263 consecutive one-second samples, 16,139 frames consumed, **zero dropped**;
+per-present mean 2.3–4.7 ms. Every sample fell in 58.0–60.3 frames/s and the
+modal value was exactly 60.0. Firefox was verified *rendering* — the article
+laid out with images, and interactive on the physical display — not merely
+launched. No regression from the security fixes is visible at the display layer.
+
+Two things had to be true for that measurement to mean anything, and both cost
+time to discover:
+
+- **`-vga none`.** QEMU adds a default stdvga, which becomes console 0, while
+  nvkvm's scanout console is registered second. A `-display gtk` window
+  therefore opens on the *text* console and shows a **black screen** while the
+  guest desktop runs perfectly on console 1 — and `screendump` silently
+  captures the 720x400 text console instead of the 1920x1080 desktop. With
+  `-vga none` nvkvm's console is the only one and both problems vanish.
+- **A verified-animating client.** An idle compositor correctly stops flipping,
+  so the rate reads ~0 with a perfectly healthy pipeline.
+
+
 The leading suspect at the time — a per-present `nvkvm_isolate_present_export()`
 IPC round-trip plus `PRIME_HANDLE_TO_FD`, uncached — was **measured at 0.07 ms**
 and cannot cap 60 to 21.  The planned export cache was therefore *not* built: it
@@ -844,42 +876,136 @@ round** for that card. The Vulkan pass is still useful as evidence — it is wha
 eliminated the "datacenter part" theory for the Hopper failure — but it is not a
 result to celebrate, and the CUDA failure is the one that counts.
 
-### X11 clients: Xwayland's glamor cannot allocate through nvkvm — OPEN, unconfirmed
+### X11 clients: Xwayland renders, but its window content never reaches the screen — OPEN, confirmed nvkvm-side
 
-Wayland clients work; **X11 clients under `weston --xwayland` do not get a window.**
-Observed on the RTX 4070 box, driver 595.84, guest weston with `--xwayland`:
+Wayland clients work; **X11 clients under `weston --xwayland` are invisible.**
+Confirmed on the physical RTX 4070 box, driver 595.84, guest weston 13.0.0 /
+Xwayland 23.2.6, running the branch under test (2026-08-20).
+
+**The decisive test was run.** The previous note asked for exactly one thing —
+put the most trivial possible X client under `weston --xwayland` and see whether
+it hits the same glamor failure — because that separates "some heavy app is at
+fault" from "nvkvm cannot serve this path at all". It is the latter:
 
 ```
-118x glamor0: GL_OUT_OF_MEMORY ... Failed to allocate memory for texture.
- 98x glamor0: GL_OUT_OF_MEMORY ... Failed to acquire the EGL Image memory.
+weston --backend=drm --renderer=gl --socket=wayland-0 --idle-time=0 --xwayland
+DISPLAY=:0 glxgears
 ```
 
-4,949 `(EE)` lines in one weston log, every backtrace through
-`libnvidia-eglcore.so.595.84`, the first firing seconds after Xwayland starts.
-Xwayland does **not** exit — it runs, but its glamor acceleration cannot
-allocate textures or EGLImages through the forwarded driver, so no client
-window is ever mapped (`xwininfo` sees the root plus a 10x10 stub).
+`glxgears` — no CEF, no launcher, no browser — reproduces the failure exactly:
 
-**Scope: this is not app-specific.** Every X11 client goes through the same
-glamor path, so expect it to affect X apps generally — plausibly including
-GNOME-on-Xwayland. The present path is a *different* code path and is
-unaffected: it measures 60.0 swaps/s with zero drops in the same session. The
-distinguishing feature is that Xwayland is a **second** GL consumer allocating
-while the compositor already holds the GPU.
+```
+(EE) glamor0: GL error: GL_OUT_OF_MEMORY error generated. Failed to allocate memory for texture.
+(EE) glamor0: GL error: GL_OUT_OF_MEMORY error generated. Failed to acquire the EGL Image memory.
+(WW) glamor: Failed to allocate 128x128 FBO due to GL_OUT_OF_MEMORY.
+(WW) glamor: Expect reduced performance.
+```
 
-**What is NOT established**, and should not be repeated as if it were:
-whether the OOM is genuine allocation exhaustion or an unimplemented/limited
-path in the forwarding; and whether it is what makes the one launcher tested
-(Minecraft, which embeds Chromium/CEF) die with `std::bad_function_call`. The
-two co-occur, but that launcher created its browser window *before* crashing,
-its binary is stripped, and there is no core — so the link is unproven.
+23 texture + 20 EGLImage OOM events, 982 `(EE)` lines, every backtrace through
+`libnvidia-eglcore.so.595.84`. **No application is at fault.** Every X11 client
+goes through this path, so this is expected to affect X apps generally.
 
-**The cheapest decisive test, when a GPU box is available:** run a trivial X
-client — `glxgears`, or `xterm` — under `weston --xwayland`. If it hits the
-same glamor `GL_OUT_OF_MEMORY`, the application is irrelevant and this is a
-pure nvkvm EGLImage-allocation bug, which is worth more than any individual
-app. Do that before investigating any specific application.
+**Control, same session:** with weston up and *no* X client connected, Xwayland
+has not been spawned and the log has **zero** `(EE)` lines. The first OOM fires
+within a second of Xwayland launching. Xwayland is spawned lazily on the first
+client connection, so "weston is healthy" tells you nothing until an X client
+actually connects.
 
+#### The symptom is NOT what this note previously claimed
+
+The earlier text said "no client window is ever mapped (`xwininfo` sees the root
+plus a 10x10 stub)". **That is wrong**, and it sent the investigation at the
+wrong layer. Measured:
+
+```
+0x200028 (Weston WM frame): 376x397+0+0   Map State: IsViewable
+   └─ 0x400002 "glxgears":  300x300+38+59
+```
+
+The window is mapped, correctly sized, framed by the WM, and `IsViewable`. The
+client's own GL is *fine* — `GL_RENDERER = NVIDIA GeForce RTX 4070/PCIe/SSE2`,
+`GL_VERSION = 4.6.0 NVIDIA 595.84`, i.e. real hardware rendering through nvkvm,
+not a software fallback — and it is throttled to **57–58 FPS**, meaning weston
+is delivering frame callbacks and does consider the surface composited.
+
+Everything reports success. **The screen is empty.** What fails is the window's
+*content* reaching the compositor, not the window's existence, not the client's
+rendering, and not the compositor's frame loop.
+
+#### A/B in a single frame
+
+Both clients running at once, one compositor, one screenshot
+(`weston-screenshooter`, weston started with `--debug`):
+
+| client | kind | result |
+|---|---|---|
+| `weston-simple-egl` | native Wayland EGL | **visible**, renders correctly |
+| `glxgears` | X11 via Xwayland/glamor | window mapped, 58 FPS, **blank** |
+
+The difference is not the GPU, the compositor, the driver or the load. It is
+Xwayland's server-side pixmap path.
+
+#### Where it fails, and what is NOT yet proven
+
+Under `NVKVM_DEBUG=1` the failure localises to the dma-buf **export** keystones,
+and *only* those:
+
+| ioctl | meaning | calls | EINVAL |
+|---|---|---|---|
+| `'F'` nr `0xd4` (`0xc08046d4`) | park RM object on an export fd | 50 | 7 |
+| `'d'` nr `0x49` (`0xc0186449`) | `GEM_EXPORT_NVKMS_MEMORY` (24 B) | 33 | 6 |
+
+Both are steps in `eglExportDMABUFImageMESA`'s kernel work — the mechanism by
+which a rendered buffer is handed to a compositor. Both return `-EINVAL` with
+`nvstatus=0x0 fault=0x0`. Neither appears at all while only weston is running;
+all 13 failures arrive with Xwayland.
+
+Every failure has the same shape — **the second call of a pair, on the same
+handle, with the same command; the first succeeds:**
+
+```
+nvkvm: ioctl_on_isolate: isolate=3 handle=135 cmd=0xc08046d4 ret=0   nvstatus=0x0 fault=0x0
+nvkvm: ioctl_on_isolate: isolate=3 handle=135 cmd=0xc08046d4 ret=-22 nvstatus=0x0 fault=0x0
+```
+
+**Nothing is refused by an allowlist.** Zero `DENY` lines in QEMU, zero errors
+of any kind in QEMU's log, zero nvkvm errors in the guest kernel log. The
+forwarding layer believes it succeeded.
+
+**What is NOT established, and must not be repeated as if it were:**
+
+- **That these EINVALs cause the blank window.** They correlate (13 failures,
+  43 OOM events, all in the Xwayland window) but they are not 1:1, and the
+  *majority* of both exports succeed — 37/50 and 27/33. A path that mostly
+  works is not obviously the path that produces a wholly blank window.
+- Whether the repeated export is nvkvm mis-routing the second call, or NVIDIA's
+  EGL legitimately probing twice and the host driver returning `EINVAL` for the
+  second too. **The missing control is the host:** run the same
+  `weston --xwayland` + `glxgears` on bare metal with an ioctl trace and see
+  whether the same double-call/`EINVAL` pattern appears there. If it does, these
+  are a red herring and the cause is elsewhere.
+- Whether this is what kills the one launcher tested (Minecraft/CEF,
+  `std::bad_function_call`). Still unproven, same as before.
+
+`GL_OUT_OF_MEMORY` is NVIDIA's EGL reporting a *failed import/export*, not
+genuine VRAM exhaustion — the GPU has 12 GB and the desktop is using a few
+hundred MB. Do not chase memory limits.
+
+#### Reproducing
+
+```bash
+# host
+NVKVM_DEBUG=1 VM_DISPLAY="gtk,gl=on" VM_SERIAL=none scripts/run_test_vm.sh -vga none
+# guest, as the unprivileged user (see the weston prerequisites above)
+weston --backend=drm --renderer=gl --socket=wayland-0 --idle-time=0 --xwayland --debug &
+DISPLAY=:0 glxgears        # -> renders, reports NVIDIA, stays invisible
+weston-simple-egl &        # -> visible, the control
+weston-screenshooter       # needs weston --debug, else "Output capture error: unauthorized"
+```
+
+`--debug` is required for `weston-screenshooter`; without it the screenshot
+fails and there is no way to tell a blank window from a working one, since every
+other signal says success.
 
 ### `NV_ESC_RM_IDLE_CHANNELS` degrades to single-channel
 
