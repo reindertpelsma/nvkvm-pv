@@ -407,12 +407,23 @@ Filter at 93.2%.
 Two caveats on that 98.0%, both of which cut in nvkvm's favour and neither of
 which we can remove:
 
-- **The "host" side is itself a VM.** This box is a Proxmox instance with the
-  A100 passed through, so the comparison is the nvkvm guest against *its
-  immediate host*, not against bare metal. That is still the right measurement
-  of what nvkvm costs — it is the same card and the same driver either side —
-  but the RTX 3050 row above, which really is bare metal, is the one to quote
-  for a bare-metal claim.
+- **The "host" side is itself a VM — which makes the number better, not worse.**
+  This box is a Proxmox instance with the A100 passed through, so the topology
+  is L0 bare metal -> L1 the rented VM (the "host" column) -> **L2 the nvkvm
+  guest**. The measurement is therefore nvkvm's forwarding cost *while the guest
+  is already nested a level deeper than usual*, and it is still 98.0% with the
+  worst of eleven workloads at 93.2%.
+
+  That is worth more than a plain parity figure. Nesting is the hostile case for
+  any design that leans on VM exits, because an L2 exit has to traverse
+  L2 -> L1 -> L0. nvkvm's whole premise is that GPU work does **not** exit — a
+  kernel launch is a store to a mapped doorbell page — and this is direct
+  evidence the premise holds where it would be punished hardest. Running nvkvm
+  inside an ordinary cloud VM is not a degraded configuration.
+
+  What it is *not* is a bare-metal number: the RTX 3050 row above is the one to
+  quote for that, and we did not measure L1 against L0, so this does not
+  separate nvkvm's cost from nesting's.
 - **The guest was given less machine.** 8 cores and 15.62 GB against the host's
   16 cores and 94.38 GB. Geekbench's GPU workloads still do CPU-side work, so
   the guest carries a handicap unrelated to forwarding.
