@@ -371,63 +371,65 @@ gbm backend name=drm         + EGL vendor=Mesa     -> host cannot do NVIDIA GBM;
                                                       here, regardless of nvkvm
 ```
 
-### Guest pixels DO reach the host window — but weston negotiates a format that does not (2026-08-20)
+### weston's DRM backend renders black; the present path is not at fault (2026-08-20)
 
-Measured on RTX 4070 / 595.84. The display path works; a specific format
-negotiation does not, and it is weston's default.
+Reproduced on two independent platforms: RTX 4070 / 595.84 / Ada, and RTX 3060 /
+580.159.04 / Ampere.
 
-**Proof the path works.** A plain client (gbm_surface + eglSwapBuffers +
-drmModeSetCrtc, no compositor) renders a known colour and flips it:
+**The present path works.** A plain client (gbm_surface + eglSwapBuffers +
+flip, no compositor) renders a known colour in the guest and it arrives on the
+host exactly, and animates:
 
 ```
-guest: GL_RENDERER NVIDIA GeForce RTX 4070, frame 0 rgb=(0.50,0.93,0.07)
-host:  nonzero_px=2073600/2621440  px[0]=0x007fee11     <- 0x7f,0xee,0x11
-host:  next sample                 px[0]=0x00f31873     <- animation follows
+guest rgb=(0.50,0.93,0.07)  ->  host px[0]=0x007fee11, nonzero_px=2073600/2073600
 ```
 
-and QEMU's window surface, dumped with `NVKVM_PRESENT_DUMP`, is that exact
-green. So guest GL -> flip -> PRIME export -> host import -> window is a
-working, animating pipeline.
+verified across every variation tried: LINEAR and block-linear modifiers,
+drmModeSetCrtc and drmModePageFlip, with and without glFinish. All deliver full
+correct content.
 
-**What weston does differently.** It negotiates `DRM_FORMAT_MOD_LINEAR`
-(`mod=0x0`, bo exactly w*h*4). Every LINEAR bo it flips arrives at the host
-completely empty -- 0 of 2073600 px set -- while the guest renders at ~640 fps.
-A sentinel written into such a bo from the host survived intact frames later,
-so nothing was drawing into it. The working client's bo instead carries
-modifier **0x0300000000606014** (= `NVKVM_MOD_BL2D(0,1,2,6,4)`, which we
-already advertise), is 10485760 bytes, and delivers its pixels perfectly.
+**weston is what is black, and it is backend-specific.** Same guest, same GPU,
+same `EGL vendor: NVIDIA`, weston's OWN screenshot of its OWN output:
 
-**Why the obvious fix does not work.** Three variants were tried and each fails
-in a different way:
-
-| change | result |
+| weston backend | weston's self-screenshot |
 |---|---|
-| drop LINEAR from `nvkvm_pipe_modifiers` | weston: `failed to create gbm surface` -> `Failed to init output gl state` |
-| advertise ONLY 0x0300000000606014 | same failure |
-| advertise no modifiers at all (NULL IN_FORMATS) | weston starts, then `failed to create kms fb: Invalid argument` on every flip |
+| `--backend=headless --renderer=gl` | full correct desktop: panel, clock, textured background, client window |
+| `--backend=drm --renderer=gl` | pure black (per-channel min/max all 0) |
 
-NVIDIA's `gbm_surface_create_with_modifiers` refuses even the exact modifier
-its own non-modifier path picks, so a compositor driven off our IN_FORMATS
-cannot allocate. Note the accept list must keep LINEAR regardless (cursors and
-shadow buffers legitimately use it) -- that is why advertise and accept were
-split rather than sharing one array.
+So weston's GL rendering is fine in this guest; only its DRM-backend output is
+black, and the black buffers we export are a faithful copy of it.
 
-So the remaining work is the modifier negotiation weston performs, not the
-present path.
+**Ruled out by measurement, not argument:**
 
-**Also open: the window freezes.** With the working client, presents keep
-flowing (2653 and counting, probe advancing) while the dumped window surface
-stops changing -- the readback stops draining after roughly a minute. This is
-the old "frames stop updating" symptom and it is NOT the sync-fd issue, which
-was fixed. Import logging was removed when the import cache landed, so the
-freeze is currently uncharacterised; restoring an `import OK`/failure counter
-is the first thing to do.
+- *Modifier negotiation.* Advertising only the modifier NVIDIA's own GBM picks
+  (0x0300000000606014) leaves weston black. LINEAR is not broken either -- a
+  LINEAR scanout surface from the test client delivers 2073600/2073600 px.
+- *Atomic vs legacy KMS.* `WESTON_DISABLE_ATOMIC=1` makes no difference.
+- *Flip mechanism, and rendering sync.* setcrtc/pageflip and finish/nofinish all
+  work for the test client.
+- *Buffer identity and host mapping.* A sentinel written into the exported
+  dma-buf from the host reads back, so the mapping is real memory and both sides
+  address the same allocation.
+- *The host's NVIDIA stack.* See the GBM prerequisite note below -- once
+  `nvidia-drm.modeset=1` is set, host and guest both report
+  `gbm backend name=nvidia` / `EGL vendor=NVIDIA`.
+
+**Corrections to earlier entries in this file.** Two prior diagnoses were wrong
+and are superseded by the above: that the GEM proxy / PRIME export handed us the
+wrong buffer (it does not -- sizes and the sentinel both confirm identity), and
+that weston's LINEAR buffers arrive empty because LINEAR is broken (LINEAR works;
+the buffers are a faithful copy of weston's black output).
+
+**Next step** is inside weston's DRM backend, not the present path: find why its
+gl-renderer produces nothing there while the headless backend on the same device
+produces a correct desktop. Damage/buffer-age handling against our
+drm_simple_display_pipe is the obvious suspect and has not been tested.
 
 Do not read "frames/s presented" as "the display works": it counts handovers.
-Use `NVKVM_PRESENT_PROBE=1` (what is in the exported buffer) and
-`NVKVM_PRESENT_DUMP=<path>` (what the window shows) instead -- both were added
-for exactly this reason, because a frame counter cannot tell black from
-correct.
+Use `NVKVM_PRESENT_PROBE=1` (what is in the exported buffer),
+`NVKVM_PRESENT_DUMP=<path>` (what the window shows), and weston's own
+`weston-screenshooter` (what the compositor thinks it drew) -- the three
+together localise the failure in one run.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
