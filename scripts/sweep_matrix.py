@@ -39,9 +39,10 @@ USAGE
     ./scripts/sweep_matrix.py --search '...' --limit 8 --go --max-spend 5.00
     ./scripts/sweep_matrix.py --render        # re-render the table only
 """
-import argparse, json, os, subprocess, sys, time, datetime
+import argparse, json, os, re, subprocess, sys, time, datetime
 
 KVM_IMAGE = "docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16"
+SWEEP_LABEL = "nvkvm-sweep"
 RESULTS   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                          "tests", "sweep-results.json")
 REPO      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -98,6 +99,55 @@ def wait_ssh(iid, budget=900):
     return None, None
 
 
+def parse_contract(out):
+    """Extract the new instance id from `vastai create instance` output.
+
+    MUST be tolerant.  If a box is created and we lose its id, the finally
+    block has nothing to destroy and it bills until a human notices.  The CLI
+    prints "Started. {'success': True, 'new_contract': 123}" -- which is NOT
+    json (bare True, prose prefix), so a plain json.loads here silently
+    orphans every box.  Try json, then the id by regex, then the trailing
+    "launched successfully" line.
+    """
+    try:
+        d = json.loads(out)
+        if isinstance(d, dict) and d.get("new_contract"):
+            return d["new_contract"]
+    except Exception:
+        pass
+    for pat in (r"new_contract['\"]?\s*[:=]\s*(\d+)",
+                r"launched successfully:\s*(\d+)"):
+        m = re.search(pat, out)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def reap_strays():
+    """Destroy anything still carrying our label.  Backstop, not primary path.
+
+    Covers the cases run_one's finally cannot: create returned an unparseable
+    id, or the create call timed out after the API had already committed the
+    rental.  Only ever touches instances labelled SWEEP_LABEL.
+    """
+    data = vast_json("show instances") or []
+    if isinstance(data, dict):
+        data = data.get("instances", []) or []
+    strays = [i for i in data if (i.get("label") or "") == SWEEP_LABEL]
+    for i in strays:
+        iid = i.get("id")
+        print(f"  !! STRAY {iid} ({i.get('gpu_name')}) alive -- destroying", file=sys.stderr, flush=True)
+        for _ in range(4):
+            _, rc = sh(f"vastai destroy instance {iid}", timeout=90)
+            if rc == 0:
+                print(f"     destroyed {iid}", file=sys.stderr, flush=True)
+                break
+            time.sleep(10)
+        else:
+            print(f"     !! COULD NOT DESTROY {iid} -- DESTROY BY HAND", file=sys.stderr, flush=True)
+    return [i.get("id") for i in strays]
+
+
 def run_one(offer, args):
     iid = None
     rec = {
@@ -110,11 +160,8 @@ def run_one(offer, args):
     }
     try:
         out, rc = sh(f"vastai create instance {offer['id']} --image {KVM_IMAGE} "
-                     f"--disk {args.disk} --ssh --direct --label nvkvm-sweep", timeout=180)
-        try:
-            iid = json.loads(out.replace("'", '"')).get("new_contract")
-        except Exception:
-            iid = None
+                     f"--disk {args.disk} --ssh --direct --label {SWEEP_LABEL}", timeout=180)
+        iid = parse_contract(out)
         if not iid:
             rec["status"] = "create-failed"; rec["detail"] = out[:300]; return rec
         rec["instance_id"] = iid
@@ -229,13 +276,16 @@ def main():
         return
 
     recs = json.load(open(RESULTS)) if os.path.exists(RESULTS) else []
-    for o in offers:
-        print(f"\n=== {o.get('gpu_name')} (offer {o.get('id')}) ===", flush=True)
-        r = run_one(o, args)
-        print(f"    -> {r.get('status')} {r.get('summary','')}", flush=True)
-        recs.append(r)
-        os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
-        json.dump(recs, open(RESULTS, "w"), indent=1)   # written per box, so a crash keeps results
+    try:
+        for o in offers:
+            print(f"\n=== {o.get('gpu_name')} (offer {o.get('id')}) ===", flush=True)
+            r = run_one(o, args)
+            print(f"    -> {r.get('status')} {r.get('summary','')}", flush=True)
+            recs.append(r)
+            os.makedirs(os.path.dirname(RESULTS), exist_ok=True)
+            json.dump(recs, open(RESULTS, "w"), indent=1)   # written per box, so a crash keeps results
+    finally:
+        reap_strays()   # nothing labelled nvkvm-sweep may survive this function
     print("\n" + render(recs))
 
 

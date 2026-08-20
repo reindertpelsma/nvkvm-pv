@@ -774,12 +774,44 @@ early on. That ioctl sets `memblock_size` once per driver instance, so a second
 client getting EBUSY is expected rather than a fault — noted here only so the
 next person does not chase it.
 
-**Where to resume**: correlate each failing UNMAP against the MAP that created
-that mapping, and check whether the object handle the guest passes still refers
-to the same host object after the preceding FREE. The two candidate readings are
-(a) the guest is unmapping an object it already freed and consumer parts happen
-to tolerate it, or (b) handle translation loses the mapping across the FREE.
-Neither is established.
+**ROOT CAUSE FOUND (2026-08-20): `p_linear_address` is zeroed and never
+refilled.** Instrumenting the handles settled it. The UNMAP does *not* follow
+the FREE — it precedes it, on the same object, and carries a NULL address:
+
+```
+A100DBG UNMAP hClient=0xc1d0003c hDevice=0x5c000002 hMemory=0x5c000157 va=0x0 nvstatus=0x57
+A100DBG FREE  hRoot=0xc1d0003c   hParent=0x5c000002 hObject=0x5c000157        nvstatus=0x0
+```
+
+`va=0x0` is the fault. The guest zeroes the field on purpose
+(`src/guest/nvkvm_ioctl.c`, `case NV_ESC_RM_UNMAP_MEMORY`) — correctly, since a
+guest VA is meaningless in the isolate's address space — and the comment there
+states the contract: *"host fills in from its map table"*.
+
+**Nothing on the live host path fills it in.** The only code that ever writes
+`p_linear_address` host-side is in `src/qemu/nvkvm_dispatch.c`, which is inside
+the `#if 0` legacy block and is not reachable. The stub knows NR `0x4f` only
+well enough to find its `status` field offset. So the driver receives every
+`RM_UNMAP_MEMORY` with VA 0, cannot find a mapping there, and answers
+`NV_ERR_OBJECT_NOT_FOUND`. The guest half of a two-part design shipped; the host
+half exists only as dead code.
+
+**Scope — how sure we are this is *the* cause.** Of **1885** forwarded ioctls in
+one failing `cuCtxCreate`, this is the **only** non-zero `nvstatus` in the entire
+trace; everything else returns 0. That makes it the sole visible fault rather
+than one symptom among several. It is *not* proof: `cuCtxCreate` could still be
+failing on something that never surfaces as an ioctl status. Treat it as the
+strongest candidate, not a closed case.
+
+**Why consumer cards do not trip on it** is not established either. The likely
+reading is that the failed UNMAP is harmless there because the FREE immediately
+after tears the object down anyway — but that is a guess, and the honest version
+is that this bug has probably been present and silent on every card.
+
+**The fix** is to implement the host side of the stated contract: record
+`(hClient, hDevice, hMemory) -> host VA` when `NV_ESC_RM_MAP_MEMORY` (0x4e)
+succeeds, and substitute it on `0x4f`. That is a real feature, not a patch, and
+it needs hardware to verify.
 
 This is the first GA100 ever tested here — every other Ampere row is a consumer
 GA10x die. It is deliberately **not** added to the tested-platforms table, whose
