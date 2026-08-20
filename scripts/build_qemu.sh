@@ -340,6 +340,54 @@ else
     echo "  virtio.c already contains virtio-nvgpu entry — skipping patch."
 fi
 
+# ── 6b. Patch ui/egl-helpers.c: import dma-bufs with TexStorage ───────────
+#
+# QEMU's egl_dmabuf_import_texture() binds an imported dma-buf with
+# glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, ...).  NVIDIA hands the guest's
+# scanout buffers out as *external-only* EGLImages and rejects that call:
+# measured on an RTX 4070 / 595.84, the 2D bind returns GL_INVALID_OPERATION
+# (0x0502) while glEGLImageTargetTexStorageEXT (GL_EXT_EGL_image_storage)
+# succeeds on the very same image.  Without this, -display gtk,gl=on imports
+# every frame, drops it, and shows a black window -- so the only usable path is
+# NVKVM_PRESENT_MODE=readback, which costs a full ~8MB glReadPixels per frame on
+# the main loop and cannot reach 60fps at 1080p.
+#
+# Same fix as nvkvm_import_dmabuf_tex() in src/qemu/nvkvm_present_egl.c.
+echo "[6b/9] Patching ui/egl-helpers.c for TexStorage dma-buf import..."
+if grep -q "glEGLImageTargetTexStorageEXT" "$QEMU_SRC/ui/egl-helpers.c"; then
+    echo "  egl-helpers.c already patched -- skipping."
+else
+    python3 - "$QEMU_SRC/ui/egl-helpers.c" <<'EGLPATCH'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = """    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    eglDestroyImageKHR(qemu_egl_display, image);"""
+new = """    {
+        /* nvkvm: NVIDIA rejects the legacy OES bind for external-only
+         * dma-buf images (GL_INVALID_OPERATION); EXT_EGL_image_storage
+         * takes the same image as immutable GL_TEXTURE_2D storage. */
+        static PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC nvkvm_tex_storage;
+        static bool nvkvm_looked_up;
+        if (!nvkvm_looked_up) {
+            nvkvm_looked_up = true;
+            nvkvm_tex_storage = (PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC)
+                eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+        }
+        if (nvkvm_tex_storage) {
+            nvkvm_tex_storage(GL_TEXTURE_2D, (GLeglImageOES)image, NULL);
+        } else {
+            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+        }
+    }
+    eglDestroyImageKHR(qemu_egl_display, image);"""
+if old not in src:
+    sys.exit("egl-helpers.c: expected bind sequence not found")
+open(path, 'w').write(src.replace(old, new, 1))
+print("  ui/egl-helpers.c patched.")
+EGLPATCH
+fi
+
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────
 #
 # Window backends are OFF by default: the normal deployment is headless (a
