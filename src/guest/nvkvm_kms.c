@@ -41,6 +41,27 @@ struct nvkvm_kms {
 	struct drm_simple_display_pipe  pipe;
 	struct hrtimer                  vblank;   /* software vblank source       */
 	ktime_t                         period;   /* 1/refresh                    */
+
+	/*
+	 * Asynchronous present.
+	 *
+	 * nvkvm_virtio_present() is a SYNCHRONOUS virtio round-trip: it puts the
+	 * request on VQ_TX and blocks until QEMU replies.  Calling it straight
+	 * from nvkvm_pipe_update() means the atomic commit -- and therefore the
+	 * guest compositor -- stalls for a full host round-trip on every single
+	 * flip.  Measured on RTX 4070 / 595.84 that capped the pipeline at
+	 * ~21 fps (~47 ms/frame) even with the host-side copy already removed by
+	 * the zero-copy GL path.
+	 *
+	 * Hand the send to an ordered workqueue so the commit returns at once.
+	 * Only the newest frame is kept: if a flip arrives while one is still
+	 * queued, the older framebuffer is dropped.  That is safe because QEMU's
+	 * present slot already discards any frame the display has not drained.
+	 */
+	struct workqueue_struct         *present_wq;
+	struct work_struct              present_work;
+	struct drm_framebuffer          *pending_fb;
+	spinlock_t                      pending_lock;
 };
 
 /* ── Software vblank (vkms-style): an hrtimer drives the CRTC vblank at a fixed
@@ -108,7 +129,22 @@ static void nvkvm_pipe_enable(struct drm_simple_display_pipe *pipe,
 
 static void nvkvm_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
+	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
+	struct drm_framebuffer *fb;
+	unsigned long flags;
+
 	drm_crtc_vblank_off(&pipe->crtc);
+
+	/* Nothing is scanned out any more: flush the queued present and drop
+	 * the framebuffer reference so the bo is not pinned past disable. */
+	if (kms->present_wq)
+		flush_workqueue(kms->present_wq);
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	fb = kms->pending_fb;
+	kms->pending_fb = NULL;
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	if (fb)
+		drm_framebuffer_put(fb);
 }
 
 static int nvkvm_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
@@ -122,6 +158,75 @@ static void nvkvm_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
 {
 	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
 	hrtimer_cancel(&kms->vblank);
+}
+
+/* Send one framebuffer's present to QEMU.  Runs in process context: the
+ * virtio round-trip inside nvkvm_virtio_present() sleeps. */
+static void nvkvm_present_send(struct drm_framebuffer *fb)
+{
+	__u32 stub_handle = 0;
+	struct nvkvm_fd_ctx *fctx = NULL;
+	int pret;
+
+	/* Re-derive owner + handle from the fb we hold a reference on, rather
+	 * than caching them at commit time: the reference keeps the proxy GEM
+	 * (and so the ctx behind it) alive for exactly as long as we need it. */
+	if (!fb || !nvkvm_fb_stub_handle(fb, &stub_handle, &fctx))
+		return;
+
+	pret = nvkvm_virtio_present(fctx, stub_handle, fb->width, fb->height,
+				    fb->pitches[0],
+				    fb->format ? fb->format->format : 0,
+				    fb->modifier);
+	if (pret)
+		pr_info_ratelimited(
+			"nvkvm present: export failed %d (flip %ux%u stub_handle=0x%x)\n",
+			pret, fb->width, fb->height, stub_handle);
+	else
+		pr_info_ratelimited(
+			"nvkvm present: flip %ux%u pitch=%u fmt=0x%08x mod=0x%llx stub_handle=0x%x → exported\n",
+			fb->width, fb->height, fb->pitches[0],
+			fb->format ? fb->format->format : 0,
+			(unsigned long long)fb->modifier, stub_handle);
+}
+
+static void nvkvm_present_work_fn(struct work_struct *w)
+{
+	struct nvkvm_kms *kms = container_of(w, struct nvkvm_kms, present_work);
+	struct drm_framebuffer *fb;
+	unsigned long flags;
+
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	fb = kms->pending_fb;
+	kms->pending_fb = NULL;
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+
+	if (fb) {
+		nvkvm_present_send(fb);
+		drm_framebuffer_put(fb);
+	}
+}
+
+/* Queue @fb for presentation and return immediately.  Replaces any frame still
+ * waiting, so a slow host cannot build a backlog in the guest. */
+static void nvkvm_present_queue(struct nvkvm_kms *kms,
+				struct drm_framebuffer *fb)
+{
+	struct drm_framebuffer *old;
+	unsigned long flags;
+
+	if (!fb || !kms->present_wq)
+		return;
+
+	drm_framebuffer_get(fb);
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	old = kms->pending_fb;
+	kms->pending_fb = fb;
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	if (old)
+		drm_framebuffer_put(old);
+
+	queue_work(kms->present_wq, &kms->present_work);
 }
 
 static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
@@ -140,29 +245,8 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 	 * codec. Best-effort: a failed present must not stall the flip completion
 	 * (we still arm the vblank event below). A plain shmem dumb fb (modetest)
 	 * is not a proxy → nothing to present. */
-	if (fb) {
-		__u32 stub_handle = 0;
-		struct nvkvm_fd_ctx *fctx = NULL;
-
-		if (nvkvm_fb_stub_handle(fb, &stub_handle, &fctx)) {
-			int pret = nvkvm_virtio_present(
-				fctx, stub_handle, fb->width, fb->height,
-				fb->pitches[0],
-				fb->format ? fb->format->format : 0,
-				fb->modifier);
-			if (pret)
-				pr_info_ratelimited(
-					"nvkvm present: export failed %d (flip %ux%u stub_handle=0x%x)\n",
-					pret, fb->width, fb->height, stub_handle);
-			else
-				pr_info_ratelimited(
-					"nvkvm present: flip %ux%u pitch=%u fmt=0x%08x mod=0x%llx stub_handle=0x%x → exported\n",
-					fb->width, fb->height, fb->pitches[0],
-					fb->format ? fb->format->format : 0,
-					(unsigned long long)fb->modifier,
-					stub_handle);
-		}
-	}
+	if (fb)
+		nvkvm_present_queue(container_of(pipe, struct nvkvm_kms, pipe), fb);
 	/* Headless: no real scanout. Pace the flip completion to the software
 	 * vblank so a compositor renders at the refresh rate, not unbounded. */
 	if (event) {
@@ -387,6 +471,13 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	nvkvm_hrtimer_setup(&kms->vblank, nvkvm_vblank_fn,
 			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	kms->period = ns_to_ktime(NSEC_PER_SEC / NVKVM_KMS_HZ);
+
+	/* Ordered: presents must reach QEMU in flip order. */
+	spin_lock_init(&kms->pending_lock);
+	INIT_WORK(&kms->present_work, nvkvm_present_work_fn);
+	kms->present_wq = alloc_ordered_workqueue("nvkvm-present", WQ_MEM_RECLAIM);
+	if (!kms->present_wq)
+		return -ENOMEM;
 
 	drm_connector_helper_add(&kms->conn, &nvkvm_conn_helper_funcs);
 	ret = drm_connector_init(ddev, &kms->conn, &nvkvm_conn_funcs,
