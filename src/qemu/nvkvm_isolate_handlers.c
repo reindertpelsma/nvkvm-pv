@@ -113,6 +113,12 @@ static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id);
  * Defined with the UVM schema below; declared here for the close handlers. */
 void nvkvm_uvm_va_purge_handle(uint32_t handle_id);
 
+/* Retire a dead isolate's RM_MAP_MEMORY VA records.  Defined with the mapva
+ * table far below, but CALLED from nvkvm_req_kill_isolate() far above it, so
+ * the declaration has to be here: the one next to the definition is below its
+ * only caller, which is an implicit declaration -- a hard error since GCC 14. */
+void nvkvm_mapva_forget_isolate(uint32_t iso);
+
 /* ── Device enumeration ──────────────────────────────────────────────────── */
 
 int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
@@ -1459,7 +1465,6 @@ int nvkvm_req_xiso_import(VirtIONvgpu *nv,
 	return 0;
 }
 
-void nvkvm_mapva_forget_isolate(uint32_t iso);
 
 /*
  * ── RM_MAP_MEMORY / RM_UNMAP_MEMORY virtual-address table (A100 fix) ──────
