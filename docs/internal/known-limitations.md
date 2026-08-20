@@ -370,65 +370,67 @@ is fully usable for display work once modeset is on.  `tests/validate.sh` is
 28/28 there either way, because compute and offscreen GL go through
 `EGL_EXT_platform_device` and never touch GBM.
 
-### weston's DRM backend renders black; the present path is not at fault (2026-08-20)
+### Compositors render black: our IN_FORMATS blob only ever offers LINEAR — ROOT CAUSE FOUND 2026-08-20
 
-Reproduced on two independent platforms: RTX 4070 / 595.84 / Ada, and RTX 3060 /
-580.159.04 / Ampere.
+Reproduced on RTX 4070 / 595.84 / Ada and RTX 3060 / 580.159.04 / Ampere.
 
-**The present path works.** A plain client (gbm_surface + eglSwapBuffers +
-flip, no compositor) renders a known colour in the guest and it arrives on the
-host exactly, and animates:
+**The chain, end to end:**
 
-```
-guest rgb=(0.50,0.93,0.07)  ->  host px[0]=0x007fee11, nonzero_px=2073600/2073600
-```
+1. `drm_simple_display_pipe_init()` builds the plane's IN_FORMATS blob during
+   init, filtering our modifier list through the helper's own
+   `drm_simple_kms_format_mod_supported`, which accepts **only LINEAR**.  Our
+   override (grafted immediately afterwards, see #110) fixes AddFB2 validation
+   but is far too late to affect the blob.
+2. So the blob a compositor reads offers exactly one pair: XRGB8888 + LINEAR.
+3. **NVIDIA cannot use a LINEAR dma-buf as an EGLImage render target**, and that
+   import is precisely how a compositor obtains its output framebuffer.
+   Measured in-guest, import a bo and attach it to an FBO:
 
-verified across every variation tried: LINEAR and block-linear modifiers,
-drmModeSetCrtc and drmModePageFlip, with and without glFinish. All deliver full
-correct content.
+   | bo | modifier | bind | FBO |
+   |---|---|---|---|
+   | RENDERING | 0x0300000000e08014 | 0x0000 | COMPLETE |
+   | SCANOUT\|RENDERING | 0x0300000000606014 | 0x0000 | COMPLETE |
+   | SCANOUT\|RENDERING +LINEAR | 0x0000000000000000 | **0x0502** | **INCOMPLETE** |
+   | SCANOUT\|RENDERING +block-linear | 0x0300000000606014 | 0x0000 | COMPLETE |
 
-**weston is what is black, and it is backend-specific.** Same guest, same GPU,
-same `EGL vendor: NVIDIA`, weston's OWN screenshot of its OWN output:
+4. The compositor therefore has no render target and composites nothing.
+   wlroots says so out loud — `EGLImage not supported` / `Failed to create FBO`
+   (`render/gles2/renderer.c:150`); weston fails silently and its own
+   `weston-screenshooter` output is pure black.
+5. We then export a buffer nobody drew into, which is why this looked like a
+   present-path bug for so long.
 
-| weston backend | weston's self-screenshot |
-|---|---|
-| `--backend=headless --renderer=gl` | full correct desktop: panel, clock, textured background, client window |
-| `--backend=drm --renderer=gl` | pure black (per-channel min/max all 0) |
+**Removing LINEAR from the advertised list does not work either**, and the
+symptom names the cause: weston reports `format XRGB8888 not supported by output
+Virtual-1` and then `failed to create gbm surface`.  With LINEAR gone the blob
+is *empty*, because every block-linear modifier we list is filtered out by the
+helper's callback before our override exists.
 
-So weston's GL rendering is fine in this guest; only its DRM-backend output is
-black, and the black buffers we export are a faithful copy of it.
+**The fix** is to make the blob honour our modifiers: build the plane with
+`drm_universal_plane_init()` and our own `drm_plane_funcs` (which already carry
+`format_mod_supported`) instead of taking `drm_simple_display_pipe`'s plane, or
+otherwise rebuild the IN_FORMATS blob after grafting the callback.  Then
+advertise the block-linear modifier NVIDIA's GBM actually picks
+(0x0300000000606014) and keep accepting LINEAR for cursors and other non-render
+framebuffers.
 
-**Ruled out by measurement, not argument:**
+**Proof the rest of the path is sound:** a plain client (gbm_surface +
+eglSwapBuffers + flip) renders a known colour that arrives on the host exactly,
+and animates — under LINEAR and block-linear, setcrtc and pageflip, with and
+without glFinish.  And weston on `--backend=headless` in the same guest, same
+GPU, same NVIDIA EGL, renders a full correct desktop; only `--backend=drm` is
+black.
 
-- *Modifier negotiation.* Advertising only the modifier NVIDIA's own GBM picks
-  (0x0300000000606014) leaves weston black. LINEAR is not broken either -- a
-  LINEAR scanout surface from the test client delivers 2073600/2073600 px.
-- *Atomic vs legacy KMS.* `WESTON_DISABLE_ATOMIC=1` makes no difference.
-- *Flip mechanism, and rendering sync.* setcrtc/pageflip and finish/nofinish all
-  work for the test client.
-- *Buffer identity and host mapping.* A sentinel written into the exported
-  dma-buf from the host reads back, so the mapping is real memory and both sides
-  address the same allocation.
-- *The host's NVIDIA stack.* See the GBM prerequisite note below -- once
-  `nvidia-drm.modeset=1` is set, host and guest both report
-  `gbm backend name=nvidia` / `EGL vendor=NVIDIA`.
+**Superseded earlier entries in this file:** that the GEM proxy / PRIME export
+handed us the wrong buffer (it does not — sizes match and a host-written
+sentinel reads back), and that weston's LINEAR buffers "arrive empty" because
+LINEAR transport is broken (LINEAR transports fine; nothing was ever drawn into
+those buffers).
 
-**Corrections to earlier entries in this file.** Two prior diagnoses were wrong
-and are superseded by the above: that the GEM proxy / PRIME export handed us the
-wrong buffer (it does not -- sizes and the sentinel both confirm identity), and
-that weston's LINEAR buffers arrive empty because LINEAR is broken (LINEAR works;
-the buffers are a faithful copy of weston's black output).
-
-**Next step** is inside weston's DRM backend, not the present path: find why its
-gl-renderer produces nothing there while the headless backend on the same device
-produces a correct desktop. Damage/buffer-age handling against our
-drm_simple_display_pipe is the obvious suspect and has not been tested.
-
-Do not read "frames/s presented" as "the display works": it counts handovers.
-Use `NVKVM_PRESENT_PROBE=1` (what is in the exported buffer),
-`NVKVM_PRESENT_DUMP=<path>` (what the window shows), and weston's own
-`weston-screenshooter` (what the compositor thinks it drew) -- the three
-together localise the failure in one run.
+Instruments that localised this, all env-gated and off by default:
+`NVKVM_PRESENT_PROBE=1` (what is in the exported buffer; `=2` also proves the
+mapping is real memory), `NVKVM_PRESENT_DUMP=<path>` (what the window shows),
+and the compositor's own screenshooter (what it thinks it drew).
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
