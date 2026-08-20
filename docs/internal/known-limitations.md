@@ -409,28 +409,46 @@ area:
 - **`f4201ff`** — advertise only modifiers the driver really implements.  Once
   the blob reached clients, the 16 hand-rolled BL2D guesses became harmful: a
   client that picks an invented modifier gets a buffer the driver cannot render
-  into.  Xorg/glamor died with "Failed to create pixmap".  Only
+  into.  Xorg/glamor died with "Failed to create pixmap" (a *different* glamor
+  failure from the open `GL_OUT_OF_MEMORY` one below — this one is fixed).  Only
   `0x0300000000606014` (SCANOUT|RENDERING) is published; LINEAR is still
   *accepted* for cursors, just not offered.
 
 **Measured on the physical RTX 4070 (595.84):** guest flip deltas 16.4–18.1 ms,
 median 16.7 ms = **59.9 Hz**, with the desktop displayed in a QEMU GTK window.
 
-**Still open: the host receives only ~21 presents/s** even though the guest
-paces at ~60 Hz.  Two theories have been tested and disproven, both with
-module-verified A/B measurements:
+**RESOLVED 2026-08-20: there was no ceiling.  The "~21 presents/s" was an
+artifact of counting log lines, which only some paths emit.**  Re-measured with
+per-frame counters compiled into the present path:
 
-| change | host rate |
+| stage | rate |
+|---|---|
+| guest KMS flips | 59.9 Hz |
+| host submits | 60.0/s |
+| host window swaps | 60.0/s |
+| dropped | 0 |
+
+Every one of 60 consecutive one-second samples was exactly 60 frames, and it
+holds at 60.0/s with 8 concurrent EGL clients (`glmark2` 58.0/s windowed, 60.0/s
+fullscreen).  The pipeline is display-refresh-bound, not overhead-bound.
+
+The leading suspect at the time — a per-present `nvkvm_isolate_present_export()`
+IPC round-trip plus `PRIME_HANDLE_TO_FD`, uncached — was **measured at 0.07 ms**
+and cannot cap 60 to 21.  The planned export cache was therefore *not* built: it
+would have been a patch for a problem that did not exist.  The two earlier A/B
+results below stand as real (the `glReadPixels` removal genuinely moved 10 → 21
+by the old metric), but the "21" endpoint was never a true rate.
+
+| change | host rate (old log-line metric) |
 |---|---|
 | per-frame `glReadPixels` removed (GL zero-copy, `2e9413f`) | 10/s → 21/s |
 | present send made non-blocking in the guest (workqueue, `8b0592c`) | 21/s → 21/s (guest reached 60 Hz) |
 | present send made fully fire-and-forget | 21/s → 22/s (noise; not landed) |
 
-So the ceiling is **not** guest-side send latency.  The leading remaining
-suspect is per-present host work: `nvkvm_req_present()` calls
-`nvkvm_isolate_present_export()` on every frame, which is a synchronous IPC
-round-trip to the sandboxed stub plus a DRM `PRIME_HANDLE_TO_FD` ioctl.  The
-import cache (`ac0dd8f`) caches the EGL import but nothing caches the export.
+**Count frames with a counter, not with log lines.**  A separate "2.5 fps with
+4.8-second freezes" reading from the same session was the kernel's printk
+ratelimiter — 291 suppressed callbacks per 5 s window is itself ~60/s.  Both
+looked like real performance bugs; neither was.
 
 **Measurement traps that produced false findings here, all confirmed:**
 
@@ -685,6 +703,43 @@ Do not put untrusted tenants behind this.
 ---
 
 ## Functional gaps worth knowing
+
+### X11 clients: Xwayland's glamor cannot allocate through nvkvm — OPEN, unconfirmed
+
+Wayland clients work; **X11 clients under `weston --xwayland` do not get a window.**
+Observed on the RTX 4070 box, driver 595.84, guest weston with `--xwayland`:
+
+```
+118x glamor0: GL_OUT_OF_MEMORY ... Failed to allocate memory for texture.
+ 98x glamor0: GL_OUT_OF_MEMORY ... Failed to acquire the EGL Image memory.
+```
+
+4,949 `(EE)` lines in one weston log, every backtrace through
+`libnvidia-eglcore.so.595.84`, the first firing seconds after Xwayland starts.
+Xwayland does **not** exit — it runs, but its glamor acceleration cannot
+allocate textures or EGLImages through the forwarded driver, so no client
+window is ever mapped (`xwininfo` sees the root plus a 10x10 stub).
+
+**Scope: this is not app-specific.** Every X11 client goes through the same
+glamor path, so expect it to affect X apps generally — plausibly including
+GNOME-on-Xwayland. The present path is a *different* code path and is
+unaffected: it measures 60.0 swaps/s with zero drops in the same session. The
+distinguishing feature is that Xwayland is a **second** GL consumer allocating
+while the compositor already holds the GPU.
+
+**What is NOT established**, and should not be repeated as if it were:
+whether the OOM is genuine allocation exhaustion or an unimplemented/limited
+path in the forwarding; and whether it is what makes the one launcher tested
+(Minecraft, which embeds Chromium/CEF) die with `std::bad_function_call`. The
+two co-occur, but that launcher created its browser window *before* crashing,
+its binary is stripped, and there is no core — so the link is unproven.
+
+**The cheapest decisive test, when a GPU box is available:** run a trivial X
+client — `glxgears`, or `xterm` — under `weston --xwayland`. If it hits the
+same glamor `GL_OUT_OF_MEMORY`, the application is irrelevant and this is a
+pure nvkvm EGLImage-allocation bug, which is worth more than any individual
+app. Do that before investigating any specific application.
+
 
 ### `NV_ESC_RM_IDLE_CHANNELS` degrades to single-channel
 

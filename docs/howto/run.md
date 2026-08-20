@@ -303,7 +303,8 @@ as root:
 ```bash
 # as ubuntu, not root -- see below
 env XDG_RUNTIME_DIR=/run/user/1000 LIBSEAT_BACKEND=seatd \
-    weston --backend=drm --renderer=gl --socket=wayland-0 --idle-time=0
+    weston --backend=drm --renderer=gl --socket=wayland-0 --idle-time=0 \
+            --xwayland
 ```
 
 Four details here are load-bearing, and each one fails in a way that does not
@@ -332,6 +333,14 @@ look like its cause:
 - **`--idle-time=0`** for anything unattended. weston's default is 300s, after
   which it blanks the output; a benchmark left running longer than that reports
   a frozen frame counter that looks exactly like a pipeline stall.
+
+- **`--xwayland`** for X-only clients, with the `xwayland` package installed.
+  Without it they do not fail politely: the Minecraft launcher (GTK) takes a
+  `SIGSEGV` inside `libX11` because `XOpenDisplay()` returns NULL and the
+  caller dereferences it unchecked, while its stderr prints `OK` and the real
+  error goes to `~/.minecraft/bootstrap_log.txt`. Xwayland spawns lazily on the
+  first X client, so `pgrep Xwayland` finding nothing beforehand is not a
+  failure.
 
 `weston-screenshooter` additionally needs weston started with `--debug`, or it
 returns `Output capture error: unauthorized`.
