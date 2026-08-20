@@ -31,9 +31,12 @@ kernel headers and toolchain:
 | 6.12 | yes | Debian 13 | **yes** |
 | 6.14 | — | Ubuntu 25.04 | **yes** |
 | 6.19 | — | Fedora 42 | **yes** |
+| 7.0 | — | Ubuntu 26.04 | **yes** |
 
 That covers every LTS in the range NVIDIA's driver supports, plus current
-stable.
+stable. 7.0 builds in both the graphics and compute-only variants; the only
+warnings are pre-existing ones that also appear on older kernels (unchecked
+`copy_to_user` returns, one 1056-byte stack frame), not 7.0 API drift.
 
 **A build is not a run**, so two of them were run:
 

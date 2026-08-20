@@ -84,7 +84,7 @@ Not yet for untrusted multi-tenant hosting — see below.
 | | |
 |---|---|
 | Host | Linux with KVM, an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
-| Guest | Linux, kernel 5.15 – 6.19 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
+| Guest | Linux, kernel 5.15 – 7.0 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Build | QEMU 9.2 is built from source by the provided script |
@@ -254,6 +254,30 @@ method: [`tests/perf/realapp_matrix.md`](tests/perf/realapp_matrix.md).
 Where the guest is measurably slower it is latency-bound control paths, never
 sustained compute or bandwidth.
 
+### Desktop graphics
+
+A Wayland compositor runs on the GPU inside the guest, and its desktop can be
+displayed and driven in a window on the host — see
+[running a guest desktop in a window](docs/howto/run.md#running-the-guest-desktop-in-a-window).
+Measured on an RTX 4070, driver 595.84, guest `weston --backend=drm
+--renderer=gl`:
+
+```
+Using rendering device: /dev/dri/renderD128
+EGL vendor: NVIDIA
+GL renderer: NVIDIA GeForce RTX 4070/PCIe/SSE2
+GL version: OpenGL ES 3.2 NVIDIA 595.84
+```
+
+The guest's composited frame reaches the host window as a dma-buf with no
+readback (`NVKVM_PRESENT_MODE=gl`): ~637 frames/s at 1920x1080, triple
+buffered, and 190,013 frames over a five-minute run with no import errors.
+
+Graphics is the one area where the guest is well short of the host rather than
+at parity: `glmark2-wayland` scores **6857 in the guest vs 21571 on the host**
+on the same box (~32%). Compute and bandwidth are at 1.00x, as above; the
+graphics present path has real overhead and is the honest number to quote.
+
 ### Containers
 
 Docker with `nvidia-container-toolkit` works inside the guest with no special
@@ -380,8 +404,8 @@ itself. It does need the matching userspace libraries, staged from the host by
 **Which guest distros are supported?**
 The distro does not matter; the **kernel version** does. `nvkvm-guest.ko` is
 built against the guest's own headers, and it builds on **5.15, 6.1, 6.6, 6.8,
-6.12, 6.14 and 6.19** — every LTS in the range NVIDIA's driver supports, plus
-current stable — in both the graphics and compute-only variants. Verify any
+6.12, 6.14, 6.19 and 7.0** — every LTS in the range NVIDIA's driver supports,
+plus current stable — in both the graphics and compute-only variants. Verify any
 kernel yourself with `bash tests/kernel_matrix.sh`, which needs Docker and
 nothing else. Table and the API differences it papers over:
 [guest kernels](docs/reference/guest-kernels.md).
