@@ -64,9 +64,14 @@ Not yet for untrusted multi-tenant hosting — see below.
 - **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
   security boundary you should rely on. It also runs in **containers**, where
   Linux namespaces are usually blocked — the isolate falls back to UID separation,
-  which is weaker; see [the isolate model](docs/internal/isolate-model.md). We audited it ourselves and published what
-  we found — 14 unenforced paths with severities and containment, four since fixed
-  — in [the pointer audit](docs/internal/audit-guest-pointers.md).
+  which is weaker; see [the isolate model](docs/internal/isolate-model.md). We
+  audit it ourselves and publish what we find, fixed or not: the
+  [pointer audit](docs/internal/audit-guest-pointers.md) (14 unenforced paths,
+  5 since fixed) and the
+  [boundary audit](docs/internal/audit-boundaries-2026-08-20.md) (19 findings
+  across all three trust boundaries, 15 fixed, 4 named as open). The most
+  exposed surface in the second was liveness, not memory safety: an
+  unprivileged guest could hang the whole VMM without corrupting anything.
   **Do not put untrusted tenants behind it.**
 - **Not a virtual monitor.** There is no scanout path. A GPU-accelerated desktop
   runs inside the guest and frames leave by *capture*, not by a virtual display.
@@ -209,14 +214,25 @@ the host; every CUDA check on that part passes. Traced to a channel/compute
 class mismatch, with two hypotheses eliminated —
 [detail](docs/reference/correctness.md#vulkan-compute-on-hopper).
 
-**Graphics: GL clients now render, but the display path is not stable.** As of
-2026-08-19 a Wayland GL client inside the guest gets a real NVIDIA context and
-puts real pixels in its window — before this it silently ran on llvmpipe. Two
-defects remain open and neither is fixed: frames stall after an initial burst,
-and a GL client can take the whole guest down with `kvm run failed Bad address`
-roughly 10–60 s in. Compute is unaffected. Treat guest graphics as
-work-in-progress, not a feature —
-[detail](docs/internal/known-limitations.md).
+**Graphics: Wayland works; X11 clients do not get a window.** A full Wayland
+desktop runs on the GPU inside the guest and is interactive in a host window at
+60.0 frames/s with zero dropped frames — a browser rendering real pages, eight
+concurrent EGL clients. The earlier "frames stall after an initial burst" is
+resolved.
+
+Still open. **X11 clients get no window**: under `weston --xwayland`, Xwayland
+runs but its glamor acceleration cannot allocate textures or EGLImages through
+the forwarded driver (`GL_OUT_OF_MEMORY`, every backtrace through
+`libnvidia-eglcore`), so nothing is ever mapped. This is not app-specific —
+every X11 client uses that path. Wayland clients are unaffected, and so is the
+present path.
+
+**`kvm run failed Bad address`** — a GL client taking the guest down 10–60 s in
+— has **not reproduced** since: 150 s+ of continuous glmark2, a full 20-scene
+run, a five-minute soak at 190,013 frames, and an interactive desktop session.
+It was originally seen on different hardware and several unrelated fixes have
+landed, so treat it as open-and-unreproduced rather than closed.
+[Detail](docs/internal/known-limitations.md).
 
 **28/28 is not evidence that your workload computes correctly.** The suite
 covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL — it does not
@@ -448,7 +464,13 @@ sustained work, budget for that; otherwise you will not notice.
 **Is it safe to run untrusted guests?**
 Not yet — treat it as experimental. The ioctl and alloc-class gates are
 default-deny and the guest kernel module is untrusted by design, but the code
-has not had an external security review. See
+has had no *external* security review. It has had two internal ones, both
+published with their open findings rather than only their fixed ones: the
+[pointer audit](docs/internal/audit-guest-pointers.md) and the
+[boundary audit](docs/internal/audit-boundaries-2026-08-20.md). Read the second
+before deciding: it found that an unprivileged guest could hang the entire VMM
+without corrupting a single byte, which is the kind of thing a "no known memory
+bugs" summary hides. See also
 [the isolate model](docs/internal/isolate-model.md).
 
 **Can nvkvm itself run inside a container?**
@@ -469,9 +491,14 @@ container boundary sits *outside* the VMM, so breaking out of the VMM lands the
 attacker in the container rather than on the host.
 
 **Why is my GPU showing as llvmpipe?**
-The guest is falling back to software rendering because the NVIDIA userspace
-libraries did not stage. See
-[staging guest libraries](docs/howto/stage-guest-libraries.md).
+Two causes, and the second is easy to miss. Either the NVIDIA userspace
+libraries did not stage — see
+[staging guest libraries](docs/howto/stage-guest-libraries.md) — or the user
+running the client is not in the guest's `video` and `render` groups, so opening
+the render node returns `EACCES` and the stack falls back silently. Nothing
+errors; you simply get software rendering that looks like a working GPU until
+you check the renderer string. `scripts/setup_guest.sh` puts the default user in
+both groups.
 
 **Does CUDA give bit-identical results to the host?**
 On everything measured, yes — including token-identical LLM output at
@@ -489,14 +516,19 @@ validating. Verify your own workload against a host run all the same; see
 | [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
+| [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
 
 ## Status
 
 Experimental. It runs real workloads at host parity on three GPU architectures,
 and it is a research artifact rather than a supported product. Known open items
-are tracked in [known limitations](docs/internal/known-limitations.md); notably
-hardware video encode (NVENC) and GL clients under Wayland are not currently
-working and are under investigation.
+are tracked in [known limitations](docs/internal/known-limitations.md); the
+largest are X11 clients under XWayland getting no window, and Vulkan compute on
+Hopper.
+
+Two entries that used to sit here have since been re-tested and no longer hold:
+GL clients under Wayland now work (a full desktop at 60 frames/s), and the
+NVENC hang did not reproduce on the driver it was reported against.
 
 Issues and measurements from other hardware are welcome — particularly boots on
 driver branches this repository has not exercised.

@@ -599,7 +599,22 @@ non-locally when a driver branch moves.
 
 ## Video
 
-### NVENC does not work in the guest on 575.51.03 — open
+### NVENC — the 575.51.03 hang DID NOT REPRODUCE (2026-08-20)
+
+**Re-tested on an RTX 3060, driver 575.51.03 — the same driver this entry was
+written against — and hardware encode completes.** The documented repro (a
+trivial 5 s 720p solid-colour source through `h264_nvenc`) exits 0 rather than
+hanging; `hevc_nvenc` likewise; a real file encode produced 920 KB of H.264; and
+via PyAV both encoders returned packets for 18 of 20 submitted frames.
+
+That is **not** proof the original finding was wrong. It was observed on
+different hardware, and a great deal has changed in this tree since. Treat this
+as *does not reproduce here*, not as fixed — and if you can still reproduce the
+hang, the detail below is what to compare against.
+
+The original entry follows, unedited:
+
+---
 
 Do not claim hardware video encode works.
 
