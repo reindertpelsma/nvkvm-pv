@@ -65,11 +65,42 @@ def vast_json(args, timeout=120):
         return None
 
 
-def search(filt, limit, max_price):
+# Pre-Turing. The project states these do not work at all -- cuInit fails and
+# the open kernel module will not probe them -- so renting one measures a
+# documented negative. Worth doing ONCE, deliberately, with
+# --include-unsupported; never worth a slot in a coverage sweep, which is what
+# happened the first time this script ran (it sorted purely by price and picked
+# a Quadro P4000 for $0.067 over cards whose behaviour is actually unknown).
+UNSUPPORTED_MARKERS = (
+    "P4000", "P5000", "P6000", "P100", "P40", "P4",          # Pascal
+    "GTX 10", "TITAN X", "TITAN Xp",                          # Pascal consumer
+    "M4000", "M6000", "M60", "M40", "GTX 9",                  # Maxwell
+    "K80", "K40", "GTX 7",                                    # Kepler
+)
+
+
+def is_unsupported(gpu):
+    g = (gpu or "").upper()
+    return any(m.upper() in g for m in UNSUPPORTED_MARKERS)
+
+
+def search(filt, limit, max_price, include_unsupported=False, prefer_untested=None):
     offers = vast_json(f"search offers '{filt}' -o dph") or []
     seen, picked = set(), []
-    for o in sorted(offers, key=lambda x: x.get("dph_total", 99)):
+
+    def rank(o):
+        # Coverage value first, price second. Cheapness is a tiebreak, not the
+        # goal: a $0.04 box that re-confirms a card already in the table buys
+        # nothing, and a $0.30 box on an untested die buys a row.
+        gpu = (o.get("gpu_name") or "")
+        untested = 0 if (prefer_untested and any(t.upper() in gpu.upper()
+                                                 for t in prefer_untested)) else 1
+        return (untested, o.get("dph_total", 99))
+
+    for o in sorted(offers, key=rank):
         gpu = o.get("gpu_name")
+        if not include_unsupported and is_unsupported(gpu):
+            continue
         # one box per (gpu model, driver branch): the point is coverage, not repeats
         key = (gpu, str(o.get("driver_version", "?")).split(".")[0])
         if key in seen or o.get("dph_total", 99) > max_price:
@@ -253,6 +284,14 @@ def main():
     ap.add_argument("--max-spend", type=float, default=5.00)
     ap.add_argument("--disk", type=int, default=64)
     ap.add_argument("--go", action="store_true", help="actually spend money (default is dry-run)")
+    ap.add_argument("--include-unsupported", action="store_true",
+                    help="also rent pre-Turing cards (Pascal and older). These are "
+                         "documented as non-working; use this only to deliberately "
+                         "re-measure that boundary, not in a coverage sweep.")
+    ap.add_argument("--prefer", default="",
+                    help="comma-separated substrings to rank FIRST regardless of price, "
+                         "e.g. --prefer 'A100,L40,5080' -- use for dies not yet in the "
+                         "tested-platforms table")
     ap.add_argument("--render", action="store_true")
     args = ap.parse_args()
 
@@ -260,7 +299,9 @@ def main():
         recs = json.load(open(RESULTS)) if os.path.exists(RESULTS) else []
         print(render(recs)); return
 
-    offers = search(args.search, args.limit, args.max_price)
+    prefer = [x.strip() for x in args.prefer.split(',') if x.strip()]
+    offers = search(args.search, args.limit, args.max_price,
+                    args.include_unsupported, prefer)
     if not offers:
         print("no offers matched"); return
     est = sum(o.get("dph_total", 0) for o in offers) * 0.75   # ~45 min each
