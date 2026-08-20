@@ -844,7 +844,45 @@ round** for that card. The Vulkan pass is still useful as evidence — it is wha
 eliminated the "datacenter part" theory for the Hopper failure — but it is not a
 result to celebrate, and the CUDA failure is the one that counts.
 
-### X11 clients: Xwayland's glamor cannot allocate through nvkvm — OPEN, unconfirmed
+### X11 clients fall back to llvmpipe — ROOT CAUSE FOUND (2026-08-20)
+
+**The EGL device does not answer `EGL_DRM_RENDER_NODE_FILE_EXT` through nvkvm,
+and everything else follows from that.** Reproduced on an A100 (GA100, Ubuntu
+26.04, GNOME 50 headless) — a different card, compositor and OS from the RTX
+4070/weston case below, which makes it an nvkvm gap rather than anything
+app-, card- or compositor-specific.
+
+The chain, each step observed:
+
+```
+mutter:   Failed to query EGL render node path: One or more argument values are invalid.
+Xwayland: glamor: GBM Wayland interfaces not available
+Xwayland: Failed to initialize glamor, falling back to sw
+glxgears: GL_RENDERER = llvmpipe (LLVM 21.1.8), Mesa 26.0.8
+```
+
+The compositor asks EGL for the render node backing its device; the query fails,
+so it cannot advertise the GBM/dmabuf Wayland interfaces that Xwayland's glamor
+requires; glamor initialisation fails; Xwayland falls back to software; and every
+X11 client on that display gets llvmpipe.
+
+**Wayland clients are unaffected.** On the same machine at the same moment,
+GNOME Shell itself is genuinely GPU-accelerated — `nvidia-smi` lists it as a
+client with type `M+C+G` holding 50 MiB. So this is specifically the
+X11-via-Xwayland path, not GL in the guest generally.
+
+The failing call is `eglQueryDeviceStringEXT(device,
+EGL_DRM_RENDER_NODE_FILE_EXT)`. That the *device* platform itself works is
+already covered by `validate.sh`'s `egl_context` check (`EGL_EXT_platform_device
+dev 0/3`), so what is missing is the render-node attribute rather than device
+support.
+
+**Inferred, not proven**: that the same missing attribute explains the weston
+`GL_OUT_OF_MEMORY` symptom recorded below. The two look like one cause with two
+presentations — weston failed to allocate where GNOME degrades to software — but
+that has not been retested on the 4070 since the root cause was found.
+
+### X11 clients: Xwayland's glamor cannot allocate through nvkvm — earlier symptom, same suspected cause
 
 Wayland clients work; **X11 clients under `weston --xwayland` do not get a window.**
 Observed on the RTX 4070 box, driver 595.84, guest weston with `--xwayland`:
