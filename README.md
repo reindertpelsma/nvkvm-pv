@@ -474,6 +474,30 @@ launch, matmul, byte-exact transfers — and OpenGL renders through the forwarde
 (28/28); the A/B that pins that on the driver rather than on nvkvm is in
 [Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
 
+Host/guest parity on that H100, same box, same scripts:
+
+| workload | host | guest | ratio |
+|---|---|---|---|
+| **Geekbench 7 GPU (OpenCL)** | **265071** | **261901** | **98.8%** |
+| bf16 matmul 8192x8192 | 487.3 TFLOP/s | 495.5 TFLOP/s | **1.02x** |
+| Qwen2.5-7B generate, batch 1, greedy | 40.0 tok/s | 32.9 tok/s | **0.82x** |
+
+Both Geekbench runs are published:
+[side by side](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612).
+Greedy generations were byte-identical between host and guest.
+
+The same two caveats as the A100 row apply, and cut the same way. The "host"
+column is itself a VM — this box was sold as dedicated bare metal and is in fact
+a Proxmox guest (`Hypervisor vendor: KVM`, DMI `Standard PC (Q35 + ICH9)`), so
+98.8% is again an **L2** measurement, nvkvm's cost while nested one level deeper
+than usual. And the guest was given less machine: 16 cores / 62.79 GB against
+20 cores / 125.88 GB.
+
+The 0.82x decode row is the control path, not the data path: batch-1 eager
+generation in HF transformers is launch-bound, so it measures per-call
+forwarding overhead almost directly. Runtimes that batch their launches do not
+pay it — llama.cpp reaches 0.97x, and the vLLM table above is at 1.00x.
+
 ## FAQ
 
 **Is this vGPU or SR-IOV?**
