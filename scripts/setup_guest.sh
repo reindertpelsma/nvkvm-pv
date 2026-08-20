@@ -113,6 +113,16 @@ write_files:
       [Unit]
       Description=Build and load the nvkvm guest module, stage NVIDIA userspace
       After=local-fs.target network.target
+      # The repo arrives over 9p and every ExecStart below reads it, but the
+      # fstab entries are `nofail` -- which removes them from local-fs.target's
+      # dependencies, so local-fs.target completes whether or not they mounted.
+      # On FIRST boot cloud-init happens to run late enough to hide this; on
+      # every REBOOT the unit lost the race and died with
+      # "cd: /mnt/nvkvm/src/guest: No such file or directory", leaving no module
+      # and no GPU nodes until someone ran `mount -a` by hand.  RequiresMountsFor
+      # pulls in and orders after the actual mount unit.  Safe to require: the
+      # first ExecStart cannot do anything without this path anyway.
+      RequiresMountsFor=/mnt/nvkvm
       [Service]
       Type=oneshot
       RemainAfterExit=yes
