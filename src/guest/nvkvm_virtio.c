@@ -453,20 +453,58 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 	 * On a pending signal we must NOT abandon the descriptor: req_buf and
 	 * inf->resp_buf are still owned by the virtqueue and QEMU will write
 	 * the response into resp_buf when the stub finishes.  Freeing now would
-	 * be a use-after-free.  Instead we ask the isolate to interrupt the
-	 * in-flight host ioctl (so it returns -EINTR promptly), then wait
-	 * uninterruptibly for the descriptor to come back, and finally report
-	 * -ERESTARTSYS so the guest syscall is restarted/interrupted normally.
+	 * be a use-after-free.  So we ask the isolate to interrupt the in-flight
+	 * host ioctl (so a genuinely long GPU operation cannot pin this thread
+	 * indefinitely), then wait uninterruptibly for the descriptor to come
+	 * back.
+	 *
+	 * And then we DELIVER that response instead of reporting -ERESTARTSYS.
+	 *
+	 * Reporting -ERESTARTSYS here was wrong, and it is what made every X11
+	 * client invisible.  The request has already been submitted to the host
+	 * by the time we can be signalled, so the operation may ALREADY HAVE
+	 * TAKEN EFFECT -- and several of the ones on this path are not
+	 * idempotent.  NV_ESC_* 'F' nr 0xd4 parks an RM object on an export fd
+	 * and DRM 'd' nr 0x49 (GEM_EXPORT_NVKMS_MEMORY) associates a bo with
+	 * it; both are steps of eglExportDMABUFImageMESA.  Run them a second
+	 * time on the same handle -- which is exactly what a restarted syscall
+	 * does -- and the driver correctly refuses with EINVAL, because the
+	 * export it is being asked to make already exists.
+	 *
+	 * NVIDIA's EGL reports that refusal as GL_OUT_OF_MEMORY ("Failed to
+	 * acquire the EGL Image memory"), which is why this looked for a long
+	 * time like an allocation/VRAM problem and was chased as one.  It is
+	 * not: the card has 12 GB and the desktop uses a few hundred MB.
+	 *
+	 * Xwayland is the client that exposes this, and the reason is simply
+	 * that it arms a periodic SIGALRM (its frame/scheduler timer).  That
+	 * guarantees a signal lands inside these ioctls sooner or later, so its
+	 * pixmap exports fail, the window has no content buffer, and the client
+	 * is composited as an empty surface -- mapped, correctly sized, getting
+	 * frame callbacks, and completely blank.  weston and native Wayland
+	 * clients do not use SIGALRM, which is precisely why they were fine and
+	 * only X11 broke.
+	 *
+	 * Measured on the physical RTX 4070 (595.84): every EINVAL in the guest
+	 * was immediately preceded by an ERESTARTSYS on the same fd (51 of
+	 * them), while the same weston + Xwayland + glxgears on the bare-metal
+	 * host produced ZERO ERESTARTSYS and ZERO EINVAL across 21,389 traced
+	 * ioctls.  With this fix: 0 GL_OUT_OF_MEMORY (was 43), 0 (EE) lines
+	 * (was 982), and glxgears/glmark2/xterm/xclock/xeyes all render.
+	 *
+	 * Completing rather than restarting is the ordinary kernel rule for a
+	 * syscall that has already made unrepeatable progress.  The signal is
+	 * not lost: it stays pending and is delivered as soon as we return.
 	 */
 	if (inf->isolate_id) {
 		if (wait_for_completion_interruptible(&inf->done) == -ERESTARTSYS) {
 			nvkvm_virtio_interrupt_isolate(inf->isolate_id,
 						       inf->txn_id);
 			wait_for_completion(&inf->done);
-			inflight_dequeue(state, inf);
-			kfree(inf->resp_buf);
-			inf->resp_buf = NULL;
-			return -ERESTARTSYS;
+			/*
+			 * Fall through to the common path: the response is
+			 * here, so hand it back.  Do NOT return -ERESTARTSYS.
+			 */
 		}
 	} else {
 		wait_for_completion(&inf->done);
