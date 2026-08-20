@@ -40,9 +40,13 @@ else
 fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────
-IMG="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
-SEED="/opt/nvkvm-guest/seed.iso"
-SSH_PORT=2222
+# Overridable so a SECOND guest can run alongside the first: a distinct image
+# and a distinct ssh forward are all that a concurrent guest needs (each gets
+# its own virtio-nvgpu + nvkvm-gpu instance).  Sharing one GPU between two
+# live guests is a supported configuration.
+IMG="${VM_IMG:-/opt/nvkvm-guest/ubuntu-24.04.qcow2}"
+SEED="${VM_SEED-/opt/nvkvm-guest/seed.iso}"
+SSH_PORT="${VM_SSH_PORT:-2222}"
 
 # Validate required files.
 if [ ! -f "$IMG" ]; then
@@ -50,10 +54,17 @@ if [ ! -f "$IMG" ]; then
     echo "       Run scripts/setup_guest.sh first."
     exit 1
 fi
-if [ ! -f "$SEED" ]; then
-    echo "ERROR: cloud-init seed ISO not found at $SEED"
-    echo "       Run scripts/setup_guest.sh first."
-    exit 1
+# The seed ISO is cloud-init's, and only cloud images consume it.  A guest
+# installed from a live ISO (see setup_mint_guest.sh) has no cloud-init at all,
+# so VM_SEED= (empty) drops the drive rather than failing.
+SEED_ARG=""
+if [ -n "$SEED" ]; then
+    if [ ! -f "$SEED" ]; then
+        echo "ERROR: cloud-init seed ISO not found at $SEED"
+        echo "       Run scripts/setup_guest.sh first, or set VM_SEED= to boot without one."
+        exit 1
+    fi
+    SEED_ARG="-drive file=$SEED,format=raw,if=virtio,readonly=on"
 fi
 
 # ── Optional extra 9p exports ────────────────────────────────────────────
@@ -78,7 +89,7 @@ echo "Starting nvkvm test VM..."
 
 echo "QEMU         : $QEMU"
 echo "Disk image   : $IMG"
-echo "Seed ISO     : $SEED"
+echo "Seed ISO     : ${SEED:-(none)}"
 echo "Repo (9p)    : $REPO_ROOT  →  guest:/mnt/nvkvm  (tag: nvkvm_src)"
 echo "SSH          : ssh ubuntu@localhost -p $SSH_PORT"
 echo ""
@@ -111,7 +122,7 @@ exec "$QEMU" \
     -cpu host \
     \
     -drive file="$IMG",format=qcow2,if=virtio \
-    -drive file="$SEED",format=raw,if=virtio,readonly=on \
+    $SEED_ARG \
     \
     -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=net0 \

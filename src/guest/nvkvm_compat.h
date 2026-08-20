@@ -113,6 +113,25 @@ static inline void vma_start_write(struct vm_area_struct *vma)
 #endif
 
 /*
+ * 6.12 moved FMODE_UNSIGNED_OFFSET into struct file_operations as the
+ * fop_flags bit FOP_UNSIGNED_OFFSET (commit 210a03c9d51a), and drm_open_helper()
+ * now *requires* every DRM driver's fops to declare it:
+ *
+ *     if (WARN_ON_ONCE(!(filp->f_op->fop_flags & FOP_UNSIGNED_OFFSET)))
+ *             return -EINVAL;
+ *
+ * Upstream drivers get it for free from DEFINE_DRM_GEM_FOPS(); ours is
+ * hand-rolled, so it has to be set explicitly.  Without it EVERY open of
+ * /dev/dri/card0 and /dev/dri/renderD128 fails with EINVAL on >= 6.12 -- which
+ * is invisible on a 6.8 guest and takes out Xorg entirely on a 6.14 one.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+#define NVKVM_DRM_FOP_FLAGS   .fop_flags = FOP_UNSIGNED_OFFSET,
+#else
+#define NVKVM_DRM_FOP_FLAGS
+#endif
+
+/*
  * The maple-tree VMA iterator (VMA_ITERATOR / for_each_vma) arrived in 6.1.
  * Before that a mm's VMAs are a plain linked list through vm_next, walked
  * under the same mmap_read_lock.  Same traversal, same order, same lock.
