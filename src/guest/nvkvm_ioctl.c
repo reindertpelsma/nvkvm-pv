@@ -99,6 +99,8 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return sizeof(struct uvm_enable_peer_access_params);
 	case UVM_DISABLE_PEER_ACCESS:
 		return sizeof(struct uvm_disable_peer_access_params);
+	case UVM_MAP_DYNAMIC_PARALLELISM_REGION:
+		return sizeof(struct uvm_map_dynamic_parallelism_region_params);
 	case UVM_CREATE_EXTERNAL_RANGE:
 		return sizeof(struct uvm_create_external_range_params);
 	case UVM_VALIDATE_VA_RANGE:

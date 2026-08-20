@@ -235,6 +235,28 @@ struct uvm_disable_peer_access_params {
 	__u32 reserved;
 };
 
+/*
+ * UVM_MAP_DYNAMIC_PARALLELISM_REGION (65).
+ *
+ * libcuda calls this during context creation on an A100 (GA100).  It was not
+ * handled at all, so nvkvm_ioctl_param_size() fell through to the FRONTEND NR
+ * switch, where 65 == 0x41 == NV_ESC_RM_IDLE_CHANNELS -- the exact bare-UVM /
+ * frontend NR collision the sanitizer's type gate exists to prevent.  Before
+ * that gate existed the ioctl was silently forwarded as the wrong call
+ * entirely; with the gate it correctly returns -ENOTTY, which is what exposed
+ * the missing entry.
+ *
+ * Layout follows the same convention as the other GPU-scoped UVM params in
+ * this header: {base, length, gpu_uuid, rm_status}, tail-padded to 8.
+ */
+struct uvm_map_dynamic_parallelism_region_params {
+	__u64 base;
+	__u64 length;
+	struct uvm_uuid gpu_uuid;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
 struct uvm_create_external_range_params {
 	__u64 base;
 	__u64 length;
