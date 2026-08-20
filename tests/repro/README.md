@@ -50,6 +50,13 @@ modifier `0x300000000606014`, same stride, `gbm_bo_get_fd()` works, the
 renders and reads back — and `eglCreateImageKHR(..., EGL_NATIVE_PIXMAP_KHR, bo,
 NULL)` fails with `EGL_BAD_PARAMETER` (0x300C) **on the host too**.
 
+The sweep at the end settles the obvious follow-up: it is not the *modifier*.
+NVIDIA's EGL refuses `EGL_NATIVE_PIXMAP_KHR` for block-linear and for plain
+`LINEAR` alike, host and guest, so there is no modifier nvkvm could advertise
+that would make this call succeed. (`GBM_BO_USE_LINEAR` is refused outright by
+this allocator; `gbm_bo_create_with_modifiers` with `DRM_FORMAT_MOD_LINEAR`
+does yield modifier 0, and that fails too.)
+
 That last call is not incidental; it is verbatim what glamor does
 (`glamor/glamor_egl.c`, `glamor_egl_create_textured_pixmap_from_gbm_bo()`),
 reached from `drmmode_set_pixmap_bo()` in the modesetting driver, which prints

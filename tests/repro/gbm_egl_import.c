@@ -19,6 +19,33 @@ static const char *tag;
 #define OK(f,...)   printf("[%s] ok   " f "\n", tag, ##__VA_ARGS__)
 #define BAD(f,...) do{ printf("[%s] FAIL " f "\n", tag, ##__VA_ARGS__); return 1; }while(0)
 
+
+/* One NATIVE_PIXMAP attempt, reporting the modifier the allocator actually
+ * chose.  force_linear uses gbm_bo_create_with_modifiers to pin LINEAR. */
+static EGLDisplay g_dpy;
+static PFNEGLCREATEIMAGEKHRPROC g_create;
+
+static void sweep(struct gbm_device *gbm, uint32_t flags, int force_linear,
+                  const char *how)
+{
+    struct gbm_bo *bo;
+    if (force_linear) {
+        uint64_t lin = 0; /* DRM_FORMAT_MOD_LINEAR */
+        bo = gbm_bo_create_with_modifiers(gbm, W, H, GBM_FORMAT_ARGB8888, &lin, 1);
+    } else {
+        bo = gbm_bo_create(gbm, W, H, GBM_FORMAT_ARGB8888, flags);
+    }
+    if (!bo) { printf("[%s]   %-28s bo_create FAILED\n", tag, how); return; }
+
+    EGLImageKHR img = g_create(g_dpy, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, bo, NULL);
+    printf("[%s]   %-28s modifier=0x%016llx NATIVE_PIXMAP=%s",
+           tag, how, (unsigned long long)gbm_bo_get_modifier(bo),
+           img == EGL_NO_IMAGE_KHR ? "FAIL" : "ok");
+    if (img == EGL_NO_IMAGE_KHR) printf(" (egl 0x%x)", eglGetError());
+    printf("\n");
+    gbm_bo_destroy(bo);
+}
+
 int main(int argc, char **argv)
 {
     const char *node = argc > 1 ? argv[1] : "/dev/dri/renderD128";
@@ -50,6 +77,7 @@ int main(int argc, char **argv)
     OK("gbm_bo_get_fd fd=%d", dmabuf);
 
     EGLDisplay dpy = eglGetDisplay((EGLNativeDisplayType)gbm);
+    g_dpy = dpy;
     if (dpy == EGL_NO_DISPLAY) BAD("eglGetDisplay");
     EGLint maj, min;
     if (!eglInitialize(dpy, &maj, &min)) BAD("eglInitialize 0x%x", eglGetError());
@@ -72,6 +100,7 @@ int main(int argc, char **argv)
         (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
     if (!pCreate) BAD("no eglCreateImageKHR");
     if (!pBind)   BAD("no glEGLImageTargetTexture2DOES");
+    g_create = pCreate;
 
     /* Path A: the dmabuf import, which is what glamor uses on modern servers. */
     EGLint att[] = {
@@ -119,6 +148,18 @@ int main(int argc, char **argv)
     unsigned char px[4] = {0,0,0,0};
     glReadPixels(8, 8, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
     OK("render+readback rgba(%d,%d,%d,%d)", px[0], px[1], px[2], px[3]);
+
+    /* Modifier sweep.  If NATIVE_PIXMAP worked for SOME modifier, then which
+     * modifier the scanout bo gets would be the lever -- and nvkvm controls
+     * what it advertises.  Measured answer: it does not.  NVIDIA's EGL refuses
+     * the import for every modifier including LINEAR, on host and guest alike,
+     * so the modifier is not the variable and there is nothing to tune. */
+    printf("[%s] -- NATIVE_PIXMAP modifier sweep --\n", tag);
+    sweep(gbm, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING, 0, "SCANOUT|RENDERING");
+    sweep(gbm, GBM_BO_USE_RENDERING, 0, "RENDERING");
+    sweep(gbm, GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING | GBM_BO_USE_LINEAR, 0,
+          "SCANOUT|RENDERING|LINEAR");
+    sweep(gbm, 0, 1, "with_modifiers(LINEAR)");
 
     printf("[%s] RESULT all-good\n", tag);
     return 0;
