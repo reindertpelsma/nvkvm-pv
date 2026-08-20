@@ -370,150 +370,100 @@ is fully usable for display work once modeset is on.  `tests/validate.sh` is
 28/28 there either way, because compute and offscreen GL go through
 `EGL_EXT_platform_device` and never touch GBM.
 
-### Wayland compositors are still black — measured per compositor 2026-08-20
+### Wayland desktops render — FIXED 2026-08-20 (drm_crtc_vblank_on)
 
-After the IN_FORMATS fixes both start cleanly and negotiate block-linear
-(`mod=0x300000000606014`), and wlroots' explicit `EGLImage not supported` /
-`Failed to create FBO` is **gone** -- that part is genuinely fixed.
+A full Wayland desktop now runs in the guest on the GPU and is displayed in a
+QEMU window on the host, interactively, confirmed on a physical RTX 4070.
 
-Measured with an animating client (`weston-flower`) actually running, which
-matters: a compositor with a static scene is *supposed* to stop flipping, so
-"no flips" only means something when something is moving.
+**The cause was vblank bookkeeping, not rendering.** We never called
+`drm_crtc_vblank_on/off`, so the vblank sequence and timestamps the core reports
+to userspace never advanced.  Flips still *completed* -- `nvkvm_pipe_update()`
+falls back to `drm_crtc_send_vblank_event()` when `drm_crtc_vblank_get()` fails
+-- which is exactly why this hid for so long: compositors kept flipping and the
+screen stayed black.
 
-| stack | flips with animating client | exported buffer |
-|---|---|---|
-| weston `--backend=drm --renderer=gl` | ~18/s (277 presents in 15 s) | empty, 0 of 2621440 px |
-| cage / wlroots | **none at all** | n/a |
-| Xorg `modesetting` | none, by design (blits into the front buffer) | renders a correct live desktop |
+weston's own scene graph named it:
 
-So the two Wayland compositors fail in *different* ways, and neither is a
-present-path fault:
+```
+Layer 0 (pos 0xffffffff):
+  View 0 (desktop shell fade surface): (0,0) -> (1920,1080)
+    [fully opaque] solid-colour buffer [R 0 G 0 B 0 A 1]
+```
 
-- **weston** flips continuously and its own screenshot is black, so it composites
-  nothing into the buffer it flips.
-- **wlroots** now creates its render target fine but never flips, even with a
-  client animating -- so it is not driving its output at all.
+weston was compositing correctly the entire time -- it was animating its
+desktop-shell fade against a clock that never moved, so an opaque black overlay
+sat above the panel and every client.  Every "weston renders nothing" reading
+was really "weston renders the fade overlay".
 
-**Correction to an earlier version of this entry:** it claimed both compositors
-"flip once and then stall", and inferred the fault was in the flip/completion
-path.  That was a measurement error -- the sample window had no animating client
-running -- and it is wrong for weston, which flips freely.  Do not trust a flip
-count taken without confirming something on screen is actually changing.
+Two further fixes were needed to get compositors that far, both in the same
+area:
 
-Already ruled out: completion events are not dropped -- `nvkvm_pipe_update()`
-falls back to `drm_crtc_send_vblank_event()` when `drm_crtc_vblank_get()` fails.
+- **`8e499a4`** — `drm_simple_display_pipe_init()` builds the plane's IN_FORMATS
+  blob using the helper's own LINEAR-only `format_mod_supported`, so every
+  block-linear modifier we listed was filtered out before our override existed.
+  Compositors were offered exactly `XRGB8888 + LINEAR`, and NVIDIA cannot use a
+  LINEAR dma-buf as an EGLImage render target (measured: `GL_INVALID_OPERATION`
+  on bind, incomplete FBO).  wlroots said so outright ("EGLImage not supported"
+  / "Failed to create FBO"); weston failed silently.  The blob is now rebuilt
+  after our callback is installed.
+- **`f4201ff`** — advertise only modifiers the driver really implements.  Once
+  the blob reached clients, the 16 hand-rolled BL2D guesses became harmful: a
+  client that picks an invented modifier gets a buffer the driver cannot render
+  into.  Xorg/glamor died with "Failed to create pixmap".  Only
+  `0x0300000000606014` (SCANOUT|RENDERING) is published; LINEAR is still
+  *accepted* for cursors, just not offered.
 
-Worth trying next, cheapest first: for weston, whether its gl-renderer is drawing
-into a *different* surface than the one it flips (compare the bo it renders to
-against the fb it commits); for wlroots, why it never schedules a frame (its
-`-d` debug output, and whether the output is enabled from its point of view).
-`drm_crtc_vblank_on/off` are also never called from `.enable`/`.disable`, which
-is unusual for a vkms-style driver and worth correcting regardless.
+**Measured on the physical RTX 4070 (595.84):** guest flip deltas 16.4–18.1 ms,
+median 16.7 ms = **59.9 Hz**, with the desktop displayed in a QEMU GTK window.
+
+**Still open: the host receives only ~21 presents/s** even though the guest
+paces at ~60 Hz.  Two theories have been tested and disproven, both with
+module-verified A/B measurements:
+
+| change | host rate |
+|---|---|
+| per-frame `glReadPixels` removed (GL zero-copy, `2e9413f`) | 10/s → 21/s |
+| present send made non-blocking in the guest (workqueue, `8b0592c`) | 21/s → 21/s (guest reached 60 Hz) |
+| present send made fully fire-and-forget | 21/s → 22/s (noise; not landed) |
+
+So the ceiling is **not** guest-side send latency.  The leading remaining
+suspect is per-present host work: `nvkvm_req_present()` calls
+`nvkvm_isolate_present_export()` on every frame, which is a synchronous IPC
+round-trip to the sandboxed stub plus a DRM `PRIME_HANDLE_TO_FD` ioctl.  The
+import cache (`ac0dd8f`) caches the EGL import but nothing caches the export.
+
+**Measurement traps that produced false findings here, all confirmed:**
+
+- `import fd=` only logs on a cache *miss*, so a healthy cached pipeline shows
+  "N presents, 0 imports" and looks dead.  This produced a false "gfx_update
+  never fires" root cause on two separate boxes.
+- A compositor that stops flipping when nothing changes is *correct*.  Any flip
+  or present count taken without a verified-animating client is meaningless.
+- `rmmod` fails silently while a compositor holds the DRM node (refcount seen at
+  177) and the following `insmod` reports `File exists` while the OLD module
+  stays resident.  Verify the loaded module by symbol
+  (`grep -c <new_symbol> /proc/kallsyms`) before trusting any kernel-side
+  measurement, and reboot the guest to swap modules reliably.
+- QEMU's stderr is block-buffered when redirected to a file, so per-second
+  bucket counts read zero.
 
 ### X11 renders correctly but the host only sees the first frame (2026-08-20)
 
-Xorg with the modesetting driver **works** on our KMS node: an X root capture
-taken in-guest shows a live desktop -- xclock ticking, an xterm with a working
-prompt.  So the DRM/KMS emulation is sound; this is not a rendering problem.
-
-What is missing is the export.  Xorg logs
+Xorg with the modesetting driver renders a live desktop on our KMS node — an
+in-guest X root capture shows xclock ticking and a working xterm.  But it logs
 
 ```
 modeset(0): Using 24bpp hw front buffer with 32bpp shadow
 ```
 
-i.e. it modesets once and then blits damage straight into that front buffer,
-never issuing a plane update and never asking for vblank.  Our present path is
-driven entirely by `nvkvm_pipe_update()` (page flips), so the host receives the
-single modeset frame and then a frozen picture over a live desktop.
+i.e. it modesets once and then blits damage straight into the front buffer,
+never issuing a plane update and never requesting vblank.  Our present path is
+driven by `nvkvm_pipe_update()` (page flips), so the host receives the modeset
+frame and then a frozen picture over a live desktop.
 
-**A first attempt at fixing this regressed Xorg and was reverted.**  The
-approach was: track the scanned-out fb, run the vblank hrtimer for the pipe's
-lifetime (`.enable`/`.disable`) rather than only while a client requests vblank,
-and re-export the current fb from a work item on each tick.  With that in place
-Xorg failed at startup with `Failed to create pixmap` -> `failed to create
-screen resources`; reverting to f4201ff made it start again, so the causal link
-is established but the cause within that change is not yet identified.  Suspects
-not yet separated: calling `nvkvm_present_fb()` from inside `.enable` (atomic
-commit tail), and taking a framebuffer reference across the modeset.
-
-Whoever picks this up should reproduce the revert first (Xorg starts at
-f4201ff), then re-add the pieces one at a time -- fb tracking without the
-`.enable` present, then the timer change -- rather than all three at once as I
-did.
-
-Note this is a *different* gap from the compositor one above: weston and wlroots
-do flip, and are black for their own reasons; X does not flip, and is correct
-but frozen.
-
-### Wayland compositors flip once, then stall — open (2026-08-20)
-
-Reproduced on RTX 4070 / 595.84 / Ada and RTX 3060 / 580.159.04 / Ampere.
-
-**The chain, end to end:**
-
-1. `drm_simple_display_pipe_init()` builds the plane's IN_FORMATS blob during
-   init, filtering our modifier list through the helper's own
-   `drm_simple_kms_format_mod_supported`, which accepts **only LINEAR**.  Our
-   override (grafted immediately afterwards, see #110) fixes AddFB2 validation
-   but is far too late to affect the blob.
-2. So the blob a compositor reads offers exactly one pair: XRGB8888 + LINEAR.
-3. **NVIDIA cannot use a LINEAR dma-buf as an EGLImage render target**, and that
-   import is precisely how a compositor obtains its output framebuffer.
-   Measured in-guest, import a bo and attach it to an FBO:
-
-   | bo | modifier | bind | FBO |
-   |---|---|---|---|
-   | RENDERING | 0x0300000000e08014 | 0x0000 | COMPLETE |
-   | SCANOUT\|RENDERING | 0x0300000000606014 | 0x0000 | COMPLETE |
-   | SCANOUT\|RENDERING +LINEAR | 0x0000000000000000 | **0x0502** | **INCOMPLETE** |
-   | SCANOUT\|RENDERING +block-linear | 0x0300000000606014 | 0x0000 | COMPLETE |
-
-4. The compositor therefore has no render target and composites nothing.
-   wlroots says so out loud — `EGLImage not supported` / `Failed to create FBO`
-   (`render/gles2/renderer.c:150`); weston fails silently and its own
-   `weston-screenshooter` output is pure black.
-5. We then export a buffer nobody drew into, which is why this looked like a
-   present-path bug for so long.
-
-**Removing LINEAR from the advertised list does not work either**, and the
-symptom names the cause: weston reports `format XRGB8888 not supported by output
-Virtual-1` and then `failed to create gbm surface`.  With LINEAR gone the blob
-is *empty*, because every block-linear modifier we list is filtered out by the
-helper's callback before our override exists.
-
-**FIXED:** `nvkvm_plane_rebuild_in_formats()` now rebuilds the blob after our
-callback is grafted on, so the advertised set is what we actually support.
-Verified: weston starts without `format XRGB8888 not supported`, and now flips
-`mod=0x300000000606014` (10485760-byte block-linear) instead of `mod=0x0`
-(8294400-byte LINEAR).  `tests/validate.sh` stays 28/28.
-
-**STILL OPEN:** weston's DRM backend is *still* black with block-linear
-negotiated -- its own screenshot is pure black (per-channel min/max all 0) and
-the exported buffer is untouched (0 of 2621440 px).  So the LINEAR/EGLImage
-defect above is real and explains wlroots's explicit failure, but it is not the
-whole story for weston, which uses `eglCreateWindowSurface` on the gbm_surface
-for its output rather than an EGLImage import.  Whatever stops weston drawing is
-still unidentified; `--backend=headless` on the same device still renders a
-correct desktop, so it remains DRM-backend-specific.
-
-**Proof the rest of the path is sound:** a plain client (gbm_surface +
-eglSwapBuffers + flip) renders a known colour that arrives on the host exactly,
-and animates — under LINEAR and block-linear, setcrtc and pageflip, with and
-without glFinish.  And weston on `--backend=headless` in the same guest, same
-GPU, same NVIDIA EGL, renders a full correct desktop; only `--backend=drm` is
-black.
-
-**Superseded earlier entries in this file:** that the GEM proxy / PRIME export
-handed us the wrong buffer (it does not — sizes match and a host-written
-sentinel reads back), and that weston's LINEAR buffers "arrive empty" because
-LINEAR transport is broken (LINEAR transports fine; nothing was ever drawn into
-those buffers).
-
-Instruments that localised this, all env-gated and off by default:
-`NVKVM_PRESENT_PROBE=1` (what is in the exported buffer; `=2` also proves the
-mapping is real memory), `NVKVM_PRESENT_DUMP=<path>` (what the window shows),
-and the compositor's own screenshooter (what it thinks it drew).
+An attempt to fix this by tracking the scanned-out fb and re-exporting it from
+the vblank tick regressed Xorg startup (`Failed to create pixmap`) and was
+reverted.  Re-add the pieces one at a time rather than together.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
