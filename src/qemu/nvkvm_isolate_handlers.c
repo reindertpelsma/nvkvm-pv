@@ -1097,6 +1097,62 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	 * visible without NVKVM_DEBUG; per-frame detail under NVKVM_DBG.
 	 */
 	off_t sz = lseek(dmabuf_fd, 0, SEEK_END);
+	/*
+	 * NVKVM_PRESENT_PROBE=1: report what is actually IN the buffer we just
+	 * exported, over a plain CPU mapping.  This exists because "frames
+	 * presented" counts handovers, not pixels: a correctly sized, correctly
+	 * rotating, entirely empty buffer produces a black window while every
+	 * counter in the path looks healthy.  Answering it without EGL keeps the
+	 * question separate from how the frame is later displayed.
+	 */
+	if (getenv("NVKVM_PRESENT_PROBE") && sz > 0) {
+		static int probes_left = 6;
+		if (probes_left > 0) {
+			probes_left--;
+			int probe_rw = getenv("NVKVM_PRESENT_PROBE")[0] == '2';
+			void *m = mmap(NULL, (size_t)sz,
+				       probe_rw ? (PROT_READ | PROT_WRITE)
+						: PROT_READ,
+				       MAP_SHARED, dmabuf_fd, 0);
+			if (m == MAP_FAILED) {
+				fprintf(stderr, "nvkvm present probe: gem=0x%x "
+					"mmap failed: %s\n",
+					req->stub_handle, strerror(errno));
+			} else {
+				const uint32_t *px = m;
+				size_t npx = (size_t)sz / 4, nz = 0, first = 0;
+				for (size_t k = 0; k < npx; k++) {
+					if (px[k]) {
+						if (!nz) {
+							first = k;
+						}
+						nz++;
+					}
+				}
+				fprintf(stderr, "nvkvm present probe: gem=0x%x size=%lld "
+					"nonzero_px=%zu/%zu first=%zu px[first]=0x%08x\n",
+					req->stub_handle, (long long)sz, nz, npx,
+					nz ? first : 0, nz ? px[first] : 0);
+				if (probe_rw) {
+					/*
+					 * Control: is this mapping a REAL view of the
+					 * buffer, or does it merely succeed?  If a value
+					 * written here does not read back, "all zeros"
+					 * says nothing about what the guest rendered.
+					 */
+					uint32_t *w = m;
+					w[0] = 0xA5A5F00Du;
+					__sync_synchronize();
+					fprintf(stderr, "nvkvm present probe: RW control "
+						"wrote 0xA5A5F00D read back 0x%08x -> mapping %s\n",
+						w[0],
+						w[0] == 0xA5A5F00Du ? "IS real memory"
+								    : "is NOT a real view");
+				}
+				munmap(m, (size_t)sz);
+			}
+		}
+	}
 	static bool logged_once;
 	if (!logged_once) {
 		logged_once = true;

@@ -330,44 +330,54 @@ measured box they get a real NVIDIA context, produce real GPU buffers, the
 compositor composites them, and the frames now reach a host window and keep
 coming.
 
-### The host never receives the guest's rendered pixels — OPEN, localized 2026-08-20
+### The guest flips a buffer nothing renders into — OPEN, localized 2026-08-20
 
 A compositor runs on the GPU in the guest and flips at ~640 fps; QEMU receives
 every frame; the window is black. Measured on RTX 4070 / 595.84.
 
-The display path is NOT the problem. What was fixed on the way in (commit
-"present: fix the black window, and the crash behind it") was real but not
-sufficient: NVIDIA hands these buffers out as external-only EGLImages, so
-`glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, ...)` fails with
-GL_INVALID_OPERATION and `glEGLImageTargetTexStorageEXT` is required; and
-importing per frame instead of caching killed the driver outright.
+**Buffer sharing works.** This was checked rather than assumed, with a host-side
+CPU mapping of the exported dma-buf (`NVKVM_PRESENT_PROBE=2`):
 
-With all of that fixed, the pixels are still absent, and the reason is upstream
-of EGL. Two independent read paths agree that the buffer we export is empty:
+```
+RW control: wrote 0xA5A5F00D -> read back 0xa5a5f00d   -> mapping IS real memory
+next flip, same gem=0x2: nonzero_px=1/2073600 px[0]=0xa5a5f00d
+```
 
-| read path | result |
-|---|---|
-| `glEGLImageTargetTexStorageEXT` + `glGetTexImage` | succeeds, `nonblack=0/2073600` |
-| plain CPU `mmap()` of the dma-buf | succeeds, `nonzero_bytes=0` of 8294400 |
+A byte written on the host survived into a later flip of the same bo. So the
+host mapping is genuine persistent memory, and host and guest are addressing
+the *same* allocation. Export and identity are correct. Sizes agree too: a bo
+whose guest dma-buf is 8323072 bytes exports as 8323072 on the host (an earlier
+apparent mismatch was two different bos being compared, not a bug).
 
-both while `glmark2-wayland` renders at 4210 FPS inside the guest. The size is
-exactly right (1920*1080*4), the GEM ids rotate over three bos as a compositor
-should, and `isolate_id` is the owning session's (verified in
-`nvkvm_virtio_present`, not inferred). So we export a correctly-sized,
-correctly-rotating, CPU-mappable buffer that nothing ever writes to.
+**What is actually wrong:** nothing writes to the buffer that gets flipped.
+Apart from that sentinel the buffer is all zeros while the guest renders, and
+the sentinel was *not* overwritten -- at 640 fps a real compositing target
+would be clobbered within milliseconds. Two independent read paths agree the
+buffer is otherwise empty (GL import + `glGetTexImage`, and plain CPU mmap).
 
-Caveat worth keeping: a VRAM bo can read as zero over a CPU mapping, so the
-mmap result alone would not be conclusive — it is the agreement of two
-unrelated paths that makes it so.
+So the guest renders into one allocation and flips another. The remaining
+question is guest-side buffer plumbing -- which host allocation the guest's
+GL/GBM actually targets, versus which stub handle ends up on the
+`drm_framebuffer` -- not the present path, not EGL, and not the export.
 
-Next step is a buffer-identity test, not more display work: write a known
-pattern into that exact bo from the guest and look for it on the host. If it
-appears, we are presenting a stale or wrong bo; if it does not, the proxy GEM's
-host backing is a different allocation from the one the guest renders into, and
-the bug is in the GEM proxy / PRIME export, not in present at all.
+This is a bug, not an architectural limit: the sentinel proves guest and host
+can share the very buffer in question.
 
-Do not read the earlier "637 frames/s presented" figure as "the display works".
-It measures frames handed over, not pixels shown.
+Things ruled out along the way, each by measurement:
+
+- *tiling/modifiers* -- a block-linear buffer read as linear gives garbage
+  (confirmed by a `kmsgrab` capture of the host's own scanout, which comes back
+  striped). We get pure black, and forcing LINEAR-only scanout modifiers
+  changed nothing.
+- *the display path* -- real bugs were found and fixed there (external-only
+  EGLImages needing `glEGLImageTargetTexStorageEXT`; per-frame image churn
+  killing the driver; a `DisplaySurface` use-after-free), and the window is
+  still black, because the pixels were never there to show.
+- *wrong isolate* -- `isolate_id` is the owning session's, read in
+  `nvkvm_virtio_present`.
+
+Do not read the "637 frames/s presented" figure as "the display works". It
+counts handovers, not pixels.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 
