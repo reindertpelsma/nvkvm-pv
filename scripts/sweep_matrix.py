@@ -130,6 +130,21 @@ def wait_ssh(iid, budget=900):
     return None, None
 
 
+def tree_stamp():
+    """Identify the tree actually shipped -- commit AND dirty state.
+
+    The sweep tars the WORKING TREE, not HEAD.  On 2026-08-20 a worktree
+    sitting on uncommitted deletions shipped a tree with the UVM 65 fix
+    reverted while HEAD was two commits past it, and the resulting
+    cuCtxCreate 999 was nearly misread as a fresh regression.  A result
+    without the tree it came from is not interpretable.
+    """
+    h, _ = sh("git -C %s rev-parse --short HEAD" % REPO, timeout=30)
+    d, _ = sh("git -C %s status --porcelain -- . ':!tests/sweep-results.json'" % REPO, timeout=30)
+    return {"commit": h.strip(), "dirty_files": sorted(
+        l.split(maxsplit=1)[-1] for l in d.splitlines() if l.strip())}
+
+
 def parse_contract(out):
     """Extract the new instance id from `vastai create instance` output.
 
@@ -154,6 +169,28 @@ def parse_contract(out):
     return None
 
 
+def destroy_verified(iid, tries=5):
+    """Destroy an instance and CONFIRM it is gone from the listing.
+
+    Two traps, both of which silently leave a box billing:
+      1. `vastai destroy instance` PROMPTS "[y/N]".  Unattended there is no
+         tty, it reads EOF, prints "Aborted." -- and exits 0.  Hence -y.
+      2. Even then the exit code only says the CLI ran.  The only proof is
+         the instance no longer appearing in `show instances`.
+    Returns True only when the id is actually absent from the listing.
+    """
+    for _ in range(tries):
+        sh(f"vastai destroy instance {iid} -y", timeout=90)
+        time.sleep(8)
+        data = vast_json("show instances") or []
+        if isinstance(data, dict):
+            data = data.get("instances", []) or []
+        if not any(str(i.get("id")) == str(iid) for i in data):
+            return True
+        time.sleep(10)
+    return False
+
+
 def reap_strays():
     """Destroy anything still carrying our label.  Backstop, not primary path.
 
@@ -168,12 +205,8 @@ def reap_strays():
     for i in strays:
         iid = i.get("id")
         print(f"  !! STRAY {iid} ({i.get('gpu_name')}) alive -- destroying", file=sys.stderr, flush=True)
-        for _ in range(4):
-            _, rc = sh(f"vastai destroy instance {iid}", timeout=90)
-            if rc == 0:
-                print(f"     destroyed {iid}", file=sys.stderr, flush=True)
-                break
-            time.sleep(10)
+        if destroy_verified(iid):
+            print(f"     destroyed {iid}", file=sys.stderr, flush=True)
         else:
             print(f"     !! COULD NOT DESTROY {iid} -- DESTROY BY HAND", file=sys.stderr, flush=True)
     return [i.get("id") for i in strays]
@@ -187,6 +220,7 @@ def run_one(offer, args):
         "dph": offer.get("dph_total"),
         "driver_reported_by_vast": offer.get("driver_version"),
         "started": datetime.datetime.now().isoformat(timespec="seconds"),
+        "tree": tree_stamp(),
         "status": "unknown",
     }
     try:
@@ -241,14 +275,43 @@ def run_one(offer, args):
         if not booted:
             rec["status"] = "guest-no-boot"; return rec
 
-        sh(f'{S} "{G} \'sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh\'"', timeout=600)
-        sh(f'{S} "{G} \'cd /mnt/nvkvm && bash tests/validate.sh --json /tmp/r.json\'"', timeout=1800)
+        # /mnt/nvkvm being mounted is NOT a readiness signal.  The mount is
+        # done by cloud-init runcmd, while nvkvm-guest.service is a oneshot
+        # ordered only After=local-fs.target -- so it can fire before its
+        # inputs exist and, with RemainAfterExit, never retry.  Measured on
+        # instance 48241076: at mount time the unit was inactive with an
+        # empty journal and no module loaded.  Racing validate.sh against
+        # that produced identical 7P/6F/15S runs on cards that differ, which
+        # reads like a GPU verdict and is not one.  So: let cloud-init
+        # finish, drive the unit explicitly, and CHECK it.
+        sh(f'{S} "{G} \'sudo cloud-init status --wait\'"', timeout=1200)
+        sh(f'{S} "{G} \'sudo systemctl restart nvkvm-guest.service\'"', timeout=1200)
+        mod, _ = sh(f'{S} "{G} \'lsmod | grep -q nvkvm_guest && echo LOADED || echo NOMODULE\'"', timeout=90)
+        if "LOADED" not in mod:
+            # Report the bring-up failure as itself, never as a GPU result.
+            rec["status"] = "guest-module-not-loaded"
+            jl, _ = sh(f'{S} "{G} \'sudo journalctl -u nvkvm-guest.service --no-pager 2>&1 | tail -25\'"', timeout=90)
+            rec["detail"] = jl[-1200:]
+            return rec
+
+        # stage_guest_libs.sh exits non-zero when an OPTIONAL library is absent
+        # (documented in setup_guest.sh), so a bad rc is recorded, not fatal --
+        # but it is no longer discarded unseen.
+        _, rec["stage_rc"] = sh(f'{S} "{G} \'sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh\'"', timeout=600)
+
+        _, vrc = sh(f'{S} "{G} \'cd /mnt/nvkvm && bash tests/validate.sh --json /tmp/r.json\'"', timeout=1800)
+        rec["validate_rc"] = vrc
         out, _ = sh(f'{S} "{G} \'cat /tmp/r.json\'"', timeout=120)
         try:
             rec["validate"] = json.loads(out)
             v = rec["validate"]
-            rec["status"] = "pass" if v.get("fail", 1) == 0 else "fail"
             rec["summary"] = f"{v.get('pass','?')}P/{v.get('fail','?')}F/{v.get('skip','?')}S"
+            # Take validate.sh's OWN verdict.  Recomputing it as fail==0
+            # counted a run with skipped checks as a success: 20P/0F/8S was
+            # reported "pass" while validate.sh exits 2 for INCOMPLETE
+            # precisely so that skips are not silently banked as passes.
+            rec["status"] = {0: "pass", 1: "fail", 2: "incomplete"}.get(
+                vrc, f"validate-rc-{vrc}")
         except Exception:
             rec["status"] = "validate-unparsed"; rec["detail"] = out[-1200:]
         return rec
@@ -257,20 +320,16 @@ def run_one(offer, args):
     finally:
         # Always destroy. Retried: an orphan bills until a human notices.
         if iid:
-            for _ in range(4):
-                _, rc = sh(f"vastai destroy instance {iid}", timeout=90)
-                if rc == 0:
-                    rec["destroyed"] = True; break
-                time.sleep(10)
-            else:
-                rec["destroyed"] = False
-                print(f"  !! DESTROY FAILED for {iid} -- destroy it by hand", file=sys.stderr)
+            rec["destroyed"] = destroy_verified(iid)
+            if not rec["destroyed"]:
+                print(f"  !! DESTROY FAILED for {iid} -- destroy it by hand", file=sys.stderr, flush=True)
 
 
 def render(records):
     rows = ["| GPU | host driver | $/hr | result | detail |", "|---|---|---|---|---|"]
     for r in records:
-        mark = {"pass": "PASS", "fail": "**FAIL**"}.get(r.get("status"), r.get("status"))
+        mark = {"pass": "PASS", "fail": "**FAIL**",
+                "incomplete": "**INCOMPLETE**"}.get(r.get("status"), r.get("status"))
         rows.append(f"| {r.get('gpu','?')} | {r.get('host_driver','?')} | "
                     f"{r.get('dph','?')} | {mark} | {r.get('summary','')} |")
     return "\n".join(rows)
