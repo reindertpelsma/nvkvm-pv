@@ -268,3 +268,71 @@ Both halves, or neither:
 
 With graphics off, `/dev/nvidia-modeset` and `/dev/dri/renderD128` never appear
 in the guest, and the corresponding host devices are never opened.
+
+## Running the guest desktop in a window
+
+By default the VM is headless (`-display none`, serial on stdio) and you reach
+the guest over SSH. On a machine with a physical display you can instead watch
+and drive the guest's desktop in a real window.
+
+The window backends are not built by default — headless is the normal
+deployment, where GTK/SDL would only add build dependencies for a window nobody
+can see. Build them in once:
+
+```bash
+NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force
+```
+
+Then start the VM with a display and a present mode:
+
+```bash
+VM_DISPLAY="gtk,gl=on" VM_SERIAL=none NVKVM_PRESENT_MODE=gl \
+    scripts/run_test_vm.sh
+```
+
+`VM_DISPLAY` != `none` also adds `virtio-keyboard-pci` and `virtio-tablet-pci`,
+without which the window would show the desktop and swallow every key and
+click. The tablet reports absolute coordinates, so the host and guest pointers
+track each other with no mouse grab.
+
+Inside the guest, run a compositor on the **DRM backend** so it composites to
+the virtual KMS head (the headless backend renders to an offscreen buffer that
+never reaches the window):
+
+```bash
+sudo -E env XDG_RUNTIME_DIR=/run/user/1000 weston --backend=drm --renderer=gl
+```
+
+### Present modes
+
+`NVKVM_PRESENT_MODE` picks how the guest's composited frame reaches the window:
+
+| value      | path                                                     |
+|------------|----------------------------------------------------------|
+| `gl`       | zero-copy: the guest frame's dma-buf goes straight to `dpy_gl_scanout_dmabuf` |
+| `readback` | import to a texture on a private EGL context, `glReadPixels` to a CPU surface |
+| unset      | auto — currently always `readback`                        |
+
+Auto is deliberately conservative: zero-copy only works when the *window's own*
+GL renderer can import an NVIDIA dma-buf, i.e. the host desktop is rendered on
+the same NVIDIA GPU, and QEMU's console API does not let us check that. On a
+host desktop you know is NVIDIA-rendered, set `gl` — it is both faster and, on
+at least one measured box, the only one of the two that works: the readback
+import failed there with `glEGLImageTargetTexture2DOES glGetError=0x0502`
+(`GL_INVALID_OPERATION`) and the window stayed blank.
+
+Measured on an RTX 4070 (driver 595.84, Ubuntu 26.04 host, GNOME/Wayland),
+guest weston on the DRM backend with glmark2 running:
+
+```
+nvkvm present: window mode=GL-zerocopy (console_has_gl=1)
+frames presented: ~637/s at 1920x1080, triple-buffered, 0 import errors
+```
+
+### Known gap: sync-fd passback
+
+`SEMSURF_FENCE_CREATE` returns a sync fd that we cannot yet translate across
+the VM boundary, so the guest reports `supports_sync_fd = 0` in `GET_DEV_INFO`
+and NVIDIA's userspace takes a path that does not need one. Implementing
+passback (a guest `dma_fence` signalled from a host watcher) would let the
+sync-fd presentation path work and is the next step for present latency.

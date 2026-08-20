@@ -83,6 +83,27 @@ echo "Repo (9p)    : $REPO_ROOT  →  guest:/mnt/nvkvm  (tag: nvkvm_src)"
 echo "SSH          : ssh ubuntu@localhost -p $SSH_PORT"
 echo ""
 
+# Display backend.  Default "none": the normal deployment is headless and the
+# guest is reached over SSH.  To watch (and drive) the guest desktop in a real
+# window on a machine with a physical display:
+#
+#   NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force     # once: builds GTK/SDL in
+#   VM_DISPLAY="gtk,gl=on" VM_SERIAL=none scripts/run_test_vm.sh
+#
+# gl=on matters: the guest's composited frame arrives as a dma-buf and is
+# scanned out with dpy_gl_scanout_dmabuf, so there is no readback.
+VM_DISPLAY="${VM_DISPLAY:-none}"
+VM_SERIAL="${VM_SERIAL:-stdio}"
+
+# With a window there has to be something to type on: the headless config has
+# no input devices at all, so a GTK/SDL window would show the guest desktop and
+# swallow every key and click.  virtio-tablet sends absolute coordinates, so the
+# host and guest pointers stay together without grabbing the mouse.
+INPUT_ARGS=""
+if [ "$VM_DISPLAY" != "none" ]; then
+    INPUT_ARGS="-device virtio-keyboard-pci -device virtio-tablet-pci"
+fi
+
 exec "$QEMU" \
     -enable-kvm \
     -m "$VM_MEM" \
@@ -106,6 +127,7 @@ exec "$QEMU" \
     $HOSTLIBS_ARG \
     $SHARE_ARG \
     \
-    -serial stdio \
-    -display none \
+    $INPUT_ARGS \
+    -serial "$VM_SERIAL" \
+    -display "$VM_DISPLAY" \
     "$@"
