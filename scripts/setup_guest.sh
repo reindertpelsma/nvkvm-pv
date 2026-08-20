@@ -188,8 +188,17 @@ runcmd:
   #
   # 1. A seat.  weston's built-in seatd needs root to open the DRM node, so a
   #    non-root compositor needs the real seatd daemon.  The group owning the
-  #    socket is NOT portable -- Debian/Ubuntu use `_seatd`, upstream uses
-  #    `seat` -- so read it off the socket instead of hardcoding either.
+  #    socket is NOT portable, and the documented names are wrong for Ubuntu:
+  #    upstream says `seat`, Debian packaging suggests `_seatd`, and the
+  #    measured value on Ubuntu 24.04 is `video`.  Read it off the socket
+  #    rather than hardcoding any of the three.
+  #
+  #    NOTE: this covers the seat, but it is NOT what unblocks snap apps.
+  #    snapd's AppArmor profile permits only /run/user/[0-9]*/wayland-[0-9]*,
+  #    so the compositor must also be started with --socket=wayland-0 or
+  #    Firefox/Chromium fail with a bare "Permission denied" no matter how
+  #    correct the seat, groups and runtime dir are.  See
+  #    docs/howto/run.md#running-the-guest-desktop-in-a-window.
   - bash -c 'apt-get install -y seatd || true'
   - bash -c 'systemctl enable --now seatd 2>/dev/null || true'
   - bash -c 'G=$(stat -c %G /run/seatd.sock 2>/dev/null); [ -n "$G" ] && [ "$G" != UNKNOWN ] && usermod -aG "$G" ubuntu || true'

@@ -270,8 +270,16 @@ GL version: OpenGL ES 3.2 NVIDIA 595.84
 ```
 
 The guest's composited frame reaches the host window as a dma-buf with no
-readback (`NVKVM_PRESENT_MODE=gl`): ~637 frames/s at 1920x1080, triple
-buffered, and 190,013 frames over a five-minute run with no import errors.
+readback (`NVKVM_PRESENT_MODE=gl`). At 1920x1080 the guest's KMS head flips at
+59.9 Hz and **every one of those frames reaches the host window: 60.0 swaps/s,
+zero dropped**, holding with 8 concurrent EGL clients. Measured with per-frame
+counters compiled into the present path, over 60 consecutive one-second samples
+of which every sample was exactly 60 frames.
+
+The pipeline is display-refresh-bound, not overhead-bound: the per-present
+PRIME export costs 0.07 ms. (An earlier figure of ~637 frames/s here came from
+an unthrottled configuration and is superseded by the counter-based
+measurement above, which is the one to quote.)
 
 Graphics is the one area where the guest is well short of the host rather than
 at parity: `glmark2-wayland` scores **6857 in the guest vs 21571 on the host**
