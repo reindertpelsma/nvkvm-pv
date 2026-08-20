@@ -245,7 +245,8 @@ host run.
 An independent third-party benchmark first, because it is the easiest to check:
 **Geekbench 7 GPU (OpenCL) scores 99.9% of bare metal** — 48335 in the guest vs
 48395 on the host, with all eleven workloads between 98.4% and 101.2%, on one
-RTX 3050 Laptop GPU and one driver
+RTX 3050 Laptop GPU and one driver. Bare metal here is literal: the host side is
+a physical ASUS TUF F17 laptop, not another VM
 ([side by side](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)).
 Both runs are public; neither is ours to edit.
 
@@ -414,8 +415,16 @@ which we can remove:
   for a bare-metal claim.
 - **The guest was given less machine.** 8 cores and 15.62 GB against the host's
   16 cores and 94.38 GB. Geekbench's GPU workloads still do CPU-side work, so
-  the guest is carrying a handicap unrelated to GPU forwarding, and 98.0% is
-  more likely an under-estimate than an over-estimate.
+  the guest carries a handicap unrelated to forwarding.
+
+**Why 98.0% here and 99.9% on the RTX 3050**, since the obvious guess is wrong:
+it is probably not the CPU handicap. The 3050 guest ran under a *larger* relative
+handicap — 4 cores against the host's 8 cores / 16 threads, 5.79 GB against
+15.34 GB — and still reached 99.9%. The likelier explanation is the GPU itself:
+an A100 finishes each workload roughly four times faster, so the same per-call
+forwarding cost occupies a correspondingly larger share of a shorter run. That
+is the same effect as the 0.73x token-generation row, at much smaller scale, and
+it predicts that parity will look slightly worse the faster the card gets.
 
 Both halves are worth reading. Sustained compute is at parity — the 1.01x is
 measurement noise, not a speedup. Single-stream token generation is **27%
