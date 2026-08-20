@@ -79,7 +79,8 @@ static bool nvkvm_present_egl_ensure(void)
  * Returns a GL texture name, or 0 on failure (after logging why). */
 static uint32_t nvkvm_import_dmabuf_tex(int fd, uint32_t width, uint32_t height,
                                         uint32_t stride, uint32_t fourcc,
-                                        uint64_t modifier)
+                                        uint64_t modifier,
+                                        EGLImageKHR *image_out)
 {
     EGLint attrs[64];
     int i = 0;
@@ -115,22 +116,57 @@ static uint32_t nvkvm_import_dmabuf_tex(int fd, uint32_t width, uint32_t height,
         return 0;
     }
 
+    /*
+     * Bind with glEGLImageTargetTexStorageEXT, NOT glEGLImageTargetTexture2DOES.
+     *
+     * NVIDIA rejects the legacy OES entry point for these dma-buf images:
+     * measured on RTX 4070 / 595.84 it returns GL_INVALID_OPERATION (0x0502)
+     * for GL_TEXTURE_2D, and the image binds only as GL_TEXTURE_EXTERNAL_OES
+     * (renderbuffer import fails too).  That is what made the window black --
+     * every frame was imported, rejected, and dropped.
+     *
+     * GL_EXT_EGL_image_storage is the modern path and takes the same image as
+     * immutable GL_TEXTURE_2D storage, so no samplerExternalOES shader and no
+     * ES context are needed.  Keep the OES call as a fallback for drivers that
+     * offer only the old extension.
+     */
+    static PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC tex_storage;
+    static bool tex_storage_looked_up;
+    if (!tex_storage_looked_up) {
+        tex_storage_looked_up = true;
+        tex_storage = (PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC)
+            eglGetProcAddress("glEGLImageTargetTexStorageEXT");
+    }
+
     GLuint texture = 0;
+    while (glGetError() != GL_NO_ERROR) { }
     glGenTextures(1, &texture);
     glBindTexture(GL_TEXTURE_2D, texture);
+    if (tex_storage) {
+        tex_storage(GL_TEXTURE_2D, (GLeglImageOES)image, NULL);
+    } else {
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+    }
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
     GLenum glerr = glGetError();
-    eglDestroyImageKHR(qemu_egl_display, image);
     if (glerr != GL_NO_ERROR) {
+        eglDestroyImageKHR(qemu_egl_display, image);
         fprintf(stderr,
-                "nvkvm present: glEGLImageTargetTexture2DOES glGetError=0x%04x\n",
-                (unsigned)glerr);
+                "nvkvm present: EGLImage->GL_TEXTURE_2D failed glGetError=0x%04x "
+                "(tex_storage=%d)\n", (unsigned)glerr, tex_storage ? 1 : 0);
         glDeleteTextures(1, &texture);
         return 0;
     }
-    fprintf(stderr, "nvkvm present: import OK tex=%u\n", texture);
+    /*
+     * Hand the EGLImage back ALIVE.  With EXT_EGL_image_storage the image IS
+     * the texture's immutable storage, so destroying it here leaves the
+     * texture pointing at released driver state -- glDeleteTextures() then
+     * faults inside libnvidia-eglcore (confirmed from a core dump: crash at
+     * glDeleteTextures, top frames inside libnvidia-eglcore).  The caller
+     * destroys it after the texture.
+     */
+    *image_out = image;
     return texture;
 }
 
@@ -205,8 +241,9 @@ int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
     }
 
     int ret = 0;
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
     uint32_t tex = nvkvm_import_dmabuf_tex(dup_fd, width, height, stride,
-                                           fourcc, modifier);
+                                           fourcc, modifier, &image);
     if (!tex) {
         ret = -EIO;
         goto out;
@@ -227,6 +264,7 @@ int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
 out_fb:
     egl_fb_destroy(&fb);
     glDeleteTextures(1, &tex);
+    eglDestroyImageKHR(qemu_egl_display, image);   /* after the texture */
 out:
     qemu_dmabuf_close(buf);
     qemu_dmabuf_free(buf);
@@ -253,6 +291,8 @@ out:
 #include <pthread.h>
 #include <string.h>
 
+#define NVKVM_PRESENT_CACHE 8
+
 typedef struct NvkvmPresent {
     QemuConsole *con;
     DeviceState *dev;
@@ -271,10 +311,32 @@ typedef struct NvkvmPresent {
      * primary dmabuf. */
     QemuDmaBuf *cur_buf;
 
-    /* Readback path: CPU surface we glReadPixels into and hand to the 2D
-     * display.  Recreated only when the geometry changes. */
-    DisplaySurface *surface;
-    uint32_t surf_w, surf_h;
+    uint32_t key;            /* guest scanout bo this frame came from */
+
+    /*
+     * Imported-buffer cache.  A compositor cycles a handful of scanout bos
+     * (measured: 3), so import each ONE and reuse it, exactly as a host
+     * compositor does.
+     *
+     * This is not only a speed matter.  Creating and destroying an EGLImage
+     * plus its texture every frame at ~600 fps reliably killed the NVIDIA
+     * driver: SIGSEGV inside libnvidia-eglcore, reached from
+     * eglDestroyImageKHR/glDeleteTextures, within ~2 s of a compositor
+     * starting.  Removing just the per-frame destroys made the same run
+     * survive indefinitely (5107 frames, no fault), which is what identified
+     * the churn rather than the import as the problem.
+     */
+    struct {
+        bool        valid;
+        uint32_t    key, w, h, stride, fourcc;
+        uint64_t    mod;
+        EGLImageKHR image;
+        GLuint      tex;
+    } cache[NVKVM_PRESENT_CACHE];
+    egl_fb fb;               /* reused; egl_fb_setup_for_tex keeps the FBO */
+
+    /* No cached DisplaySurface: the console owns it and may free it at any
+     * time (see nvkvm_present_readback).  Fetch it per frame. */
 
     int  mode;               /* -1 undecided, 0 readback, 1 GL zero-copy */
 } NvkvmPresent;
@@ -321,6 +383,7 @@ static int nvkvm_present_decide_mode(NvkvmPresent *p)
     return p->mode;
 }
 
+
 /* Push the pending frame to the GL console with no CPU copy. */
 static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
                              uint32_t stride, uint32_t fourcc, uint64_t mod)
@@ -342,14 +405,74 @@ static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
         qemu_dmabuf_close(p->cur_buf);
         qemu_dmabuf_free(p->cur_buf);
     }
+    for (int i = 0; i < NVKVM_PRESENT_CACHE; i++) {
+        if (p->cache[i].valid) {
+            glDeleteTextures(1, &p->cache[i].tex);
+            eglDestroyImageKHR(qemu_egl_display, p->cache[i].image);
+            p->cache[i].valid = false;
+        }
+    }
+    egl_fb_destroy(&p->fb);
     p->cur_buf = buf;
+}
+
+
+/* Look the frame's bo up in the import cache, importing it on a miss.
+ * Returns the GL texture, or 0.  Never destroys anything on the hot path. */
+static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t key, int fd,
+                                       uint32_t w, uint32_t h, uint32_t stride,
+                                       uint32_t fourcc, uint64_t mod)
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < NVKVM_PRESENT_CACHE; i++) {
+        if (!p->cache[i].valid) {
+            if (free_slot < 0) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (p->cache[i].key == key) {
+            /* Same bo id, but the compositor may have reallocated it at a new
+             * geometry -- then the cached import describes the wrong memory. */
+            if (p->cache[i].w == w && p->cache[i].h == h &&
+                p->cache[i].stride == stride &&
+                p->cache[i].fourcc == fourcc && p->cache[i].mod == mod) {
+                return p->cache[i].tex;
+            }
+            glDeleteTextures(1, &p->cache[i].tex);
+            eglDestroyImageKHR(qemu_egl_display, p->cache[i].image);
+            p->cache[i].valid = false;
+            free_slot = i;
+            break;
+        }
+    }
+
+    if (free_slot < 0) {
+        /* Full: drop slot 0.  A compositor cycles far fewer bos than this. */
+        glDeleteTextures(1, &p->cache[0].tex);
+        eglDestroyImageKHR(qemu_egl_display, p->cache[0].image);
+        p->cache[0].valid = false;
+        free_slot = 0;
+    }
+
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint tex = nvkvm_import_dmabuf_tex(fd, w, h, stride, fourcc, mod, &image);
+    if (!tex) {
+        return 0;
+    }
+    p->cache[free_slot] = (typeof(p->cache[0])){
+        .valid = true, .key = key, .w = w, .h = h, .stride = stride,
+        .fourcc = fourcc, .mod = mod, .image = image, .tex = tex,
+    };
+    return tex;
 }
 
 /* Import the pending frame on our private NVIDIA EGL context, read it back to a
  * CPU surface, and push it to the 2D display.  Works for any host display GPU. */
-static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t w,
-                                   uint32_t h, uint32_t stride, uint32_t fourcc,
-                                   uint64_t mod)
+static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t key,
+                                   uint32_t w, uint32_t h, uint32_t stride,
+                                   uint32_t fourcc, uint64_t mod)
 {
     if (!nvkvm_present_egl_ensure()) {
         close(fd);
@@ -361,27 +484,29 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t w,
         return;
     }
 
-    uint32_t tex = nvkvm_import_dmabuf_tex(fd, w, h, stride, fourcc, mod);
+    GLuint tex = nvkvm_present_cached_tex(p, key, fd, w, h, stride, fourcc,
+                                          mod);
     if (!tex) {
         goto out_ctx;
     }
+    egl_fb_setup_for_tex(&p->fb, w, h, tex, false);   /* keeps its FBO */
 
-    egl_fb fb = { 0 };
-    egl_fb_setup_for_tex(&fb, w, h, tex, false);
-
-    if (!p->surface || p->surf_w != w || p->surf_h != h) {
-        if (p->surface) {
-            qemu_free_displaysurface(p->surface);
-        }
-        p->surface = qemu_create_displaysurface(w, h);
-        p->surf_w = w;
-        p->surf_h = h;
-        qemu_console_resize(p->con, w, h);
-        dpy_gfx_replace_surface(p->con, p->surface);
+    /*
+     * Never cache the DisplaySurface.  The console OWNS it: qemu_console_resize()
+     * creates and installs one itself (ui/console.c), and every
+     * dpy_gfx_replace_surface() frees the outgoing surface.  Ask the console
+     * for its current surface each frame rather than holding a pointer that a
+     * window resize or VM reset can free under us -- the glReadPixels below
+     * writes w*h*4 bytes (8 MB at 1080p) into whatever it is given.
+     */
+    qemu_console_resize(p->con, w, h);
+    DisplaySurface *ds = qemu_console_surface(p->con);
+    if (!ds || surface_width(ds) != (int)w || surface_height(ds) != (int)h) {
+        fprintf(stderr, "nvkvm present: console surface unusable for %ux%u\n",
+                w, h);
+        goto out_ctx;
     }
-    egl_fb_read(p->surface, &fb);          /* glReadPixels texture → CPU BGRA */
-    egl_fb_destroy(&fb);
-    glDeleteTextures(1, &tex);
+    egl_fb_read(ds, &p->fb);               /* glReadPixels texture -> CPU BGRA */
     dpy_gfx_update(p->con, 0, 0, w, h);
 
 out_ctx:
@@ -403,6 +528,7 @@ static void nvkvm_present_gfx_update(void *opaque)
     int      fd     = p->fd;
     uint32_t w      = p->w,  h = p->h, stride = p->stride, fourcc = p->fourcc;
     uint64_t mod    = p->modifier;
+    uint32_t key    = p->key;
     p->fd    = -1;            /* take ownership of this frame's fd */
     p->dirty = false;
     pthread_mutex_unlock(&p->lock);
@@ -410,7 +536,7 @@ static void nvkvm_present_gfx_update(void *opaque)
     if (nvkvm_present_decide_mode(p) == 1) {
         nvkvm_present_gl(p, fd, w, h, stride, fourcc, mod);
     } else {
-        nvkvm_present_readback(p, fd, w, h, stride, fourcc, mod);
+        nvkvm_present_readback(p, fd, key, w, h, stride, fourcc, mod);
     }
 }
 
@@ -464,9 +590,6 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
         qemu_dmabuf_close(p->cur_buf);
         qemu_dmabuf_free(p->cur_buf);
     }
-    if (p->surface) {
-        qemu_free_displaysurface(p->surface);
-    }
     if (p->fd >= 0) {
         close(p->fd);
     }
@@ -475,6 +598,7 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
 }
 
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+                          uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,
                           uint32_t fourcc, uint64_t modifier)
 {
@@ -488,6 +612,7 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
         close(p->fd);        /* drop the frame the display hasn't taken yet */
     }
     p->fd       = dmabuf_fd;
+    p->key      = buf_key;
     p->w        = width;
     p->h        = height;
     p->stride   = stride;

@@ -45,6 +45,7 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv);
  * was accepted (caller must not close it), false if the console is inactive
  * (caller still owns the fd). */
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+                          uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,
                           uint32_t fourcc, uint64_t modifier);
 

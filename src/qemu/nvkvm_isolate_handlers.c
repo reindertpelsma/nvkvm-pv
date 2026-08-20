@@ -1118,7 +1118,8 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	 * (compute-only build, graphics=off, or no display backend), submit
 	 * returns false and we fall through to close it ourselves.
 	 */
-	if (nvkvm_present_submit(nv, dmabuf_fd, req->width, req->height,
+	if (nvkvm_present_submit(nv, dmabuf_fd, req->stub_handle,
+				 req->width, req->height,
 				 req->pitch, req->format, req->modifier)) {
 		resp->status = 0;
 		return 0;
