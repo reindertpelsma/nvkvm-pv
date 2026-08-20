@@ -330,54 +330,63 @@ measured box they get a real NVIDIA context, produce real GPU buffers, the
 compositor composites them, and the frames now reach a host window and keep
 coming.
 
-### The guest flips a buffer nothing renders into — OPEN, localized 2026-08-20
+### Guest pixels DO reach the host window — but weston negotiates a format that does not (2026-08-20)
 
-A compositor runs on the GPU in the guest and flips at ~640 fps; QEMU receives
-every frame; the window is black. Measured on RTX 4070 / 595.84.
+Measured on RTX 4070 / 595.84. The display path works; a specific format
+negotiation does not, and it is weston's default.
 
-**Buffer sharing works.** This was checked rather than assumed, with a host-side
-CPU mapping of the exported dma-buf (`NVKVM_PRESENT_PROBE=2`):
+**Proof the path works.** A plain client (gbm_surface + eglSwapBuffers +
+drmModeSetCrtc, no compositor) renders a known colour and flips it:
 
 ```
-RW control: wrote 0xA5A5F00D -> read back 0xa5a5f00d   -> mapping IS real memory
-next flip, same gem=0x2: nonzero_px=1/2073600 px[0]=0xa5a5f00d
+guest: GL_RENDERER NVIDIA GeForce RTX 4070, frame 0 rgb=(0.50,0.93,0.07)
+host:  nonzero_px=2073600/2621440  px[0]=0x007fee11     <- 0x7f,0xee,0x11
+host:  next sample                 px[0]=0x00f31873     <- animation follows
 ```
 
-A byte written on the host survived into a later flip of the same bo. So the
-host mapping is genuine persistent memory, and host and guest are addressing
-the *same* allocation. Export and identity are correct. Sizes agree too: a bo
-whose guest dma-buf is 8323072 bytes exports as 8323072 on the host (an earlier
-apparent mismatch was two different bos being compared, not a bug).
+and QEMU's window surface, dumped with `NVKVM_PRESENT_DUMP`, is that exact
+green. So guest GL -> flip -> PRIME export -> host import -> window is a
+working, animating pipeline.
 
-**What is actually wrong:** nothing writes to the buffer that gets flipped.
-Apart from that sentinel the buffer is all zeros while the guest renders, and
-the sentinel was *not* overwritten -- at 640 fps a real compositing target
-would be clobbered within milliseconds. Two independent read paths agree the
-buffer is otherwise empty (GL import + `glGetTexImage`, and plain CPU mmap).
+**What weston does differently.** It negotiates `DRM_FORMAT_MOD_LINEAR`
+(`mod=0x0`, bo exactly w*h*4). Every LINEAR bo it flips arrives at the host
+completely empty -- 0 of 2073600 px set -- while the guest renders at ~640 fps.
+A sentinel written into such a bo from the host survived intact frames later,
+so nothing was drawing into it. The working client's bo instead carries
+modifier **0x0300000000606014** (= `NVKVM_MOD_BL2D(0,1,2,6,4)`, which we
+already advertise), is 10485760 bytes, and delivers its pixels perfectly.
 
-So the guest renders into one allocation and flips another. The remaining
-question is guest-side buffer plumbing -- which host allocation the guest's
-GL/GBM actually targets, versus which stub handle ends up on the
-`drm_framebuffer` -- not the present path, not EGL, and not the export.
+**Why the obvious fix does not work.** Three variants were tried and each fails
+in a different way:
 
-This is a bug, not an architectural limit: the sentinel proves guest and host
-can share the very buffer in question.
+| change | result |
+|---|---|
+| drop LINEAR from `nvkvm_pipe_modifiers` | weston: `failed to create gbm surface` -> `Failed to init output gl state` |
+| advertise ONLY 0x0300000000606014 | same failure |
+| advertise no modifiers at all (NULL IN_FORMATS) | weston starts, then `failed to create kms fb: Invalid argument` on every flip |
 
-Things ruled out along the way, each by measurement:
+NVIDIA's `gbm_surface_create_with_modifiers` refuses even the exact modifier
+its own non-modifier path picks, so a compositor driven off our IN_FORMATS
+cannot allocate. Note the accept list must keep LINEAR regardless (cursors and
+shadow buffers legitimately use it) -- that is why advertise and accept were
+split rather than sharing one array.
 
-- *tiling/modifiers* -- a block-linear buffer read as linear gives garbage
-  (confirmed by a `kmsgrab` capture of the host's own scanout, which comes back
-  striped). We get pure black, and forcing LINEAR-only scanout modifiers
-  changed nothing.
-- *the display path* -- real bugs were found and fixed there (external-only
-  EGLImages needing `glEGLImageTargetTexStorageEXT`; per-frame image churn
-  killing the driver; a `DisplaySurface` use-after-free), and the window is
-  still black, because the pixels were never there to show.
-- *wrong isolate* -- `isolate_id` is the owning session's, read in
-  `nvkvm_virtio_present`.
+So the remaining work is the modifier negotiation weston performs, not the
+present path.
 
-Do not read the "637 frames/s presented" figure as "the display works". It
-counts handovers, not pixels.
+**Also open: the window freezes.** With the working client, presents keep
+flowing (2653 and counting, probe advancing) while the dumped window surface
+stops changing -- the readback stops draining after roughly a minute. This is
+the old "frames stop updating" symptom and it is NOT the sync-fd issue, which
+was fixed. Import logging was removed when the import cache landed, so the
+freeze is currently uncharacterised; restoring an `import OK`/failure counter
+is the first thing to do.
+
+Do not read "frames/s presented" as "the display works": it counts handovers.
+Use `NVKVM_PRESENT_PROBE=1` (what is in the exported buffer) and
+`NVKVM_PRESENT_DUMP=<path>` (what the window shows) instead -- both were added
+for exactly this reason, because a frame counter cannot tell black from
+correct.
 
 ### Offscreen GL was broken on driver branches 595 and 610 — fixed 2026-08-17
 

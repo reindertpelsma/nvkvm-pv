@@ -1106,9 +1106,8 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	 * question separate from how the frame is later displayed.
 	 */
 	if (getenv("NVKVM_PRESENT_PROBE") && sz > 0) {
-		static int probes_left = 6;
-		if (probes_left > 0) {
-			probes_left--;
+		static unsigned probe_n;
+		if ((probe_n++ % 60) == 0) {
 			int probe_rw = getenv("NVKVM_PRESENT_PROBE")[0] == '2';
 			void *m = mmap(NULL, (size_t)sz,
 				       probe_rw ? (PROT_READ | PROT_WRITE)

@@ -507,6 +507,21 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t key,
         goto out_ctx;
     }
     egl_fb_read(ds, &p->fb);               /* glReadPixels texture -> CPU BGRA */
+    /*
+     * NVKVM_PRESENT_DUMP=<path>: write what the window is about to show, as a
+     * PPM.  On a headless host, or one whose compositor refuses screenshots,
+     * this is the only way to answer "is there a picture" without asking a
+     * human to look at the screen -- and a frame counter cannot answer it.
+     */
+    {
+        const char *dump = getenv("NVKVM_PRESENT_DUMP");
+        if (dump) {
+            static unsigned dn;
+            if ((dn++ % 120) == 0) {
+                nvkvm_write_ppm(dump, ds);
+            }
+        }
+    }
     dpy_gfx_update(p->con, 0, 0, w, h);
 
 out_ctx:
