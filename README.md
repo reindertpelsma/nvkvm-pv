@@ -375,6 +375,18 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 4060 | Ada AD107 | 580.95.05 | 580 | 28/28 |
 | RTX 4090 | Ada AD102 | 580.95.05 | 580 | 28/28 |
 | RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
+| A100 80GB PCIe | **Ampere GA100** (datacenter) | 580.126.09 | 580 | 28/28 \*\*\* |
+
+\*\*\* First datacenter GA100. It needed two fixes to get there, both of
+which had been silently wrong on every card before it: the host half of the
+`RM_UNMAP_MEMORY` address contract was never implemented (every unmap reached
+the driver with VA 0), and `UVM_MAP_DYNAMIC_PARALLELISM_REGION` was unhandled —
+`libcuda` calls it during context creation on GA100, and because bare UVM NRs
+collide with the frontend space (65 == 0x41 == `NV_ESC_RM_IDLE_CHANNELS`) it had
+been forwarded as a completely different ioctl until the sanitizer type gate
+turned that into an honest `ENOTTY`. With both fixed: 28/28, and a 3B LLM
+generating in the guest at 5.75 GiB VRAM, with 249 TFLOP/s fp16 matmul measured
+through the forwarder.
 
 \*\* nvkvm refused a legitimate `UVM_FREE` — the ioctl names its range by base
 alone and sends length 0, and the ownership check rejected the zero length. The
