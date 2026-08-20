@@ -217,6 +217,26 @@ Traced, with two hypotheses eliminated by experiment:
   question is why, not what it was told. Run with `NVKVM_DEBUG=1` to see the
   `CLASSLIST_V2` line.
 
+* **Not "datacenter parts" as a class, either — eliminated 2026-08-20 on an
+  A100.** The obvious confound was that the H100 is a display-less,
+  ECC-capable datacenter card and every passing row was a consumer part, which
+  would make this a datacenter problem rather than a Hopper one. It is not: an
+  **A100 80GB PCIe** (GA100, driver 580.126.09) — equally display-less, equally
+  ECC-capable, equally a datacenter SKU — **passes `vk_compute_dispatch`**, with
+  4096 elements verified, plus EGL and a pixel-checked GL draw. So the
+  distinguishing factor is Hopper, not the market segment.
+
+  This also *supports* the channel/compute diagnosis above rather than merely
+  narrowing it. If the userspace driver reaches for `AMPERE_CHANNEL_GPFIFO_A`
+  regardless of the part, that choice is harmless on an Ampere die — the
+  compute class it then allocates matches — and fatal only where the channel
+  and compute classes come from different generations. The A100 is exactly the
+  case where the same behaviour should be benign, and it is.
+
+  (That A100 has an unrelated problem of its own: `cuCtxCreate` returns 999
+  before any kernel launch. Different failure, different layer, tracked in
+  [known limitations](../internal/known-limitations.md).)
+
 **This does not affect CUDA.** All 19 CUDA checks pass on the H100 over that
 same Ampere channel, with byte-exact verification, and the class list reaching
 the guest is complete — nvkvm is not withholding Hopper classes from the

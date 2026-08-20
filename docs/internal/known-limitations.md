@@ -719,6 +719,47 @@ Do not put untrusted tenants behind this.
 
 ## Functional gaps worth knowing
 
+### A100 (Ampere GA100): `cuCtxCreate` fails with 999 — OPEN, first datacenter-Ampere test
+
+Measured 2026-08-20 on an **A100 80GB PCIe**, host driver **580.126.09**, ABI
+profile 580, guest kernel 6.8, on a nested-virt host (massed-compute).
+
+Bring-up is clean and CUDA gets a long way in before dying:
+
+```
+PASS  nvidia_smi_gpu        NVIDIA A100 80GB PCIe
+PASS  cuda_init             rc=0
+PASS  cuda_device_count     1
+PASS  cuda_device_name      NVIDIA A100 80GB PCIe
+PASS  cuda_compute_cap      sm_80
+FAIL  cuda_ctx_create       rc=999 (CUDA_ERROR_UNKNOWN)
+```
+
+Everything downstream of the context skips, so the run is **22 PASS / 1 FAIL /
+5 SKIP**. The failure is not flag-dependent and not specific to one entry point:
+`cuCtxCreate_v2` returns 999 for flags 0/1/2/4, and `cuDevicePrimaryCtxRetain` —
+the path most runtimes actually take — returns 999 as well.
+
+**What is NOT the cause**, checked: no `DENY` and no allowlist refusal anywhere
+in the host log, and no nvkvm error in the guest ring (`RING MAPPED ... 3-way
+OK`, `synthesized GET_PIDS` and nothing else). So the driver is being reached and
+is failing the request, rather than nvkvm refusing to forward it.
+
+**Graphics on the same box is fine**, which is the surprising part — Vulkan
+compute, EGL and GL all pass *with pixel verification*, on a card with no display
+engine at all:
+
+```
+PASS  vk_compute_dispatch   4096 elements, data[i]=i*3+7 verified on A100
+PASS  gl_renderer           'NVIDIA A100 80GB PCIe/PCIe/SSE2'
+PASS  gl_draw_pixel_check   inside==triangle, outside==clear
+```
+
+This is the first GA100 ever tested here — every other Ampere row is a consumer
+GA10x die. It is deliberately **not** added to the tested-platforms table, whose
+stated bar is "reached a real CUDA kernel launch": this did not.
+
+
 ### X11 clients: Xwayland's glamor cannot allocate through nvkvm — OPEN, unconfirmed
 
 Wayland clients work; **X11 clients under `weston --xwayland` do not get a window.**
