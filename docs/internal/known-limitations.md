@@ -370,6 +370,36 @@ is fully usable for display work once modeset is on.  `tests/validate.sh` is
 28/28 there either way, because compute and offscreen GL go through
 `EGL_EXT_platform_device` and never touch GBM.
 
+### Wayland compositors flip once, then stall — narrowed 2026-08-20
+
+After the IN_FORMATS fixes, weston and wlroots both start cleanly, negotiate
+block-linear (`mod=0x300000000606014`) and report no errors -- wlroots' explicit
+`EGLImage not supported` / `Failed to create FBO` is **gone**, so that part is
+genuinely fixed.  They are still black, and the measurement that matters is:
+
+```
+presents in 12s: 0        (both weston and cage/wlroots)
+last flip:       the modeset, and nothing after it
+```
+
+So they are not rendering black frames -- they submit **one** flip and then stop
+submitting entirely.  Xorg on the same device is unaffected because it never
+flips at all (it blits into the front buffer), and it renders a correct live
+desktop.  That asymmetry is the strongest clue available: whatever stalls them
+is in the flip/completion path, not in rendering and not in the export.
+
+Checked and NOT the cause: flip completion events are not simply dropped --
+`nvkvm_pipe_update()` already falls back to `drm_crtc_send_vblank_event()` when
+`drm_crtc_vblank_get()` fails, so an event is always delivered.
+
+Not yet checked, in the order worth trying: whether the compositor is blocked in
+`poll()` on the DRM fd (strace it -- one run answers whether it is waiting for
+an event or has given up); whether `drm_crtc_vblank_on/off` belong in
+`.enable`/`.disable` (we never call them, which is unusual for a vkms-style
+driver and affects vblank bookkeeping even though the event fallback masks it);
+and whether the software vblank hrtimer is actually running when an event is
+armed rather than sent immediately.
+
 ### X11 renders correctly but the host only sees the first frame (2026-08-20)
 
 Xorg with the modesetting driver **works** on our KMS node: an X root capture
@@ -406,7 +436,7 @@ Note this is a *different* gap from the compositor one above: weston and wlroots
 do flip, and are black for their own reasons; X does not flip, and is correct
 but frozen.
 
-### Compositors render black — one cause fixed, one still open (2026-08-20)
+### Wayland compositors flip once, then stall — open (2026-08-20)
 
 Reproduced on RTX 4070 / 595.84 / Ada and RTX 3060 / 580.159.04 / Ampere.
 
