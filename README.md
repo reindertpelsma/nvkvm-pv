@@ -392,8 +392,30 @@ Host/guest parity measured on that A100 with identical scripts, identical torch
 
 | workload | host | guest | ratio |
 |---|---|---|---|
+| **Geekbench 7 GPU (OpenCL)** | **207234** | **203098** | **98.0%** |
 | fp16 matmul 8192x8192 | 246.8 TFLOP/s | 249.1 TFLOP/s | **1.01x** |
 | Qwen2.5-3B generate, batch 1, greedy | 15.4 tok/s | 11.3 tok/s | **0.73x** |
+
+The Geekbench row is the one to check first, because it is the only line here a
+reader can verify without taking our word for it — both runs are published:
+[side by side](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405).
+All eleven workloads land between **93.2% and 100.1%**, two of them at or above
+parity (Particle Physics 100.1%, Face Tracking 100.0%); the weakest is Video
+Filter at 93.2%.
+
+Two caveats on that 98.0%, both of which cut in nvkvm's favour and neither of
+which we can remove:
+
+- **The "host" side is itself a VM.** This box is a Proxmox instance with the
+  A100 passed through, so the comparison is the nvkvm guest against *its
+  immediate host*, not against bare metal. That is still the right measurement
+  of what nvkvm costs — it is the same card and the same driver either side —
+  but the RTX 3050 row above, which really is bare metal, is the one to quote
+  for a bare-metal claim.
+- **The guest was given less machine.** 8 cores and 15.62 GB against the host's
+  16 cores and 94.38 GB. Geekbench's GPU workloads still do CPU-side work, so
+  the guest is carrying a handicap unrelated to GPU forwarding, and 98.0% is
+  more likely an under-estimate than an over-estimate.
 
 Both halves are worth reading. Sustained compute is at parity — the 1.01x is
 measurement noise, not a speedup. Single-stream token generation is **27%
