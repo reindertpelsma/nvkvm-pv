@@ -794,6 +794,39 @@ The guest synthesises an opaque per-fd id instead
   corrupt, so realize fails loudly instead
   (`src/qemu/virtio_nvgpu.c:1239-1254`).
 
+### The compute-only build configuration is not exercised by anyone
+
+`src/qemu/` has four meaningful build configurations, and the default build
+covers exactly one of them:
+
+| config | selected by |
+|---|---|
+| A | graphics + `CONFIG_OPENGL` — the default, and the only one normally built |
+| B | `-DNVKVM_QEMU_GRAPHICS=0` |
+| C | `!CONFIG_OPENGL` |
+| D | both |
+
+B, C and D compile a different arm of every `#if defined(CONFIG_OPENGL) &&
+NVKVM_QEMU_GRAPHICS` in the present path — including the no-op stubs. Because
+nothing builds them routinely, those stubs drift from the header they are
+supposed to satisfy and nobody notices. This is not hypothetical: during the
+2026-08-20 audit, config B was found **already broken** —
+
+```
+nvkvm_present_egl.c:659:6: error: conflicting types for 'nvkvm_present_submit'
+```
+
+— a stub whose signature had fallen behind its own declaration. It was repaired
+in `53e3a96`, and all four configurations were then compiled clean across all 11
+nvkvm translation units under QEMU's full warning set.
+
+There is no CI in this repo. Until there is, **build B/C/D by hand before
+touching the present path**, or the compute-only deployment breaks silently
+while every local build stays green. For C and D the `!CONFIG_OPENGL` arm has to
+be selected genuinely — a `config-host.h` shim ahead of the build dir on the
+`-iquote` path — rather than approximated through the graphics gate, or the arm
+you think you are testing is not the one that compiles.
+
 ### Dead code you may trip over while reading
 
 `src/qemu/nvkvm_dispatch.c` and `src/qemu/nvkvm_frontend.c` implement the
