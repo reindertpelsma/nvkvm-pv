@@ -330,46 +330,45 @@ measured box they get a real NVIDIA context, produce real GPU buffers, the
 compositor composites them, and the frames now reach a host window and keep
 coming.
 
-### Display work needs a host whose NVIDIA GBM stack actually works (2026-08-20)
+### Display work needs nvidia-drm.modeset=1 on the host (2026-08-20)
 
 Compute and offscreen GL need only `EGL_EXT_platform_device`.  The
-display/compositor path additionally needs the **GBM** platform, and that is a
-separate piece of NVIDIA userspace which some hosts simply do not have wired
-up.  Check before spending time on display bugs, because the failure looks
-exactly like an nvkvm bug: compositors fall back to llvmpipe and nothing is
-presented.
+display/compositor path additionally needs the **GBM** platform, and NVIDIA only
+provides GBM when its DRM module is loaded with `modeset=1`.  Without it,
+libgbm silently falls back to Mesa and every compositor lands on llvmpipe --
+inside the guest that is indistinguishable from an nvkvm bug.
 
-Measured on a vast.ai RTX 3060 box (driver 580.159.04, Ubuntu 22.04 container),
-with a headless probe that opens the render node, makes a GBM device and asks
-who claims the EGLDisplay:
+Measured on a vast.ai RTX 3060 (driver 580.159.04), same probe before and after:
 
 ```
-                     host (no nvkvm)        guest (through nvkvm)
-drm driver           nvidia-drm             nvidia-drm
-gbm backend name     drm    <- Mesa         drm    <- Mesa
-EGL vendor           Mesa Project           Mesa Project
-GL_RENDERER          llvmpipe               llvmpipe
+                     modeset=N (default)     modeset=Y
+gbm backend name     drm    <- Mesa          nvidia
+EGL vendor           Mesa Project            NVIDIA
+GL_RENDERER          llvmpipe                NVIDIA GeForce RTX 3060/PCIe/SSE2
 ```
 
-The host fails identically with nvkvm not involved at all, so this is the
-environment, not us.  That box lacked `/usr/lib/x86_64-linux-gnu/gbm/
-nvidia-drm_gbm.so` entirely; adding the symlink (it points at
-`libnvidia-allocator.so.<ver>`, which was present) did not help, nor did
-`GBM_BACKEND` / `GBM_BACKENDS_PATH`.  Its Mesa is 23.2 on 22.04.
+The host showed this with nvkvm not involved at all, and the guest inherited it:
+the guest's GBM only reaches NVIDIA once the **host** module has modeset on.
 
-What still works there, so the box is not useless: `tests/validate.sh` is
-**28/28**, including `gl_renderer_is_nvidia` — offscreen EGL via
-`EGL_EXT_platform_device` reaches the real GPU.  Only the GBM platform is
-missing.
-
-Quick triage before any display debugging on a new host:
+Fix on the host:
 
 ```
-gbm backend name=nvidia-drm  + EGL vendor=NVIDIA   -> usable
-gbm backend name=drm         + EGL vendor=Mesa     -> host cannot do NVIDIA GBM;
-                                                      display work is impossible
-                                                      here, regardless of nvkvm
+rmmod nvidia_drm && modprobe nvidia_drm modeset=1     # or nvidia-drm.modeset=1 on the kernel cmdline
+cat /sys/module/nvidia_drm/parameters/modeset          # expect Y
 ```
+
+Triage before any display debugging on a new host -- run a GBM probe on the
+**host** first, because if the host cannot do NVIDIA GBM the guest never will:
+
+```
+gbm backend name=nvidia + EGL vendor=NVIDIA  -> usable
+gbm backend name=drm    + EGL vendor=Mesa    -> check modeset before suspecting nvkvm
+```
+
+Note this is easy to misread as an environment limitation.  It is not: the box
+is fully usable for display work once modeset is on.  `tests/validate.sh` is
+28/28 there either way, because compute and offscreen GL go through
+`EGL_EXT_platform_device` and never touch GBM.
 
 ### weston's DRM backend renders black; the present path is not at fault (2026-08-20)
 
