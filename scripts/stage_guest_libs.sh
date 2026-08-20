@@ -90,7 +90,19 @@ stage(){ # $1 basename-in-bundle  $2 destdir  [$3.. extra symlink names]
 }
 
 # -- system dir: NVML for nvidia-smi (+ libcuda for completeness) --
-stage "libnvidia-ml.so.$V" "$SYS" "libnvidia-ml.so.1"
+# The bare "libnvidia-ml.so" is staged alongside the SONAME for the same reason
+# libcuda.so is below, but for dlopen rather than for the linker: third-party
+# tools that query NVML commonly dlopen the UNVERSIONED name.  Geekbench 7 does,
+# and without this link it fails with
+#     Failed to load nvmlInit_v2: <its own binary>: undefined symbol: nvmlInit_v2
+# which reads as a broken NVML or a broken binary and is neither -- the dlopen
+# of "libnvidia-ml.so" simply found no such file, so it fell back to
+# dlsym(RTLD_DEFAULT) and reported the failure against itself.  Measured: with
+# the .so.1 link alone, dlopen("libnvidia-ml.so.1") succeeds and
+# dlopen("libnvidia-ml.so") fails; with both, NVML works and nvidia-smi -L
+# reports the same GPU and UUID as the host.  The host gets this link from the
+# normal driver package; the guest only gets what we stage.
+stage "libnvidia-ml.so.$V" "$SYS" "libnvidia-ml.so.1" "libnvidia-ml.so"
 stage "libcuda.so.$V"      "$SYS" "libcuda.so.1" "libcuda.so"
 # Remove a STALE differently-versioned copy, never the one just staged.
 # This line used to hardcode 575.51.03; on a host actually running 575.51.03 it

@@ -1491,10 +1491,12 @@ struct nvkvm_mapva_ent {
 	uint32_t isolate_id;
 	uint32_t h_client, h_device, h_memory;
 	uint64_t va;
+	uint64_t seq;      /* insertion order, for LIFO matching */
 };
 
 static struct nvkvm_mapva_ent g_mapva[NVKVM_MAPVA_MAX];
 static pthread_mutex_t g_mapva_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_mapva_seq;
 
 static void nvkvm_mapva_record(uint32_t iso, uint32_t hc, uint32_t hd,
 			       uint32_t hm, uint64_t va)
@@ -1503,19 +1505,22 @@ static void nvkvm_mapva_record(uint32_t iso, uint32_t hc, uint32_t hd,
 	if (!va)
 		return;
 	pthread_mutex_lock(&g_mapva_lock);
+	/*
+	 * Always take a NEW slot; never overwrite an existing entry for the same
+	 * object.  One object can be mapped more than once at different VAs
+	 * (NVOS33 carries offset and length, so the same hMemory yields
+	 * different addresses), and an earlier version of this code overwrote on
+	 * remap.  That lost the first VA, so the next unmap of the FIRST mapping
+	 * was handed the SECOND mapping's address and tore down the wrong
+	 * region -- observed as vk_probe/gl_probe dying on SIGBUS while pure
+	 * CUDA, which remaps far less, passed.
+	 */
 	for (int i = 0; i < NVKVM_MAPVA_MAX; i++) {
-		struct nvkvm_mapva_ent *e = &g_mapva[i];
-		if (e->in_use && e->isolate_id == iso && e->h_client == hc &&
-		    e->h_device == hd && e->h_memory == hm) {
-			e->va = va;              /* remap of the same object */
-			pthread_mutex_unlock(&g_mapva_lock);
-			return;
-		}
-		if (!e->in_use && free_slot < 0)
-			free_slot = i;
+		if (!g_mapva[i].in_use) { free_slot = i; break; }
 	}
 	if (free_slot >= 0) {
-		struct nvkvm_mapva_ent ne = { 1, iso, hc, hd, hm, va };
+		struct nvkvm_mapva_ent ne = { 1, iso, hc, hd, hm, va,
+					      ++g_mapva_seq };
 		g_mapva[free_slot] = ne;
 	}
 	/* Table full: drop it.  The unmap then fails exactly as it did before
@@ -1527,16 +1532,26 @@ static void nvkvm_mapva_record(uint32_t iso, uint32_t hc, uint32_t hd,
 static uint64_t nvkvm_mapva_take(uint32_t iso, uint32_t hc, uint32_t hd,
 				 uint32_t hm)
 {
-	uint64_t va = 0;
+	uint64_t va = 0, best = 0;
+	int best_i = -1;
 	pthread_mutex_lock(&g_mapva_lock);
+	/*
+	 * LIFO: take the MOST RECENT mapping of this object.  Map/unmap of the
+	 * same object nests in practice, so newest-first is the pairing that
+	 * matches; taking an arbitrary entry is what produced the wrong-region
+	 * unmap described above.
+	 */
 	for (int i = 0; i < NVKVM_MAPVA_MAX; i++) {
 		struct nvkvm_mapva_ent *e = &g_mapva[i];
 		if (e->in_use && e->isolate_id == iso && e->h_client == hc &&
-		    e->h_device == hd && e->h_memory == hm) {
-			va = e->va;
-			e->in_use = 0;
-			break;
+		    e->h_device == hd && e->h_memory == hm && e->seq > best) {
+			best = e->seq;
+			best_i = i;
 		}
+	}
+	if (best_i >= 0) {
+		va = g_mapva[best_i].va;
+		g_mapva[best_i].in_use = 0;
 	}
 	pthread_mutex_unlock(&g_mapva_lock);
 	return va;
