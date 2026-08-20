@@ -3,13 +3,16 @@
  *
  * Each isolate has a dedicated reader thread that multiplexes IOCTL responses
  * by txn_id onto per-caller condvars allocated on the callers' stacks.
- * Non-IOCTL commands serialize via sync_lock + sync_cond (one at a time).
+ * Non-IOCTL commands serialize via sync_cmd_lock (a real one-at-a-time gate,
+ * audit F3-1) and hand off through sync_lock + sync_cond.
  * All socket writes go through write_lock (prevents partial-send interleaving).
  *
  * The stub binary is embedded as nvkvm_stub_elf[] generated at build time
  * from src/stub/nvkvm_stub; loaded via memfd_create + fexecve (no disk file).
  *
- * Lock order: sync_lock > write_lock > lock
+ * Lock order: sync_cmd_lock > sync_lock > write_lock > lock
+ * (present_lock/xiso_lock/loop_lock are independent outer gates over their own
+ * *_sync_lock; they nest write_lock beneath them but never sync_lock.)
  */
 
 #include "qemu/osdep.h"
@@ -344,7 +347,14 @@ static int nvkvm_child_enter_mount_ns(void)
 		return -1;
 	if (syscall(SYS_pivot_root, ".", ".") < 0)
 		return -1;
-	umount2(".", MNT_DETACH);
+	/* Audit R4-L2: this used to ignore its return, the same fail-open the
+	 * MS_REMOUNT below already learned about.  pivot_root(".", ".") leaves
+	 * the OLD host root stacked on the current directory; if the detach
+	 * fails it stays overmounted and path resolution from the stub reaches
+	 * the host filesystem again — i.e. the whole point of the pivot is
+	 * silently undone.  Fail closed: the caller _exit(126)s the child. */
+	if (umount2(".", MNT_DETACH) < 0)
+		return -1;
 	if (chdir("/") < 0)
 		return -1;
 	/* Restricted /dev dirfd, opened AFTER the pivot: its ".." is the sandbox
@@ -381,6 +391,7 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 
 #include "nvkvm_isolate.h"
 #include "virtio_nvgpu.h"
+#include "nvkvm_present_egl.h"   /* S-4: nvkvm_present_forget_isolate() */
 
 #include "../../src/common/nvkvm_isolate_proto.h"
 #include "../../src/common/nvkvm_ring.h"
@@ -445,6 +456,213 @@ static void nvkvm_isolate_closefrom(int first)
 		}
 	}
 	close(dfd);
+}
+
+/* ── Bounded waits (audit F1-1 / F2-1, hang audit 2026-08) ───────────────── */
+
+/*
+ * WHY every QEMU->stub round-trip now has a deadline.
+ *
+ * The synchronous isolate commands (CLOSE_HANDLE, MMAP, MUNMAP, POLL, UNPOLL,
+ * COPY_HANDLE, SETUP_RING, PRESENT_EXPORT, XISO_IMPORT, REALIZE_UVM_FD)
+ * dispatch INLINE on the single virtio TX thread with the QEMU BQL held (see
+ * the threading note at the top of virtio_nvgpu.c).  Every one of them used to
+ * park in an untimed pthread_cond_wait, so a stub that simply never answered —
+ * which an unprivileged guest process can arrange just by keeping the SPSC ring
+ * continuously fed, starving the stub's control-socket service edge — wedged
+ * the main loop, QMP, all timers and every vCPU until SIGKILL.
+ *
+ * We cannot fix that properly here: taking the round-trip off the BQL is a
+ * threading-model change the owner has not asked for.  What a deadline DOES buy
+ * is a downgrade from "one guest process hangs the whole VMM" to "one
+ * misbehaving isolate is killed": on expiry we declare the isolate dead, which
+ * tears down its socket, unblocks every other waiter on it, and lets the guest
+ * see -ETIMEDOUT.  RESIDUAL RISK: for up to the timeout below the BQL is still
+ * held, so the VM is still stalled — just bounded now, not forever.
+ *
+ * Choice of value: 30 s.  These commands are open/close/mmap/munmap, poll
+ * registration and PRIME export/import — none of them queues GPU work or waits
+ * on a channel, so the slowest realistic one is REALIZE_UVM_FD (UVM_INITIALIZE
+ * + per-GPU register + one alloc + mmap) on a heavily contended host, which is
+ * milliseconds in practice and orders of magnitude inside this budget.  The
+ * risk we are trading against is a FALSE timeout killing a healthy isolate,
+ * which is worse than the hang it prevents, so the value is deliberately far
+ * more generous than the work it bounds rather than tuned close to it.
+ */
+#define NVKVM_ISO_SYNC_TIMEOUT_MS   30000u
+
+/*
+ * Re-check cadence inside a wait.  A waiter wakes this often to re-evaluate
+ * "is my isolate still alive and still mine" so a teardown that happens while
+ * it is parked is noticed promptly instead of at the full deadline.
+ */
+#define NVKVM_ISO_WAIT_SLICE_MS       250u
+
+/*
+ * Receive timeout on QEMU's end of the isolate socket (audit F2-1).
+ *
+ * The reader thread blocks in recv() for a blob whose length the STUB
+ * declared; a stub that announces a payload and never sends it parked the
+ * reader forever, and nvkvm_isolate_kill() then close()d the socket and
+ * pthread_join()ed that thread — but close() does NOT wake a peer already
+ * inside recv() on the same file description, so the join never returned (with
+ * the BQL held, from the TX handler).  The kill path now shutdown()s first,
+ * which does wake it; this timeout is the belt-and-braces so no recv on this
+ * socket can block indefinitely even if shutdown is somehow not reached.
+ *
+ * 5 s rather than something tight: the follow-up param/aux blobs are sent
+ * back-to-back with their header by the stub worker, so any legitimate gap is
+ * sub-millisecond; the only cost of a large value is how long a wedged blob
+ * read persists, and the only cost of a small one is a false teardown.
+ */
+#define NVKVM_ISO_SOCK_RCVTIMEO_MS   5000u
+
+/*
+ * Condvar clock.  Defaults to CLOCK_REALTIME (what pthread_cond_init(NULL)
+ * uses); we switch to CLOCK_MONOTONIC when the platform allows, so that an NTP
+ * step or a settimeofday() cannot either fire a deadline early or postpone it
+ * indefinitely.  Set once, at table init, before any condvar is created.
+ */
+static clockid_t                 nvkvm_iso_clockid = CLOCK_REALTIME;
+static pthread_condattr_t        nvkvm_iso_condattr;
+static const pthread_condattr_t *nvkvm_iso_condattr_p;
+
+static void nvkvm_iso_cond_attr_init(void)
+{
+	static bool done;
+	if (done)
+		return;
+	done = true;
+	if (pthread_condattr_init(&nvkvm_iso_condattr) == 0 &&
+	    pthread_condattr_setclock(&nvkvm_iso_condattr,
+				      CLOCK_MONOTONIC) == 0) {
+		nvkvm_iso_clockid    = CLOCK_MONOTONIC;
+		nvkvm_iso_condattr_p = &nvkvm_iso_condattr;
+	}
+}
+
+static void nvkvm_iso_deadline(struct timespec *ts, unsigned ms)
+{
+	clock_gettime(nvkvm_iso_clockid, ts);
+	ts->tv_sec  += (time_t)(ms / 1000u);
+	ts->tv_nsec += (long)(ms % 1000u) * 1000000L;
+	if (ts->tv_nsec >= 1000000000L) {
+		ts->tv_nsec -= 1000000000L;
+		ts->tv_sec  += 1;
+	}
+}
+
+static bool nvkvm_iso_deadline_passed(const struct timespec *ts)
+{
+	struct timespec now;
+	clock_gettime(nvkvm_iso_clockid, &now);
+	return now.tv_sec > ts->tv_sec ||
+	       (now.tv_sec == ts->tv_sec && now.tv_nsec >= ts->tv_nsec);
+}
+
+/*
+ * Declare an isolate dead from a WAITER (deadline expiry), as opposed to the
+ * orderly nvkvm_isolate_kill() path.
+ *
+ * Deliberately does NOT close the socket: the reader thread is still using that
+ * descriptor and closing it here would race a reused fd number (the C-1 class
+ * of bug).  shutdown() wakes the reader (and any sender blocked in send()) and
+ * leaves the fd valid; the reader then unwinds and wakes every other pending
+ * caller with -ECONNRESET.  SIGKILL stops the stub from continuing to consume
+ * the ring.  Slot teardown (waitpid, fd close, ring unmap) still happens in
+ * nvkvm_isolate_kill() when the guest or session teardown gets there.
+ */
+static void nvkvm_isolate_declare_dead(struct nvkvm_isolate *iso,
+				       const char *why)
+{
+	pid_t pid = 0;
+	int   fd  = -1;
+
+	pthread_mutex_lock(&iso->lock);
+	if (iso->alive) {
+		iso->alive = false;
+		pid = iso->pid;
+		fd  = iso->sock_fd;
+	}
+	pthread_mutex_unlock(&iso->lock);
+
+	if (pid <= 0 && fd < 0)
+		return;   /* somebody else already declared it */
+
+	fprintf(stderr, "nvkvm: isolate %u declared dead: %s\n", iso->id, why);
+	if (fd >= 0)
+		shutdown(fd, SHUT_RDWR);
+	if (pid > 0)
+		kill(pid, SIGKILL);
+}
+
+/*
+ * Bounded wait on one of the response slots.
+ *
+ * `mtx`/`cond`/`done` name the slot (shared sync_*, present_*, xiso_* or
+ * loop_*); `mtx` must be held on entry and is still held on return.  Returns:
+ *    0            the reader delivered a response (*done is true)
+ *   -ENODEV       the isolate died / the slot was reused underneath us
+ *   -ETIMEDOUT    timeout_ms elapsed with no response
+ *
+ * timeout_ms == 0 means "no overall deadline" — used only by ENTER_LOOP, whose
+ * duration is bounded by the guest's ring traffic and is therefore legitimately
+ * unbounded; it still wakes every slice to re-check liveness.
+ */
+static int nvkvm_iso_slot_wait(struct nvkvm_isolate *iso,
+			       pthread_mutex_t *mtx, pthread_cond_t *cond,
+			       const bool *done, unsigned timeout_ms)
+{
+	const uint32_t id0 = iso->id;
+	struct timespec end;
+
+	if (timeout_ms)
+		nvkvm_iso_deadline(&end, timeout_ms);
+
+	while (!*done) {
+		struct timespec slice;
+
+		nvkvm_iso_deadline(&slice, NVKVM_ISO_WAIT_SLICE_MS);
+		if (timeout_ms && (slice.tv_sec > end.tv_sec ||
+				   (slice.tv_sec == end.tv_sec &&
+				    slice.tv_nsec > end.tv_nsec)))
+			slice = end;
+		pthread_cond_timedwait(cond, mtx, &slice);
+		if (*done)
+			break;
+		/*
+		 * Liveness re-check.  Read without iso->lock on purpose (same
+		 * as the pre-existing F-5 predicate in nvkvm_isolate_enter_loop):
+		 * these are plain word-sized fields, and a stale read only costs
+		 * one more slice.  The reader thread also sets the slot on death,
+		 * so this is the backstop for a reader that is itself wedged.
+		 */
+		if (!iso->in_use || iso->id != id0 || !iso->alive)
+			return -ENODEV;
+		if (timeout_ms && nvkvm_iso_deadline_passed(&end))
+			return -ETIMEDOUT;
+	}
+	return 0;
+}
+
+/*
+ * As above, but a deadline expiry is treated as isolate death rather than as
+ * "wait a bit longer": a stub that has not answered a bounded command inside
+ * NVKVM_ISO_SYNC_TIMEOUT_MS is not slow, it is not coming back, and every
+ * other caller parked on it (plus, for the inline commands, the whole VMM) is
+ * paying for it.  Called with `mtx` held; the shutdown/SIGKILL it performs
+ * take no locks that can order against it.
+ */
+static int nvkvm_iso_slot_wait_or_die(struct nvkvm_isolate *iso,
+				      pthread_mutex_t *mtx,
+				      pthread_cond_t *cond,
+				      const bool *done, unsigned timeout_ms,
+				      const char *what)
+{
+	int rc = nvkvm_iso_slot_wait(iso, mtx, cond, done, timeout_ms);
+	if (rc == -ETIMEDOUT)
+		nvkvm_isolate_declare_dead(iso, what);
+	return rc;
 }
 
 /* ── In-flight IOCTL request (lives on the caller's stack) ──────────────── */
@@ -559,6 +777,20 @@ static void reader_signal_xiso(struct nvkvm_isolate *iso, int err, uint32_t gem)
 	pthread_mutex_unlock(&iso->xiso_sync_lock);
 }
 
+/*
+ * ENTER_LOOP (audit F3-1): dedicated slot, mirroring present/xiso.  Factored
+ * out so the reader-exit path can wake a stranded pump too.
+ */
+static void reader_signal_loop(struct nvkvm_isolate *iso, int err, uint64_t head)
+{
+	pthread_mutex_lock(&iso->loop_sync_lock);
+	iso->loop_error = err;
+	iso->loop_head  = head;
+	iso->loop_done  = true;
+	pthread_cond_signal(&iso->loop_cond);
+	pthread_mutex_unlock(&iso->loop_sync_lock);
+}
+
 static void *isolate_reader_fn(void *arg)
 {
 	struct nvkvm_isolate *iso = arg;
@@ -595,6 +827,23 @@ static void *isolate_reader_fn(void *arg)
 			.msg_controllen = sizeof(cmsg_buf),
 		};
 		ssize_t n = recvmsg(iso->sock_fd, &msg, 0);
+		/*
+		 * F2-1: the socket carries SO_RCVTIMEO now, so an idle reader
+		 * wakes periodically instead of parking forever.  That is the
+		 * point (a kill can no longer depend on close() waking us), but
+		 * it means EAGAIN here is the NORMAL idle case, not an error —
+		 * treat it as "nothing yet" and only unwind if the isolate has
+		 * been torn down underneath us.  EINTR likewise.
+		 */
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+			      errno == EINTR)) {
+			pthread_mutex_lock(&iso->lock);
+			bool gone = !iso->alive || iso->sock_fd < 0;
+			pthread_mutex_unlock(&iso->lock);
+			if (gone)
+				break;
+			continue;
+		}
 		if (n <= 0)
 			break;
 
@@ -668,6 +917,15 @@ static void *isolate_reader_fn(void *arg)
 			/*
 			 * Read param blob.  We're the only reader on this
 			 * socket so we can do this without the lock.
+			 *
+			 * F2-1: param_size/aux_size are values the STUB chose,
+			 * so this recv is a blocking wait on a length the other
+			 * side declared.  SO_RCVTIMEO bounds it: a stub that
+			 * announces a payload and never sends it now yields
+			 * EAGAIN (n < 0) and we unwind through reader_exit,
+			 * where every waiter is woken with -ECONNRESET, instead
+			 * of parking here forever with a killer blocked on our
+			 * pthread_join.
 			 */
 			if (param_size > 0) {
 				if (p && p->param_buf &&
@@ -744,15 +1002,12 @@ static void *isolate_reader_fn(void *arg)
 			break;
 		}
 
-		case ISOLATE_RESP_LOOP_EXITED: {
-			pthread_mutex_lock(&iso->sync_lock);
-			iso->sync_loop_head = u.loop_exited.head;
-			iso->sync_error     = u.loop_exited.error;
-			iso->sync_done      = true;
-			pthread_cond_signal(&iso->sync_cond);
-			pthread_mutex_unlock(&iso->sync_lock);
+		case ISOLATE_RESP_LOOP_EXITED:
+			/* F3-1: own slot — it must not clobber (or be clobbered
+			 * by) a short TX-thread command sharing sync_*. */
+			reader_signal_loop(iso, u.loop_exited.error,
+					   u.loop_exited.head);
 			break;
-		}
 
 		case ISOLATE_RESP_OPEN_DEVICE: {
 			int got_fd = -1;
@@ -826,6 +1081,8 @@ reader_exit:
 	reader_signal_present(iso, -ECONNRESET, -1);
 	/* …and any pending cross-isolate import waiter (dedicated slot, #110). */
 	reader_signal_xiso(iso, -ECONNRESET, 0);
+	/* …and any pending ENTER_LOOP pump (dedicated slot, F3-1). */
+	reader_signal_loop(iso, -ECONNRESET, 0);
 
 	return NULL;
 }
@@ -965,6 +1222,10 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 {
 	memset(t, 0, sizeof(*t));
 	pthread_mutex_init(&t->lock, NULL);
+	/* F1-1: every condvar below is waited on with a deadline now, so pin
+	 * them to CLOCK_MONOTONIC before creating any of them — a wall-clock
+	 * step must not be able to fire a timeout early or defer it. */
+	nvkvm_iso_cond_attr_init();
 	nvkvm_isolate_cfg_resolve(&t->cfg, t->cfg_error, sizeof(t->cfg_error),
 				  t->cfg_report, sizeof(t->cfg_report));
 	t->next_id = 1;
@@ -973,14 +1234,18 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 		iso->sock_fd = -1;
 		pthread_mutex_init(&iso->lock,       NULL);
 		pthread_mutex_init(&iso->write_lock, NULL);
+		pthread_mutex_init(&iso->sync_cmd_lock, NULL);
 		pthread_mutex_init(&iso->sync_lock,  NULL);
-		pthread_cond_init(&iso->sync_cond,   NULL);
+		pthread_cond_init(&iso->sync_cond,   nvkvm_iso_condattr_p);
 		pthread_mutex_init(&iso->present_lock,      NULL);
 		pthread_mutex_init(&iso->present_sync_lock, NULL);
-		pthread_cond_init(&iso->present_cond,       NULL);
+		pthread_cond_init(&iso->present_cond,       nvkvm_iso_condattr_p);
 		pthread_mutex_init(&iso->xiso_lock,         NULL);
 		pthread_mutex_init(&iso->xiso_sync_lock,    NULL);
-		pthread_cond_init(&iso->xiso_cond,          NULL);
+		pthread_cond_init(&iso->xiso_cond,          nvkvm_iso_condattr_p);
+		pthread_mutex_init(&iso->loop_lock,         NULL);
+		pthread_mutex_init(&iso->loop_sync_lock,    NULL);
+		pthread_cond_init(&iso->loop_cond,          nvkvm_iso_condattr_p);
 		iso->present_fd = -1;
 	}
 }
@@ -993,6 +1258,7 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 			nvkvm_isolate_kill(t, iso->id);
 		pthread_mutex_destroy(&iso->lock);
 		pthread_mutex_destroy(&iso->write_lock);
+		pthread_mutex_destroy(&iso->sync_cmd_lock);
 		pthread_mutex_destroy(&iso->sync_lock);
 		pthread_cond_destroy(&iso->sync_cond);
 		pthread_mutex_destroy(&iso->present_lock);
@@ -1001,6 +1267,9 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 		pthread_mutex_destroy(&iso->xiso_lock);
 		pthread_mutex_destroy(&iso->xiso_sync_lock);
 		pthread_cond_destroy(&iso->xiso_cond);
+		pthread_mutex_destroy(&iso->loop_lock);
+		pthread_mutex_destroy(&iso->loop_sync_lock);
+		pthread_cond_destroy(&iso->loop_cond);
 	}
 	pthread_mutex_destroy(&t->lock);
 }
@@ -1055,6 +1324,25 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	int sv[2];
 	if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) < 0)
 		return -errno;
+
+	/*
+	 * F2-1: bound every recv on QEMU's end.  Only sv[0] (ours) gets it —
+	 * the stub's end is a separate socket and keeps its blocking reads, so
+	 * this changes nothing about how the stub waits for work.  Without it
+	 * the reader thread can sit in recv() for a blob length the stub
+	 * declared and never sent, and a killer that close()s the fd and joins
+	 * that thread never returns, because close() does not wake a peer
+	 * already inside recv() on the same file description.  Best-effort:
+	 * a kernel that refuses the option leaves us where we were, and the
+	 * shutdown() in the kill path is the primary fix regardless.
+	 */
+	{
+		struct timeval tv = {
+			.tv_sec  = NVKVM_ISO_SOCK_RCVTIMEO_MS / 1000,
+			.tv_usec = (NVKVM_ISO_SOCK_RCVTIMEO_MS % 1000) * 1000,
+		};
+		setsockopt(sv[0], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	}
 
 	/* Remember the owning device so ring setup/teardown can use the sparse
 	 * GPA window allocator (idempotent — same nv every call). */
@@ -1525,41 +1813,90 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 		return -ENOENT;
 	}
 
-	if (iso->alive && iso->sock_fd >= 0) {
-		struct isolate_cmd_exit cmd = { .type = ISOLATE_CMD_EXIT };
-		/* Best-effort; ignore error — we're shutting down anyway. */
-		send(iso->sock_fd, &cmd, sizeof(cmd), MSG_NOSIGNAL);
-	}
-
+	bool was_alive = iso->alive;
+	int  peek_fd   = iso->sock_fd;
 	iso->alive = false;
 	pthread_mutex_unlock(&iso->lock);
 
 	/*
-	 * Audit C-1: an IOCTL_ON_ISOLATE runs on a QEMU thread-pool worker and
-	 * sends on iso->sock_fd under write_lock, on a DIFFERENT thread than this
-	 * kill (the TX thread).  Tear the fd down under write_lock too, so we
-	 * either wait for an in-flight send to finish or a later one observes
-	 * sock_fd==-1 and skips — never a close()+reuse race where a worker
-	 * writes isolate bytes into a recycled fd.
+	 * Audit C-1 (unchanged intent): the fd is claimed — snapshotted AND
+	 * nulled — under write_lock, so an IOCTL_ON_ISOLATE running on a
+	 * thread-pool worker either finishes its send first or sees -1 and
+	 * skips, and exactly one caller ends up owning the descriptor to close.
+	 *
+	 * Audit F5-1: the ISOLATE_CMD_EXIT send used to happen a few lines up,
+	 * under iso->lock, whose own contract says "held briefly; never during
+	 * blocking I/O" — and a plain send() on a SEQPACKET socketpair whose
+	 * peer has stopped reading blocks once the buffer fills, which is
+	 * exactly the state a wedged stub is in.  It happens here instead:
+	 * outside iso->lock and non-blocking.  It is best-effort in every sense
+	 * — the shutdown() below delivers EOF to the stub's reader loop, which
+	 * terminates it just as EXIT does, and the SIGKILL further down is the
+	 * backstop.
+	 *
+	 * trylock first, because a sender already blocked in send() holds
+	 * write_lock and will not release it until the shutdown we have not
+	 * performed yet; taking it blocking here would be the very hang we are
+	 * removing.  If we lose that race we claim the fd after the shutdown,
+	 * where the blocking acquire is guaranteed to complete.
 	 */
-	pthread_mutex_lock(&iso->write_lock);
-	int sock_fd = iso->sock_fd;
-	iso->sock_fd = -1;
-	pthread_mutex_unlock(&iso->write_lock);
+	int sock_fd = -1;
+	if (pthread_mutex_trylock(&iso->write_lock) == 0) {
+		sock_fd = iso->sock_fd;
+		iso->sock_fd = -1;
+		if (was_alive && sock_fd >= 0) {
+			struct isolate_cmd_exit cmd = { .type = ISOLATE_CMD_EXIT };
+			send(sock_fd, &cmd, sizeof(cmd),
+			     MSG_NOSIGNAL | MSG_DONTWAIT);
+		}
+		pthread_mutex_unlock(&iso->write_lock);
+	}
 
-	/* Closing the socket makes the reader thread's recv() return 0/error. */
-	if (sock_fd >= 0)
-		close(sock_fd);
+	/*
+	 * Audit F2-1: shutdown BEFORE anything blocks on this isolate.
+	 *
+	 * close() does not wake a peer thread that is already inside recv() on
+	 * the same file description, so the old sequence (close, then
+	 * pthread_join the reader) deadlocked whenever the reader was parked in
+	 * the blob recv for a length the stub had declared and never sent — with
+	 * this function running on the TX thread under the BQL, i.e. wedging the
+	 * whole VMM.  shutdown() does wake it, immediately, and additionally
+	 * unblocks any sender stuck in send() on this socket, which is what
+	 * makes the write_lock acquisition below guaranteed to complete.  An
+	 * AF_UNIX shutdown does not discard what is already queued to the peer,
+	 * so the EXIT above is still delivered before the stub sees EOF.  The fd
+	 * stays open here on purpose; it is closed only after the join, so the
+	 * reader can never touch a recycled descriptor.
+	 */
+	if (peek_fd >= 0)
+		shutdown(peek_fd, SHUT_RDWR);
+
+	if (sock_fd < 0) {
+		/* trylock lost the race (or another caller already claimed the
+		 * fd).  The shutdown has since unblocked whoever held it, so
+		 * this acquire completes; a second -1 here just means somebody
+		 * else owns the close. */
+		pthread_mutex_lock(&iso->write_lock);
+		sock_fd = iso->sock_fd;
+		iso->sock_fd = -1;
+		pthread_mutex_unlock(&iso->write_lock);
+	}
 
 	/*
 	 * Join the reader thread: it has already signaled all pending IOCTL
 	 * callers and the sync waiter (if any).  After join, no thread accesses
-	 * iso's internals through the reader path.
+	 * iso's internals through the reader path.  Bounded by the shutdown
+	 * above plus SO_RCVTIMEO, so this cannot be the hang it once was.
 	 */
 	if (iso->reader_started) {
 		pthread_join(iso->reader_tid, NULL);
 		iso->reader_started = false;
 	}
+
+	/* Safe only now: the reader is gone, so no thread can recv() on a
+	 * descriptor number the kernel is free to hand out again. */
+	if (sock_fd >= 0)
+		close(sock_fd);
 
 	pid_t pid = iso->pid;
 	if (pid > 0) {
@@ -1622,6 +1959,48 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	if (ring_mfd >= 0)
 		close(ring_mfd);
 
+	/*
+	 * S-4: invalidate this isolate's entries in the console's imported-buffer
+	 * cache.  Nothing invalidated on isolate death, so a dead compositor's
+	 * EGLImage kept its dma-buf — and the VRAM behind it — pinned for the
+	 * life of the VM, and its cache slot went on answering for whatever bo id
+	 * the next isolate reused.
+	 *
+	 * Hooked HERE, in kill(), rather than at the individual call sites: this
+	 * is the single choke point every isolate death funnels through — the
+	 * NVKVM_REQ_KILL_ISOLATE handler, nvkvm_isolate_kill_session() below, and
+	 * nvkvm_isolate_table_fini()'s teardown loop all land here — so the
+	 * invariant "an isolate cannot die without its cache entries dying with
+	 * it" is structural instead of a list of call sites that has to be kept
+	 * in sync.  Two of those three had no hook at all until now.
+	 *
+	 * The KILL_ISOLATE handler also calls it (nvkvm_isolate_handlers.c),
+	 * which now makes that path record the id twice.  Deliberately left
+	 * alone: that file belongs to another change, and the duplicate is inert
+	 * — forget_isolate() only appends to a dead-id list that the main loop
+	 * drains on the next gfx_update, and the second reap of an already-
+	 * invalidated entry is a no-op.  The undrained-frame close() is guarded
+	 * by p->fd >= 0, so it cannot double-close either.
+	 *
+	 * Lock-safety (the whole point of this audit): called with NO isolate
+	 * lock held, and forget_isolate() takes only the present context's own
+	 * p->lock, which nothing in this file ever holds.  nvkvm_present_egl.c
+	 * makes no call back into the isolate layer, so the two lock domains
+	 * cannot form a cycle.  It performs no GL work either — it records the
+	 * dead id and schedules a BH; the eglDestroyImageKHR/glDeleteTextures
+	 * happen in nvkvm_present_reap_dead() on the main loop, where the GL
+	 * context is current.  So this is safe on the TX thread and on the
+	 * unrealize path alike.
+	 *
+	 * At device unrealize it is a no-op by construction, not by luck:
+	 * virtio_nvgpu_device_unrealize() runs nvkvm_present_console_fini()
+	 * (which NULLs nv->present_ctx before freeing it) before
+	 * nvkvm_isolate_table_fini(), so forget_isolate() returns at its !p
+	 * guard rather than touching freed memory.
+	 */
+	if (t->nv)
+		nvkvm_present_forget_isolate((VirtIONvgpu *)t->nv, isolate_id);
+
 	NVKVM_DBG( "nvkvm_isolate: killed isolate %u\n", isolate_id);
 	return 0;
 }
@@ -1646,6 +2025,11 @@ void nvkvm_isolate_kill_session(struct nvkvm_isolate_table *t,
 static int sync_send_recv(struct nvkvm_isolate *iso,
 			  const void *cmd_buf, size_t cmd_size)
 {
+	/* F3-1: the real one-at-a-time gate.  Unlike sync_lock this is held
+	 * across the WHOLE round-trip and is not dropped by the cond wait, so a
+	 * second sender cannot walk in, clear sync_done, and steal the reply
+	 * meant for a parked predecessor. */
+	pthread_mutex_lock(&iso->sync_cmd_lock);
 	pthread_mutex_lock(&iso->sync_lock);
 	iso->sync_done  = false;
 	iso->sync_error = 0;
@@ -1656,13 +2040,17 @@ static int sync_send_recv(struct nvkvm_isolate *iso,
 
 	if (sr < 0) {
 		pthread_mutex_unlock(&iso->sync_lock);
+		pthread_mutex_unlock(&iso->sync_cmd_lock);
 		return (int)sr;
 	}
 
-	while (!iso->sync_done)
-		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
-	int result = iso->sync_error;
+	int rc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
+					    &iso->sync_cond, &iso->sync_done,
+					    NVKVM_ISO_SYNC_TIMEOUT_MS,
+					    "sync command never answered");
+	int result = rc ? rc : iso->sync_error;
 	pthread_mutex_unlock(&iso->sync_lock);
+	pthread_mutex_unlock(&iso->sync_cmd_lock);
 	return result;
 }
 
@@ -1671,6 +2059,7 @@ static int sync_send_recv(struct nvkvm_isolate *iso,
  */
 static int sync_sendmsg_recv(struct nvkvm_isolate *iso, struct msghdr *msg)
 {
+	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
 	pthread_mutex_lock(&iso->sync_lock);
 	iso->sync_done  = false;
 	iso->sync_error = 0;
@@ -1681,13 +2070,17 @@ static int sync_sendmsg_recv(struct nvkvm_isolate *iso, struct msghdr *msg)
 
 	if (sr < 0) {
 		pthread_mutex_unlock(&iso->sync_lock);
+		pthread_mutex_unlock(&iso->sync_cmd_lock);
 		return (int)sr;
 	}
 
-	while (!iso->sync_done)
-		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
-	int result = iso->sync_error;
+	int rc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
+					    &iso->sync_cond, &iso->sync_done,
+					    NVKVM_ISO_SYNC_TIMEOUT_MS,
+					    "sync fd-passing command never answered");
+	int result = rc ? rc : iso->sync_error;
 	pthread_mutex_unlock(&iso->sync_lock);
+	pthread_mutex_unlock(&iso->sync_cmd_lock);
 	return result;
 }
 
@@ -1697,6 +2090,7 @@ static int sync_sendmsg_recv(struct nvkvm_isolate *iso, struct msghdr *msg)
 static int sync_send_recv_mmap(struct nvkvm_isolate *iso,
 				const void *cmd_buf, size_t cmd_size)
 {
+	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
 	pthread_mutex_lock(&iso->sync_lock);
 	iso->sync_done        = false;
 	iso->sync_error       = 0;
@@ -1708,13 +2102,18 @@ static int sync_send_recv_mmap(struct nvkvm_isolate *iso,
 
 	if (sr < 0) {
 		pthread_mutex_unlock(&iso->sync_lock);
+		pthread_mutex_unlock(&iso->sync_cmd_lock);
 		return (int)sr;
 	}
 
-	while (!iso->sync_done)
-		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
-	int result = iso->sync_error ? iso->sync_error : iso->sync_mmap_retval;
+	int rc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
+					    &iso->sync_cond, &iso->sync_done,
+					    NVKVM_ISO_SYNC_TIMEOUT_MS,
+					    "MMAP never answered");
+	int result = rc ? rc
+		     : (iso->sync_error ? iso->sync_error : iso->sync_mmap_retval);
 	pthread_mutex_unlock(&iso->sync_lock);
+	pthread_mutex_unlock(&iso->sync_cmd_lock);
 	return result;
 }
 
@@ -2009,39 +2408,52 @@ int nvkvm_isolate_enter_loop(struct nvkvm_isolate_table *t, uint32_t isolate_id,
 
 	/*
 	 * Sync send: this BLOCKS until the stub's consumer loop idles out and
-	 * replies LOOP_EXITED (which the reader thread delivers via sync_cond).
+	 * replies LOOP_EXITED (which the reader thread delivers via loop_cond).
 	 * The caller runs on QEMU's thread pool, so a long loop does not stall
 	 * the main loop.  Slow-path IOCTLs that arrive while the stub loops use
-	 * the independent per-txn pending mechanism, not sync_lock.
+	 * the independent per-txn pending mechanism, not the sync slot.
+	 *
+	 * F3-1: this used to share the sync_* slot with the short TX-thread
+	 * commands, and because it is BOTH long-lived and issued from a
+	 * different thread it was the one command that made "two live commands
+	 * on a one-command slot" actually reachable — a concurrent MMAP would
+	 * clear sync_done under a parked pump and then collect whichever reply
+	 * arrived first.  It now has its own slot, and loop_lock serialises
+	 * ENTER_LOOP callers among themselves.
+	 *
+	 * The wait deliberately has NO overall deadline: the loop's lifetime is
+	 * whatever the guest's ring traffic makes it, so any fixed budget would
+	 * be a false-positive machine.  It is bounded instead by liveness — the
+	 * slot wait re-checks in_use/id/alive every slice — which is safe here
+	 * precisely because this caller does not hold the BQL.
 	 */
-	pthread_mutex_lock(&iso->sync_lock);
-	iso->sync_done      = false;
-	iso->sync_error     = 0;
-	iso->sync_loop_head = 0;
+	pthread_mutex_lock(&iso->loop_lock);
+	pthread_mutex_lock(&iso->loop_sync_lock);
+	iso->loop_done  = false;
+	iso->loop_error = 0;
+	iso->loop_head  = 0;
 
 	pthread_mutex_lock(&iso->write_lock);
 	ssize_t sr = sock_send_full(iso->sock_fd, &cmd, sizeof(cmd));
 	pthread_mutex_unlock(&iso->write_lock);
 	if (sr < 0) {
-		pthread_mutex_unlock(&iso->sync_lock);
+		pthread_mutex_unlock(&iso->loop_sync_lock);
+		pthread_mutex_unlock(&iso->loop_lock);
 		return (int)sr;
 	}
 
-	/* F-5: ENTER_LOOP runs on the thread pool (not the serialized TX thread),
-	 * so guard against the slot being killed+reused under us: bail if our
-	 * identity no longer holds. The kill path also sets sync_done via
-	 * reader_signal_sync (broadcast), so this is belt-and-suspenders. */
-	while (!iso->sync_done && iso->id == isolate_id && iso->alive)
-		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
+	int wrc = nvkvm_iso_slot_wait(iso, &iso->loop_sync_lock, &iso->loop_cond,
+				      &iso->loop_done, 0 /* no deadline */);
 	int err;
-	if (!iso->sync_done) {
+	if (wrc) {
 		err = -ENODEV;                 /* torn down / reused while parked */
 	} else {
-		err = iso->sync_error;
+		err = iso->loop_error;
 		if (head_out)
-			*head_out = iso->sync_loop_head;
+			*head_out = iso->loop_head;
 	}
-	pthread_mutex_unlock(&iso->sync_lock);
+	pthread_mutex_unlock(&iso->loop_sync_lock);
+	pthread_mutex_unlock(&iso->loop_lock);
 	return err;
 }
 
@@ -2075,6 +2487,7 @@ int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 
 	/* Inline sync_send_recv pattern; we also need the received fd, which
 	 * the reader stashes in iso->sync_open_fd before signaling. */
+	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
 	pthread_mutex_lock(&iso->sync_lock);
 	iso->sync_done    = false;
 	iso->sync_error   = 0;
@@ -2085,15 +2498,19 @@ int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 	pthread_mutex_unlock(&iso->write_lock);
 	if (sr < 0) {
 		pthread_mutex_unlock(&iso->sync_lock);
+		pthread_mutex_unlock(&iso->sync_cmd_lock);
 		return (int)sr;
 	}
 
-	while (!iso->sync_done)
-		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
-	int err = iso->sync_error;
-	int fd  = iso->sync_open_fd;
+	int wrc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
+					     &iso->sync_cond, &iso->sync_done,
+					     NVKVM_ISO_SYNC_TIMEOUT_MS,
+					     "OPEN_DEVICE never answered");
+	int err = wrc ? wrc : iso->sync_error;
+	int fd  = wrc ? -1  : iso->sync_open_fd;
 	iso->sync_open_fd = -1;
 	pthread_mutex_unlock(&iso->sync_lock);
+	pthread_mutex_unlock(&iso->sync_cmd_lock);
 
 	if (err) {
 		if (fd >= 0)
@@ -2153,10 +2570,20 @@ int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
 		return (int)sr;
 	}
 
-	while (!iso->present_done)
-		pthread_cond_wait(&iso->present_cond, &iso->present_sync_lock);
-	int err = iso->present_err;
-	int fd  = iso->present_fd;
+	/*
+	 * F4-1: present_lock is held across this whole round-trip (by design —
+	 * see the header), and this runs inline on the TX thread under the BQL,
+	 * so an untimed wait here parked the VMM AND every later frame behind
+	 * it.  Bounded now; RESIDUAL RISK: the BQL is still held for up to the
+	 * timeout, which only moving present off the TX thread would fix.
+	 */
+	int wrc = nvkvm_iso_slot_wait_or_die(iso, &iso->present_sync_lock,
+					     &iso->present_cond,
+					     &iso->present_done,
+					     NVKVM_ISO_SYNC_TIMEOUT_MS,
+					     "PRESENT_EXPORT never answered");
+	int err = wrc ? wrc : iso->present_err;
+	int fd  = wrc ? -1  : iso->present_fd;
 	iso->present_fd = -1;
 	pthread_mutex_unlock(&iso->present_sync_lock);
 	pthread_mutex_unlock(&iso->present_lock);
@@ -2235,10 +2662,15 @@ int nvkvm_isolate_xiso_import(struct nvkvm_isolate_table *t,
 		return (int)sr;
 	}
 
-	while (!iso->xiso_done)
-		pthread_cond_wait(&iso->xiso_cond, &iso->xiso_sync_lock);
-	int err = iso->xiso_err;
-	uint32_t gem = iso->xiso_gem;
+	/* F4-1: same shape as present — xiso_lock spans the round-trip and the
+	 * broker runs inline on the TX thread under the BQL, so the wait must be
+	 * bounded.  Same residual risk. */
+	int wrc = nvkvm_iso_slot_wait_or_die(iso, &iso->xiso_sync_lock,
+					     &iso->xiso_cond, &iso->xiso_done,
+					     NVKVM_ISO_SYNC_TIMEOUT_MS,
+					     "XISO_IMPORT never answered");
+	int err = wrc ? wrc : iso->xiso_err;
+	uint32_t gem = wrc ? 0 : iso->xiso_gem;
 	pthread_mutex_unlock(&iso->xiso_sync_lock);
 	pthread_mutex_unlock(&iso->xiso_lock);
 
@@ -2344,6 +2776,20 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 	 * Wait for the reader thread to deliver the response.
 	 * If the send failed, the reader will notice the dead socket and
 	 * signal us with -ECONNRESET.  Either way we always wait.
+	 *
+	 * F1-1: this is the ONE wait deliberately left without a deadline, and
+	 * the reasons are that (a) its duration is legitimately unbounded — it
+	 * is a real guest GPU ioctl, which may sit in the driver for as long as
+	 * the guest's own work takes, so any budget here is a false-positive
+	 * machine that would kill healthy isolates mid-compute, and (b) unlike
+	 * the sync commands it does NOT hold the BQL: IOCTL_ON_ISOLATE is
+	 * offloaded to QEMU's thread pool (see virtio_nvgpu.c), so a stuck one
+	 * costs a pool thread, not the main loop.  Liveness still comes from the
+	 * reader, which wakes every pending caller with -ECONNRESET when the
+	 * socket dies — and the socket now dies promptly in every teardown path
+	 * (shutdown + SO_RCVTIMEO).  RESIDUAL RISK: a stub that stays alive and
+	 * answers nothing can still tie up thread-pool workers, one per
+	 * in-flight ioctl.
 	 */
 	pthread_mutex_lock(&iso->lock);
 	while (!pending.done)
@@ -2455,6 +2901,7 @@ int nvkvm_isolate_realize_uvm_fd(struct nvkvm_isolate_table *t,
 		.offset       = offset,
 	};
 
+	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
 	pthread_mutex_lock(&iso->sync_lock);
 	iso->sync_done              = false;
 	iso->sync_error             = 0;
@@ -2477,17 +2924,21 @@ int nvkvm_isolate_realize_uvm_fd(struct nvkvm_isolate_table *t,
 	ssize_t sr = (sr1 < 0) ? sr1 : ((sr2 < 0) ? sr2 : sr3);
 	if (sr < 0) {
 		pthread_mutex_unlock(&iso->sync_lock);
+		pthread_mutex_unlock(&iso->sync_cmd_lock);
 		return (int)sr;
 	}
 
-	while (!iso->sync_done)
-		pthread_cond_wait(&iso->sync_cond, &iso->sync_lock);
-	int err           = iso->sync_error;
-	uint64_t host_va  = iso->sync_realize_host_va;
-	uint64_t out_len  = iso->sync_realize_length;
-	uint64_t token    = iso->sync_realize_token;
-	uint32_t rm_st    = iso->sync_realize_rm_status;
+	int wrc = nvkvm_iso_slot_wait_or_die(iso, &iso->sync_lock,
+					     &iso->sync_cond, &iso->sync_done,
+					     NVKVM_ISO_SYNC_TIMEOUT_MS,
+					     "REALIZE_UVM_FD never answered");
+	int err           = wrc ? wrc : iso->sync_error;
+	uint64_t host_va  = wrc ? 0 : iso->sync_realize_host_va;
+	uint64_t out_len  = wrc ? 0 : iso->sync_realize_length;
+	uint64_t token    = wrc ? 0 : iso->sync_realize_token;
+	uint32_t rm_st    = wrc ? 0 : iso->sync_realize_rm_status;
 	pthread_mutex_unlock(&iso->sync_lock);
+	pthread_mutex_unlock(&iso->sync_cmd_lock);
 
 	if (host_va_out)   *host_va_out   = host_va;
 	if (length_out)    *length_out    = out_len;

@@ -79,12 +79,23 @@ static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 	return 0; /* table full */
 }
 
-static bool iso_mmap_free(uint32_t token, struct nvkvm_iso_mmap_entry *out)
+/*
+ * S-2 (cross-isolate): detach a token, but ONLY for the isolate that owns it.
+ *
+ * iso_mmap_tbl is one VM-global array and the token is a bare index into it, so
+ * "the caller named a live token" says nothing about whose mapping it is.  The
+ * ownership test belongs here, under the same lock as the detach: doing it in
+ * the caller would leave a window where two isolates race to free one entry.
+ * owner_isolate_id == 0 is never a valid owner — callers must name themselves.
+ */
+static bool iso_mmap_free(uint32_t token, uint32_t owner_isolate_id,
+			  struct nvkvm_iso_mmap_entry *out)
 {
-	if (token == 0 || token >= NVKVM_ISO_MMAP_MAX)
+	if (token == 0 || token >= NVKVM_ISO_MMAP_MAX || owner_isolate_id == 0)
 		return false;
 	pthread_mutex_lock(&iso_mmap_lock);
-	if (!iso_mmap_tbl[token].used) {
+	if (!iso_mmap_tbl[token].used ||
+	    iso_mmap_tbl[token].isolate_id != owner_isolate_id) {
 		pthread_mutex_unlock(&iso_mmap_lock);
 		return false;
 	}
@@ -387,6 +398,16 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 	 * GPA window space, KVM slots and iso_mmap_tbl entries irrecoverably.
 	 */
 	nvkvm_iso_mmap_reap_isolate(nv, req->isolate_id);
+
+	/*
+	 * S-4: drop this isolate's entries from the console's imported-buffer
+	 * cache.  Nothing used to invalidate on isolate death, so a dead
+	 * compositor's EGLImages kept its dma-buf (and the VRAM behind it)
+	 * pinned for the life of the VM — and, because stub GEM ids restart at 1
+	 * in every isolate, the NEXT compositor's bo 1 hit the dead one's cached
+	 * import and displayed its pixels.
+	 */
+	nvkvm_present_forget_isolate(nv, req->isolate_id);
 
 	/*
 	 * Walk every session and prune the killed isolate from its
@@ -1037,6 +1058,96 @@ static uint64_t nvkvm_admin_get_pid_mem(VirtIONvgpu *nv, pid_t tgid,
 }
 
 /*
+ * S-3 (VMM abort): bytes-per-pixel for the scanout formats the virtual head is
+ * allowed to flip.  Default-deny, like every other gate on this path: an
+ * unknown fourcc is one whose pitch we cannot check, and an unchecked pitch is
+ * what turns a present into a QEMU abort (see nvkvm_present_geom_ok).  The
+ * guest head advertises XRGB8888/ARGB8888 only (src/guest/nvkvm_kms.c
+ * nvkvm_pipe_formats[]); the BGR twins are listed because they are the same
+ * 4-byte layout and cost nothing to accept.
+ */
+#define NVKVM_FOURCC(a, b, c, d) \
+	((uint32_t)(a) | ((uint32_t)(b) << 8) | \
+	 ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
+
+static uint32_t nvkvm_present_bpp(uint32_t fourcc)
+{
+	switch (fourcc) {
+	case NVKVM_FOURCC('X', 'R', '2', '4'):   /* DRM_FORMAT_XRGB8888 */
+	case NVKVM_FOURCC('A', 'R', '2', '4'):   /* DRM_FORMAT_ARGB8888 */
+	case NVKVM_FOURCC('X', 'B', '2', '4'):   /* DRM_FORMAT_XBGR8888 */
+	case NVKVM_FOURCC('A', 'B', '2', '4'):   /* DRM_FORMAT_ABGR8888 */
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+/*
+ * Largest scanout we will accept.  The virtual head is a fixed 1080p mode, so
+ * this is pure headroom; what it actually bounds is the host-side allocation a
+ * flip triggers.  8192 keeps width*bpp and width*bpp*height comfortably inside
+ * the `int` arithmetic QEMU's console code does on these values.
+ */
+#define NVKVM_PRESENT_MAX_DIM  8192u
+
+/*
+ * S-3 (VMM abort): PRESENT geometry is guest-controlled and lands, unexamined,
+ * on qemu_console_resize() → qemu_create_displaysurface(), which computes
+ * width*4 as a signed int and ABORTS the whole VMM when pixman refuses the
+ * allocation — a guest-triggered kill of every other VM process sharing this
+ * QEMU.  The GL branch hands the same numbers to qemu_dmabuf_new().  Note the
+ * present path's own `surface_width(ds) != (int)w` test runs AFTER the resize,
+ * i.e. after the allocation that would have aborted, so it is not a bound.
+ *
+ * Reject rather than clamp: a frame whose geometry does not describe its buffer
+ * is not a frame we can fix up, and silently showing a different rectangle than
+ * the guest flipped is its own bug.  `buf_size` is the real host dma-buf extent
+ * (lseek SEEK_END) when known, 0 when not — with it this becomes an exact test
+ * that the described image fits the memory behind it, which is also what keeps
+ * the EGL import and the glReadPixels from running off the end.
+ */
+static bool nvkvm_present_geom_ok(const struct nvkvm_req_present *req,
+				  uint64_t buf_size)
+{
+	uint32_t bpp = nvkvm_present_bpp(req->format);
+
+	if (bpp == 0) {
+		NVKVM_DBG("nvkvm present: DENY fourcc 0x%08x (not a scanout "
+			  "format this head may flip)\n", req->format);
+		return false;
+	}
+	if (req->width == 0 || req->height == 0 ||
+	    req->width > NVKVM_PRESENT_MAX_DIM ||
+	    req->height > NVKVM_PRESENT_MAX_DIM) {
+		NVKVM_DBG("nvkvm present: DENY %ux%u (out of range)\n",
+			  req->width, req->height);
+		return false;
+	}
+	/* A row must hold the pixels it claims to. */
+	if (req->pitch < (uint64_t)req->width * bpp) {
+		NVKVM_DBG("nvkvm present: DENY pitch=%u < %u*%u\n",
+			  req->pitch, req->width, bpp);
+		return false;
+	}
+	if (req->pitch > (uint64_t)NVKVM_PRESENT_MAX_DIM * 4 * 4) {
+		NVKVM_DBG("nvkvm present: DENY pitch=%u (absurd)\n", req->pitch);
+		return false;
+	}
+	/* 64-bit product: two uint32s cannot wrap it, and buf_size below caps
+	 * the whole image at what the host actually allocated. */
+	uint64_t need = (uint64_t)req->pitch * req->height;
+	if (buf_size && need > buf_size) {
+		NVKVM_DBG("nvkvm present: DENY %ux%u pitch=%u needs %llu > "
+			  "dma-buf %llu\n", req->width, req->height, req->pitch,
+			  (unsigned long long)need,
+			  (unsigned long long)buf_size);
+		return false;
+	}
+	return true;
+}
+
+/*
  * PRESENT (#106 present path B) — the guest's virtual KMS head flipped a
  * scanout bo backed by a render-node GEM.  Ask the owning isolate's stub to
  * export it as a host dma-buf (PRIME_HANDLE_TO_FD) and route it to the host
@@ -1069,12 +1180,40 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 		return 0;
 	}
 
+	/*
+	 * S-3: geometry first, before anything is exported — this is the cheap,
+	 * fd-free half of the check (the exact "does it fit the buffer" half
+	 * needs the dma-buf, and runs once we have it, below).
+	 */
+	if (!nvkvm_present_geom_ok(req, 0)) {
+		resp->status = EINVAL;
+		return 0;
+	}
+
 	uint32_t iso_id = req->isolate_id ? req->isolate_id
 					  : session_first_isolate(nv, req->session_id);
 	if (iso_id == 0) {
 		NVKVM_DBG("nvkvm present: no isolate (req_iso=%u sess=%u)\n",
 			  req->isolate_id, req->session_id);
 		resp->status = ENOENT;
+		return 0;
+	}
+
+	/*
+	 * S-2 (defence in depth): the handle→session half is checked above; this
+	 * is the session→isolate half, the same pairing XISO_IMPORT verifies for
+	 * both of its (isolate, handle) pairs.  A guest-supplied isolate_id that
+	 * does not belong to the handle's session must not reach a stub even
+	 * though the stub would resolve the GEM in its own table and answer
+	 * -EBADF — that is the stub catching what the boundary should have.
+	 * The isolate_id == 0 case takes iso_id from the session itself and so
+	 * passes by construction.
+	 */
+	if (!session_has_isolate(nv, h->session_id, iso_id)) {
+		NVKVM_DBG("nvkvm present: isolate/handle session mismatch "
+			  "(iso=%u h=%u sess=%u)\n",
+			  iso_id, req->handle_id, h->session_id);
+		resp->status = EPERM;
 		return 0;
 	}
 
@@ -1097,6 +1236,18 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	 * visible without NVKVM_DEBUG; per-frame detail under NVKVM_DBG.
 	 */
 	off_t sz = lseek(dmabuf_fd, 0, SEEK_END);
+	/*
+	 * S-3: now that the real host extent is known, re-run the geometry test
+	 * against it.  The value was already being read here for logging; using
+	 * it turns "the numbers are plausible" into "the described image fits
+	 * the memory the host actually allocated", which is the property the
+	 * EGL import and the readback downstream both depend on.
+	 */
+	if (!nvkvm_present_geom_ok(req, sz > 0 ? (uint64_t)sz : 0)) {
+		close(dmabuf_fd);
+		resp->status = EINVAL;
+		return 0;
+	}
 	/*
 	 * NVKVM_PRESENT_PROBE=1: report what is actually IN the buffer we just
 	 * exported, over a plain CPU mapping.  This exists because "frames
@@ -1173,7 +1324,14 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	 * (compute-only build, graphics=off, or no display backend), submit
 	 * returns false and we fall through to close it ourselves.
 	 */
-	if (nvkvm_present_submit(nv, dmabuf_fd, req->stub_handle,
+	/*
+	 * S-4: `stub_handle` is a GEM handle from the OWNING stub's own drm_file
+	 * IDR — it starts at 1 in every isolate, so it is unique only within one
+	 * isolate.  Pass the isolate id alongside it so the console's import
+	 * cache can key on (isolate, bo) instead of colliding two compositors on
+	 * bo 1 at the head's single fixed mode.
+	 */
+	if (nvkvm_present_submit(nv, dmabuf_fd, iso_id, req->stub_handle,
 				 req->width, req->height,
 				 req->pitch, req->format, req->modifier)) {
 		resp->status = 0;
@@ -1827,10 +1985,22 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			}
 		}
 
-		/* RM_ALLOC (nvos21/nvos64): hClass at param+12 (shared prefix). */
-		if (nr == 0x2b && param_buf && req->param_size >= 16) {
-			uint32_t cls = 0;
-			memcpy(&cls, (char *)param_buf + 12, 4);
+		/* RM_ALLOC (nvos21/nvos64): hClass at param+12 (shared prefix).
+		 *
+		 * S-5: the short-buffer case must land in the DENY arm, not skip
+		 * the gate.  It used to be a condition on entering the gate at
+		 * all, so a guest that declared param_size < 16 was never asked
+		 * which class it wanted — and the stub then zero-pads the buffer
+		 * out to _IOC_SIZE (deliberately, G-8) and forwards it, so the
+		 * driver saw a full, well-formed alloc that the allowlist never
+		 * looked at.  Default to the sentinel the allowlist cannot
+		 * contain instead, exactly as the VID_HEAP gate above and the
+		 * NVKMS gate do: a param too short to hold the discriminator is
+		 * a request we cannot classify, and unclassifiable is denied. */
+		if (nr == 0x2b) {
+			uint32_t cls = 0xffffffffu;
+			if (param_buf && req->param_size >= 16)
+				memcpy(&cls, (char *)param_buf + 12, 4);
 			if (!nvkvm_alloc_class_allowed(cls)) {
 				fprintf(stderr, "nvkvm: DENY alloc class 0x%08x\n", cls);
 				/*
@@ -1863,10 +2033,16 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * params size (1 MiB) as nvproxy does (our 64K slots already cap it, but be
 	 * explicit).
 	 */
-	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL &&
-	    param_buf && req->param_size >= 12) {
-		uint32_t cc = 0;
-		memcpy(&cc, (char *)param_buf + 8, 4);
+	/* S-5: as for RM_ALLOC above — `param_size >= 12` gated ENTRY to the
+	 * check, so a short param_size skipped the only allowlist on this path
+	 * entirely (the stub has none on the socket path, and zero-pads to
+	 * _IOC_SIZE before forwarding).  The size test now selects the sentinel
+	 * command instead of selecting whether to test at all; 0xffffffff is not
+	 * a real RM control cmd and cannot be in the allowlist, so it denies. */
+	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL) {
+		uint32_t cc = 0xffffffffu;
+		if (param_buf && req->param_size >= 12)
+			memcpy(&cc, (char *)param_buf + 8, 4);
 		if (!nvkvm_ctrl_cmd_allowed(cc) || req->aux_size > (1u << 20)) {
 			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
 				"(not in allowlist / oversize)\n", cc);
@@ -1891,16 +2067,27 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * h_src_object).  h_client itself is the caller's own client (recorded
 	 * post-success below), so we only need to vet the src.
 	 */
+	/*
+	 * S-5: same shape as the two gates above — a param_size < 16 used to
+	 * skip this gate outright, and the stub's zero-padding then handed the
+	 * driver a complete NVOS55 the gate never inspected.  This one cannot
+	 * use a sentinel: 0xffffffff is an ALLOWED value here (it means "no
+	 * source client"), so a too-short param is refused explicitly instead.
+	 */
 	if (_IOC_TYPE(req->cmd) == 'F' &&
-	    _IOC_NR(req->cmd) == NV_ESC_RM_DUP_OBJECT &&
-	    param_buf && req->param_size >= 16) {
+	    _IOC_NR(req->cmd) == NV_ESC_RM_DUP_OBJECT) {
 		uint32_t h_client_src = 0;
-		memcpy(&h_client_src, (char *)param_buf + 12, 4);
-		if (h_client_src != 0 && h_client_src != (uint32_t)-1 &&
-		    !nvkvm_client_allow_has(nv, h_client_src)) {
+		bool short_param = (!param_buf || req->param_size < 16);
+		if (!short_param)
+			memcpy(&h_client_src, (char *)param_buf + 12, 4);
+		if (short_param ||
+		    (h_client_src != 0 && h_client_src != (uint32_t)-1 &&
+		     !nvkvm_client_allow_has(nv, h_client_src))) {
 			NVKVM_DBG(
-				"nvkvm: DENY DUP_OBJECT foreign h_client_src=0x%x "
-				"(not a client of this VM)\n", h_client_src);
+				"nvkvm: DENY DUP_OBJECT %s h_client_src=0x%x "
+				"(not a client of this VM)\n",
+				short_param ? "unreadable" : "foreign",
+				h_client_src);
 			resp->retval     = (uint64_t)(int64_t)(-EACCES);
 			resp->status     = 0;
 			resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
@@ -1920,8 +2107,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * client-creating alloc itself (param[0]=h_root=0, new client in hObjNew).
 	 * Layered defense-in-depth on top of eliminating host-wide TYPE_ALL (H-2).
 	 */
-	if (_IOC_TYPE(req->cmd) == 'F' && param_buf && req->param_size >= 4 &&
-	    nv->client_allow_n > 0) {
+	if (_IOC_TYPE(req->cmd) == 'F' && nv->client_allow_n > 0) {
 		unsigned nr = _IOC_NR(req->cmd);
 		int hclient_at_0 =
 			nr == NV_ESC_RM_ALLOC || nr == NV_ESC_RM_ALLOC_MEMORY ||
@@ -1933,6 +2119,29 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			nr == 0x4a /* VID_HEAP_CONTROL */;
 		if (hclient_at_0) {
 			uint32_t hc = 0;
+			/*
+			 * Fail CLOSED on a param too short to hold the hClient.
+			 * The `param_size >= 4` test used to sit in the outer
+			 * condition, so a guest declaring a shorter param skipped
+			 * this gate entirely rather than being refused by it —
+			 * the same fail-open shape as the ALLOC-class and
+			 * RM_CONTROL gates above (and the stub, which zero-pads
+			 * up to _IOC_SIZE, would then have forwarded it).  Every
+			 * NR listed here takes an hClient at offset 0 by
+			 * definition, so a request that cannot contain one is
+			 * malformed, not exempt.
+			 */
+			if (!param_buf || req->param_size < 4) {
+				NVKVM_DBG(
+					"nvkvm: DENY ioctl NR=0x%x param_size=%u "
+					"too short for hClient\n",
+					nr, (unsigned)req->param_size);
+				resp->retval     = (uint64_t)(int64_t)(-EACCES);
+				resp->status     = 0;
+				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
+				resp->fault_addr = 0;
+				return 0;
+			}
 			memcpy(&hc, (char *)param_buf, 4);
 			int is_root_alloc = 0;
 			if (nr == NV_ESC_RM_ALLOC && req->param_size >= 16) {
@@ -2230,8 +2439,13 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 
 	/* DIAG: for RM_MAP_MEMORY, dump all params so we can see what the
 	 * kernel saw and what it returned. */
+	/* S-6: the guard has to cover the LAST field read below, not the last
+	 * one before it.  `fd` sits at offset 48 in the 56-byte NVOS33, so the
+	 * memcpy touches bytes 48..51 — a param_size of exactly 48 read four
+	 * bytes past the end of an allocation of exactly that size.  The memcpy
+	 * is unconditional; only the print that follows was ever gated. */
 	if (_IOC_NR(req->cmd) == NV_ESC_RM_MAP_MEMORY && param_buf &&
-	    req->param_size >= 48) {
+	    req->param_size >= 52) {
 		uint32_t h_client = 0, h_device = 0, h_memory = 0;
 		uint64_t offset = 0, length = 0, plinear = 0;
 		uint32_t mm_status = 0, flags = 0;
@@ -2410,6 +2624,55 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	if (!h || h->fd < 0) {
 		resp->status = EBADF;
 		return 0;
+	}
+
+	/*
+	 * S-2 (cross-isolate): the guest names an (isolate, handle) PAIR here,
+	 * exactly as XISO_IMPORT does, and the two are independent assertions.
+	 * `h->fd >= 0` alone only proves the handle exists SOMEWHERE in this VM
+	 * — it says nothing about who owns it — so without this an isolate could
+	 * map any other host-process isolate's live /dev/nvidia* fd into the
+	 * window, at a GPA of its choosing, in the privileged QEMU process.
+	 * Isolates are separate uid-separated host processes, so that is the
+	 * host-process boundary this layer is responsible for, not intra-VM
+	 * policy; PRESENT and XISO_IMPORT already check the same two things
+	 * (handle→session, session→isolate) and this handler simply did not.
+	 */
+	if (h->session_id != req->session_id ||
+	    !session_has_isolate(nv, req->session_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm: mmap_on_isolate: handle/isolate session "
+			  "mismatch (h=%u h_sess=%u req_sess=%u iso=%u)\n",
+			  req->handle_id, h->session_id, req->session_id,
+			  req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
+
+	/*
+	 * S-1 (oob-map): for a memory handle the object has a KNOWN extent (the
+	 * ftruncate at creation), so check the guest's window against it.  This
+	 * matters more than a normal bounds check: the in-window branch below
+	 * prefaults every page from inside the VMM, so a mapping that runs past
+	 * the memfd's last page is not a wrong result, it is a SIGBUS that kills
+	 * QEMU.  Compare against the page-rounded size because mmap legitimately
+	 * covers the whole final page of a non-page-multiple object.
+	 * TYPE_NVIDIA handles are exempt: `offset` there is an RM mapping token
+	 * with no relation to a file length (h->size is 0 and means "unknown").
+	 */
+	if (h->type == NVKVM_HANDLE_TYPE_MEMORY) {
+		uint64_t obj_end = (h->size + 4095ULL) & ~4095ULL;
+		if (obj_end < h->size ||                       /* round-up wrap */
+		    req->offset > obj_end ||
+		    req->length > obj_end - req->offset) {
+			NVKVM_DBG("nvkvm: mmap_on_isolate: [0x%llx,+0x%llx) "
+				  "outside memory handle %u (size=%llu)\n",
+				  (unsigned long long)req->offset,
+				  (unsigned long long)req->length,
+				  req->handle_id,
+				  (unsigned long long)h->size);
+			resp->status = EINVAL;
+			return 0;
+		}
 	}
 
 	/* N-2: bound the raw length BEFORE the page-align round-up — a length
@@ -2686,7 +2949,25 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 {
 	struct nvkvm_iso_mmap_entry e;
 
-	if (!iso_mmap_free(req->mmap_token, &e)) {
+	/*
+	 * S-2 (cross-isolate): the token is an index into one VM-global table,
+	 * and isolates are separate, uid-separated HOST processes — the same
+	 * boundary PRESENT/XISO_IMPORT validate against.  Without this check any
+	 * isolate could walk the token space and tear down a NEIGHBOUR's live GPU
+	 * mapping: the teardown below runs entirely on the victim's recorded
+	 * entry (its isolate, its GVA, its GPA extent), so a stranger's token
+	 * unmaps in the victim's address space and returns the victim's window
+	 * extent for reuse while it is still writing through it.
+	 *
+	 * iso_mmap_free() now refuses a token this isolate does not own, and
+	 * reports it as ENOENT — the same answer as an unknown token, so probing
+	 * cannot distinguish "not yours" from "not there".
+	 */
+	if (req->isolate_id == 0) {
+		resp->status = EINVAL;
+		return 0;
+	}
+	if (!iso_mmap_free(req->mmap_token, req->isolate_id, &e)) {
 		resp->status = ENOENT;
 		return 0;
 	}
@@ -2883,6 +3164,23 @@ int nvkvm_req_write_memory_handle(VirtIONvgpu *nv,
 		resp->status = EBADF;
 		return 0;
 	}
+	/*
+	 * S-1 (oob): N-1 established WHICH fd may be written; this bounds WHERE.
+	 * The offset is guest-chosen and pwrite past EOF silently GROWS the
+	 * memfd, so without this a guest could inflate a one-page object to an
+	 * arbitrary size (host memory it never asked for) and leave content
+	 * outside the extent every other check reasons about.  h->size is the
+	 * ftruncate at creation; the comparison is written as a subtraction so
+	 * offset+size cannot wrap.
+	 */
+	if (req->offset > h->size || req->size > h->size - req->offset) {
+		NVKVM_DBG("nvkvm: write_memory_handle %u: [0x%llx,+%u) outside "
+			  "object (size=%llu)\n", req->handle_id,
+			  (unsigned long long)req->offset, req->size,
+			  (unsigned long long)h->size);
+		resp->status = EINVAL;
+		return 0;
+	}
 
 	ssize_t n = pwrite(h->fd, data_buf, req->size, (off_t)req->offset);
 	if (n < 0) {
@@ -2914,6 +3212,18 @@ int nvkvm_req_read_memory_handle(VirtIONvgpu *nv,
 	/* N-1: only a memfd handle may be pread() — see write handler. */
 	if (h->type != NVKVM_HANDLE_TYPE_MEMORY) {
 		resp->status = EBADF;
+		return 0;
+	}
+	/* S-1: bound the read to the object, as for the write handler.  A read
+	 * past EOF only short-reads (already EIO here) rather than growing the
+	 * file, but leaving the two sides of the same object under different
+	 * rules is how the next caller ends up reasoning about the wrong one. */
+	if (req->offset > h->size || req->size > h->size - req->offset) {
+		NVKVM_DBG("nvkvm: read_memory_handle %u: [0x%llx,+%u) outside "
+			  "object (size=%llu)\n", req->handle_id,
+			  (unsigned long long)req->offset, req->size,
+			  (unsigned long long)h->size);
+		resp->status = EINVAL;
 		return 0;
 	}
 

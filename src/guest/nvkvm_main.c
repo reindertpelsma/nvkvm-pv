@@ -2330,8 +2330,27 @@ forwarded:;
 				__u32 sz;
 
 				if (!copy_from_user(&orig, aux_uptr, sizeof(orig))) {
+					/*
+					 * SECOND fetch of size_of_strings: the
+					 * allocation above was sized from the FIRST
+					 * fetch (out of our own copy).  Userspace can
+					 * change the field in between, so `sz` here is
+					 * NOT a safe bound on aux_buf -- bounding it
+					 * against the ABI max only proves it is a legal
+					 * size, not that we allocated that much.  Check
+					 * it against the extension we actually have, the
+					 * same way the FIFO_GET_CHANNELLIST and InfoList
+					 * writebacks above already do; without this a
+					 * shrink-then-grow reads ~1.5 KiB of adjacent
+					 * slab out to userspace.
+					 */
+					size_t need;
+
 					sz = orig.size_of_strings;
-					if (sz > 0 && sz <= 512) {
+					need = (size_t)ctrl->params_size +
+					       3 * (size_t)sz;
+					if (sz > 0 && sz <= 512 &&
+					    aux_size >= need) {
 						char *ext = (char *)aux_buf +
 							    ctrl->params_size;
 						/* Copy version strings to original user buffers */

@@ -225,6 +225,11 @@ int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 	h->fd         = fd;
 	h->session_id = session_id;
 	h->dev_id     = 0;
+	/* S-1: remember what we just sized the memfd to.  Discarding it (as
+	 * this did) is what left every later (offset, length) on this object
+	 * unbounded — the ftruncate is the object's extent, so it has to
+	 * survive the call that performed it. */
+	h->size       = size;
 	*handle_id_out = id;
 	pthread_mutex_unlock(&t->lock);
 

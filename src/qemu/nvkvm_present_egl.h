@@ -45,8 +45,15 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv);
  * was accepted (caller must not close it), false if the console is inactive
  * (caller still owns the fd). */
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
-                          uint32_t buf_key,
+                          uint32_t owner_isolate_id, uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,
                           uint32_t fourcc, uint64_t modifier);
+
+/* S-4: forget every cached import belonging to a dead isolate.  Safe to call
+ * from a virtio worker thread: it only records the request, and the drop
+ * itself happens on the main loop where the GL context lives.  No-op in the
+ * compute-only build. */
+void nvkvm_present_forget_isolate(struct VirtIONvgpu *nv,
+                                  uint32_t isolate_id);
 
 #endif /* NVKVM_PRESENT_EGL_H */
