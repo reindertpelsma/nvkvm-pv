@@ -100,8 +100,16 @@ stage(){ # $1 basename-in-bundle  $2 destdir  [$3.. extra symlink names]
 # dlsym(RTLD_DEFAULT) and reported the failure against itself.  Measured: with
 # the .so.1 link alone, dlopen("libnvidia-ml.so.1") succeeds and
 # dlopen("libnvidia-ml.so") fails; with both, NVML works and nvidia-smi -L
-# reports the same GPU and UUID as the host.  The host gets this link from the
-# normal driver package; the guest only gets what we stage.
+# reports the same GPU and UUID as the host.
+#
+# NOTE, corrected 2026-08-20: this is NOT an nvkvm defect and the guest is not
+# unusual here.  The unversioned name ships in the driver's -dev package, and a
+# host with only the runtime package (libnvidia-compute-NNN) does not have it
+# either -- measured on an A100 host, where Geekbench failed exactly the same
+# way outside any VM.  We stage the link anyway, because a guest that works
+# where the host does not is the better failure direction for a staging script,
+# and because the alternative is every NVML consumer in the guest failing with
+# a message that blames itself.
 stage "libnvidia-ml.so.$V" "$SYS" "libnvidia-ml.so.1" "libnvidia-ml.so"
 stage "libcuda.so.$V"      "$SYS" "libcuda.so.1" "libcuda.so"
 # Remove a STALE differently-versioned copy, never the one just staged.
