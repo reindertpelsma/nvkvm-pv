@@ -78,8 +78,15 @@ static enum hrtimer_restart nvkvm_vblank_fn(struct hrtimer *t)
 /* ── Connector: a single fixed mode, no EDID ─────────────────────────────── */
 static int nvkvm_conn_get_modes(struct drm_connector *conn)
 {
-	/* One preferred mode at the virtual panel's fixed resolution. */
-	return drm_add_modes_noedid(conn, NVKVM_KMS_W, NVKVM_KMS_H);
+	int count;
+
+	/* drm_add_modes_noedid() adds the whole standard table up to this size
+	 * and marks NONE of it preferred, so a client picks by its own
+	 * heuristics -- Xorg chose 1400x1050 on a 1920x1080 panel.  Flag the
+	 * native mode, the way vkms/virtio-gpu do. */
+	count = drm_add_modes_noedid(conn, NVKVM_KMS_W, NVKVM_KMS_H);
+	drm_set_preferred_mode(conn, NVKVM_KMS_W, NVKVM_KMS_H);
+	return count;
 }
 
 /* A virtual panel is always present: report connected on every probe so the
@@ -425,6 +432,29 @@ static bool nvkvm_plane_format_mod_supported(struct drm_plane *plane,
 	const uint64_t *m;
 
 	(void)plane; (void)format;
+	/*
+	 * LINEAR is ACCEPTED here but deliberately not ADVERTISED (it is absent
+	 * from nvkvm_pipe_modifiers, which is what the IN_FORMATS blob offers).
+	 * The two lists are consulted by different callers and want different
+	 * answers:
+	 *
+	 *   - IN_FORMATS is what a compositor PICKS a render target from, and
+	 *     NVIDIA cannot use a LINEAR dma-buf as an EGLImage render target,
+	 *     so offering LINEAR there makes wlroots/glamor fail to create an
+	 *     FBO and composite nothing.
+	 *   - drm_any_plane_has_format() consults this callback for EVERY
+	 *     framebuffer creation, including plain CPU-rendered dumb buffers
+	 *     that are never an EGL render target.  Xorg's modesetting DDX
+	 *     scans out exactly such a buffer, and the legacy ADDFB ioctl it
+	 *     uses has no modifier field at all -- the core fills in
+	 *     DRM_FORMAT_MOD_LINEAR.  Rejecting it here failed every AddFB with
+	 *     -EINVAL, which cost native Xorg twice over: the DDX's 32bpp probe
+	 *     fell back to a 24bpp packed fb and switched glamor OFF (silent
+	 *     software rendering), and the scanout fb could not be created at
+	 *     all ("failed to set mode: Invalid argument").
+	 */
+	if (modifier == DRM_FORMAT_MOD_LINEAR)
+		return true;
 	for (m = nvkvm_pipe_modifiers; *m != DRM_FORMAT_MOD_INVALID; m++)
 		if (*m == modifier)
 			return true;
@@ -456,6 +486,9 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	ddev->mode_config.min_height = 0;
 	ddev->mode_config.max_width  = NVKVM_KMS_W;
 	ddev->mode_config.max_height = NVKVM_KMS_H;
+	/* Reported as DRM_CAP_DUMB_PREFERRED_DEPTH; left at 0 a client has to
+	 * guess, and Xorg's modesetting DDX guesses by probing a scanout fb. */
+	ddev->mode_config.preferred_depth = 24;
 	ddev->mode_config.funcs      = &nvkvm_kms_mode_funcs;
 
 	/* Flip events need vblank bookkeeping even though we complete them

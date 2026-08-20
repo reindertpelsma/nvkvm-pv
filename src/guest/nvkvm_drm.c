@@ -926,6 +926,9 @@ const struct file_operations nvkvm_drm_fops = {   /* F-4: non-static for embedde
 	.read           = drm_read,
 	.mmap           = drm_gem_mmap,   /* #102: mmap dumb (shmem) scanout buffers */
 	.llseek         = noop_llseek,
+	/* Required by drm_open_helper() on >= 6.12 or every open() of the DRM
+	 * nodes returns -EINVAL; see NVKVM_DRM_FOP_FLAGS in nvkvm_compat.h. */
+	NVKVM_DRM_FOP_FLAGS
 };
 
 static const struct drm_driver nvkvm_drm_driver = {
