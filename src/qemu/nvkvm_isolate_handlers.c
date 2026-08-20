@@ -408,6 +408,9 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 	 * import and displayed its pixels.
 	 */
 	nvkvm_present_forget_isolate(nv, req->isolate_id);
+	/* Retire this isolate's MAP->VA entries too, or the table fills up
+	 * with dead mappings over a long-lived VM's process churn. */
+	nvkvm_mapva_forget_isolate(req->isolate_id);
 
 	/*
 	 * Walk every session and prune the killed isolate from its
@@ -1456,6 +1459,98 @@ int nvkvm_req_xiso_import(VirtIONvgpu *nv,
 	return 0;
 }
 
+void nvkvm_mapva_forget_isolate(uint32_t iso);
+
+/*
+ * ── RM_MAP_MEMORY / RM_UNMAP_MEMORY virtual-address table (A100 fix) ──────
+ *
+ * NV_ESC_RM_UNMAP_MEMORY carries the VA to unmap in NVOS34.p_linear_address.
+ * The guest zeroes that field on purpose (src/guest/nvkvm_ioctl.c) -- a guest
+ * VA is meaningless in the isolate's address space -- and its comment states
+ * the contract: "host fills in from its map table".  That map table never
+ * existed on the live path.  The only code that wrote the field host-side sits
+ * inside nvkvm_dispatch.c's `#if 0` block, so every unmap reached the driver
+ * with VA 0 and came back NV_ERR_OBJECT_NOT_FOUND (0x57).
+ *
+ * Measured on an A100 (GA100): that was the ONLY non-zero nvstatus in 1885
+ * forwarded ioctls of a failing cuCtxCreate.  Consumer cards very likely hit
+ * the same failed unmap and survive it, because the FREE that follows tears
+ * the object down anyway.
+ *
+ * This is the missing half: remember the VA the driver hands back on a
+ * successful MAP, and put it back on the matching UNMAP.
+ *
+ * Keyed on isolate_id as well as the object triple, deliberately: the table is
+ * VM-global, and without that an isolate could name another isolate's mapping
+ * and have the host unmap it.
+ */
+#define NVKVM_MAPVA_MAX 8192
+
+struct nvkvm_mapva_ent {
+	int      in_use;
+	uint32_t isolate_id;
+	uint32_t h_client, h_device, h_memory;
+	uint64_t va;
+};
+
+static struct nvkvm_mapva_ent g_mapva[NVKVM_MAPVA_MAX];
+static pthread_mutex_t g_mapva_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nvkvm_mapva_record(uint32_t iso, uint32_t hc, uint32_t hd,
+			       uint32_t hm, uint64_t va)
+{
+	int free_slot = -1;
+	if (!va)
+		return;
+	pthread_mutex_lock(&g_mapva_lock);
+	for (int i = 0; i < NVKVM_MAPVA_MAX; i++) {
+		struct nvkvm_mapva_ent *e = &g_mapva[i];
+		if (e->in_use && e->isolate_id == iso && e->h_client == hc &&
+		    e->h_device == hd && e->h_memory == hm) {
+			e->va = va;              /* remap of the same object */
+			pthread_mutex_unlock(&g_mapva_lock);
+			return;
+		}
+		if (!e->in_use && free_slot < 0)
+			free_slot = i;
+	}
+	if (free_slot >= 0) {
+		struct nvkvm_mapva_ent ne = { 1, iso, hc, hd, hm, va };
+		g_mapva[free_slot] = ne;
+	}
+	/* Table full: drop it.  The unmap then fails exactly as it did before
+	 * this fix -- degraded, not newly broken. */
+	pthread_mutex_unlock(&g_mapva_lock);
+}
+
+/* Look up and CONSUME the mapping: an unmap retires it. */
+static uint64_t nvkvm_mapva_take(uint32_t iso, uint32_t hc, uint32_t hd,
+				 uint32_t hm)
+{
+	uint64_t va = 0;
+	pthread_mutex_lock(&g_mapva_lock);
+	for (int i = 0; i < NVKVM_MAPVA_MAX; i++) {
+		struct nvkvm_mapva_ent *e = &g_mapva[i];
+		if (e->in_use && e->isolate_id == iso && e->h_client == hc &&
+		    e->h_device == hd && e->h_memory == hm) {
+			va = e->va;
+			e->in_use = 0;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&g_mapva_lock);
+	return va;
+}
+
+void nvkvm_mapva_forget_isolate(uint32_t iso)
+{
+	pthread_mutex_lock(&g_mapva_lock);
+	for (int i = 0; i < NVKVM_MAPVA_MAX; i++)
+		if (g_mapva[i].in_use && g_mapva[i].isolate_id == iso)
+			g_mapva[i].in_use = 0;
+	pthread_mutex_unlock(&g_mapva_lock);
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
@@ -2228,6 +2323,20 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 
 	uint32_t nvstatus  = 0;
 	uint64_t fault_addr = 0;
+	/*
+	 * UNMAP: put the remembered VA back before the driver sees it.  NVOS34 is
+	 * {h_client, h_device, h_memory, reserved0, p_linear_address@16, ...}.
+	 */
+	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == 0x4f &&
+	    param_buf && req->param_size >= 24) {
+		const uint32_t *w = (const uint32_t *)param_buf;
+		uint64_t va = nvkvm_mapva_take(req->isolate_id, w[0], w[1], w[2]);
+		if (va)
+			memcpy((char *)param_buf + 16, &va, 8);
+		/* No entry: leave the guest's zero.  Failing closed here keeps a
+		 * forged triple from unmapping something we never mapped. */
+	}
+
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
 				      req->isolate_id,
 				      req->handle_id,
@@ -2237,6 +2346,18 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				      req->flags,
 				      &nvstatus,
 				      &fault_addr);
+
+	/*
+	 * MAP: on success the driver wrote the isolate-side VA into
+	 * NVOS33.p_linear_address@32.  Remember it for the matching unmap.
+	 */
+	if (ret == 0 && nvstatus == 0 && _IOC_TYPE(req->cmd) == 'F' &&
+	    _IOC_NR(req->cmd) == 0x4e && param_buf && req->param_size >= 40) {
+		const uint32_t *w = (const uint32_t *)param_buf;
+		uint64_t va;
+		memcpy(&va, (const char *)param_buf + 32, 8);
+		nvkvm_mapva_record(req->isolate_id, w[0], w[1], w[2], va);
+	}
 
 	resp->retval     = (ret < 0) ? (uint64_t)(int64_t)ret : (uint64_t)ret;
 	resp->status     = (ret == -EFAULT && fault_addr) ? EFAULT : 0;
@@ -2540,6 +2661,39 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			"ret=%lld nvstatus=0x%x fault=0x%llx\n",
 			req->isolate_id, req->handle_id, req->cmd,
 			(long long)ret, nvstatus, (unsigned long long)fault_addr);
+	}
+
+	/*
+	 * A100 (GA100) debug: cuCtxCreate fails with a repeating
+	 * RM_FREE(ok) -> RM_UNMAP_MEMORY(OBJECT_NOT_FOUND) pair. Dump the
+	 * object handles on all three so the UNMAP can be correlated against
+	 * the MAP that created it, and against the FREE just before it.
+	 * NVOS34 (unmap) is {h_client,h_device,h_memory,rsvd,p_linear_address,...}
+	 * NVOS33 (map)   is the same prefix, then offset/length/p_linear_address.
+	 * NVOS00 (free)  is {h_root,h_object_parent,h_object_old,status}.
+	 */
+	if (nvkvm_debug_enabled && param_buf && _IOC_TYPE(req->cmd) == 'F') {
+		unsigned nr = _IOC_NR(req->cmd);
+		const uint32_t *w = (const uint32_t *)param_buf;
+		if (nr == 0x4f && req->param_size >= 24) {          /* UNMAP */
+			uint64_t va; memcpy(&va, (const char *)param_buf + 16, 8);
+			NVKVM_DBG("nvkvm: A100DBG UNMAP hClient=0x%x hDevice=0x%x "
+				  "hMemory=0x%x va=0x%llx nvstatus=0x%x\n",
+				  w[0], w[1], w[2], (unsigned long long)va, nvstatus);
+		} else if (nr == 0x4e && req->param_size >= 40) {   /* MAP */
+			uint64_t off, len, va;
+			memcpy(&off, (const char *)param_buf + 16, 8);
+			memcpy(&len, (const char *)param_buf + 24, 8);
+			memcpy(&va,  (const char *)param_buf + 32, 8);
+			NVKVM_DBG("nvkvm: A100DBG MAP   hClient=0x%x hDevice=0x%x "
+				  "hMemory=0x%x off=0x%llx len=0x%llx va=0x%llx nvstatus=0x%x\n",
+				  w[0], w[1], w[2], (unsigned long long)off,
+				  (unsigned long long)len, (unsigned long long)va, nvstatus);
+		} else if (nr == 0x29 && req->param_size >= 16) {   /* FREE */
+			NVKVM_DBG("nvkvm: A100DBG FREE  hRoot=0x%x hParent=0x%x "
+				  "hObject=0x%x nvstatus=0x%x\n",
+				  w[0], w[1], w[2], nvstatus);
+		}
 	}
 
 	/* Trace UVM ioctls' rm_status field so we can see what the driver
