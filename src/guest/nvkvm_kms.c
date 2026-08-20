@@ -192,19 +192,24 @@ static const uint32_t nvkvm_pipe_formats[] = {
 				 (((uint64_t)(g) & 0x3) << 20) | (((uint64_t)(s) & 0x1) << 22) | \
 				 (((uint64_t)(c) & 0x7) << 23)))
 static const uint64_t nvkvm_pipe_modifiers[] = {
-	DRM_FORMAT_MOD_LINEAR,
-	/* uncompressed 16Bx2 block-linear (KIND=6) — the host-importable family */
-	NVKVM_MOD_BL2D(0, 1, 2, 6, 0), NVKVM_MOD_BL2D(0, 1, 2, 6, 1),
-	NVKVM_MOD_BL2D(0, 1, 2, 6, 2), NVKVM_MOD_BL2D(0, 1, 2, 6, 3),
-	NVKVM_MOD_BL2D(0, 1, 2, 6, 4), NVKVM_MOD_BL2D(0, 1, 2, 6, 5),
-	/* compressed (KIND=8) — gbm's default render pick; accepted so flips work */
-	NVKVM_MOD_BL2D(1, 1, 2, 8, 0), NVKVM_MOD_BL2D(1, 1, 2, 8, 1),
-	NVKVM_MOD_BL2D(1, 1, 2, 8, 2), NVKVM_MOD_BL2D(1, 1, 2, 8, 3),
-	NVKVM_MOD_BL2D(1, 1, 2, 8, 4), NVKVM_MOD_BL2D(1, 1, 2, 8, 5),
-	/* the bare macro values too (harmless, some paths may use them) */
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(0), DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(1),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(2), DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(3),
-	DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(4), DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(5),
+	/*
+	 * ONLY modifiers this driver is known to implement, read off real bos
+	 * that NVIDIA's own GBM produced in-guest:
+	 *
+	 *   SCANOUT|RENDERING -> 0x0300000000606014   (= BL2D(0,1,2,6,4))
+	 *   RENDERING         -> 0x0300000000e08014   (= BL2D(0,1,2,14,4))
+	 *
+	 * Both import as EGLImages and give a COMPLETE FBO, verified in-guest.
+	 * Publishing anything beyond these is actively harmful now that the
+	 * IN_FORMATS blob is rebuilt and compositors actually see the list: a
+	 * client that picks an invented modifier gets a buffer the driver
+	 * cannot use as a render target, and fails exactly where wlroots does
+	 * ("Failed to create FBO") and Xorg/glamor does ("Failed to create
+	 * pixmap").  LINEAR is excluded for the same reason -- see the accept
+	 * callback, which still allows it for cursors.
+	 */
+	NVKVM_MOD_BL2D(0, 1, 2, 6, 4),    /* 0x0300000000606014 scanout+render */
+	NVKVM_MOD_BL2D(0, 1, 2, 14, 4),   /* 0x0300000000e08014 render         */
 	DRM_FORMAT_MOD_INVALID
 };
 
