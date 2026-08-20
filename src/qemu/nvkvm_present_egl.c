@@ -16,6 +16,7 @@
  * are handled for us.
  */
 #include "qemu/osdep.h"
+#include <time.h>
 #include "virtio_nvgpu.h"   /* NVKVM_QEMU_GRAPHICS compile-time gate */
 #include "nvkvm_drm_node.h"
 
@@ -624,6 +625,41 @@ static void nvkvm_present_reap_dead(NvkvmPresent *p)
                    EGL_NO_CONTEXT);
 }
 
+/*
+ * Present-path frame counters (NVKVM_PRESENT_TIMING=1).
+ *
+ * A rate must come from a COUNTER, never from counting log lines: only some
+ * paths emit a line per frame, which is how a phantom "21 presents/s ceiling"
+ * was once measured on a pipeline that was in fact running at a full 60.
+ * These count every frame the display consumed and every frame the
+ * single-slot handoff had to drop, and print ONE line per wall-clock second
+ * carrying the rate itself -- so the number in the log is already frames/s and
+ * needs no arithmetic over the log, which is where the phantom came from.
+ *
+ * Off unless the environment variable is set, so a normal run pays nothing.
+ */
+static unsigned nvkvm_st_consumed, nvkvm_st_dropped;
+static unsigned nvkvm_st_bucket_consumed, nvkvm_st_bucket_dropped;
+static double   nvkvm_st_present_us, nvkvm_st_bucket_us;
+static double   nvkvm_st_bucket_t0;
+static bool     nvkvm_st_on, nvkvm_st_checked;
+
+static bool nvkvm_disp_stats(void)
+{
+    if (!nvkvm_st_checked) {
+        nvkvm_st_checked = true;
+        nvkvm_st_on = getenv("NVKVM_PRESENT_TIMING") != NULL;
+    }
+    return nvkvm_st_on;
+}
+
+static double nvkvm_st_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
 /* GraphicHwOps.gfx_update — main loop, BQL held.  Drain the slot and present. */
 static void nvkvm_present_gfx_update(void *opaque)
 {
@@ -645,10 +681,47 @@ static void nvkvm_present_gfx_update(void *opaque)
     p->dirty = false;
     pthread_mutex_unlock(&p->lock);
 
+    struct timespec ta, tb;
+    bool stats = nvkvm_disp_stats();
+    if (stats) {
+        clock_gettime(CLOCK_MONOTONIC, &ta);
+    }
+
     if (nvkvm_present_decide_mode(p) == 1) {
         nvkvm_present_gl(p, fd, w, h, stride, fourcc, mod);
     } else {
         nvkvm_present_readback(p, fd, owner, key, w, h, stride, fourcc, mod);
+    }
+
+    if (stats) {
+        double now, us;
+
+        clock_gettime(CLOCK_MONOTONIC, &tb);
+        us = (tb.tv_sec - ta.tv_sec) * 1e6 + (tb.tv_nsec - ta.tv_nsec) / 1e3;
+        nvkvm_st_present_us += us;
+        nvkvm_st_bucket_us  += us;
+        nvkvm_st_consumed++;
+        nvkvm_st_bucket_consumed++;
+
+        now = nvkvm_st_now();
+        if (nvkvm_st_bucket_t0 == 0.0) {
+            nvkvm_st_bucket_t0 = now;
+        } else if (now - nvkvm_st_bucket_t0 >= 1.0) {
+            fprintf(stderr,
+                    "nvkvm disp stats: %.1f frames/s dropped=%u "
+                    "present_mean=%.2fms (total consumed=%u dropped=%u)\n",
+                    nvkvm_st_bucket_consumed / (now - nvkvm_st_bucket_t0),
+                    nvkvm_st_bucket_dropped,
+                    nvkvm_st_bucket_consumed
+                        ? nvkvm_st_bucket_us / nvkvm_st_bucket_consumed / 1000.0
+                        : 0.0,
+                    nvkvm_st_consumed, nvkvm_st_dropped);
+            fflush(stderr);
+            nvkvm_st_bucket_t0       = now;
+            nvkvm_st_bucket_consumed = 0;
+            nvkvm_st_bucket_dropped  = 0;
+            nvkvm_st_bucket_us       = 0.0;
+        }
     }
 }
 
@@ -722,6 +795,10 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     pthread_mutex_lock(&p->lock);
     if (p->fd >= 0) {
         close(p->fd);        /* drop the frame the display hasn't taken yet */
+        if (nvkvm_disp_stats()) {
+            nvkvm_st_dropped++;
+            nvkvm_st_bucket_dropped++;
+        }
     }
     p->fd       = dmabuf_fd;
     p->owner    = owner_isolate_id;   /* S-4: half of the cache identity */
