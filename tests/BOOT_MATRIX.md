@@ -702,3 +702,19 @@ Testing Hopper needs a host with nested virtualisation and an H100 from somewher
 other than vast — a bare-metal cloud instance, or hardware access. Recorded as an
 open gap rather than an assumed pass: the classes being present means the *known*
 failure mode is covered, not that Hopper works.
+
+**Where the H100 row actually came from: Spheron.** Worth recording, because the
+paragraph above suggests bare metal is the only route and it is not. Spheron's
+GPU instances are VMs, but *some flavors expose `/dev/kvm`* — the H100 that
+produced the 27/28 row was one of them.
+
+Not all of them do, and the console does not tell you which. An A100 80GB PCIe
+in `Canada 1` (2026-08-20) is a VM **without** nested virt, confirmed four ways:
+`svm`/`vmx` absent from `/proc/cpuinfo`, `kvm-ok` reporting no KVM extensions,
+`kvm_amd: SVM not supported by CPU` in dmesg, and `modprobe kvm_amd` failing
+with `Operation not supported`. The listing showed `Dedicated` and `PCIE`, both
+of which are true *of the GPU* and say nothing about the host.
+
+**So probe before committing.** Boot, run `ls /dev/kvm`, and destroy if it is
+missing — that costs a few cents and is the only reliable signal. A `VM` badge
+means *ask*, not *no*.
