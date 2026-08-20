@@ -330,6 +330,47 @@ measured box they get a real NVIDIA context, produce real GPU buffers, the
 compositor composites them, and the frames now reach a host window and keep
 coming.
 
+### Display work needs a host whose NVIDIA GBM stack actually works (2026-08-20)
+
+Compute and offscreen GL need only `EGL_EXT_platform_device`.  The
+display/compositor path additionally needs the **GBM** platform, and that is a
+separate piece of NVIDIA userspace which some hosts simply do not have wired
+up.  Check before spending time on display bugs, because the failure looks
+exactly like an nvkvm bug: compositors fall back to llvmpipe and nothing is
+presented.
+
+Measured on a vast.ai RTX 3060 box (driver 580.159.04, Ubuntu 22.04 container),
+with a headless probe that opens the render node, makes a GBM device and asks
+who claims the EGLDisplay:
+
+```
+                     host (no nvkvm)        guest (through nvkvm)
+drm driver           nvidia-drm             nvidia-drm
+gbm backend name     drm    <- Mesa         drm    <- Mesa
+EGL vendor           Mesa Project           Mesa Project
+GL_RENDERER          llvmpipe               llvmpipe
+```
+
+The host fails identically with nvkvm not involved at all, so this is the
+environment, not us.  That box lacked `/usr/lib/x86_64-linux-gnu/gbm/
+nvidia-drm_gbm.so` entirely; adding the symlink (it points at
+`libnvidia-allocator.so.<ver>`, which was present) did not help, nor did
+`GBM_BACKEND` / `GBM_BACKENDS_PATH`.  Its Mesa is 23.2 on 22.04.
+
+What still works there, so the box is not useless: `tests/validate.sh` is
+**28/28**, including `gl_renderer_is_nvidia` — offscreen EGL via
+`EGL_EXT_platform_device` reaches the real GPU.  Only the GBM platform is
+missing.
+
+Quick triage before any display debugging on a new host:
+
+```
+gbm backend name=nvidia-drm  + EGL vendor=NVIDIA   -> usable
+gbm backend name=drm         + EGL vendor=Mesa     -> host cannot do NVIDIA GBM;
+                                                      display work is impossible
+                                                      here, regardless of nvkvm
+```
+
 ### Guest pixels DO reach the host window — but weston negotiates a format that does not (2026-08-20)
 
 Measured on RTX 4070 / 595.84. The display path works; a specific format
