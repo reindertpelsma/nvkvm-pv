@@ -225,6 +225,82 @@ static const uint64_t nvkvm_pipe_modifiers[] = {
  * host detiles correctly. We accept any format here — the format itself is
  * validated against plane->format_types before this is called.
  */
+
+/*
+ * Rebuild the plane's IN_FORMATS blob.
+ *
+ * drm_simple_display_pipe_init() builds that blob during init, filtering our
+ * modifier list through drm_simple_kms_format_mod_supported -- which accepts
+ * ONLY DRM_FORMAT_MOD_LINEAR.  Every block-linear modifier we advertise is
+ * therefore dropped before our own callback is grafted on, and a compositor
+ * reading IN_FORMATS is offered exactly XRGB8888 + LINEAR.
+ *
+ * That is fatal rather than merely suboptimal: NVIDIA cannot use a LINEAR
+ * dma-buf as an EGLImage render target (measured in-guest: GL_INVALID_OPERATION
+ * on bind, incomplete FBO), and that import is how a compositor obtains its
+ * output framebuffer.  weston and wlroots both take LINEAR, fail to create
+ * their render FBO and composite nothing -- so we export buffers nobody drew
+ * into, and the screen is black.
+ *
+ * Replace the blob with one that actually lists what we support, now that
+ * plane->funcs is ours.
+ */
+#ifndef NVKVM_FORMAT_BLOB_VERSION
+#define NVKVM_FORMAT_BLOB_VERSION 1
+#endif
+static int nvkvm_plane_rebuild_in_formats(struct drm_plane *plane,
+					  const u32 *formats, unsigned int nf,
+					  const u64 *mods, unsigned int nm)
+{
+	struct drm_device *dev = plane->dev;
+	struct drm_format_modifier_blob *bh;
+	struct drm_format_modifier *fm;
+	struct drm_property_blob *blob;
+	size_t formats_size, mods_size, blob_size;
+	unsigned int i, j;
+	u32 *fmt;
+	u64 mask;
+
+	if (!dev->mode_config.modifiers_property || !nf || !nm)
+		return -EINVAL;
+	if (nf > 64)              /* the per-modifier format mask is 64 bits */
+		nf = 64;
+
+	formats_size = sizeof(u32) * nf;
+	mods_size    = sizeof(struct drm_format_modifier) * nm;
+	blob_size    = sizeof(*bh) + ALIGN(formats_size, 8) + mods_size;
+
+	blob = drm_property_create_blob(dev, blob_size, NULL);
+	if (IS_ERR(blob))
+		return PTR_ERR(blob);
+
+	bh = blob->data;
+	bh->version          = NVKVM_FORMAT_BLOB_VERSION;
+	bh->flags            = 0;
+	bh->count_formats    = nf;
+	bh->formats_offset   = sizeof(*bh);
+	bh->count_modifiers  = nm;
+	bh->modifiers_offset = bh->formats_offset + ALIGN(formats_size, 8);
+
+	fmt = (u32 *)((char *)bh + bh->formats_offset);
+	memcpy(fmt, formats, formats_size);
+
+	mask = (nf == 64) ? ~0ULL : ((1ULL << nf) - 1);
+	fm = (struct drm_format_modifier *)((char *)bh + bh->modifiers_offset);
+	for (i = 0, j = 0; i < nm; i++) {
+		fm[j].formats  = mask;   /* every format, for this modifier */
+		fm[j].offset   = 0;
+		fm[j].pad      = 0;
+		fm[j].modifier = mods[i];
+		j++;
+	}
+
+	drm_object_property_set_value(&plane->base,
+				      dev->mode_config.modifiers_property,
+				      blob->base.id);
+	return 0;
+}
+
 static bool nvkvm_plane_format_mod_supported(struct drm_plane *plane,
 					     u32 format, u64 modifier)
 {
@@ -304,6 +380,16 @@ int nvkvm_kms_init(struct drm_device *ddev)
 		nvkvm_plane_funcs = *pl->funcs;
 		nvkvm_plane_funcs.format_mod_supported = nvkvm_plane_format_mod_supported;
 		pl->funcs = &nvkvm_plane_funcs;
+
+		/* The blob built during init used the helper's LINEAR-only
+		 * filter; rebuild it now that the callback above is ours. */
+		ret = nvkvm_plane_rebuild_in_formats(pl, nvkvm_pipe_formats,
+						     ARRAY_SIZE(nvkvm_pipe_formats),
+						     nvkvm_pipe_modifiers,
+						     ARRAY_SIZE(nvkvm_pipe_modifiers) - 1);
+		if (ret)
+			pr_warn("nvkvm: could not rebuild IN_FORMATS (%d); compositors will only see LINEAR\n",
+				ret);
 	}
 
 	drm_mode_config_reset(ddev);

@@ -370,7 +370,7 @@ is fully usable for display work once modeset is on.  `tests/validate.sh` is
 28/28 there either way, because compute and offscreen GL go through
 `EGL_EXT_platform_device` and never touch GBM.
 
-### Compositors render black: our IN_FORMATS blob only ever offers LINEAR — ROOT CAUSE FOUND 2026-08-20
+### Compositors render black — one cause fixed, one still open (2026-08-20)
 
 Reproduced on RTX 4070 / 595.84 / Ada and RTX 3060 / 580.159.04 / Ampere.
 
@@ -406,13 +406,20 @@ Virtual-1` and then `failed to create gbm surface`.  With LINEAR gone the blob
 is *empty*, because every block-linear modifier we list is filtered out by the
 helper's callback before our override exists.
 
-**The fix** is to make the blob honour our modifiers: build the plane with
-`drm_universal_plane_init()` and our own `drm_plane_funcs` (which already carry
-`format_mod_supported`) instead of taking `drm_simple_display_pipe`'s plane, or
-otherwise rebuild the IN_FORMATS blob after grafting the callback.  Then
-advertise the block-linear modifier NVIDIA's GBM actually picks
-(0x0300000000606014) and keep accepting LINEAR for cursors and other non-render
-framebuffers.
+**FIXED:** `nvkvm_plane_rebuild_in_formats()` now rebuilds the blob after our
+callback is grafted on, so the advertised set is what we actually support.
+Verified: weston starts without `format XRGB8888 not supported`, and now flips
+`mod=0x300000000606014` (10485760-byte block-linear) instead of `mod=0x0`
+(8294400-byte LINEAR).  `tests/validate.sh` stays 28/28.
+
+**STILL OPEN:** weston's DRM backend is *still* black with block-linear
+negotiated -- its own screenshot is pure black (per-channel min/max all 0) and
+the exported buffer is untouched (0 of 2621440 px).  So the LINEAR/EGLImage
+defect above is real and explains wlroots's explicit failure, but it is not the
+whole story for weston, which uses `eglCreateWindowSurface` on the gbm_surface
+for its output rather than an EGLImage import.  Whatever stops weston drawing is
+still unidentified; `--backend=headless` on the same device still renders a
+correct desktop, so it remains DRM-backend-specific.
 
 **Proof the rest of the path is sound:** a plain client (gbm_surface +
 eglSwapBuffers + flip) renders a known colour that arrives on the host exactly,
