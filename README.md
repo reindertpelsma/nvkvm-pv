@@ -385,8 +385,27 @@ the driver with VA 0), and `UVM_MAP_DYNAMIC_PARALLELISM_REGION` was unhandled �
 collide with the frontend space (65 == 0x41 == `NV_ESC_RM_IDLE_CHANNELS`) it had
 been forwarded as a completely different ioctl until the sanitizer type gate
 turned that into an honest `ENOTTY`. With both fixed: 28/28, and a 3B LLM
-generating in the guest at 5.75 GiB VRAM, with 249 TFLOP/s fp16 matmul measured
-through the forwarder.
+generating in the guest at 5.75 GiB VRAM.
+
+Host/guest parity measured on that A100 with identical scripts, identical torch
+(2.13.0+cu130), same box:
+
+| workload | host | guest | ratio |
+|---|---|---|---|
+| fp16 matmul 8192x8192 | 246.8 TFLOP/s | 249.1 TFLOP/s | **1.01x** |
+| Qwen2.5-3B generate, batch 1, greedy | 15.4 tok/s | 11.3 tok/s | **0.73x** |
+
+Both halves are worth reading. Sustained compute is at parity — the 1.01x is
+measurement noise, not a speedup. Single-stream token generation is **27%
+slower**, and that is the honest number for this shape of workload: greedy
+batch-1 decoding is hundreds of tiny kernel launches per token with a
+synchronisation between each, which is exactly the latency-bound control path
+where a forwarding layer costs something. It is the same reason the vLLM figure
+elsewhere in this table reaches 0.99-1.00x: that workload batches, so it is
+bandwidth- and compute-bound rather than launch-bound.
+
+Quote whichever matches your workload, and do not quote the matmul number for an
+interactive chatbot. Both runs produced byte-identical output text.
 
 \*\* nvkvm refused a legitimate `UVM_FREE` — the ioctl names its range by base
 alone and sends length 0, and the ownership check rejected the zero length. The
