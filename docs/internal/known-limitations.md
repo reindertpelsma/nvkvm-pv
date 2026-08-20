@@ -755,6 +755,32 @@ PASS  gl_renderer           'NVIDIA A100 80GB PCIe/PCIe/SSE2'
 PASS  gl_draw_pixel_check   inside==triangle, outside==clear
 ```
 
+**Localised to an ioctl (2026-08-20), with `NVKVM_DEBUG=1`.** The context
+creation drives a repeating pair, and the second half always fails:
+
+```
+ioctl_on_isolate: cmd=0xc0104629  ret=0  nvstatus=0x0    NV_ESC_RM_FREE          ok
+ioctl_on_isolate: cmd=0xc020464f  ret=0  nvstatus=0x57   NV_ESC_RM_UNMAP_MEMORY  OBJECT_NOT_FOUND
+...repeats, then: nvkvm_isolate: killed isolate 3
+```
+
+`nvstatus 0x57` is `NV_ERR_OBJECT_NOT_FOUND` — the *same* status as the Hopper
+Vulkan failure, though at a different call site. The driver is reached and
+answers; nvkvm is not refusing anything. Note the ordering: a FREE immediately
+followed by an UNMAP of what looks like the same object.
+
+Also seen, and believed benign: `NV_ESC_SYS_PARAMS` (0xd6) returns `-EBUSY`
+early on. That ioctl sets `memblock_size` once per driver instance, so a second
+client getting EBUSY is expected rather than a fault — noted here only so the
+next person does not chase it.
+
+**Where to resume**: correlate each failing UNMAP against the MAP that created
+that mapping, and check whether the object handle the guest passes still refers
+to the same host object after the preceding FREE. The two candidate readings are
+(a) the guest is unmapping an object it already freed and consumer parts happen
+to tolerate it, or (b) handle translation loses the mapping across the FREE.
+Neither is established.
+
 This is the first GA100 ever tested here — every other Ampere row is a consumer
 GA10x die. It is deliberately **not** added to the tested-platforms table, whose
 stated bar is "reached a real CUDA kernel launch": this did not.
