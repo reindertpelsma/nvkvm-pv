@@ -148,7 +148,7 @@ chmod 440 /etc/sudoers.d/90-$GUEST_USER
 # Autologin straight into Cinnamon: the point of this guest is a desktop on the
 # physical display, and a greeter asking for a password is in the way.
 mkdir -p /etc/lightdm/lightdm.conf.d
-cat > /etc/lightdm/lightdm.conf.d/90-autologin.conf <<'LD'
+cat > /etc/lightdm/lightdm.conf.d/90-autologin.conf <<LD
 [Seat:*]
 autologin-user=$GUEST_USER
 autologin-user-timeout=0
