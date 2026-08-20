@@ -84,6 +84,33 @@ static const struct drm_connector_funcs nvkvm_conn_funcs = {
 };
 
 /* ── Display pipe (CRTC + primary plane + encoder) ───────────────────────── */
+/*
+ * A CRTC must have vblank turned ON while it is enabled, or the vblank
+ * timestamp/sequence bookkeeping the core hands back to userspace never
+ * advances.  We used to skip this entirely.
+ *
+ * The symptom was not a missing flip -- flips completed, because
+ * nvkvm_pipe_update() falls back to drm_crtc_send_vblank_event() when
+ * drm_crtc_vblank_get() fails.  It was that weston's desktop-shell fade-in
+ * never finished: its scene graph showed a "desktop shell fade surface"
+ * covering the whole output, fully opaque, solid black, sitting above the
+ * panel and every client.  Weston was compositing correctly the whole time --
+ * it was animating against a clock that never moved, so the screen stayed
+ * black and looked like a rendering failure.
+ */
+static void nvkvm_pipe_enable(struct drm_simple_display_pipe *pipe,
+			      struct drm_crtc_state *crtc_state,
+			      struct drm_plane_state *plane_state)
+{
+	(void)crtc_state; (void)plane_state;
+	drm_crtc_vblank_on(&pipe->crtc);
+}
+
+static void nvkvm_pipe_disable(struct drm_simple_display_pipe *pipe)
+{
+	drm_crtc_vblank_off(&pipe->crtc);
+}
+
 static int nvkvm_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 {
 	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
@@ -150,6 +177,8 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 }
 
 static const struct drm_simple_display_pipe_funcs nvkvm_pipe_funcs = {
+	.enable         = nvkvm_pipe_enable,
+	.disable        = nvkvm_pipe_disable,
 	.update         = nvkvm_pipe_update,
 	.enable_vblank  = nvkvm_pipe_enable_vblank,
 	.disable_vblank = nvkvm_pipe_disable_vblank,
