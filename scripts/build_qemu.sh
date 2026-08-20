@@ -341,14 +341,31 @@ else
 fi
 
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────
+#
+# Window backends are OFF by default: the normal deployment is headless (a
+# container or a remote host), where GTK/SDL only add build dependencies and
+# attack surface for a window nobody can see.  Set NVKVM_QEMU_UI=1 to build
+# them in -- needed to run the guest desktop in a real window on a machine
+# with a physical display:
+#
+#   NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force
+#   qemu-system-x86_64 ... -display gtk,gl=on
+#
+# The present path (#102) is the same either way; -display only decides where
+# the composited guest frame lands.
+if [ "${NVKVM_QEMU_UI:-0}" = "1" ]; then
+    NVKVM_UI_FLAGS="--enable-gtk --enable-sdl"
+    echo "  NVKVM_QEMU_UI=1 -> building with GTK + SDL window backends."
+else
+    NVKVM_UI_FLAGS="--disable-sdl --disable-gtk"
+fi
 echo "[7/9] Configuring QEMU (target: x86_64-softmmu, KVM only)..."
 cd "$QEMU_SRC"
 ./configure \
     --target-list=x86_64-softmmu \
     --enable-kvm \
     --disable-werror \
-    --disable-sdl \
-    --disable-gtk \
+    $NVKVM_UI_FLAGS \
     --enable-opengl \
     `# opengl pulls in the egl-headless display + dpy_gl_scanout_dmabuf, the` \
     `# host-aligned present path (#102). virglrenderer stays off — the nvkvm` \

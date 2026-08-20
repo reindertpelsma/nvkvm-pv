@@ -494,6 +494,22 @@ static int nvkvm_drm_fwd_get_dev_info(struct drm_device *dev, void *data,
 
 	if (r == 0 && dev && dev->primary)
 		p->primary_index = dev->primary->index;
+	/*
+	 * Do NOT advertise sync-fd support.  SEMSURF_FENCE_CREATE returns its
+	 * sync fd in an OUT field (fd@16) that we forward verbatim, so the
+	 * guest receives the HOST's descriptor number -- meaningless in the
+	 * guest process.  Cross-boundary sync-fd passback is unimplemented
+	 * (see nvkvm_drm_fwd_semsurf_fence_create).
+	 *
+	 * Claiming the capability anyway is what actually broke graphics:
+	 * libnvidia-egl-wayland took the sync-fd presentation path, waited on
+	 * a fence that could never signal, and every GL client hung on its
+	 * first eglSwapBuffers -- glmark2 sat on scene 1 with 0 CPU time
+	 * indefinitely, while the same weston+glmark2 on the host scored
+	 * 21571.  Reporting 0 makes it pick a path we can actually service.
+	 */
+	if (r == 0)
+		p->supports_sync_fd = 0;
 	return r;
 }
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
