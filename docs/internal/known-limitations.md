@@ -370,6 +370,42 @@ is fully usable for display work once modeset is on.  `tests/validate.sh` is
 28/28 there either way, because compute and offscreen GL go through
 `EGL_EXT_platform_device` and never touch GBM.
 
+### X11 renders correctly but the host only sees the first frame (2026-08-20)
+
+Xorg with the modesetting driver **works** on our KMS node: an X root capture
+taken in-guest shows a live desktop -- xclock ticking, an xterm with a working
+prompt.  So the DRM/KMS emulation is sound; this is not a rendering problem.
+
+What is missing is the export.  Xorg logs
+
+```
+modeset(0): Using 24bpp hw front buffer with 32bpp shadow
+```
+
+i.e. it modesets once and then blits damage straight into that front buffer,
+never issuing a plane update and never asking for vblank.  Our present path is
+driven entirely by `nvkvm_pipe_update()` (page flips), so the host receives the
+single modeset frame and then a frozen picture over a live desktop.
+
+**A first attempt at fixing this regressed Xorg and was reverted.**  The
+approach was: track the scanned-out fb, run the vblank hrtimer for the pipe's
+lifetime (`.enable`/`.disable`) rather than only while a client requests vblank,
+and re-export the current fb from a work item on each tick.  With that in place
+Xorg failed at startup with `Failed to create pixmap` -> `failed to create
+screen resources`; reverting to f4201ff made it start again, so the causal link
+is established but the cause within that change is not yet identified.  Suspects
+not yet separated: calling `nvkvm_present_fb()` from inside `.enable` (atomic
+commit tail), and taking a framebuffer reference across the modeset.
+
+Whoever picks this up should reproduce the revert first (Xorg starts at
+f4201ff), then re-add the pieces one at a time -- fb tracking without the
+`.enable` present, then the timer change -- rather than all three at once as I
+did.
+
+Note this is a *different* gap from the compositor one above: weston and wlroots
+do flip, and are black for their own reasons; X does not flip, and is correct
+but frozen.
+
 ### Compositors render black — one cause fixed, one still open (2026-08-20)
 
 Reproduced on RTX 4070 / 595.84 / Ada and RTX 3060 / 580.159.04 / Ampere.
