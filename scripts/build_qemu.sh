@@ -27,6 +27,18 @@ NVKVM_BASE="$(nvkvm_default_prefix)"
 QEMU_SRC="${NVKVM_QEMU_SRC:-$NVKVM_BASE/qemu-src}"
 QEMU_PREFIX="${NVKVM_QEMU_PREFIX:-$NVKVM_BASE/qemu-nvkvm}"
 
+# ── Guard: host architecture ──────────────────────────────────────────────
+# Checked here as well as at compile time so the failure arrives in one line,
+# before ~10 minutes of QEMU build, rather than as a wall of assembler errors.
+_arch="$(uname -m)"
+if [ "$_arch" != "x86_64" ]; then
+    echo "build_qemu.sh: unsupported host architecture '$_arch' -- nvkvm is x86-64 only." >&2
+    echo "  The isolate stub uses x86-64 assembly, x86-64 syscall numbers, an" >&2
+    echo "  AUDIT_ARCH_X86_64 seccomp filter and a CPUID-based MAXPHYADDR probe." >&2
+    echo "  This is a deliberate limit, not an oversight: see src/stub/nvkvm_stub.c." >&2
+    exit 1
+fi
+
 # ── Guard: already built ───────────────────────────────────────────────────
 # --force rebuilds even when the binary exists.  You need this after editing
 # anything under src/qemu/ or src/common/: the guard below is what makes a plain

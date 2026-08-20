@@ -31,6 +31,25 @@
 #include <linux/audit.h>
 #include <linux/futex.h>
 #include <linux/elf.h>
+/*
+ * x86-64 only, and deliberately so. The port surface is not the C in this file
+ * -- it is stub_clone3.S, the inline syscall wrappers below, the self-relocation
+ * code, the seccomp filter (AUDIT_ARCH_X86_64 plus an aarch64 syscall table that
+ * differs structurally: no open, no fork), and the CPUID-based MAXPHYADDR probe
+ * in nvkvm_tables.c.
+ *
+ * The reason not to port is not effort, it is that it could not be TESTED:
+ * nvkvm needs a host that can run KVM guests, and ARM nested virtualisation is
+ * barely deployed. An architecture nobody can exercise is how a project ends up
+ * with claims that quietly stop being true.
+ *
+ * Failing here, loudly, beats failing later in scattered ways that read as
+ * bugs rather than as an unsupported platform.
+ */
+#if !defined(__x86_64__)
+#error "nvkvm: the isolate stub supports x86-64 hosts only. See the comment above this #error."
+#endif
+
 #include <asm/unistd.h>
 
 #include "stub_freestanding.h"
