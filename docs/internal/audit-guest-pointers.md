@@ -753,6 +753,12 @@ from a corrupted isolate is the whole point of the seccomp filter, which has not
 - **`pRunlistPreemptEvent`** (U-13).
 - **The seccomp filter itself.** Assumed effective; not read line-by-line. Since it is what bounds
   every severity rating in this report, it should be the next thing audited.
+  **Done 2026-08-20** — see [`audit-boundaries-2026-08-20.md`](audit-boundaries-2026-08-20.md) §6.
+  The filter and the namespace sandbox around it hold up: the BPF was verified
+  instruction by instruction (the jump offsets are correct, and an off-by-one in
+  one of them would have been a clean allowlist bypass). Three hardening gaps
+  were found and fixed, the substantive one being a process-creation syscall left
+  in the allowlist that nothing calls after the filter is applied.
 
 ---
 
