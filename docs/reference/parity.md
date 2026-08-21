@@ -56,6 +56,43 @@ the host's 16 and 94.38 GB; on the H100, 16 cores and 62.79 GB against 20 and
 125.88 GB. Geekbench's GPU workloads still do CPU-side work, so the guest
 carries a handicap unrelated to forwarding.
 
+## Published on OpenBenchmarking: where the cost actually is
+
+clpeak on the same RTX 4070, both sides, one result file on Phoronix's server:
+[**openbenchmarking.org/result/2608219-NE-NVKVMPVRT27**](https://openbenchmarking.org/result/2608219-NE-NVKVMPVRT27)
+
+Seven of its eight subtests land between 99.4% and 100.2% — single- and
+double-precision compute, integer compute, global memory bandwidth, and both
+buffer-transfer directions are all at parity. The eighth is **kernel launch
+latency: 3.84 us on the host, 8.18 us in the guest, 2.13x.**
+
+That is the clearest statement of the trade this design makes. Sustained GPU
+work does not exit and costs nothing; each *launch* costs about +4.3 us. Every
+other row on this page follows from that one number — which is why batched
+serving reaches 1.00x and single-stream eager decode does not. Details and
+method in [clpeak on OpenBenchmarking](openbenchmarking-clpeak.md).
+
+## A second opinion: Blender Cycles
+
+Geekbench is one vendor's harness. Blender Open Data on the same RTX 4070,
+bare metal on both sides, splits the guest's cost in a way Geekbench does not:
+
+| metric | ratio |
+|---|---|
+| GPU render time (`render_time_no_sync`) | **99.95%** (range 99.86–100.07%) |
+| total render time, what Open Data scores | **93.10%** (range 90.63–94.22%) |
+
+The GPU work is at parity; the whole visible deficit is Cycles' scene-sync
+phase, which costs the guest a roughly constant +2.0 to +4.1 s per scene — CPU
+work on 4 vCPUs instead of 24 threads, plus host-to-device upload. That is the
+same CPU handicap noted above, showing up as a measurable line item rather than
+being blended into a single score.
+
+These are self-reported, not third-party hosted: launcher 3.x has no anonymous
+submission path. Full method, per-run timings, and a bimodality trap that
+`monster` sets for small samples are in
+[Blender Open Data](blender-opendata.md).
+
 ## Why 98.0% on an A100 and 99.9% on an RTX 3050
 
 The obvious guess — the CPU handicap — is probably wrong. The 3050 guest ran

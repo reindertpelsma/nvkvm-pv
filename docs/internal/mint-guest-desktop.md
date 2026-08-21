@@ -289,6 +289,48 @@ order and never changes the current page — so real handover means either a
 front-end change or the hardware-accurate shape (nvkvm's own device exposing a
 boot framebuffer, so there is exactly one console and nothing to select).
 
+### Running QEMU as an unprivileged host user breaks GPU forwarding
+
+Found 2026-08-21 while bringing the desktop back up outside the container.
+Booting the Mint guest with `scripts/run_test_vm.sh` as the ordinary `ubuntu`
+user, rather than as root, produces a guest where **the KMS head comes up but
+the GPU does not work at all**:
+
+    guest: nvkvm: virtual KMS head ready (1920x1080, 1 connector/crtc)
+    guest: nvkvm: session 1: no command-buffer ring (ret=-19) — virtqueue path
+    guest: nvidia-smi -> "couldn't communicate with the NVIDIA driver"
+
+and the session then dies in a way that points at the wrong thing entirely:
+
+    weston: [libseat/backend/logind.c:137] Could not take device: No such file or directory
+    weston: ERROR: DRM device 'card1' is not a KMS device.
+
+That error sends you hunting through logind, seats and udev — `card1` *is*
+tagged `master-of-seat`, *is* listed under `seat0` by `loginctl seat-status`,
+and the by-driver node selection picked it correctly. None of that is the
+problem. The problem is upstream: the GPU session never established, so there
+is no KMS device behind the node.
+
+The isolate reports the strongest rung in both cases —
+
+    nvkvm: isolate mode auto -> namespace (strongest rung; clone(CLONE_NEWUSER|...) succeeded)
+
+— so the log gives no hint that anything is degraded. `clone(CLONE_NEWUSER)`
+succeeds for an unprivileged user; something later in the isolate's setup does
+not, and the failure surfaces only as `-ENODEV` on `SETUP_RING` at the guest's
+first GPU ioctl.
+
+**Running the identical command under `sudo` fixes it completely** — same
+image, same flags, same isolate mode — and the desktop comes up accelerated.
+This is why it had not been seen before: the container runs QEMU as root, so
+every previous run of this guest was privileged.
+
+Not yet root-caused, and it should be: either the isolate needs to refuse to
+report `namespace` when it cannot actually serve, or unprivileged operation
+needs to work. Until then, run the VM as root, and treat
+`no command-buffer ring (ret=-19)` in the guest as "the host side is not
+serving", not as a guest-side driver problem.
+
 ### screendump by device id — a QEMU abort we can hit
 
 `screendump <file> nvkvm0` **kills QEMU**:
