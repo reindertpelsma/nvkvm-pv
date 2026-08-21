@@ -9,10 +9,17 @@
 #
 #   bash tests/kernel_matrix.sh                  # the default image set
 #   bash tests/kernel_matrix.sh debian:13 fedora:42
+#   STRICT_SKIP=1 bash tests/kernel_matrix.sh ...   # a SKIP is a failure
 #
 # A compile FAILURE is conclusive: the module cannot be built there.  A compile
 # PASS is necessary but not sufficient — it says nothing about whether the
 # module loads or works, which needs a booted guest on that kernel.
+#
+# A SKIP (the image has no kernel headers to build against) is neither.  Run
+# by hand that is fine — you can see it.  In CI it is not: a green job that
+# actually compiled nothing is worse than a red one, and an image whose headers
+# package gets renamed would quietly degrade to "passing".  STRICT_SKIP=1 makes
+# a SKIP exit non-zero, and CI sets it.
 #
 # Results table: docs/reference/guest-kernels.md
 set -u
@@ -86,6 +93,7 @@ for img in "${IMAGES[@]}"; do
     while IFS='|' read -r _ tag kver verdict detail; do
         printf '%-22s %-14s %-6s %s\n' "$tag" "$kver" "$verdict" "$detail"
         [ "$verdict" = FAIL ] && rc=1
+        [ "$verdict" = SKIP ] && [ "${STRICT_SKIP:-0}" = 1 ] && rc=1
     done <<< "$out"
 done
 exit $rc
