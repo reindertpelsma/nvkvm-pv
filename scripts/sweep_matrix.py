@@ -44,6 +44,24 @@ import argparse, json, os, re, shlex, subprocess, sys, time, datetime
 KVM_IMAGE = "docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16"
 SWEEP_LABEL = "nvkvm-sweep"
 
+# Graceful cancellation, observed BY THE SCRIPT.
+#
+# Ctrl-C cannot be relied on here.  A run started as a background job inherits
+# SIGINT as ignored, so the signal is silently dropped and the run continues;
+# escalating to SIGKILL then bypasses the finally: block that destroys the
+# instance.  That is not hypothetical -- it orphaned instance 48253468, a box
+# created seconds before the kill, which billed until it was found by reading
+# `vastai show instances` rather than by trusting the kill.
+#
+# So: to stop a run, `touch /tmp/nvkvm-sweep.stop`.  It is checked between
+# drivers and between boxes, unwinds through the normal paths, and every
+# instance is destroyed on the way out.
+STOP_FILE = "/tmp/nvkvm-sweep.stop"
+
+
+def stop_requested():
+    return os.path.exists(STOP_FILE)
+
 # Instances this script must NEVER destroy, whatever else happens.
 #
 # reap_strays() already filters on SWEEP_LABEL, so in principle nothing else is
@@ -192,6 +210,9 @@ def driver_urls(ver):
     ]
 
 
+_PURGED_HOSTS = set()
+
+
 def rsh(S, cmd):
     """Quote a remote command ONCE, correctly.
 
@@ -309,24 +330,59 @@ def install_driver(S, ver, arch, log):
 
     # The distro packages only need clearing once per box, before the first
     # .run lands.  After that the .run owns the userspace.
-    if not getattr(install_driver, "_purged", None):
+    # Keyed by BOX, not global.  This was a function attribute, so after the
+    # first box set it the second box never purged its distro driver at all --
+    # a .run would have been layered over a live dpkg userspace, which is the
+    # exact stale-library mismatch purge_distro_driver() exists to prevent.
+    if S not in _PURGED_HOSTS:
         purge_distro_driver(S)
-        install_driver._purged = True
+        _PURGED_HOSTS.add(S)
 
+    # DO NOT collapse every curl failure into "not published".
+    #
+    # The first version of this said exactly that whenever curl returned
+    # non-zero, and it was wrong in a way that matters: on 2026-08-21 the sweep
+    # reported "no installer published at any path" for 570.124.06 and
+    # 535.54.03 -- both of which return HTTP 200 to a HEAD request from
+    # elsewhere, and one of which this very script had downloaded successfully
+    # an hour earlier.  A transport failure was being written down as a fact
+    # about what NVIDIA publishes.  That is a harness failure wearing the
+    # costume of a finding, which is the one thing this sweep must not produce.
+    #
+    # So classify: an HTTP 404 means genuinely absent; anything else (disk
+    # full, DNS, connection reset, rate-limiting, timeout) is transport and is
+    # labelled [HARNESS].
     fetched, use_ver = False, None
     tried = []
     for cand in candidates:
         for url in driver_urls(cand):
-            _, rc = sh(f"{S} 'curl -fsSL -o /root/drv.run {url} && chmod +x /root/drv.run'",
-                       timeout=1800)
-            if rc == 0:
-                fetched, use_ver = True, cand
-                break
-            tried.append(url)
+            out, rc = sh(rsh(S,
+                f"curl -sS -L --max-time 1500 -w '\\nHTTP=%{{http_code}}' "
+                f"-o /root/drv.run {url} 2>&1; echo \" CURLRC=$?\"; "
+                f"df -P /root | tail -1"), timeout=1800)
+            code = ""
+            m = re.search(r"HTTP=(\d+)", out)
+            if m:
+                code = m.group(1)
+            crc = re.search(r"CURLRC=(\d+)", out)
+            crc = crc.group(1) if crc else "?"
+            if rc == 0 and code == "200":
+                _, crc2 = sh(rsh(S, "chmod +x /root/drv.run && test -s /root/drv.run"),
+                             timeout=120)
+                if crc2 == 0:
+                    fetched, use_ver = True, cand
+                    break
+            tried.append(f"{url}  -> HTTP={code or '?'} curl_rc={crc}")
         if fetched:
             break
     if not fetched:
-        return False, ("no installer published at any path; tried:\n  " +
+        only404 = all("HTTP=404" in t for t in tried) and tried
+        if only404:
+            return False, ("not published by NVIDIA (HTTP 404 at every path); tried:\n  " +
+                           "\n  ".join(tried[-4:])), None
+        return False, ("[HARNESS] download failed for a TRANSPORT reason, not a missing "
+                       "file -- do NOT record this as 'NVIDIA no longer publishes X'. "
+                       "Check disk, DNS and CDN rate-limiting on the box; tried:\n  " +
                        "\n  ".join(tried[-4:])), None
 
     # Nothing may hold the device or the module cannot be unloaded.
@@ -349,6 +405,17 @@ def install_driver(S, ver, arch, log):
     cc = kernel_cc(S)
     ccenv = f"CC={cc} " if cc else ""
 
+    # LESSON, recorded where the next person will be tempted to undo it:
+    # --no-cc-version-check exists to get past a COSMETIC compiler mismatch
+    # (kernel built by gcc 12.3, install running gcc 12.2 -- harmless).  It
+    # also hides a REAL one.  Passing it unconditionally is what turned a
+    # one-line "compiler version mismatch" abort into thousands of lines of
+    # "unrecognized command-line option" followed by the uninformative "The
+    # nvidia kernel module was not created" -- a message indistinguishable
+    # from a genuine driver/kernel incompatibility, and one that would have
+    # been written into a results table as a GPU finding.  If you re-add it to
+    # the first attempt, you are re-arming exactly that trap.
+    #
     # Attempt order is diagnostic, not just hopeful.
     #
     # --no-cc-version-check is DELIBERATELY absent from the first two attempts.
@@ -378,12 +445,19 @@ def install_driver(S, ver, arch, log):
     if rc != 0:
         tail, _ = sh(rsh(S, f"tail -25 {log}"), timeout=60)
         hint = ""
-        gt, _ = sh(rsh(S, f"grep -c 'ftrivial-auto-var-init' {log} 2>/dev/null || echo 0"),
+        # Match the CLASS, not the symptom.  -ftrivial-auto-var-init=zero is
+        # merely the flag today's kernel/compiler pair happens to disagree
+        # about; any "cc: error:" or "unrecognized command-line option" in a
+        # driver install log means the module was compiled by the wrong
+        # toolchain, whatever the flag is called next year.
+        gt, _ = sh(rsh(S, f"grep -ciE 'unrecognized command-line option|cc: error:|"
+                          f"ftrivial-auto-var-init' {log} 2>/dev/null || echo 0"),
                    timeout=60)
         if gt.strip().isdigit() and int(gt.strip()) > 0:
-            hint = (f"\n[HARNESS] kernel-module build used the wrong compiler "
-                    f"(kernel_cc={cc or 'UNDETECTED'}); this is a toolchain "
-                    f"failure, NOT a driver/GPU result.")
+            hint = (f"\n[HARNESS] kernel-module build failed with compiler errors "
+                    f"(kernel_cc={cc or 'UNDETECTED'}); this is a TOOLCHAIN "
+                    f"failure, NOT a driver/GPU result.  Compare /proc/version's "
+                    f"compiler against the cc actually used.")
         return False, (tail[-1100:] + hint), None
 
     sh(f"{S} 'modprobe nvidia; modprobe nvidia_uvm; true'", timeout=180)
@@ -758,9 +832,17 @@ def run_one(offer, args):
         sh(f"{S} 'mkdir -p /root/nvkvm && tar -xzf /root/sweep-tree.tgz -C /root/nvkvm'", timeout=180)
 
         # One-time: QEMU and the guest image do not depend on the host driver.
+        # NEEDRESTART_MODE=a / DEBIAN_FRONTEND=noninteractive: on instance
+        # 48254541 build_qemu.sh --install-deps died with needrestart's
+        # interactive "Services to be restarted" prompt in the log tail and
+        # nothing else -- recorded as build-failed, which is a harness result
+        # wearing the shape of an environment one.  apt must never be able to
+        # ask a question here.
+        ENV = ("DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "
+               "NEEDRESTART_SUSPEND=1 ")
         for step, cmd, tmo in [
-            ("build",  "cd /root/nvkvm && bash scripts/build_qemu.sh --install-deps", 3600),
-            ("guest",  "cd /root/nvkvm && bash scripts/setup_guest.sh",              1200),
+            ("build",  f"cd /root/nvkvm && {ENV} bash scripts/build_qemu.sh --install-deps", 3600),
+            ("guest",  f"cd /root/nvkvm && {ENV} bash scripts/setup_guest.sh",              1200),
         ]:
             _, rc = sh(f"{S} '{cmd} > /root/{step}.log 2>&1'", timeout=tmo)
             if rc != 0:
@@ -796,6 +878,10 @@ def run_one(offer, args):
                             detail=f"arch={base['arch']} floor={ARCH_FLOOR.get(base['arch'])}")]
 
         for ver, prof, why in todo:
+            if stop_requested():
+                print(f"    STOP requested ({STOP_FILE}) -- ending this box cleanly",
+                      flush=True)
+                break
             print(f"    driver {ver} (expect ABI {prof}) ...", flush=True)
             ok, detail, actual = install_driver(S, ver, base["arch"], f"/root/drv-{ver}.log")
             if not ok:
@@ -982,6 +1068,10 @@ def main():
     recs = json.load(open(RESULTS)) if os.path.exists(RESULTS) else []
     try:
         for o in offers:
+            if stop_requested():
+                print(f"\nSTOP requested ({STOP_FILE}) -- not renting any further boxes",
+                      flush=True)
+                break
             print(f"\n=== {o.get('gpu_name')} (offer {o.get('id')}) ===", flush=True)
             got = run_one(o, args)          # a LIST now: one record per driver
             recs.extend(got)
