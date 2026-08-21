@@ -1,8 +1,19 @@
-# tests/perf — host-vs-guest parity harness (PLAN + building blocks)
+# tests/perf — host-vs-guest parity harness
 
-Goal: a single repeatable runner that proves nvkvm runs real workloads at host
-parity, with correct methodology baked in so we never again chase a phantom gap
-(see the 2026-06-01 corrections in ../../docs/perf/forwarding_latency_decomposition.md).
+A repeatable runner that measures nvkvm against the same machine's bare metal,
+with the methodology rules baked into the code so we do not chase another
+phantom gap. Every one of those rules is here because a phantom gap was chased.
+
+**Where the results actually live** — this file is the harness; the numbers are
+elsewhere and are the things to quote:
+
+| | |
+|---|---|
+| [`realapp_matrix.md`](realapp_matrix.md) | the real-application host-vs-guest table and its method |
+| [`llm_parity.md`](llm_parity.md) | vLLM serving parity, both the CUDA-graph and `--enforce-eager` passes |
+| [`results/`](results/) | dated result sets, each recording what was ruled out |
+| [`../../docs/reference/parity.md`](../../docs/reference/parity.md) | what the ratios do and do not establish |
+| [`../../docs/internal/known-limitations.md`](../../docs/internal/known-limitations.md#numbers-you-should-not-quote) | numbers that should **not** be quoted, and why |
 
 ## Building blocks already here (committed 2026-06-01)
 - `launchstorm.c`     — separates pipelined submit (A) vs launch+sync RT (B) vs
@@ -36,7 +47,7 @@ harness thresholds are encoded in run_parity.sh; these are the current baseline:
 - empty cuCtxSync  : host 0.35 / guest 0.39 us     = **1.11x**  (gate: <=3x; guard WB-sysmem)
 - launch+sync RTT  : host 6.5  / guest 12.0 us     = **1.85x**  (tripwire: <4x — known control tax)
 - alloc+free RTT   : host 133  / guest 3863 us     = **29x**    (tripwire: <50x — KNOWN tax,
-  the standing optimization target; never been at parity — see [[perf_host_vs_guest]])
+  the standing optimization target; never been at parity)
 - DtoH/HtoD byte-exact correctness: OK both sides (hard gate).
 GPU util during decode is sampled (tail-median) but INFORMATIONAL only — guest
 nvidia-smi util is unreliable, and util sampling is what produced this session's
@@ -47,7 +58,7 @@ phantom "14x gap"; tok/s is the parity signal, not util.
                         aliases `vh` (host) and `vg` (guest, ProxyJump via vh).
                         Stages the self-contained probes to each target, runs the
                         SAME workloads HOST-THEN-GUEST (strictly serial — one
-                        physical GPU, see [[remote_test_serialization]]), parses,
+                        physical GPU -- a concurrent run measures contention, not forwarding), parses,
                         and prints the PASS/FAIL parity table above.
                         `--no-llm` skips the slow decode test. Exit 0 = all gates pass.
 - `parity_remote.sh`  — runs ON a target; builds gpu_bench.c (self-contained
@@ -76,7 +87,20 @@ Two caveats live in that doc and should be read before quoting the table:
   removes 95% of.  The "control-RTT is only 1-2% of per-token time" comment is
   confirmed for graph-using stacks and wrong for launch-per-kernel ones.
 
-### Next: real-app matrix
-Point `cuda_api_prof.so` (LD_PRELOAD interposer) at real apps beyond llama.cpp:
-PyTorch (a small train/infer step), a CUDA sample, vLLM, Stable Diffusion. Compare
-guest-vs-host per-API cycle costs to confirm parity generalizes past the probes.
+### The real-app matrix — done, and it lives in `realapp_matrix.md`
+`cuda_api_prof.so` (the LD_PRELOAD interposer) was pointed at real applications
+beyond llama.cpp — PyTorch train and inference steps, ResNet-50, BERT, ViT,
+Vulkan compute, offscreen GL. Parity does generalise past the probes: sixteen
+workloads at 1.00x, with the exceptions named rather than dropped. The table and
+its method are in [`realapp_matrix.md`](realapp_matrix.md).
+
+### Two traps this harness cannot enforce for you
+
+Both cost real time, and both are in
+[`results/glmark2_2026-08-21/RESULTS.md`](results/glmark2_2026-08-21/RESULTS.md):
+
+- **Never quote a single-scene benchmark.** A guest's *first* pass through a
+  workload in a process runs at ~0.37x while every later one runs 0.88–0.93x, so
+  a one-shot run measures the cold path and nothing else.
+- **Do not perturb what you measure.** A 1 Hz `nvidia-smi` poll took
+  `gl_finishrate` from 10.5 us to 174.8 us — on the *host*.

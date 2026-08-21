@@ -58,6 +58,16 @@ pkg/abi/nvgpu/uvm.go                          — UVM structs
 g3doc/proposals/nvidia_driver_proxy.md        — design rationale
 ```
 
+### What is NOT derived from nvproxy
+
+Worth stating, because the derivation above is extensive enough that a reader
+may assume the rest follows: the virtio transport, the QEMU device, the
+per-process **isolate stub** (a freestanding `-nostdlib` static binary with its
+own sandbox), the GPA-window/mmap machinery, the ABI **profile table** keyed on
+host driver version, and the DRM/NVKMS paths are nvkvm's own. gVisor's nvproxy
+runs inside a userspace kernel on the same host; nvkvm crosses a VM boundary,
+and most of what is not in the list above exists because of that difference.
+
 ## NVIDIA open-gpu-kernel-modules
 
 NVIDIA ABI struct definitions (ioctl numbers, parameter structs) derived from:
@@ -68,3 +78,23 @@ Licensed under MIT and GPL-2.0 (dual-licensed). Header files used:
 - `kernel-open/common/inc/nv-ioctl.h`
 - `kernel-open/common/inc/nv-ioctl-numbers.h`
 - `kernel-open/nvidia-uvm/uvm_ioctl.h`
+
+## Prior and parallel work
+
+Not derived from, and no code taken — but read while building this, and worth
+reading by anyone evaluating it. These are the other public non-vendor attempts
+at driver-level NVIDIA GPU virtualization:
+
+- **nestrilabs/virtio-nvgpu** — https://github.com/nestrilabs/virtio-nvgpu
+  A virtio transport with libkrun and KVM memslot mmap. The closest in shape to
+  nvkvm's transport half.
+- **straylight-software/isospin-microvm** — https://github.com/straylight-software/isospin-microvm
+  A vsock transport with Firecracker workers borrowing a GPU-owning VM. A
+  different answer to the same question about where the driver should live.
+
+## Licence of this file's subject
+
+`nvkvm` is Apache-2.0 except the guest kernel module (`src/guest/`), which is
+GPL-2.0 as required for kernel symbol access — see `LICENSE`. gVisor is
+Apache-2.0; open-gpu-kernel-modules is dual MIT / GPL-2.0. Nothing here is
+copied under a licence incompatible with the file it lands in.

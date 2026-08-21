@@ -144,7 +144,9 @@ ioctl. Pair it with a guest module built `NVKVM_GRAPHICS=0`.
 **Always capture QEMU's stdout.** It is the only place `DENY`/allowlist
 diagnostics appear, and the absence of a capture is precisely why the current
 NVENC failure has no root cause
-(`tests/perf/realapp_matrix.md`, "NVENC now hangs on the guest"):
+([`tests/perf/realapp_matrix.md`](../../tests/perf/realapp_matrix.md), the NVENC
+row — and see [Known limitations](../internal/known-limitations.md#nvenc--the-5755103-hang-did-not-reproduce-2026-08-20)
+for why that row is now "does not reproduce here" rather than "fixed"):
 
 ```bash
 sudo bash scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 &
@@ -409,7 +411,7 @@ env XDG_RUNTIME_DIR=/run/user/1000 LIBSEAT_BACKEND=seatd \
             --xwayland
 ```
 
-Five details here are load-bearing, and each one fails in a way that does not
+Six details here are load-bearing, and each one fails in a way that does not
 look like its cause:
 
 - **Pick the DRM node by DRIVER, never by index.** This is the one that fails

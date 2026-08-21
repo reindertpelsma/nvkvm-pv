@@ -173,19 +173,33 @@ that reason (`src/qemu/nvkvm_fe_alloc_allowlist.h:40-45`).
 entries take their size from the ABI profile; the rest are `sizeof`.
 
 `libcuda` frequently passes `alloc_parms_size = 0` and relies on the driver to
-size the buffer by class, so a missing entry means copying zero bytes. The
-failures are specific and the comments record them:
+size the buffer by class, so a missing entry means copying **zero bytes** — and
+the stub then forwards `pAllocParms = NULL`. **This is the single most expensive
+failure shape in this codebase**, because RM does not reject it: it builds the
+object from all-defaults, returns success, and the damage surfaces several
+layers away as something that looks like a driver bug. Every instance so far:
 
-| class | missing entry causes |
-|---|---|
-| `NV50_THIRD_PARTY_P2P` (0x503c) | `cuInit` → `CUDA_ERROR_NOT_SUPPORTED` (801) |
-| `NV01_MEMORY_VIRTUAL` (0x70) | kernel sees `hVASpace=0` → `INVALID_ARGUMENT` |
-| `NV_SEMAPHORE_SURFACE` (0xda) | `INVALID_ARGUMENT`, then `libnvidia-eglcore` NULL-derefs |
-| `NV01_CONTEXT_DMA` (0x0002) | NVENC `InitializeEncoder` fails |
+| class | tag | missing entry causes |
+|---|---|---|
+| `NV01_MEMORY_VIRTUAL` (`0x70`) | #84 | kernel sees `hVASpace=0` → `INVALID_ARGUMENT`; breaks libGLX's EGL device enum |
+| `NV_SEMAPHORE_SURFACE` (`0xda`) | #84 | `INVALID_ARGUMENT`, then `libnvidia-eglcore` NULL-derefs the missing object |
+| `NV01_CONTEXT_DMA` (`0x0002`) + `NVENC_SW_SESSION` (`0xa0bc`) | #99 | NVENC `InitializeEncoder` fails |
+| `BLACKWELL_CHANNEL_GPFIFO_A/B`, `BLACKWELL_DMA_COPY_A/B` | #101 | `cuCtxCreate` → `CUDA_ERROR_INVALID_VALUE` (1) on an RTX 5090 |
+| `HOPPER_USERMODE_A` (`0xc661`) | — | aperture built without `bBar1Mapping` → `GET_ADDR_SPACE_TYPE` answers REGMEM, Vulkan dies three calls later on an H100 |
+| `NV50_THIRD_PARTY_P2P` (`0x503c`) | — | `cuInit` → `CUDA_ERROR_NOT_SUPPORTED` (801) |
+| `GT200_DEBUGGER` (`0x83de`) | — | `INVALID_ARGUMENT`, then `CUDA_ERROR_CONTEXT_IS_DESTROYED` (709) on the next `cuMemAlloc` |
 
-(`src/guest/nvkvm_main.c:1664-1697`.) A new architecture generation typically
-brings new channel/compute/graphics class ids, which also need adding to the
-alloc-class allowlist (`src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`).
+(`src/guest/nvkvm_main.c:1690-1795`; the class ids and their write-ups are in
+`src/abi/nvgpu.h`.) The Hopper one is worth reading in full, because it is the
+instance where the wrong conclusion got **published twice** before the right one:
+[Vulkan compute on Hopper](../reference/correctness.md#vulkan-compute-on-hopper--root-caused-it-was-ours-and-it-was-never-a-driver-bug).
+
+**Being on the alloc-class allowlist is not the same as being sized.** Every
+class above was *reachable* — the allowlist let it through — and unsized. If you
+add a class id to `src/qemu/nvkvm_fe_alloc_allowlist.h:59-149`, check the two
+size-by-`hClass` switches in the guest at the same time. A new architecture
+generation typically brings new channel/compute/graphics class ids and needs
+both.
 
 ## 8. Update the documentation
 

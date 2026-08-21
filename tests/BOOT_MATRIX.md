@@ -319,15 +319,28 @@ directory).
 is byte-identical to the host's** under matched settings — all three sampled
 completions diff clean against `HOST_SHMOFF`. Throughput:
 
+> **SUPERSEDED 2026-08-21. Do not quote the table below as a current number.**
+> Every row in it was measured with `NCCL_SHM_DISABLE=1`, which was a
+> *workaround for a bug of ours*, not a setting. That bug is fixed (see
+> **FIXED 2026-08-21** further down this section), the workaround is no longer
+> needed, and the same comparison with the SHM transport on both sides reads
+> **~0.86x** — recorded near the end of this section, and summarised in
+> [`docs/reference/parity.md`](../docs/reference/parity.md#multi-gpu-tensor-parallel-serving).
+> The rows are kept because they are what the workaround actually cost, and
+> because the shape of the cost (the guest hurt far worse than the host) is the
+> evidence that pointed at the SHM transport in the first place.
+
 | config (both sides identical) | host tok/s | guest tok/s | guest/host |
 |---|---|---|---|
 | eager, `NCCL_SHM_DISABLE=1` | 47.94 | 10.04 | **0.21x** |
 | CUDA graphs, `NCCL_SHM_DISABLE=1` | 36.01 | 13.30 | **0.37x** |
 | host's best (eager, SHM transport on) | **115.70** | not reachable | 0.12x |
 
-The last row is the honest headline: the guest's best (13.30) is **11.5% of the
-host's best (115.70)**, because the host may use NCCL's SHM transport and the
-guest may not — see the bug below. CUDA graphs *help* the guest (10.04 → 13.30)
+~~The last row is the honest headline: the guest's best (13.30) is **11.5% of
+the host's best (115.70)**~~ — true *at the time*, and no longer: the guest may
+now use the SHM transport too. What the row still shows is why the workaround
+was so expensive, because the host could use NCCL's SHM transport and the guest
+could not — see the bug below. CUDA graphs *help* the guest (10.04 → 13.30)
 and *hurt* the host (47.94 → 36.01) at this batch size, which is what you would
 expect if per-launch forwarding is a real cost in the guest and pure overhead
 on bare metal.
@@ -380,9 +393,11 @@ Isolation is exact:
 | `NCCL_SHM_DISABLE=1` alone | **PASS** |
 
 So the defect is specifically the SHM transport's VMM import, not P2P (A4000
-has no P2P on either side anyway — see the peer matrix above). **Workaround:
-`NCCL_SHM_DISABLE=1`**, which restores full correctness at host-parity
-collective bandwidth, at the cost of the throughput shown in the table above.
+has no P2P on either side anyway — see the peer matrix above). ~~**Workaround:
+`NCCL_SHM_DISABLE=1`**~~ — **no longer needed as of 2026-08-21**; the defect is
+fixed and NCCL world=6 passes in the guest with default settings. The workaround
+restored correctness but not bandwidth (0.83 GB/s against 1.52 GB/s with the
+transport available), at the cost of the throughput shown in the table above.
 
 **FIXED 2026-08-21 — see the branch `nccl-shm-fix`.** The three sentences below
 are kept because the dead end they describe is still a dead end *on its own*,

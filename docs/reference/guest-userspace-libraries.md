@@ -86,7 +86,7 @@ bundle contains (`scripts/stage_guest_libs.sh:123-128`):
 version-matched or ffmpeg reports "Cannot load libnvidia-encode.so.1"
 (`scripts/stage_guest_libs.sh:101-104`). Staging them makes the encoder loadable;
 it does not make it work — see
-[Known limitations](../internal/known-limitations.md#nvenc-does-not-work-in-the-guest-on-5755103--open).
+[Known limitations](../internal/known-limitations.md#nvenc--the-5755103-hang-did-not-reproduce-2026-08-20).
 
 ### Not driver-versioned
 
@@ -180,7 +180,7 @@ For a Wayland client, the client's own `GL_RENDERER` is the only thing that
 settles it — the compositor can be GPU-accelerated while its clients are not,
 and that is the currently observed state
 (`tests/perf/realapp_matrix.md`, "Display / desktop — re-validated"). See
-[Known limitations](../internal/known-limitations.md#gl-clients-under-wayland-render-on-the-gpu-but-present-nothing--open).
+[Known limitations](../internal/known-limitations.md#gl-clients-under-wayland-presented-nothing--two-root-causes-fixed-2026-08-19).
 
 `stage_guest_libs.sh` reports what it staged and exits **2** if anything was
 missing from the bundle (`scripts/stage_guest_libs.sh:335-346`). Treat a

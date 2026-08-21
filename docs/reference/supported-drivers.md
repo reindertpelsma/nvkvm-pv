@@ -114,8 +114,9 @@ classes, and the guest's channel-alloc sizing handles
 are absent, so a pre-Volta card would need them added.
 
 That is deliberate, and it is a supported claim rather than an untested
-assumption — a GTX 1080 was measured (see the README's platform table). Three
-reasons not to chase pre-Turing:
+assumption — a GTX 1080 was measured, and
+[what it did](#the-gtx-1080-measurement) is below. Three reasons not to chase
+pre-Turing:
 
 - **The open kernel module cannot drive Pascal at all.** It refuses to probe:
   `not supported by open nvidia.ko because it does not include the required GPU
@@ -159,6 +160,18 @@ whose driver line ends at 580. Not worth it.
 
 ## Multi-GPU
 
+**Up to six GPUs in one guest, measured.** The largest run is 6x RTX A4000 on
+driver 570.124.06 (`validate.sh` 28/28 with `cuda_device_count 6`, six
+concurrent isolates each driving their own card, all six busy at once); 4x RTX
+5060 and 2x RTX 4070 are also on the
+[tested platforms](tested-platforms.md) list, and the per-check output is in
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md). NVLink/P2P *between* guest
+GPUs is still unexercised, and tensor-parallel serving is the one shape below
+parity — [about 0.86x](parity.md#multi-gpu-tensor-parallel-serving).
+
+The section below is the two-GPU bring-up that got it working, kept because it
+names the three guest-side bugs and what each looked like.
+
 **Two GPUs work, measured 2026-08-18** on a 2x RTX 4070 host (driver 575.51.03,
 host BDFs `0000:00:07.0` and `0000:00:09.0`). Not merely enumerated: a PTX-JIT
 `vec_add` ran on each device with all 1,048,576 elements checked, and the host's
@@ -200,8 +213,9 @@ Known gaps, neither of which blocks CUDA:
   `scripts/run_test_vm.sh`), so the guest PCI bus shows a single NVIDIA card
   regardless of GPU count. CUDA, NVML and Vulkan all go through RM and are
   unaffected; anything that counts GPUs by walking guest PCI would see one.
-- Untested beyond two GPUs, and NVLink/P2P between guest GPUs was not exercised
-  at all.
+- NVLink/P2P *between* guest GPUs has not been exercised. (Six GPUs in one
+  guest has since been measured — see the head of this section — so "untested
+  beyond two" no longer applies to device count.)
 
 ## Host CPU
 
