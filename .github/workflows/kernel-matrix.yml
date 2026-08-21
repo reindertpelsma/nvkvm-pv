@@ -9,16 +9,19 @@
 # they go in parallel and a failure names the kernel directly in the check list,
 # rather than one job whose log has to be read to find out which row broke.
 #
-# The image set is the script's own default, spelled out here so the matrix can
-# fan out.  It spans the range on purpose:
+# The image set is the script's own default plus ubuntu:26.04, spelled out here
+# so the matrix can fan out.  It spans the whole claimed range on purpose --
+# both ends of "5.15-7.0" are in it, because an unchecked endpoint is where a
+# support claim quietly stops being true:
 #
 #   ubuntu:22.04  5.15   the supported FLOOR
 #   debian:12     6.1    LTS
 #   ubuntu:24.04  6.8    current LTS
 #   debian:13     6.12   the version DRM node support starts at
 #   ubuntu:25.04  6.14
-#   fedora:42     6.14+  a non-Debian toolchain -- catches gcc/glibc drift the
+#   fedora:42     6.19   a non-Debian toolchain -- catches gcc/glibc drift the
 #                        Debian family does not
+#   ubuntu:26.04  7.0    the supported CEILING
 #
 # STRICT_SKIP=1 turns "this image had no kernel headers" into a failure.  Run by
 # hand a SKIP is visible and fine; in CI it is a green job that compiled nothing.
@@ -60,6 +63,7 @@ jobs:
           - debian:13
           - ubuntu:25.04
           - fedora:42
+          - ubuntu:26.04
     steps:
       - uses: actions/checkout@v4
 
