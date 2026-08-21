@@ -58,7 +58,7 @@ numbers](#tested-applications).
 That is one GPU, with CUDA graphs, on throughput. Three shapes cost more, all
 measured: single-stream greedy decode without graphs (0.73–0.82x), tensor-parallel
 serving across several GPUs ([about
-0.86x](#multi-gpu-serving-correct-and-no-longer-forced-off-the-fast-path)), and NVENC video encode, which
+0.86x](#multi-gpu-serving)), and NVENC video encode, which
 hangs outright on one driver.
 
 ## What it is not
@@ -176,22 +176,13 @@ staging step.
   bare host does not. Neither is ready for untrusted tenants:
   [the trade in full](docs/internal/isolate-model.md),
   [`SECURITY.md`](SECURITY.md).
-- **The driver userspace is mounted read-only, not copied in.** The container
-  hands the guest the host's NVIDIA libraries over a read-only 9p share and the
-  guest links against them, so `apt upgrade` inside the guest cannot replace a
-  driver library — there is none in its filesystem to replace.
-- **`./data` is shared with the guest** at `/data`, read-write, for moving work
-  in and out.
-- **The guest disk is a named volume**, so rebuilding the image does not
-  re-download it, and the GPU comes back on every boot (a systemd unit rebuilds
-  the module against the running kernel).
-- **Sizing and image:** `VM_MEM`, `VM_SMP`, and `NVKVM_GUEST_IMAGE_URL` to bring
-  your own cloud image — any cloud-init capable Linux that can build an
-  out-of-tree module should work, though only the default Ubuntu 24.04 is tested.
-
-Verified end to end on an RTX 3060: cold `docker compose up` to `nvidia-smi`
-inside the guest, surviving a guest reboot and a guest `apt` install of a
-conflicting NVIDIA package.
+- **The guest survives reboots and `apt upgrade`.** The driver userspace is
+  mounted read-only rather than copied in, so nothing in the guest can replace
+  it, and a systemd unit rebuilds the module against the running kernel on every
+  boot. `./data` is shared at `/data` for moving work in and out.
+- **Knobs:** `VM_MEM`, `VM_SMP`, and `NVKVM_GUEST_IMAGE_URL` to bring your own
+  cloud image — anything cloud-init capable that can build an out-of-tree module
+  should work; only Ubuntu 24.04 is tested.
 
 ### Prebuilt tarball, on a bare host
 
@@ -394,7 +385,7 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   earlier 0.12–0.37x figures were measured with that transport disabled and are
   superseded. Output parity on the fast path is **not yet confirmed** — see the
   section. Single-GPU serving is at parity
-  ([numbers](#multi-gpu-serving-correct-and-no-longer-forced-off-the-fast-path)).
+  ([numbers](#multi-gpu-serving)).
 - **Frameworks that pin large host buffers pay a penalty.** Registering pinned
   memory is slower than native and a single registration is capped at 2 GiB —
   noticeable in data loaders and serving stacks that pin aggressively. Stock
@@ -504,39 +495,18 @@ At temperature 0 the guest produced **token-id identical** output to the host on
 all three tasks (long-chain reasoning, C11 lock-free ring codegen, 8k-token
 summarisation).
 
-### Multi-GPU serving: correct, and no longer forced off the fast path
+### Multi-GPU serving
 
 vLLM with `--tensor-parallel-size 6` on six RTX A4000s runs a 38 GB model that
-does not fit on any one 16 GB card, and the guest's output is **byte-identical
-to the host's** under matched settings. So it works and it is correct.
+fits on none of them, at **about 0.86x of host** (guest 140.15 vs host 163.57
+tok/s). NCCL runs with default settings.
 
-It used to also be *slow for a specific, fixable reason*: NCCL's shared-memory
-transport failed in the guest inside `cuMemImportFromShareableHandle`, so every
-world>=2 NCCL job needed `NCCL_SHM_DISABLE=1` and the host's fastest path was
-simply unavailable. **That bug is fixed** (2026-08-21) — the CUDA VMM
-shareable-handle fd is now brokered across isolates the same way #110 brokers
-dma-bufs. NCCL world=6 passes in the guest with **default settings**, and the
-SHM transport being available roughly doubles collective bandwidth:
-
-| world=6 all-reduce, 64 MiB sustained | before (`NCCL_SHM_DISABLE=1`) | after (default) |
-|---|---|---|
-| guest aggregate payload | 0.83 GB/s | **1.52 GB/s** |
-
-**End-to-end serving improves far more than that suggests, because the guest was
-hurt worse by the workaround than the host was.** One TP=6 measurement with the
-fix and SHM enabled on both sides: **guest 140.15 vs host 163.57 tok/s, about
-0.86x**. The same comparison with `NCCL_SHM_DISABLE=1` forced on both sides had
-read 0.21x — the host fell from 115.7 to 47.9 without SHM, the guest fell to
-10.0. Those older figures are superseded and should not be quoted.
-
-Two honest caveats. That is **one** datapoint, not a re-measured matrix; TP=1/2/4
-scaling on the fixed stack is still being measured. And in that run the
-**generated-text hashes differed between host and guest**, where the earlier
-comparison was byte-identical — that may be reduction-order nondeterminism in
-tensor-parallel collectives, which is common, but we have not shown it either
-way and are not claiming output parity on this path until we have.
-
-Single-GPU serving is unaffected.
+Two caveats. That is **one** measurement, not a matrix — TP=1/2/4 scaling is
+still being measured. And in that run the generated-text hashes differed between
+host and guest, which may be ordinary reduction-order nondeterminism in
+tensor-parallel collectives; **we are not claiming output parity on this path
+until we have shown which it is.** Single-GPU serving is unaffected.
+[How the number got there](docs/reference/parity.md).
 
 ### Fine-tuning
 
