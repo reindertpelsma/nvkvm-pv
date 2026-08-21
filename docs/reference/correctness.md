@@ -109,7 +109,7 @@ memory, because leaving the driver's mapping in place causes an unrecoverable
 `EFAULT` that kills the guest. The fix for that case is a `KVM_MEM_READONLY`
 sub-slot, so reads are served and writes become resumable MMIO exits.
 
-**Vulkan compute fails on Hopper** (`vk_compute_dispatch`) — see the note under
+**Vulkan compute on Hopper** (`vk_compute_dispatch`) — fixed 2026-08-21, see the note under
 [Tested platforms](#tested-platforms).
 
 ## Two CUDA checks failed on Ada + driver 595.84 — FIXED 2026-08-19
@@ -186,88 +186,169 @@ is 28/28, and the same Ada part on 580.95.05 is 28/28 — but **nothing in the
 check is architecture-specific**. It was latent for any guest whose libcuda
 takes the by-base free path.
 
-## Vulkan compute on Hopper — RESOLVED 2026-08-21, and it was never an nvkvm bug
+## Vulkan compute on Hopper — FIXED 2026-08-21; it was ours, and it was never a driver bug
 
-**Status: fixed by the host NVIDIA driver, not by us.** On an H100 PCIe (GH100)
-with driver **580.126.09**, `tests/validate.sh` is **28/28**, including
-`vk_compute_dispatch` (4096 elements, `data[i]=i*3+7` verified). The failure
-below reproduces only on the **570.124.06** branch this row was first measured
-on. Both halves of the old diagnosis turned out to be wrong; the corrected
-account is kept here because the *way* it was wrong is the instructive part.
+**Status: root-caused and fixed.** `HOPPER_USERMODE_A` (`0xc661`) had no entry in
+the guest module's alloc-parameter size-by-`hClass` tables, so nvkvm forwarded a
+**NULL parameter block** for it and the host RM built a different object than the
+caller asked for. On an H100 that cost Vulkan its compute queue. Fixed in
+`src/guest/nvkvm_main.c`; `tests/validate.sh` is now **28/28** on an H100 PCIe on
+570.124.06 and 575.57.08, both of which read 27/28 before.
 
-### What was originally recorded
+### The driver sweep that found it (2026-08-21)
 
-`vkCreateDevice` returned `-4` (`VK_ERROR_DEVICE_LOST`) in the guest while the
-same binary returned `0` on the host, and the QEMU trace showed the userspace
-driver allocating an `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`) channel and then
-failing to allocate `HOPPER_COMPUTE_A` (`0xcbc0`) under it with
-`NV_ERR_OBJECT_NOT_FOUND` (`0x57`). That was written up as a *channel/compute
-class mismatch* — an Ampere channel being an illegitimate parent for a Hopper
-compute object. Minimal reproducer:
+Measured on one H100 PCIe box by swapping only the host NVIDIA driver. The nvkvm
+QEMU binary and `nvkvm-guest.ko` were **byte-identical across every row**; the
+guest libraries were re-bundled with `scripts/make_host_bundle.sh` and re-staged
+with `scripts/stage_guest_libs.sh` after each swap, as they must be. Drivers
+installed from NVIDIA's official `.run` with `--kernel-module-type=open`.
+
+| host driver | ABI profile nvkvm selected | HOST `vk_compute_dispatch` | GUEST `validate.sh` (before fix) |
+|---|---|---|---|
+| 565.57.01  | 550 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
+| 570.124.06 | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
+| 570.148.08 | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
+| 575.57.08  | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
+| 580.65.06  | 580 | **PASS** | 28/28 |
+| 580.126.09 | 580 | **PASS** | 28/28 |
+
+**The host column is the whole argument.** Every driver, 570.124.06 included,
+runs the probe correctly on bare metal. A driver that works on the host and
+fails through nvkvm is an nvkvm bug, by definition — which is why this table was
+worth the box it took to measure.
+
+Two earlier claims died here. The write-up that said this was **"a defect in the
+570.124.06 driver branch"** was reached by *elimination* — no 570 machine was
+available, so "the only remaining variable is the host driver" was treated as
+naming the culprit. It names the *trigger*. A bug of ours that only some drivers
+expose fits that evidence identically, and that is what it was. And the affected
+range was never "the 570 branch": 565 fails and 575 fails too, spanning **two**
+different ABI profiles (550 and 570), so the profile table is not the
+discriminator either.
+
+### Root cause
+
+The probe's own status codes, from the guest on 575.57.08 with `NVKVM_DEBUG=1`:
+
+```
+nvkvm: TRACE ALLOC hParent=0xbeef0004 hNew=0xbeefc360 hClass=0xc661 aps=0 aux=0 nvstatus=0x0
+nvkvm: A100DBG FREE hRoot=0xc1d00067 hParent=0xbeef0003 hObject=0xbeee0100    nvstatus=0x0
+nvkvm: RM_ALLOC failed: hParent=0xbeee0100 hObjNew=0xbeee90c0 hClass=0xcbc0
+       alloc_parms_size=0 aux_size=0 nvstatus=0x57
+```
+
+`0x57` is **`NV_ERR_OBJECT_NOT_FOUND`**, confirmed against `nvstatuscodes.h` at
+upstream tag `570.124.06` (`0x55` `NOT_READY`, `0x56` `NOT_SUPPORTED`, `0x57`
+`OBJECT_NOT_FOUND`). The object not found is the **parent**: the channel
+`0xbeee0100` is freed one ioctl earlier and the compute-class allocation then
+names it as `hParent`. That free is the userspace driver giving up, not the
+fault — so the fault is upstream of it.
+
+Finding the upstream point took a host/guest ioctl diff — the same `LD_PRELOAD`
+shim (`tools/nv_ioctl_trace.c`) run on **both** sides, logging every
+`NV_ESC_RM_ALLOC` / `RM_CONTROL` / `RM_FREE` with its parameter bytes. The two
+sequences are **identical for 46 consecutive allocations** and every control's
+in/out bytes match, until this one control answers differently:
+
+```
+NV0000_CTRL_CMD_CLIENT_GET_ADDR_SPACE_TYPE (0xd01) on object 0xbeefc360
+  HOST   params = 60c3efbe 00000000 02000000   addrSpaceType = 2  VIDMEM
+  GUEST  params = 60c3efbe 00000000 03000000   addrSpaceType = 3  REGMEM
+```
+
+Object `0xbeefc360` is a **`HOPPER_USERMODE_A` (`0xc661`)** — the usermode
+doorbell aperture. It is allocated with `pAllocParms` set and `paramsSize = 0`,
+the ordinary "let RM size the struct by class" convention. `0xc661` is defined in
+`src/abi/nvgpu.h` but **had no case in either size-by-`hClass` switch** in
+`src/guest/nvkvm_main.c`, so:
+
+1. the guest module computed `ap_size = 0` and copied **no** parameter bytes;
+2. the stub, which sets `pAllocParms = aux_size > 0 ? aux_buf : NULL`, forwarded
+   a **NULL** parameter block;
+3. RM allocated the usermode object from all-defaults — no `bBar1Mapping` — so
+   its aperture came back **REGMEM** instead of **VIDMEM**;
+4. the userspace driver mapped it the way REGMEM requires, concluded the channel
+   it had just built was unusable, freed it, and then allocated
+   `HOPPER_COMPUTE_A` under the dead handle;
+5. `NV_ERR_OBJECT_NOT_FOUND` → `vkCreateDevice` → `VK_ERROR_DEVICE_LOST` → 27/28.
+
+Nothing was ever denied and no forwarded ioctl returned a non-zero status until
+the very last one. This is the **fifth** instance of the same silent failure mode
+in this codebase — a class that is *reachable* but *unsized*, so zero bytes are
+forwarded and the damage surfaces layers away (#84 twice, #99, #101, now this).
+`tests/BOOT_MATRIX.md` predicted it in writing: *"A guest-side warning when a
+known-allowed hClass hits the default arm of a size switch would have turned
+every one of these into a one-line log message instead of a bisect."*
+
+### The fix
+
+`src/guest/nvkvm_main.c` no longer forwards a NULL parameter block for a class it
+cannot size. For an unsized `hClass` it copies a **page-bounded window** of the
+caller's buffer (256 bytes, clipped at the end of the page holding the pointer,
+so it can never fault into an unmapped neighbour) and — in the NVOS64 path —
+**leaves the caller's `alloc_parms_size` at 0**, because that is precisely what a
+native caller passes and what makes RM size the struct by class itself. Guessing
+a size there would be the one thing RM does reject. It also emits the warning
+`BOOT_MATRIX.md` asked for:
+
+```
+nvkvm: RM_ALLOC hClass=0xc661 has no alloc-param size entry; forwarding a 256-byte window
+```
+
+The window is deliberately not a new table row: a table entry can be *wrong*, and
+being wrong here is silent. Letting RM size its own struct cannot be.
+
+### Verified
+
+| host driver | before | after |
+|---|---|---|
+| 570.124.06 | 27/28, `vk_compute_dispatch` FAIL | **28/28 PASS** |
+| 575.57.08  | 27/28, `vk_compute_dispatch` FAIL | **28/28 PASS** |
+| 580.126.09 | 28/28 | **28/28** (no regression) |
+
+Host-side unit suite (`tests/unit`): `test_ctrl_gate`, `test_dispatch`,
+`test_frontend`, `test_handle` all pass.
+
+**Not established:** *why* the 580 userspace was immune. It issues the same
+`0xc661` allocation and got the same NULL parameter block, and still worked — so
+something in the 580 Vulkan driver tolerates the default usermode object on this
+path. That was not chased, because the guest is now correct on every driver
+either way. Do not record a reason for it that has not been measured; that
+mistake is what produced the first two versions of this section.
+
+**This never affected CUDA.** All 19 CUDA checks passed on the H100 on every
+driver in the sweep, before and after the fix.
+
+### The old "channel/compute class mismatch" diagnosis, for the record
+
+The failure was once written up as a *class mismatch* — an
+`AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`) channel being an illegitimate parent for a
+`HOPPER_COMPUTE_A` (`0xcbc0`) object. It never was: the bare-metal host does the
+same pairing and succeeds, on every driver tested. Hopper reuses the Ampere
+GPFIFO channel class and `HOPPER_CHANNEL_GPFIFO_A` (`0xc86f`) is requested by
+neither side. The status was never `INVALID_CLASS`; it was `OBJECT_NOT_FOUND`,
+which is a statement about the parent handle. Minimal reproducer:
 [`tests/repro/vk_create_device.c`](tests/repro/vk_create_device.c).
 
-### Correction 1 — the "class mismatch" is normal, not a fault
+### What the earlier 580-only A/B did and did not show
 
-**The bare-metal host does exactly the same thing.** Tracing
-`NV_ESC_RM_ALLOC` on the host with an `LD_PRELOAD` shim (decoding
-`NVOS64_PARAMETERS.hClass`/`status`) while running the *same* reproducer on
-driver 580.126.09:
-
-```
-HOST  RM_ALLOC hParent=0xcef80002 hNew=0xbeee0100 hClass=0xc56f status=0x0   AMPERE_CHANNEL_GPFIFO_A
-HOST  RM_ALLOC hParent=0xbeee0100 hNew=0xbeee90c0 hClass=0xcbc0 status=0x0   HOPPER_COMPUTE_A under it
-```
-
-`HOPPER_COMPUTE_A` under an `AMPERE_CHANNEL_GPFIFO_A` parent is what a working
-H100 does — Hopper reuses the Ampere GPFIFO channel class. `HOPPER_CHANNEL_GPFIFO_A`
-(`0xc86f`) is present in the class list but is requested by **neither** the host
-nor the guest. So "the driver picks the Ampere channel on a Hopper part" was
-never the anomaly it was taken for, and the open question it left behind ("why
-does class discovery steer the driver to an Ampere channel?") had no answer
-because it had no premise.
-
-The guest on 580.126.09 now produces a byte-for-byte equivalent sequence, with
-**zero** non-zero `status` values across the whole trace:
-
-```
-GUEST RM_ALLOC hParent=0xcef80002 hNew=0xbeee0100 hClass=0xc56f status=0x0
-GUEST RM_ALLOC hParent=0xbeee0100 hNew=0xbeee90c0 hClass=0xcbc0 status=0x0
-```
-
-This is the project's most-repeated mistake, made again: **a difference was
-attributed to nvkvm without first checking what the host does.** The host check
-is one `LD_PRELOAD` shim and five minutes.
-
-### Correction 2 — no nvkvm change fixed it; the driver branch did
-
-Establishing *what* changed required separating two variables that moved
-together: the host driver (570.124.06 → 580.126.09) and roughly twenty of our
-commits. Measured by A/B on one H100 PCIe box, same hardware, same guest image:
+Before a pre-580 box existed, the driver and ~20 nvkvm commits had moved
+together, so they were separated by A/B on 580.126.09 — where, as the sweep above
+now explains, *nothing* fails:
 
 | arm | QEMU | guest module | driver | `vkCreateDevice` |
 |---|---|---|---|---|
-| shipping | `e8e472f` (LIFO=2, DP=1) | `e8e472f` | 580.126.09 | **rc=0 OK** |
-| map-VA fill-in disabled | `e8e472f` + gate | `e8e472f` | 580.126.09 | **rc=0 OK** |
-| **full original stack** | **`a996386`** (LIFO=0, DP=0) | **`a996386`** | 580.126.09 | **rc=0 OK** |
+| shipping | `e8e472f` | `e8e472f` | 580.126.09 | rc=0 OK |
+| map-VA fill-in disabled | `e8e472f` + gate | `e8e472f` | 580.126.09 | rc=0 OK |
+| **full original stack** | **`a996386`** | **`a996386`** | 580.126.09 | rc=0 OK |
 
-`a996386` is the exact tree whose commit message records *"H100 validate.sh
-re-run with this change: 28 checks, 27 PASS, 1 FAIL"* — i.e. the tree that
-measured the failure. Rebuilt from that tree (QEMU **and** the guest module —
-`nvkvm_guest` size 110592 vs 114688 for current, confirming a genuinely
-different binary) it **passes** on 580.126.09.
-
-Since the only remaining variable is the host driver, **the Hopper
-`vk_compute_dispatch` failure was a defect in the 570.124.06 driver branch.**
-nvkvm required no change, and none of our 2026-08-20 map-VA / `UNMAP_MEMORY`
-work is responsible — arm 2 disables the host half of the `UNMAP_MEMORY`
-address contract outright and Vulkan still comes up.
-
-What is **not** established: the failure was not re-measured on 570.124.06 with
-the current tree, because no 570 box was available. The claim is therefore
-"the original stack passes on 580", not "the current stack fails on 570".
-
-**This never affected CUDA.** All 19 CUDA checks passed on the H100 throughout,
-over that same Ampere channel, with byte-exact verification.
+That A/B was correctly executed and its narrow result stands — no nvkvm change
+between `a996386` and `e8e472f` fixed this, and the 2026-08-20 map-VA /
+`UNMAP_MEMORY` work is not involved. Its mistake was the inference drawn from it.
+Every arm ran on the one driver that cannot exhibit the bug, so the experiment
+could only ever return "OK", and "the only remaining variable is the host driver"
+turned that into a verdict about NVIDIA's code. The missing measurement was one
+bare-metal run of the probe on 570 — about a minute, once a 570 machine exists.
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
 595.84 row had no 28/28 measurement.  **That footnote used to blame a box

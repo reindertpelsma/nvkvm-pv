@@ -800,11 +800,16 @@ ioctl_on_isolate: cmd=0xc020464f  ret=0  nvstatus=0x57   NV_ESC_RM_UNMAP_MEMORY 
 Vulkan failure, though at a different call site. The driver is reached and
 answers; nvkvm is not refusing anything.
 
-> **Note added 2026-08-21.** The shared status code is a coincidence, not a
-> shared cause. The Hopper Vulkan failure turned out to be a defect in the
-> 570.124.06 driver branch — the same nvkvm tree that measured it passes on
-> 580.126.09 — so do not treat these two `0x57`s as one bug. See
-> [correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
+> **Note added 2026-08-21, revised the same day.** These two `0x57`s are still
+> different bugs — different call sites, different objects — but the reason
+> given for separating them was wrong. The first version of this note said the
+> Hopper Vulkan failure "turned out to be a defect in the 570.124.06 driver
+> branch". It is not a driver defect: a driver sweep on an H100 shows the same
+> probe passing on **bare metal** on 570.124.06 while failing through nvkvm, so
+> that one is ours too, and it is still open. Note also that both failures share
+> a shape worth remembering — an object is freed and then referenced — which is
+> a hint, not a proof of common cause. See
+> [correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug).
 
 Note the ordering: a FREE immediately
 followed by an UNMAP of what looks like the same object.
@@ -881,8 +886,9 @@ about.
 Practical consequence: the A100 passing `vk_compute_dispatch`, EGL and a
 pixel-checked GL draw while failing `cuCtxCreate` is **exactly the wrong way
 round** for that card. The Vulkan pass is still useful as evidence — it is what
-eliminated the "datacenter part" theory for the Hopper failure (itself since
-resolved as a 570-branch driver defect) — but it is not a
+eliminated the "datacenter part" theory for the Hopper failure (which is not a
+driver defect and is still open — see
+[correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug)) — but it is not a
 result to celebrate, and the CUDA failure is the one that counts.
 
 ### X11 clients fall back to llvmpipe on a display-less A100 — NOT AN NVKVM BUG

@@ -2713,6 +2713,22 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			NVKVM_DBG("nvkvm: A100DBG FREE  hRoot=0x%x hParent=0x%x "
 				  "hObject=0x%x nvstatus=0x%x\n",
 				  w[0], w[1], w[2], nvstatus);
+		} else if (nr == NV_ESC_RM_ALLOC && req->param_size >= 16) {
+			/* Every RM_ALLOC, not only the failing ones.  Diffing the
+			 * guest's alloc sequence against the host's (LD_PRELOAD
+			 * shim, tools/nv_ioctl_trace.c) is the only way to find
+			 * where a forwarded session first diverges; logging just
+			 * the failure shows the symptom, never the cause. */
+			uint32_t aps = 0;
+			if (req->param_size == sizeof(struct nvos64_parameters))
+				memcpy(&aps, (const char *)param_buf + 32, 4);
+			NVKVM_DBG("nvkvm: TRACE ALLOC hRoot=0x%x hParent=0x%x "
+				  "hNew=0x%x hClass=0x%04x aps=%u aux=%u nvstatus=0x%x\n",
+				  w[0], w[1], w[2], w[3], aps, req->aux_size, nvstatus);
+		} else if (nr == NV_ESC_RM_CONTROL && req->param_size >= 24) {
+			NVKVM_DBG("nvkvm: TRACE CTRL  hClient=0x%x hObject=0x%x "
+				  "cmd=0x%08x nvstatus=0x%x\n",
+				  w[0], w[1], w[2], nvstatus);
 		}
 	}
 
