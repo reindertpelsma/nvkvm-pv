@@ -577,6 +577,7 @@ validating. Verify your own workload against a host run all the same; see
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 | [`SECURITY.md`](SECURITY.md) | Threat model, what is known broken, how to report a vulnerability |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | What is most useful to send, and three traps in the build |
 | [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
 
 ## Status
@@ -593,7 +594,10 @@ used to sit here have been re-tested and no longer hold — Wayland GL, the NVEN
 hang, Vulkan compute on Hopper, and DRM on guest kernels 6.12+.
 
 Issues and measurements from other hardware are welcome — particularly boots on
-driver branches this repository has not exercised.
+driver branches this repository has not exercised. Coverage here is a function
+of what someone happened to rent, so your card is probably one we do not have:
+see [contributing](CONTRIBUTING.md), and note that a **failure** report is worth
+more to us than a success.
 
 ## Credits
 

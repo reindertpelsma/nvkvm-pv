@@ -1,0 +1,37 @@
+name: Platform report — it worked (or didn't) on my hardware
+description: Add a row to the tested-platforms table
+labels: ["platform"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These are genuinely wanted, including the boring "it just worked" ones,
+        and **especially** on driver branches the tested-platforms table does
+        not already cover. Coverage here is a function of what someone happened
+        to rent; your hardware is hardware we do not have.
+
+  - type: textarea
+    id: env
+    attributes:
+      label: GPU, host driver, guest kernel
+      value: |
+        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+        cat /proc/driver/nvidia/version     # the kernel module's own version
+        uname -r                            # in the guest
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: validate
+    attributes:
+      label: tests/validate.sh TOTAL / VERDICT line
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: workload
+    attributes:
+      label: Anything real you ran on it
+      description: Optional, and the most interesting part when present.
