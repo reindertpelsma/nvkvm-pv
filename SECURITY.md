@@ -38,7 +38,7 @@ Details: [the isolate model](docs/internal/isolate-model.md) and
 |---|---|
 | guest process | isolate, guest kernel, VMM, **another guest process** |
 | guest kernel | isolate, VMM |
-| isolate | VMM, host |
+| isolate | VMM, host, **guest kernel**, **another guest process** |
 
 **Guest process → guest process is in scope, with a caveat worth stating.** Each
 guest process gets its own isolate on the host, with its own RM client, so one
@@ -46,16 +46,30 @@ process's GPU objects are not meant to be reachable from another's — and we
 treat a way to reach them as a vulnerability. A recent audit found one and it is
 fixed.
 
-But that separation is **additive to whatever the guest OS already provides, not
-a substitute for it.** Two guest processes running as the same user can already
-reach each other by ordinary means — `ptrace`, `/proc/<pid>/mem` — and nvkvm
-neither prevents that nor tries to. So the GPU-level separation is only
-meaningful between guest processes that are themselves separated: different
-UIDs, or containers inside the guest.
+But it **preserves** a boundary rather than creating one. It is meaningful
+between guest processes the guest OS has already separated — different UIDs, or
+containers — and means nothing between two processes running as the same user,
+which can reach each other by ordinary means regardless.
 
-**Out of scope**, as safe by construction: isolate → guest process, guest kernel
-→ guest process, VMM → anything. The VMM and the host are trusted; the guest is
-not.
+**An isolate is not trusted either**, which is why two more rows are in the table
+than you might expect. A compromised isolate is a sandboxed host process, and
+the interesting thing it can try next is not always the host: reaching **the
+guest kernel** through the response path is a privilege escalation *inside* the
+guest, obtained by way of the host, and reaching **another guest process** is
+the mirror of a guest process reaching one. Both count.
+
+**Out of scope**, as safe by construction: an isolate → **its own** guest
+process (it exists to serve that process; there is no boundary between them),
+guest kernel → guest process, and VMM → anything. The VMM and the host are
+trusted; the guest and the isolates are not.
+
+**The contract for every "another guest process" row is that nvkvm preserves a
+boundary the guest OS has already drawn.** Where the guest separates two
+processes — different UIDs, or containers — nvkvm must not become the way around
+that, and a way around it is a vulnerability. Where the guest draws no boundary,
+two processes running as the same user, there is nothing to preserve: they can
+already reach each other with `ptrace` or `/proc/<pid>/mem`, and nvkvm neither
+adds a boundary nor claims to.
 
 Also out of scope: side channels between guests sharing a GPU (timing,
 contention, residual VRAM contents). We have not studied them and you should
