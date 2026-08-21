@@ -1,0 +1,330 @@
+[New LWP 104173]
+[New LWP 104130]
+[New LWP 98499]
+[New LWP 98481]
+[New LWP 98463]
+[New LWP 98445]
+[New LWP 98427]
+[New LWP 98409]
+[New LWP 98391]
+[New LWP 98373]
+[New LWP 98355]
+[New LWP 98337]
+[New LWP 98319]
+[New LWP 98280]
+[New LWP 98261]
+[New LWP 98243]
+[New LWP 98148]
+[New LWP 98052]
+[New LWP 98051]
+[New LWP 98046]
+[New LWP 98045]
+[New LWP 98044]
+[New LWP 98043]
+[New LWP 98039]
+[New LWP 98037]
+[New LWP 98036]
+[New LWP 98035]
+[New LWP 98034]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+__syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+
+Thread 29 (Thread 0x7b23484566c0 (LWP 98034) "qemu-system-x86"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x000061f7c3263432 in qemu_futex_wait (val=<optimized out>, f=<optimized out>) at /opt/qemu-src/include/qemu/futex.h:29
+#2  qemu_event_wait (ev=ev@entry=0x61f7c4437c68 <rcu_call_ready_event>) at ../util/qemu-thread-posix.c:464
+#3  0x000061f7c326c93b in call_rcu_thread (opaque=<optimized out>) at ../util/rcu.c:278
+#4  0x000061f7c326218f in qemu_thread_start (args=0x61f7f4d73020) at ../util/qemu-thread-posix.c:541
+#5  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#6  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 28 (Thread 0x7b2347b546c0 (LWP 98035) "[pango] fontcon"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007b234ac64eab in g_cond_wait () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#2  0x00007b234abfff6c in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#3  0x00007b234abfffdc in g_async_queue_pop () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#4  0x00007b23495dfdcb in ??? () at /usr/lib/x86_64-linux-gnu/libpangoft2-1.0.so.0
+#5  0x00007b234ac6e279 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 27 (Thread 0x7b23473536c0 (LWP 98036) "pool-spawner"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007b234ac64eab in g_cond_wait () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#2  0x00007b234abfff6c in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#3  0x00007b234ac6e714 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#4  0x00007b234ac6e279 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#5  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#6  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 26 (Thread 0x7b2346b526c0 (LWP 98037) "gmain"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=8, a6=0, nr=271) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=8, a6=a6@entry=0, nr=271) at ./nptl/cancellation.c:75
+#3  0x00007b2349b282f6 in __GI_ppoll (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>, sigmask=<optimized out>) at ../sysdeps/unix/sysv/linux/ppoll.c:42
+#4  0x00007b234ac392f1 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#5  0x00007b234ac393c3 in g_main_context_iteration () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#6  0x00007b234ac39411 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#7  0x00007b234ac6e279 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#8  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#9  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 25 (Thread 0x7b234631b6c0 (LWP 98039) "dconf worker"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=8, a6=0, nr=271) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=a5@entry=8, a6=a6@entry=0, nr=271) at ./nptl/cancellation.c:75
+#3  0x00007b2349b282f6 in __GI_ppoll (fds=<optimized out>, nfds=<optimized out>, timeout=<optimized out>, sigmask=<optimized out>) at ../sysdeps/unix/sysv/linux/ppoll.c:42
+#4  0x00007b234ac392f1 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#5  0x00007b234ac393c3 in g_main_context_iteration () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#6  0x00007b2348a3d97d in ??? () at /usr/lib/x86_64-linux-gnu/gio/modules/libdconfsettings.so
+#7  0x00007b234ac6e279 in ??? () at /usr/lib/x86_64-linux-gnu/libglib-2.0.so.0
+#8  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#9  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 24 (Thread 0x7b1f2fdff6c0 (LWP 98043) "qemu-system-x86"):
+#0  futex_wait (futex_word=0x61f7c44186c0 <bql>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x61f7c44186c0 <bql>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007b2349aa79d4 in lll_mutex_lock_optimized (mutex=0x61f7c44186c0 <bql>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=mutex@entry=0x61f7c44186c0 <bql>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x000061f7c3262514 in qemu_mutex_lock_impl (mutex=0x61f7c44186c0 <bql>, file=0x61f7c32c5a6e "../system/physmem.c", line=2718) at ../util/qemu-thread-posix.c:94
+#5  0x000061f7c2e51e36 in bql_lock_impl (file=file@entry=0x61f7c32c5a6e "../system/physmem.c", line=line@entry=2718) at ../system/cpus.c:536
+#6  0x000061f7c302d179 in prepare_mmio_access (mr=0x61f7f512bf10) at ../system/physmem.c:2718
+#7  flatview_read_continue_step (attrs=..., attrs@entry=..., buf=buf@entry=0x7b2345aea000 "", mr_addr=1, l=l@entry=0x7b1f2fdfe100, mr=0x61f7f512bf10, len=1) at ../system/physmem.c:2864
+#8  0x000061f7c3031a9c in flatview_read_continue (fv=fv@entry=0x7b1f24023dd0, addr=addr@entry=1017, attrs=attrs@entry=..., ptr=ptr@entry=0x7b2345aea000, len=len@entry=1, mr_addr=<optimized out>, l=<optimized out>, mr=<optimized out>) at ../system/physmem.c:2908
+#9  0x000061f7c3031b7a in flatview_read (fv=0x7b1f24023dd0, addr=1017, attrs=..., buf=0x7b2345aea000, len=1) at ../system/physmem.c:2938
+#10 0x000061f7c3031f91 in address_space_read_full (as=<optimized out>, addr=1017, attrs=..., buf=<optimized out>, len=1) at ../system/physmem.c:2951
+#11 address_space_rw (as=<optimized out>, addr=addr@entry=1017, attrs=..., attrs@entry=..., buf=<optimized out>, len=len@entry=1, is_write=is_write@entry=false) at ../system/physmem.c:2979
+
+Thread 23 (Thread 0x7b1f2f5fe6c0 (LWP 98044) "qemu-system-x86"):
+#0  futex_wait (futex_word=0x61f7c44186c0 <bql>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x61f7c44186c0 <bql>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007b2349aa79d4 in lll_mutex_lock_optimized (mutex=0x61f7c44186c0 <bql>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=mutex@entry=0x61f7c44186c0 <bql>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x000061f7c3262514 in qemu_mutex_lock_impl (mutex=0x61f7c44186c0 <bql>, file=0x61f7c32c5a6e "../system/physmem.c", line=2718) at ../util/qemu-thread-posix.c:94
+#5  0x000061f7c2e51e36 in bql_lock_impl (file=file@entry=0x61f7c32c5a6e "../system/physmem.c", line=line@entry=2718) at ../system/cpus.c:536
+#6  0x000061f7c302ed29 in prepare_mmio_access (mr=0x7b1f1e306f40) at ../system/physmem.c:2718
+#7  flatview_write_continue_step (attrs=..., attrs@entry=..., buf=buf@entry=0x7b2345ae6028 "", mr_addr=0, l=l@entry=0x7b1f2f5fd110, mr=0x7b1f1e306f40, len=2) at ../system/physmem.c:2767
+#8  0x000061f7c302eedb in flatview_write_continue (fv=0x7b1f24004380, addr=61710090137600, attrs=..., ptr=<optimized out>, len=2, mr_addr=<optimized out>, l=<optimized out>, mr=<optimized out>) at ../system/physmem.c:2816
+#9  flatview_write (fv=0x7b1f24004380, addr=<optimized out>, attrs=..., buf=<optimized out>, len=<optimized out>) at ../system/physmem.c:2847
+#10 0x000061f7c3032054 in address_space_write (as=<optimized out>, addr=<optimized out>, attrs=..., buf=0x7b2345ae6028, len=<optimized out>) at ../system/physmem.c:2967
+#11 address_space_rw (as=<optimized out>, addr=<optimized out>, attrs=..., attrs@entry=..., buf=buf@entry=0x7b2345ae6028, len=<optimized out>, is_write=<optimized out>) at ../system/physmem.c:2977
+
+Thread 22 (Thread 0x7b1f2edfd6c0 (LWP 98045) "qemu-system-x86"):
+#0  __GI___ioctl (fd=24, request=request@entry=44672) at ../sysdeps/unix/sysv/linux/ioctl.c:36
+#1  0x000061f7c3095b7e in kvm_vcpu_ioctl (cpu=cpu@entry=0x61f7f52aa190, type=type@entry=44672) at ../accel/kvm/kvm-all.c:3332
+#2  0x000061f7c309608e in kvm_cpu_exec (cpu=cpu@entry=0x61f7f52aa190) at ../accel/kvm/kvm-all.c:3134
+#3  0x000061f7c3097c65 in kvm_vcpu_thread_fn (arg=0x61f7f52aa190) at ../accel/kvm/kvm-accel-ops.c:50
+#4  0x000061f7c326218f in qemu_thread_start (args=0x61f7f518e550) at ../util/qemu-thread-posix.c:541
+#5  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#6  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 21 (Thread 0x7b1f2e5fc6c0 (LWP 98046) "qemu-system-x86"):
+#0  futex_wait (futex_word=0x61f7c44186c0 <bql>, expected=2, private=0) at ../sysdeps/nptl/futex-internal.h:126
+#1  __GI___lll_lock_wait (futex=futex@entry=0x61f7c44186c0 <bql>, private=0) at ./nptl/lowlevellock.c:49
+#2  0x00007b2349aa79d4 in lll_mutex_lock_optimized (mutex=0x61f7c44186c0 <bql>) at ./nptl/pthread_mutex_lock.c:48
+#3  ___pthread_mutex_lock (mutex=mutex@entry=0x61f7c44186c0 <bql>) at ./nptl/pthread_mutex_lock.c:87
+#4  0x000061f7c3262514 in qemu_mutex_lock_impl (mutex=0x61f7c44186c0 <bql>, file=0x61f7c32c5a6e "../system/physmem.c", line=2718) at ../util/qemu-thread-posix.c:94
+#5  0x000061f7c2e51e36 in bql_lock_impl (file=file@entry=0x61f7c32c5a6e "../system/physmem.c", line=line@entry=2718) at ../system/cpus.c:536
+#6  0x000061f7c302d179 in prepare_mmio_access (mr=0x61f7f5917ce0) at ../system/physmem.c:2718
+#7  flatview_read_continue_step (attrs=..., attrs@entry=..., buf=buf@entry=0x7b2345ae1000 "", mr_addr=7, l=l@entry=0x7b1f2e5fb100, mr=0x61f7f5917ce0, len=1) at ../system/physmem.c:2864
+#8  0x000061f7c3031a9c in flatview_read_continue (fv=fv@entry=0x7b1f24023dd0, addr=addr@entry=375, attrs=attrs@entry=..., ptr=ptr@entry=0x7b2345ae1000, len=len@entry=1, mr_addr=<optimized out>, l=<optimized out>, mr=<optimized out>) at ../system/physmem.c:2908
+#9  0x000061f7c3031b7a in flatview_read (fv=0x7b1f24023dd0, addr=375, attrs=..., buf=0x7b2345ae1000, len=1) at ../system/physmem.c:2938
+#10 0x000061f7c3031f91 in address_space_read_full (as=<optimized out>, addr=375, attrs=..., buf=<optimized out>, len=1) at ../system/physmem.c:2951
+#11 address_space_rw (as=<optimized out>, addr=addr@entry=375, attrs=..., attrs@entry=..., buf=<optimized out>, len=len@entry=1, is_write=is_write@entry=false) at ../system/physmem.c:2979
+
+Thread 20 (Thread 0x7b1f1cbff6c0 (LWP 98051) "gly-global-exec"):
+#0  0x00007b23491618e3 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#1  0x00007b234915a582 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#2  0x00007b2349158989 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#3  0x00007b2349158891 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#4  0x00007b234928de64 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#5  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#6  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 19 (Thread 0x7b1f1c9fe6c0 (LWP 98052) "async-io"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x00007b234903cb66 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#2  0x00007b23491611fa in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#3  0x00007b2349160dec in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#4  0x00007b234928de64 in ??? () at /usr/lib/x86_64-linux-gnu/libglycin-2.so.0
+#5  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#6  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 18 (Thread 0x7b1f2fdff6c0 (LWP 98148) "kvm-nx-lpage-re"):
+#0  0x0000000000000000 in ??? ()
+
+Thread 17 (Thread 0x7afe7f1db6c0 (LWP 98243) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7f1da280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e690488) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 16 (Thread 0x7afe7e9da6c0 (LWP 98261) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7e9d9280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e691df0) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 15 (Thread 0x7afe7d9f06c0 (LWP 98280) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7d9ef280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e693758) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 14 (Thread 0x7afe7d1ef6c0 (LWP 98319) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7d1ee280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e696a28) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 13 (Thread 0x7afe7c9ee6c0 (LWP 98337) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7c9ed280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e698390) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 12 (Thread 0x7afe7c1ed6c0 (LWP 98355) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7c1ec280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e699cf8) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 11 (Thread 0x7afe7b9ec6c0 (LWP 98373) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7b9eb280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e69b660) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 10 (Thread 0x7afe7b1eb6c0 (LWP 98391) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7b1ea280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e69cfc8) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 9 (Thread 0x7afe7a9ea6c0 (LWP 98409) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7a9e9280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e69e930) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 8 (Thread 0x7afe7a1e96c0 (LWP 98427) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe7a1e8280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6a0298) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 7 (Thread 0x7afe799e86c0 (LWP 98445) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe799e7280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6a1c00) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 6 (Thread 0x7afe791e76c0 (LWP 98463) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe791e6280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6a3568) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 5 (Thread 0x7afe789e66c0 (LWP 98481) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe789e5280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6a4ed0) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 4 (Thread 0x7afe781e56c0 (LWP 98499) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe781e4280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6a6838) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 3 (Thread 0x7afe707c66c0 (LWP 104130) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe707c5280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6b00a8) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 2 (Thread 0x7afe6f7c46c0 (LWP 104173) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=0, a3=0, a4=0, a5=0, a6=0, nr=47) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=a2@entry=0, a3=a3@entry=0, a4=a4@entry=0, a5=a5@entry=0, a6=a6@entry=0, nr=47) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39361 in __recvmsg_syscall (fd=<optimized out>, msg=0x0, flags=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:27
+#4  __libc_recvmsg (fd=<optimized out>, msg=msg@entry=0x7afe6f7c3280, flags=flags@entry=0) at ../sysdeps/unix/sysv/linux/recvmsg.c:41
+#5  0x000061f7c2d01baf in isolate_reader_fn (arg=0x7b1f1e6b1a10) at ../hw/misc/nvkvm_isolate.c:987
+#6  0x00007b2349aa407a in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:454
+#7  0x00007b2349b3772c in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+Thread 1 (Thread 0x7b2348a452c0 (LWP 98032) "qemu-system-x86"):
+#0  __syscall_cancel_arch () at ../sysdeps/unix/sysv/linux/x86_64/syscall_cancel.S:56
+#1  0x00007b2349aa061c in __internal_syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=<optimized out>, a6=<optimized out>, nr=45) at ./nptl/cancellation.c:49
+#2  __syscall_cancel (a1=<optimized out>, a2=<optimized out>, a3=<optimized out>, a4=<optimized out>, a5=<optimized out>, a6=<optimized out>, nr=45) at ./nptl/cancellation.c:75
+#3  0x00007b2349b39309 in __libc_recvfrom (fd=<optimized out>, buf=<optimized out>, len=<optimized out>, flags=<optimized out>, addr=..., addrlen=<optimized out>) at ../sysdeps/unix/sysv/linux/recvfrom.c:27
+#4  0x00007b234aba04ca in ??? () at /usr/lib/x86_64-linux-gnu/libslirp.so.0
+#5  0x00007b234aba5299 in slirp_pollfds_poll () at /usr/lib/x86_64-linux-gnu/libslirp.so.0
+#6  0x000061f7c326853f in notifier_list_notify (list=list@entry=0x61f7c4437e90 <main_loop_poll_notifiers>, data=data@entry=0x7ffd9716aef0) at ../util/notify.c:39
+#7  0x000061f7c3276f09 in main_loop_wait (nonblocking=nonblocking@entry=0) at ../util/main-loop.c:591
+#8  0x000061f7c2e5cd2e in qemu_main_loop () at ../system/runstate.c:835
+#9  0x000061f7c31c063d in qemu_default_main () at ../system/main.c:37
+#10 0x00007b2349a2a601 in __libc_start_call_main (main=main@entry=0x61f7c2c05e70 <main>, argc=argc@entry=32, argv=argv@entry=0x7ffd9716b0c8) at ../sysdeps/nptl/libc_start_call_main.h:59
+#11 0x00007b2349a2a718 in __libc_start_main_impl (main=0x61f7c2c05e70 <main>, argc=32, argv=0x7ffd9716b0c8, init=<optimized out>, fini=<optimized out>, rtld_fini=<optimized out>, stack_end=0x7ffd9716b0b8) at ../csu/libc-start.c:360
+[Inferior 1 (process 98032) detached]

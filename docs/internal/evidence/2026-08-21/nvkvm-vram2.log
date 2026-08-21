@@ -1,0 +1,8 @@
+# ts total_used qemu_mib stub_total_mib stub_count_withmem stub_procs guest_procs marker
+18:35:20 2251 154 304 3 0 250 boot
+18:35:35 2251 154 304 3 0 249 boot
+18:35:50 2263 154 316 3 0 250 boot
+18:36:06 2254 154 308 3 0 250 boot
+18:36:21 2255 154 308 3 0 250 boot
+18:36:36 2264 154 317 3 0 250 boot
+18:36:51 2265 154 317 3 0 251 boot
