@@ -16,6 +16,28 @@
  * NV2081_BINAPI class ((cmd >> 16) == 0x2081) — both GSP-routed, no app
  * pointers. A 1 MiB inner-params size cap is also enforced in code.
  *
+ * EXCLUSIONS — rows nvproxy's compUtil set HAS that we deliberately drop.
+ * These must not come back on the next regeneration:
+ *   - 0x20800513 NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2.  nvproxy adds it
+ *     at 575.51.02 as ctrlHandler(rmControlSimple, compUtil), so a straight
+ *     regeneration WILL re-emit it.  Do not.  Its host handler
+ *     (subdeviceCtrlCmdThermalSystemExecuteV2_IMPL,
+ *     src/nvidia/src/kernel/gpu/subdevice/subdevice_ctrl_gpu_kernel.c) opens
+ *     with an unbounded write loop over a fixed 0x20-entry array:
+ *         for (NvU32 i = 0; i < pParams->instructionListSize; i++)
+ *                 pParams->instructionList[i].executed = NV_FALSE;
+ *     instructionListSize is a caller-supplied NvU32 that nothing validates,
+ *     the loop runs BEFORE the clientAPIVersion check that would otherwise
+ *     bounce a malformed request to physical RM, and the export table entry
+ *     is flags=0x8 (RMCTRL_FLAGS_NON_PRIVILEGED) accessRight=0x0 — i.e. any
+ *     client can reach it.  A guest sets instructionListSize = 0xffffffff and
+ *     walks off the end of a 1432-byte kernel allocation.  We have no
+ *     per-command parameter validation (see above: only the 1 MiB aux cap), so
+ *     nothing here would catch it, and thermal readback is telemetry that no
+ *     compute path depends on.  If a workload turns out to need this, the fix
+ *     is a bounded per-command check (reject instructionListSize > 0x20) at
+ *     the gate in nvkvm_isolate_handlers.c — NOT restoring the bare row.
+ *
  * Anything not matched here or by those rules is DENIED (NV_ERR_NOT_SUPPORTED),
  * matching nvproxy's posture. This is a HOST/cross-VM attack-surface control
  * (reg-ops/HWPM/debug/fabric/power fall out automatically); it lives in QEMU
@@ -106,7 +128,6 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x20800403u,
 	0x20800406u,
 	0x20800407u,
-	0x20800513u,
 	0x20800802u,
 	0x2080110bu,
 	0x20801201u,
