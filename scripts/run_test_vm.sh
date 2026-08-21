@@ -161,8 +161,22 @@ VM_SERIAL="${VM_SERIAL:-stdio}"
 # Both devices together is the right answer rather than a compromise: QEMU uses
 # the tablet while the window is ungrabbed, so the desktop keeps the seamless
 # pointer described above, and delivers relative motion through the mouse once
-# the window grabs input (ctrl-alt-g, or automatically when a guest application
-# takes a pointer lock).
+# the window has grabbed input.
+#
+# THE GUEST CANNOT TAKE THE GRAB.  Adding a relative device does not let a guest
+# application capture the host pointer, and that distinction is the whole point:
+# every grab in ui/gtk.c is a user gesture -- ctrl-alt-g
+# ("user-request-main-window"), a left-button press once the guest is in
+# relative mode ("relative-mode-click", and note the tablet keeps
+# qemu_input_is_absolute() true so even that cannot fire while it is active), or
+# the "Grab On Hover" menu item, which is opt-in and off by default.  QEMU has
+# no channel through which it could learn that a guest application took a
+# pointer lock, so it cannot react to one.
+#
+# That is deliberately the same consent model as a browser's Pointer Lock API:
+# the page asks, and the USER grants it with a gesture.  A VM window that a
+# guest could silently make swallow the host pointer would be a worse version of
+# the thing browsers fixed years ago.
 INPUT_ARGS=""
 if [ "$VM_DISPLAY" != "none" ]; then
     INPUT_ARGS="-device virtio-keyboard-pci -device virtio-tablet-pci"
