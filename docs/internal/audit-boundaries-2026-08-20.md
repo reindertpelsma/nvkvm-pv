@@ -39,15 +39,15 @@ guest kernel → guest process, VMM → anything.
 | A-8 | **high** | blocking-under-lock | guest process → VMM | **partial** — deadlined, but the lock is still held across the trip; residual risk in-line |
 | A-9 | **high** | lifetime-race | guest process → guest kernel | **open** — mitigated indirectly: the VMM now kills a wedged stub, releasing the pump |
 | A-10 | medium | cache-confusion | isolate → isolate (display) | **fixed** — cache key carries the owning isolate; invalidated on isolate death |
-| A-11 | medium | fd-confusion | guest → isolate | **open** — one control command still executes inline on the ring without fd translation |
+| A-11 | medium | fd-confusion | guest → isolate | **fixed** — the command was `0x3d06`; `53dc238` punts it (and `0x3d08`) off the ring and translates the fd. See §8 |
 | A-12 | medium | oob-map | guest kernel → VMM | **fixed** — handles record their size; offset+length checked overflow-safe |
 | A-17 | medium | allowlist-bypass | guest kernel → VMM | **fixed** — gates select a denied sentinel instead of being skipped |
 | A-18 | medium | missing-validation | guest kernel → VMM | **fixed** — geometry validated pre- and post-export against the real dma-buf size |
 | A-19 | low | oob read | guest kernel → VMM | **fixed** — guard corrected to `>= 52` |
 | A-13 | medium | blocking-under-lock | guest process → VMM | **fixed** — EXIT sent outside `iso->lock`, `MSG_DONTWAIT` |
-| A-14 | medium | lock-order | guest kernel → VMM | **open** — `alive`/`id` still read under the wrong lock |
+| A-14 | medium | lock-order | guest kernel → VMM | **fixed** — the slot wait takes `iso->lock` for the snapshot and the re-check |
 | A-15 | medium | sandbox surface | isolate → host | **fixed** — `clone3` removed from the allowlist |
-| A-16 | low ×6 | refcount / leak / hardening | various | **open** — see §5 |
+| A-16 | low ×6 | refcount / leak / hardening | various | **partial** — four of the six fixed; see §5 for which, and for what is left |
 
 **Nothing found gives a guest arbitrary code execution on the host.** The two
 memory-safety breaks that cross a trust boundary (A-3, A-5) are both contained
@@ -57,7 +57,7 @@ built to provide, and it holds. The most serious *practical* exposure is
 liveness: A-1 and A-2 let an unprivileged guest process hang the entire VMM
 with no memory corruption at all.
 
-**Status, 2026-08-20.** Fifteen of the nineteen are fixed and the fixes are
+**Status, 2026-08-20.** Fifteen of the nineteen were fixed and the fixes are
 verified to build: QEMU compiles clean (all nvkvm objects, no new warnings), the
 guest module builds and links, and the unit suite is byte-identical to a baseline
 captured *before* any of this work — a baseline that mattered, because
@@ -65,14 +65,15 @@ captured *before* any of this work — a baseline that mattered, because
 blamed on these changes. None of it is runtime-tested against a GPU workload; a
 60fps desktop run with 8 concurrent EGL clients is the obvious next gate.
 
-What remains open is listed honestly rather than quietly dropped: **A-9**
-(the guest pump's uninterruptible wait — now indirectly mitigated, since a stub
-that stops answering is killed by the new VMM deadline, which releases the pump),
-**A-11** (one control command still runs inline on the ring without the fd
-translation the slow path performs), **A-14** (two fields read under the wrong
-lock), and the low-severity items in §5. A-8 is deliberately partial: the
-round-trip is now deadlined, but the lock is still held across it, because
-restructuring that is a threading change rather than a fix.
+**Update, 2026-08-21 (§8).** A-11 turned out to have been closed the same day by
+`53dc238`, the NCCL cross-isolate work, which landed *after* this document was
+written; A-14 is now fixed, and four of the six §5 items with it. That leaves
+**A-9** open (the guest pump's uninterruptible wait — indirectly mitigated, since
+a stub that stops answering is killed by the VMM deadline, which releases the
+pump), **A-8** deliberately partial (the round-trip is deadlined, but the lock is
+still held across it, because restructuring that is a threading change rather
+than a fix), and two §5 items open by choice — see §5 and §8. Everything in §8
+is build-verified only; none of it has been run against a GPU.
 
 ---
 
@@ -324,20 +325,42 @@ finding, and because these are the assumptions the rest of the design rests on.
 
 ## 5. Low-severity items
 
-- Handle-id capture/restore disagree on a struct offset for one UVM ioctl, so
-  an internal handle_id is returned to userspace (information disclosure).
-- Unbounded pinning: up to 2 GiB per ioctl with no `RLIMIT_MEMLOCK` or cgroup
-  accounting, repeatable concurrently.
-- Three leaks on migration/mmap error paths; one is an unbounded,
-  guest-drivable exhaustion of the handle and mmap-token tables that no reap
-  path reclaims.
-- A handle is used across a lock drop with no reference held (PLAUSIBLE; needs
-  ~65k allocations to line up).
-- Two `-ENOMEM` early returns never free the transaction id they reserved;
-  once the bitmap fills, every GPU operation guest-wide fails until reload.
-- `nvkvm_ring_has_work` does a plain read of the peer-owned counter, violating
-  the header's own producer/consumer split; and the ring pointer is loaded
-  twice without `READ_ONCE` while teardown NULL-stores it.
+Status added 2026-08-21; the wording of each item is as first written.
+
+- **fixed** — Handle-id capture/restore disagree on a struct offset for one UVM
+  ioctl, so an internal handle_id is returned to userspace (information
+  disclosure). *The ioctl is `UVM_MAP_EXTERNAL_ALLOCATION`, whose `rm_ctrl_fd`
+  is version-variant; capture/restore now read it at the same profile offset
+  the sanitizer writes.*
+- **open, by choice** — Unbounded pinning: up to 2 GiB per ioctl with no
+  `RLIMIT_MEMLOCK` or cgroup accounting, repeatable concurrently. *A resource
+  policy to decide, not a defect to patch; left for a deliberate decision.*
+- **fixed, with one residual** — Three leaks on migration/mmap error paths; one
+  is an unbounded, guest-drivable exhaustion of the handle and mmap-token
+  tables that no reap path reclaims. *Four contained leaks were found and
+  closed, not three. The unbounded one is `nvkvm_cpu_page_migrate`'s
+  MMAP_ON_ISOLATE failure: the handle already carries an isolate reference by
+  then, and `nvkvm_handle_close()` refuses with `-EBUSY` while that is held —
+  a return the guest does not check — so the entry survived until session
+  teardown, and nothing reaps `nv->handles`. A FIFTH leak was found and
+  deliberately left: `nvkvm_efault_resolve()`'s GPU-VMA branch discards the
+  token its re-`MMAP_ON_ISOLATE` returns, and fixing it means moving the old
+  token's release ahead of the new mapping and carrying the region pointer
+  across an `mmap_read_lock` drop — restructuring, not a contained fix. It is
+  bounded by `nvkvm_iso_mmap_reap_handle()` at handle close.*
+- **open** — A handle is used across a lock drop with no reference held
+  (PLAUSIBLE; needs ~65k allocations to line up). *Not re-traced; left as
+  found rather than guessed at.*
+- **fixed** — Two `-ENOMEM` early returns never free the transaction id they
+  reserved; once the bitmap fills, every GPU operation guest-wide fails until
+  reload. *Fourteen such returns across twelve call sites, not two. The
+  correct idiom was already present at two of the twelve.*
+- **fixed** — `nvkvm_ring_has_work` does a plain read of the peer-owned
+  counter, violating the header's own producer/consumer split; and the ring
+  pointer is loaded twice without `READ_ONCE` while teardown NULL-stores it.
+  *Both counters are acquire-loaded now (the helper serves both roles, so
+  either counter can be the peer's), and the pump loads the ring pointer once
+  through `READ_ONCE`.*
 
 ## 6. Sandbox surface (A-15 and hardening)
 
@@ -379,3 +402,69 @@ finding, and because these are the assumptions the rest of the design rests on.
   against the dma-buf extent. Not determinable without the closed driver.
 - The `U-5`/`U-7`…`U-13` items from the predecessor audit remain open and were
   not re-examined here.
+
+---
+
+## 8. Follow-up, 2026-08-21 — what was closed, and what was not
+
+Static analysis and build verification only. **Nothing below has been run
+against a GPU.** `tests/validate.sh` needs one and could not be executed, so
+every claim here is "the code now does X", never "X was observed working".
+
+### A-11 — already fixed, by `53dc238`, and this document was right when written
+
+The command was `NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD` (`0x3d06`). At
+the time of writing, `ring_ctrl_must_punt()` punted `0x3d05` and nothing else in
+that family, so `0x3d06` — which *was* in the control allowlist — satisfied the
+punt check and executed inline on the ring, carrying a raw guest fd NUMBER into
+a stub where it means something else. `0x3d08` was not a second instance
+because it was not allowlisted, so the punt function's allowlist gate caught it;
+"one control command" was exactly right.
+
+`53dc238` (the NCCL SHM work, committed hours after this document) added both
+`0x3d06` and `0x3d08` to the punt list, added the guest-side fd translation for
+them, and excluded them from the ring at the caller via `have_import_fd`. Both
+halves are now covered, and the punt list matches the guest's translation set:
+`guest_fd_to_handle_id()` is called for exactly three inner control commands —
+`0x3d05`, `0x3d06`, `0x3d08` — and all three are punted. Every other embedded-fd
+translation in the tree is on a frontend or NVKMS ioctl, and the ring only
+accepts `NV_ESC_RM_CONTROL`, so none of them can reach it.
+
+One shape worth recording for the next reader: a record with `aux_size == 0`
+returns "no inner params → trivially flat" from `ring_ctrl_must_punt()` *before*
+the `0x3d0*` check, so a `0x3d06` with no inner params does still run inline.
+That is not an instance of A-11 — with no inner params there is no embedded fd
+to confuse, and the stub zeroes the params pointer on that path anyway.
+
+**No code change was made for A-11.** §7's first open question — whether the
+punt list is a complete superset of every allowlisted control carrying an inner
+*pointer* — is untouched by this; only the fd-bearing subset was enumerated.
+
+### A-14 — fixed
+
+`nvkvm_iso_slot_wait()` snapshotted `iso->id` and re-checked `in_use`/`id`/
+`alive` with no lock, under a comment arguing that a stale read only costs one
+more slice. Those fields are documented in `nvkvm_isolate.h` as protected by
+`iso->lock` and are written under it from three places, and the predicate is the
+*only* exit for the ENTER_LOOP wait, which has no deadline at all. Both reads
+now take `iso->lock`.
+
+Not a lock-order change: `mtx → iso->lock` already existed, because
+`nvkvm_iso_slot_wait_or_die()` calls `nvkvm_isolate_declare_dead()` with the slot
+mutex held. The reverse order does not occur anywhere, and this helper is never
+called with `mtx == &iso->lock`.
+
+### §5 — four of six
+
+See the annotated list in §5. The two left open are the pinning-accounting
+policy question and the PLAUSIBLE handle-across-lock-drop, neither of which is a
+contained code fix. A fifth migration/mmap leak was found during the work and is
+recorded there as deliberately unfixed, with the reason.
+
+### Left alone on purpose
+
+- **A-8.** This document already calls the fix a threading change rather than a
+  fix. That has not become less true the night before a release.
+- **A-9.** Indirectly mitigated, and the direct fix is the same threading
+  surgery.
+- Everything in §6 and §7.
