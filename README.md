@@ -392,8 +392,10 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   and a real correctness bug has passed it before. Check your own results
   against a host run ([what that bug was](docs/reference/correctness.md)).
 - **Multi-GPU tensor-parallel serving is correct but slow** — 0.12–0.37x of
-  host, because NCCL's shared-memory transport fails in the guest and its
-  fastest path is unavailable. Single-GPU serving is at parity
+  host. Part of that is a confirmed bug (NCCL's shared-memory transport fails in
+  the guest, so its fastest path is unreachable); the rest shows up even with
+  identical NCCL settings on both sides and is **not yet explained**. Single-GPU
+  serving is at parity
   ([numbers](#multi-gpu-serving-correct-not-yet-fast)).
 - **Frameworks that pin large host buffers pay a penalty.** Registering pinned
   memory is slower than native and a single registration is capped at 2 GiB —
@@ -505,12 +507,19 @@ also slow:
 | CUDA graphs | 36.0 | 13.3 tok/s | 0.37x |
 | host's best configuration | 115.7 | not reachable | 0.12x |
 
-The collectives are not the problem — matched, the guest matches or beats the
-host on both bandwidth and latency, and an NCCL world=6 check passes on both
-sides. The cause is a **guest-only bug**: NCCL's shared-memory transport fails
-in `cuMemImportFromShareableHandle`, so `NCCL_SHM_DISABLE=1` is required and the
-host's fastest path is unavailable in the guest. Single-GPU serving is
-unaffected.
+Note the first two rows have `NCCL_SHM_DISABLE=1` on **both** sides, so most of
+this gap is not explained by the SHM bug below — with identical NCCL settings
+the guest is still 3-5x slower, and **we do not yet know why**. The collectives
+themselves are not it: matched, the guest matches or beats the host on both
+bandwidth and latency, and an NCCL world=6 check passes on both sides.
+
+What the third row shows is a separate, **confirmed guest-only bug**: NCCL's
+shared-memory transport fails in `cuMemImportFromShareableHandle`, so
+`NCCL_SHM_DISABLE=1` is required in the guest and the host's fastest
+configuration is simply unreachable there. Fixing it closes the gap between rows
+one and three; it does not by itself explain rows one and two.
+
+Single-GPU serving is unaffected.
 
 ### Fine-tuning
 
