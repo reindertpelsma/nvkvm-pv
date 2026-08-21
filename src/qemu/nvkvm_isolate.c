@@ -613,8 +613,22 @@ static int nvkvm_iso_slot_wait(struct nvkvm_isolate *iso,
 			       pthread_mutex_t *mtx, pthread_cond_t *cond,
 			       const bool *done, unsigned timeout_ms)
 {
-	const uint32_t id0 = iso->id;
+	uint32_t id0;
 	struct timespec end;
+
+	/*
+	 * A-14: id/in_use/alive are documented as protected by iso->lock, so
+	 * both the snapshot here and the re-check below take it.  The lock
+	 * order this establishes (mtx -> iso->lock) is the one the file already
+	 * uses: nvkvm_iso_slot_wait_or_die() calls nvkvm_isolate_declare_dead()
+	 * with `mtx` held, and that takes iso->lock.  Nothing anywhere takes a
+	 * sync/present/xiso/loop slot lock while holding iso->lock, and this
+	 * function is never called with mtx == &iso->lock, so there is no
+	 * inversion.
+	 */
+	pthread_mutex_lock(&iso->lock);
+	id0 = iso->id;
+	pthread_mutex_unlock(&iso->lock);
 
 	if (timeout_ms)
 		nvkvm_iso_deadline(&end, timeout_ms);
@@ -631,13 +645,19 @@ static int nvkvm_iso_slot_wait(struct nvkvm_isolate *iso,
 		if (*done)
 			break;
 		/*
-		 * Liveness re-check.  Read without iso->lock on purpose (same
-		 * as the pre-existing F-5 predicate in nvkvm_isolate_enter_loop):
-		 * these are plain word-sized fields, and a stale read only costs
-		 * one more slice.  The reader thread also sets the slot on death,
-		 * so this is the backstop for a reader that is itself wedged.
+		 * Liveness re-check.  Under iso->lock (A-14): these fields are
+		 * written under it by kill/declare_dead/create, so reading them
+		 * bare was a data race whose torn or stale result decides
+		 * whether a parked caller unwinds.  The reader thread also sets
+		 * the slot on death, so this is the backstop for a reader that
+		 * is itself wedged.  Once per NVKVM_ISO_WAIT_SLICE_MS, so the
+		 * added contention on a lock whose contract is "held briefly"
+		 * is nil.
 		 */
-		if (!iso->in_use || iso->id != id0 || !iso->alive)
+		pthread_mutex_lock(&iso->lock);
+		bool gone = !iso->in_use || iso->id != id0 || !iso->alive;
+		pthread_mutex_unlock(&iso->lock);
+		if (gone)
 			return -ENODEV;
 		if (timeout_ms && nvkvm_iso_deadline_passed(&end))
 			return -ETIMEDOUT;
