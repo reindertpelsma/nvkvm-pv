@@ -95,19 +95,23 @@ Not yet for untrusted multi-tenant hosting — see below.
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script |
 
-**Check you can actually use KVM before anything else.** CPU flags do not prove
-it — a container inherits the host's, so `grep vmx /proc/cpuinfo` looks healthy
-inside one that has no `/dev/kvm` at all:
+**Check you can actually open `/dev/kvm` before anything else.** That is the
+whole test — not CPU flags, which a container inherits from its host, so
+`grep vmx /proc/cpuinfo` reads healthy inside one that has no `/dev/kvm`:
 
 ```bash
-ls -l /dev/kvm          # must exist, and you must be able to open it
-systemd-detect-virt     # `kvm`/`none` fine; `docker`/`lxc` means no KVM for you
+ls -l /dev/kvm && test -w /dev/kvm && echo "KVM usable"
 ```
 
-Without `/dev/kvm`, QEMU silently falls back to software emulation (TCG). It
-will appear to work and be unusably slow, which is the most expensive way to
-find out. Cloud instances, CI runners and containers are the usual places this
-bites; nested VMs need nested virtualisation enabled on the host.
+If the device is there but not writable, you are missing the `kvm` group.
+Containers are fine **provided the device is passed in** — the
+[`docker-compose.yml`](docker-compose.yml) here does exactly that. What does not
+work is a container without it, or a VM whose host has nested virtualisation
+switched off.
+
+Without `/dev/kvm`, QEMU silently falls back to software emulation (TCG): it
+appears to work and is unusably slow, which is the most expensive way to find
+out.
 
 ## Install
 
