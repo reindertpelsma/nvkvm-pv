@@ -255,6 +255,28 @@ def purge_distro_driver(S):
               "build-essential dkms pkg-config libglvnd-dev linux-headers-$(uname -r) "
               "> /root/prereq.log 2>&1; true"), timeout=1200)
 
+    # A previous .RUN install is not a dpkg package and survives the purge
+    # above.  nvidia-installer then refuses outright:
+    #
+    #   ERROR: The installation was canceled due to the availability or
+    #   presence of an alternate driver installation.
+    #
+    # MEASURED on instance 48277346 (RTX 3090, shipped 535.288.01): both
+    # 580.95.05 and 610.43.02 downloaded and self-checked clean, then aborted
+    # with exactly that line -- which lands in the table as
+    # driver-install-failed and reads like "these drivers will not install on
+    # Ampere".  They would; the box simply had a driver we had not removed.
+    # The installer ships its own uninstaller for precisely this, so use it.
+    sh(rsh(S, "test -x /usr/bin/nvidia-uninstall && "
+              "/usr/bin/nvidia-uninstall --silent --no-questions "
+              ">> /root/purge.log 2>&1; true"), timeout=900)
+    left, _ = sh(rsh(S, "ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.* "
+                       "/usr/lib/x86_64-linux-gnu/libcuda.so.* 2>/dev/null | wc -l"),
+                 timeout=120)
+    if left.strip().isdigit() and int(left.strip()) > 0:
+        print(f"    (warning: {left.strip()} nvidia userspace libs survived the purge)",
+              flush=True)
+
 
 def installed_driver_version(S):
     """The running kernel module's version, or '' if none is loaded."""
