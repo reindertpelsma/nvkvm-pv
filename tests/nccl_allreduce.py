@@ -128,7 +128,9 @@ def main():
         # self-spawn one process per GPU
         import subprocess
         world = args.world or torch.cuda.device_count()
-        env = dict(os.environ, MASTER_ADDR="127.0.0.1", MASTER_PORT="29517",
+        env = dict(os.environ,
+                   MASTER_ADDR=os.environ.get("MASTER_ADDR", "127.0.0.1"),
+                   MASTER_PORT=os.environ.get("MASTER_PORT", "29517"),
                    WORLD_SIZE=str(world))
         procs = []
         for r in range(world):
