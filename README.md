@@ -302,10 +302,38 @@ PRIME export costs 0.07 ms. (An earlier figure of ~637 frames/s here came from
 an unthrottled configuration and is superseded by the counter-based
 measurement above, which is the one to quote.)
 
-Graphics is the one area where the guest is well short of the host rather than
-at parity: `glmark2-wayland` scores **6857 in the guest vs 21571 on the host**
-on the same box (~32%). Compute and bandwidth are at 1.00x, as above; the
-graphics present path has real overhead and is the honest number to quote.
+Graphics is the one area that is short of parity rather than at it, but far
+less so than an earlier note here claimed. Re-measured 2026-08-21 on an RTX
+3060 (driver 575.51.03) with **one** glmark2 2023.01 binary, sha256-identical on
+both sides, under headless weston on both sides, `glmark2-wayland --off-screen`
+over the full default suite:
+
+| | host | guest | ratio |
+|---|---|---|---|
+| full suite, off-screen | 32102 / 30246 | 22685 | **0.73x** |
+| full suite, off-screen, guest on `clocksource=tsc` | 32102 / 30246 | 27677 | **0.89x** |
+| full suite, windowed on the compositor | 725 | 531 | 0.73x |
+
+The GPU itself is at parity — GL fill rate is 67.618 vs 67.639 Gpix/s (1.000x)
+and draw-call submission is 66.6 ns/call on the host vs 58.8 ns in the guest.
+What costs the guest its 0.73x is two things, neither of them the present path:
+
+- **A cold first scene.** In a fresh process the guest's *first* glmark2 scene
+  runs at ~0.37x of host and every scene after it at 0.88-0.93x. It is
+  per-process, survives `--reuse-context`, and shows up as EPT violations and
+  EPT misconfigs that vanish once warm. **A single-scene glmark2 invocation
+  measures that cold path and nothing else** — the superseded "6857 vs 21571,
+  ~32%" figure is in exactly that range and should not be quoted.
+- **Non-vDSO clock reads.** Under `kvm-clock` the guest leaves the vDSO fast
+  path: `clock_gettime` costs 644.7 ns there against 49.2 ns on the host. The GL
+  driver spin-waits on a timed loop and glmark2 times every frame, so
+  short-frame scenes pay it. `clocksource=tsc` in the guest takes the suite from
+  22685 to 27677.
+
+See `tests/perf/results/glmark2_2026-08-21/RESULTS.md` for the full
+decomposition, the probes, and what was ruled out (cacheability, ioctl
+forwarding and per-frame VM exits all measured at or near parity; CUDA
+submit+sync round trip is 91.34 us guest vs 91.58 us host).
 
 ### Containers
 
