@@ -3,7 +3,7 @@
 #                 minimal KVM-only QEMU binary at /opt/qemu-nvkvm.
 #
 # This script is a CONVENIENCE, not the mechanism.  Everything it does to
-# upstream QEMU is ten patch files in patches/, applied with `git apply`;
+# upstream QEMU is nine patch files in patches/, applied with `git apply`;
 # everything it adds is a file copy.  docs/howto/build.md walks the identical
 # sequence by hand, and you can follow it instead of running this — that is the
 # point of keeping the delta as patches rather than as sed expressions.
@@ -285,14 +285,39 @@ if [ "${#NVKVM_PATCHES[@]}" -eq 0 ]; then
 fi
 
 cd "$QEMU_SRC"
-NVKVM_PENDING=()
+#
+# Apply INCREMENTALLY, not check-everything-then-apply-everything.
+#
+# The series is ordered, and later patches may touch lines that earlier ones
+# introduce -- 0010 edits code that 0009 adds to ui/sdl2.c.  Validating every
+# patch against the tree as it stands BEFORE applying any of them therefore
+# fails for the first genuinely dependent patch in the series, with a message
+# blaming the tree.  That is what happened: 0010 applies perfectly to a v9.2.0
+# tree with 0001-0009 on it, and could never apply to a pristine one.
+#
+# Atomicity is kept by rolling back on failure instead of by batching: each
+# patch is checked against the CURRENT tree, applied immediately, and recorded,
+# so a failure can reverse exactly what this run did and leave the tree as it
+# was found.
+#
+NVKVM_APPLIED=()
+NVKVM_NEW=0
 for _p in "${NVKVM_PATCHES[@]}"; do
     _name="$(basename "$_p")"
     if git apply --reverse --check "$_p" 2>/dev/null; then
         echo "  already applied: $_name"
     elif git apply --check "$_p" 2>/dev/null; then
-        NVKVM_PENDING+=( "$_p" )
+        git apply "$_p"
+        NVKVM_APPLIED+=( "$_p" )
+        NVKVM_NEW=$((NVKVM_NEW + 1))
+        echo "  applied: $_name"
     else
+        if [ "${#NVKVM_APPLIED[@]}" -gt 0 ]; then
+            echo "  rolling back ${#NVKVM_APPLIED[@]} patch(es) applied this run..." >&2
+            for (( _i=${#NVKVM_APPLIED[@]}-1; _i>=0; _i-- )); do
+                git apply --reverse "${NVKVM_APPLIED[$_i]}" 2>/dev/null || true
+            done
+        fi
         cat >&2 <<EOF
 
 ERROR: $_name neither applies to nor is already applied to
@@ -304,6 +329,9 @@ This almost always means one of:
   * the tree was hand-edited, or half-patched by an older build script;
   * the patch was edited and no longer matches upstream context.
 
+Note the series is applied in order and later patches may depend on earlier
+ones, so this is reported against the tree WITH its predecessors applied.
+
 git's own reason follows.  To start clean:
     rm -rf $QEMU_SRC && $0 --force
 EOF
@@ -312,17 +340,8 @@ EOF
     fi
 done
 
-if [ "${#NVKVM_PENDING[@]}" -eq 0 ]; then
+if [ "$NVKVM_NEW" -eq 0 ]; then
     echo "  all ${#NVKVM_PATCHES[@]} patches already applied — nothing to do."
-else
-    if ! git apply --check "${NVKVM_PENDING[@]}"; then
-        echo "ERROR: the patch series does not apply as a set — tree untouched." >&2
-        exit 1
-    fi
-    git apply "${NVKVM_PENDING[@]}"
-    for _p in "${NVKVM_PENDING[@]}"; do
-        echo "  applied: $(basename "$_p")"
-    done
 fi
 
 # ── 4. Copy nvkvm QEMU source files into hw/misc/ ─────────────────────────

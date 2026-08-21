@@ -24,7 +24,6 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | on grab, makes a relative mouse the guest's current device; on ungrab, restores the absolute one. **Not known to work** — see its header |
 | `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
 | `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. Pointer lock was **reported working** on that box; the evtest that would prove it was never read — see its header |
-| `0010-sdl2-separate-cursor-hiding-from-input-ownership.patch` | `ui/sdl2.c` | Four grab-mode defects with one root cause: `gui_grab` conflates "hiding the host cursor" with "the guest owns your input". Only an explicit grab locks; adds the keyboard grab SDL never took; one keypress is one toggle; the caption stops lying. Verified interactively on an RTX 3050. |
 
 Each patch's commit message says *why* it is there. Read those before changing
 one — several of them record a measurement (a driver version, an error code)
@@ -32,7 +31,7 @@ that is the whole justification for the change.
 
 ## Which of these should stop existing
 
-Eight of the ten carry `ui/` changes, and `ui/` is the surface we would most
+Seven of the nine carry `ui/` changes, and `ui/` is the surface we would most
 like to shed — it is generic front-end code, shared with every other QEMU user,
 and the part a reviewer has least reason to trust us with.
 
