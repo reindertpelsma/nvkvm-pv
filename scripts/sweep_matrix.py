@@ -38,6 +38,7 @@ USAGE
     ./scripts/sweep_matrix.py --search 'vms_enabled=true num_gpus=1' --limit 8
     ./scripts/sweep_matrix.py --search '...' --limit 8 --go --max-spend 5.00
     ./scripts/sweep_matrix.py --render        # re-render the table only
+    ./scripts/sweep_matrix.py --check-tree    # does the tree match HEAD? (free)
 """
 import argparse, json, os, re, subprocess, sys, time, datetime
 
@@ -302,6 +303,43 @@ def tree_stamp():
     d, _ = sh("git -C %s status --porcelain -- . ':!tests/sweep-results.json'" % REPO, timeout=30)
     return {"commit": h.strip(), "dirty_files": sorted(
         l.split(maxsplit=1)[-1] for l in d.splitlines() if l.strip())}
+
+
+def check_tree(allow_dirty=False):
+    """Refuse to spend money on a tree that is not the tree you think it is.
+
+    tree_stamp() RECORDS the dirty state, which is how the 2026-08-20 incident
+    was eventually understood -- after the boxes were rented and the bill paid.
+    Recording is not preventing.  This runs BEFORE any create, and stops a
+    sweep whose result would be uninterpretable before it costs anything.
+
+    CI cannot cover this: a CI runner checks out a clean tree by definition, so
+    the failure mode -- a long-lived worktree that has drifted from HEAD -- can
+    only be caught on the machine that is about to ship the tarball.  That is
+    here.
+
+    --allow-dirty is the deliberate escape hatch for the real case of sweeping
+    an uncommitted fix.  It is loud on purpose: the dirty files go into every
+    result record either way, so the tarball stays interpretable.
+    """
+    st = tree_stamp()
+    print(f"tree: {st['commit']}"
+          f"{' + %d uncommitted file(s)' % len(st['dirty_files']) if st['dirty_files'] else ' (clean)'}")
+    if not st["dirty_files"]:
+        return True
+    for f in st["dirty_files"]:
+        print(f"    dirty: {f}")
+    if allow_dirty:
+        print("--allow-dirty given: shipping the WORKING TREE, not "
+              f"{st['commit']}.  The files above are what differs.")
+        return True
+    print("\nREFUSING: the working tree does not match HEAD, and the sweep tars the\n"
+          "working tree.  Whatever these boxes measure will be attributed to\n"
+          f"{st['commit']}, which is not what would run.  On 2026-08-20 that shipped a\n"
+          "216-line silent revert to a paid sweep and nearly cost a week chasing a\n"
+          "regression that had already been fixed.\n\n"
+          "  commit the change, stash it, or pass --allow-dirty to ship it knowingly.")
+    return False
 
 
 def parse_contract(out):
@@ -660,6 +698,14 @@ def main():
     ap.add_argument("--list-drivers", action="store_true",
                     help="print the driver matrix and exit")
     ap.add_argument("--render", action="store_true")
+    ap.add_argument("--check-tree", action="store_true",
+                    help="print the tree that WOULD be shipped and exit non-zero "
+                         "if it differs from HEAD. Spends nothing; safe to run "
+                         "anywhere, including from another script.")
+    ap.add_argument("--allow-dirty", action="store_true",
+                    help="ship a working tree that differs from HEAD anyway. "
+                         "For sweeping an uncommitted fix on purpose -- the "
+                         "differing files are printed and recorded either way.")
     args = ap.parse_args()
     args.drivers = [x.strip() for x in args.drivers.split(",") if x.strip()]
 
@@ -671,6 +717,9 @@ def main():
         for a, f in ARCH_FLOOR.items():
             print(f"  {a:<10} {f}")
         return
+
+    if args.check_tree:
+        sys.exit(0 if check_tree(args.allow_dirty) else 1)
 
     if args.render:
         recs = json.load(open(RESULTS)) if os.path.exists(RESULTS) else []
@@ -700,7 +749,11 @@ def main():
               f"-- ignored; we install our own")
     if not args.go:
         print("\nDRY RUN — nothing rented. Re-run with --go to execute.")
+        check_tree(allow_dirty=True)   # advisory here; nothing is being spent
         return
+    # Last gate before money: is this tree the tree we think it is?
+    if not check_tree(args.allow_dirty):
+        sys.exit(1)
     if est > args.max_spend:
         print(f"\nREFUSING: estimate ${est:.2f} exceeds --max-spend ${args.max_spend:.2f}")
         return

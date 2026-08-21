@@ -34,7 +34,7 @@ OPEN_SCM_SRCS = test_open_scm.c
 
 CTRL_GATE_SRCS = test_ctrl_gate.c
 
-.PHONY: all clean run
+.PHONY: all clean run check
 
 all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate
 
@@ -75,6 +75,15 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_tables
 	./test_open_scm
 	./test_ctrl_gate
+
+# `check` is what CI runs, and what you should run too.  `run` above is the
+# raw thing: it exits non-zero because of the test_isolate drift documented
+# there, which makes it useless as a pass/fail signal.  run_tests.sh names the
+# five known-failing cases explicitly, so the suite is GREEN when exactly those
+# fail and RED for anything else -- including a suite that fails to build,
+# which plain `make` hides by aborting on the first error.
+check:
+	@bash run_tests.sh
 
 clean:
 	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate

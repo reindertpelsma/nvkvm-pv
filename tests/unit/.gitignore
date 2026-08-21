@@ -6,3 +6,4 @@ test_isolate
 test_tables
 mock_stub
 test_open_scm
+test_ctrl_gate
