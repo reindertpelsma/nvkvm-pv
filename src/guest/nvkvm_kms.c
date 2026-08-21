@@ -32,9 +32,65 @@
 
 #include "nvkvm.h"
 
-#define NVKVM_KMS_W   1920
-#define NVKVM_KMS_H   1080
-#define NVKVM_KMS_HZ  60
+/*
+ * The virtual head's mode.  These were compile-time constants, which made
+ * 1920x1080 a property of the binary rather than of the deployment -- wrong for
+ * anyone whose panel is not that, and wrong for a headless guest streaming to
+ * something with its own idea of a resolution.
+ *
+ * Guest-side only, deliberately: QEMU sizes its console from whatever the guest
+ * actually scans out (nvkvm_present calls qemu_console_resize() before
+ * presenting), so nothing on the host needs telling.
+ *
+ * 0444 -- read-only after load.  A mode change would have to renegotiate with
+ * every client already holding a framebuffer, which is a different feature.
+ * Set them at insmod, or in a modprobe.d conf:
+ *
+ *     options nvkvm-guest kms_width=2560 kms_height=1440 kms_hz=60
+ */
+#define NVKVM_KMS_W_DEFAULT   1920
+#define NVKVM_KMS_H_DEFAULT   1080
+#define NVKVM_KMS_HZ_DEFAULT  60
+
+/* Bounds are sanity, not policy: reject a value that would make the mode list
+ * or the vblank timer nonsense, and fall back rather than refuse to load. */
+#define NVKVM_KMS_MIN         64u
+#define NVKVM_KMS_MAX         16384u
+#define NVKVM_KMS_HZ_MIN      1u
+#define NVKVM_KMS_HZ_MAX      1000u
+
+static unsigned int nvkvm_kms_w  = NVKVM_KMS_W_DEFAULT;
+static unsigned int nvkvm_kms_h  = NVKVM_KMS_H_DEFAULT;
+static unsigned int nvkvm_kms_hz = NVKVM_KMS_HZ_DEFAULT;
+
+module_param_named(kms_width, nvkvm_kms_w, uint, 0444);
+MODULE_PARM_DESC(kms_width, "virtual head width in pixels (default 1920)");
+module_param_named(kms_height, nvkvm_kms_h, uint, 0444);
+MODULE_PARM_DESC(kms_height, "virtual head height in pixels (default 1080)");
+module_param_named(kms_hz, nvkvm_kms_hz, uint, 0444);
+MODULE_PARM_DESC(kms_hz, "virtual head refresh rate in Hz (default 60)");
+
+static void nvkvm_kms_clamp_mode(void)
+{
+	if (nvkvm_kms_w < NVKVM_KMS_MIN || nvkvm_kms_w > NVKVM_KMS_MAX) {
+		pr_warn("nvkvm: kms_width=%u out of range [%u,%u], using %u\n",
+			nvkvm_kms_w, NVKVM_KMS_MIN, NVKVM_KMS_MAX,
+			NVKVM_KMS_W_DEFAULT);
+		nvkvm_kms_w = NVKVM_KMS_W_DEFAULT;
+	}
+	if (nvkvm_kms_h < NVKVM_KMS_MIN || nvkvm_kms_h > NVKVM_KMS_MAX) {
+		pr_warn("nvkvm: kms_height=%u out of range [%u,%u], using %u\n",
+			nvkvm_kms_h, NVKVM_KMS_MIN, NVKVM_KMS_MAX,
+			NVKVM_KMS_H_DEFAULT);
+		nvkvm_kms_h = NVKVM_KMS_H_DEFAULT;
+	}
+	if (nvkvm_kms_hz < NVKVM_KMS_HZ_MIN || nvkvm_kms_hz > NVKVM_KMS_HZ_MAX) {
+		pr_warn("nvkvm: kms_hz=%u out of range [%u,%u], using %u\n",
+			nvkvm_kms_hz, NVKVM_KMS_HZ_MIN, NVKVM_KMS_HZ_MAX,
+			NVKVM_KMS_HZ_DEFAULT);
+		nvkvm_kms_hz = NVKVM_KMS_HZ_DEFAULT;
+	}
+}
 
 struct nvkvm_kms {
 	struct drm_connector            conn;
@@ -84,8 +140,8 @@ static int nvkvm_conn_get_modes(struct drm_connector *conn)
 	 * and marks NONE of it preferred, so a client picks by its own
 	 * heuristics -- Xorg chose 1400x1050 on a 1920x1080 panel.  Flag the
 	 * native mode, the way vkms/virtio-gpu do. */
-	count = drm_add_modes_noedid(conn, NVKVM_KMS_W, NVKVM_KMS_H);
-	drm_set_preferred_mode(conn, NVKVM_KMS_W, NVKVM_KMS_H);
+	count = drm_add_modes_noedid(conn, nvkvm_kms_w, nvkvm_kms_h);
+	drm_set_preferred_mode(conn, nvkvm_kms_w, nvkvm_kms_h);
 	return count;
 }
 
@@ -484,8 +540,9 @@ int nvkvm_kms_init(struct drm_device *ddev)
 		return ret;
 	ddev->mode_config.min_width  = 0;
 	ddev->mode_config.min_height = 0;
-	ddev->mode_config.max_width  = NVKVM_KMS_W;
-	ddev->mode_config.max_height = NVKVM_KMS_H;
+	nvkvm_kms_clamp_mode();
+	ddev->mode_config.max_width  = nvkvm_kms_w;
+	ddev->mode_config.max_height = nvkvm_kms_h;
 	/* Reported as DRM_CAP_DUMB_PREFERRED_DEPTH; left at 0 a client has to
 	 * guess, and Xorg's modesetting DDX guesses by probing a scanout fb. */
 	ddev->mode_config.preferred_depth = 24;
@@ -503,7 +560,7 @@ int nvkvm_kms_init(struct drm_device *ddev)
 
 	nvkvm_hrtimer_setup(&kms->vblank, nvkvm_vblank_fn,
 			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	kms->period = ns_to_ktime(NSEC_PER_SEC / NVKVM_KMS_HZ);
+	kms->period = ns_to_ktime(NSEC_PER_SEC / nvkvm_kms_hz);
 
 	/* Ordered: presents must reach QEMU in flip order. */
 	spin_lock_init(&kms->pending_lock);
@@ -552,6 +609,6 @@ int nvkvm_kms_init(struct drm_device *ddev)
 
 	drm_mode_config_reset(ddev);
 	pr_info("nvkvm: virtual KMS head ready (%dx%d, 1 connector/crtc)\n",
-		NVKVM_KMS_W, NVKVM_KMS_H);
+		nvkvm_kms_w, nvkvm_kms_h);
 	return 0;
 }

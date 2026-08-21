@@ -250,7 +250,18 @@ export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
 pkill -f "Xwayland :2" 2>/dev/null
 sleep 1
 
-Xwayland :2 -fullscreen -geometry 1920x1080 &
+# Follow the HEAD's mode rather than asserting one.  kms_width/kms_height are
+# module parameters now, so 1920x1080 is a default, not a fact -- hardcoding it
+# here would render the desktop larger than the scanout on any guest that set
+# them.  Ask the connector nvkvm actually drives; fall back only if that fails.
+NVKVM_MODE=$(for c in /sys/class/drm/card*/card*-*/; do
+        drv=$(basename "$(readlink -f "$c/../device/driver" 2>/dev/null)" 2>/dev/null)
+        [ "$drv" = nvkvm-guest ] && head -1 "$c/modes" 2>/dev/null && break
+    done)
+[ -n "$NVKVM_MODE" ] || NVKVM_MODE=1920x1080
+echo "nvkvm head mode: $NVKVM_MODE"
+
+Xwayland :2 -fullscreen -geometry "$NVKVM_MODE" &
 for _ in $(seq 1 60); do
     [ -S /tmp/.X11-unix/X2 ] && break
     sleep 0.5
@@ -272,7 +283,7 @@ export DISPLAY=:2
 # survive a restart, because 5120x2880 is still the preferred mode and comes
 # back every time Xwayland starts.  This is the part that persists.
 for _ in $(seq 1 20); do
-    xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null && break
+    xrandr --output XWAYLAND0 --mode "$NVKVM_MODE" 2>/dev/null && break
     sleep 0.5
 done
 
@@ -286,8 +297,8 @@ done
 (
     for _ in $(seq 1 30); do
         sleep 2
-        xrandr 2>/dev/null | grep -q "current 1920 x 1080" ||
-            xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null
+        xrandr 2>/dev/null | grep -q "current ${NVKVM_MODE%x*} x ${NVKVM_MODE#*x}" ||
+            xrandr --output XWAYLAND0 --mode "$NVKVM_MODE" 2>/dev/null
     done
 ) &
 xrandr 2>/dev/null | grep -E "^(Screen |XWAYLAND0 )"   # leave the proof in the log
