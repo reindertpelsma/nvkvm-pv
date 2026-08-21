@@ -238,6 +238,22 @@ console.  Verified by booting with QEMU's default VGA present:
 Keeping the VGA also fixes the GRUB `gfxterm` stall: GRUB and the early kernel
 now have a device to draw on, and `/dev/fb0` + `fbcon` exist in the guest.
 
+![the emulated VGA boot console](../img/mint-guest-boot-console.png)
+
+That capture is the *emulated VGA* console (QEMU console 0) taken while the
+accelerated desktop was running on the nvkvm head (console 1) at the same time.
+Both are live simultaneously; there is no conflict between the two devices, and
+`tests/validate.sh` still reports 28/28 in this configuration.
+
+What is still missing is only the *automatic* handover: QEMU's front-end opens
+on console 0 and stays there, so a `-display gtk` user must switch tabs (use
+`-display gtk,show-tabs=on` to make that discoverable) once the guest desktop
+comes up.  There is no existing QEMU API for a device to ask the front-end to
+switch consoles — `ui/gtk.c` builds one notebook page per console in index
+order and never changes the current page — so real handover means either a
+front-end change or the hardware-accurate shape (nvkvm's own device exposing a
+boot framebuffer, so there is exactly one console and nothing to select).
+
 ### screendump by device id — a QEMU abort we can hit
 
 `screendump <file> nvkvm0` **kills QEMU**:
