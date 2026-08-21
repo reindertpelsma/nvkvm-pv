@@ -222,8 +222,27 @@ NVIDIA's EGL returns `EGL_BAD_PARAMETER` for that call **on bare metal too** —
 we measured host and guest side by side ([the repro](tests/repro/gbm_egl_import.c)),
 and dma-buf export itself survives the round trip perfectly. It is the
 long-standing reason `modesetting` + glamor is not the supported combination on
-NVIDIA's proprietary driver anywhere. The supported combination is NVIDIA's own
-X driver, which nvkvm does not stage into the guest yet.
+NVIDIA's proprietary driver anywhere.
+
+The combination that *is* supported on real NVIDIA hardware is NVIDIA's own X
+driver, and we tried it: staged by hand, `nvidia_drv.so` and the GLX server
+module both load and the stock `OutputClass` even matches nvkvm's head, but it
+then fails at `Failed to initialize the NVIDIA graphics device!` because it
+wants PCI BARs that nvkvm deliberately does not expose. Closing that gap would
+not be enough on its own — the NVIDIA X driver drives outputs through
+nvidia-modeset on the *real* GPU's display engine and physical connectors, so
+it is aimed at the host's display hardware rather than at nvkvm's virtual head.
+What a guest X driver should scan out to is an open design question, not a
+missing forward. [Detail](docs/internal/mint-guest-desktop.md).
+
+**A compositor in the guest can land on llvmpipe without saying so.** The VM
+boots with an emulated VGA so GRUB and the early kernel have somewhere to draw,
+which means the guest sees two DRM devices — `card0 -> bochs-drm` and
+`card1 -> nvidia`. A compositor that takes the first one it finds renders
+correctly, animates, and screenshots fine, entirely in software. Select the DRM
+node **by driver name, never by index**, and check `GL renderer` says NVIDIA
+before trusting any graphics number — indices move between configurations.
+[How](docs/howto/run.md#running-the-guest-desktop-in-a-window).
 
 **`kvm run failed Bad address`** — a GL client taking the guest down 10–60 s in
 — has **not reproduced** since: 150 s+ of continuous glmark2, a full 20-scene

@@ -307,8 +307,43 @@ env XDG_RUNTIME_DIR=/run/user/1000 LIBSEAT_BACKEND=seatd \
             --xwayland
 ```
 
-Four details here are load-bearing, and each one fails in a way that does not
+Five details here are load-bearing, and each one fails in a way that does not
 look like its cause:
+
+- **Pick the DRM node by DRIVER, never by index.** This is the one that fails
+  *silently and looks like success*, so take it first. If the VM boots with an
+  emulated VGA present -- which it does by default, so that GRUB and the early
+  kernel have somewhere to draw -- the guest has **two** DRM devices, and the
+  emulated one usually enumerates first:
+
+  ```
+  card0 -> bochs-drm      <- NOT the GPU
+  card1 -> nvidia         <- nvkvm's head
+  ```
+
+  A compositor that takes `card0` (weston's default is the first it finds) will
+  come up, composite, animate, and screenshot perfectly -- **on llvmpipe**. The
+  only tell is a line most people never read:
+
+  ```
+  EGL vendor: Mesa Project
+  GL renderer: llvmpipe (LLVM 20.1.2, 256 bits)
+  ```
+
+  Resolve it by driver instead, and pass it explicitly:
+
+  ```bash
+  for c in /sys/class/drm/card[0-9]*; do
+      [ "$(basename "$(readlink -f "$c/device/driver")")" = nvidia ] &&
+          NVCARD=$(basename "$c") && break
+  done
+  weston --backend=drm --drm-device="$NVCARD" ...
+  ```
+
+  **Always confirm `GL renderer` says NVIDIA before believing any graphics
+  result.** Card indices are not stable across configurations: with no emulated
+  VGA the same head is `card0`, so a hardcoded index is right until the day it
+  quietly is not.
 
 - **`--socket=wayland-0`, not an arbitrary name.** snapd's AppArmor profile
   permits only `/run/user/[0-9]*/wayland-[0-9]*`. With any other socket name,

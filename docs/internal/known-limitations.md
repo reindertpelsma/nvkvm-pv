@@ -454,12 +454,33 @@ launched. No regression from the security fixes is visible at the display layer.
 Two things had to be true for that measurement to mean anything, and both cost
 time to discover:
 
-- **`-vga none`.** QEMU adds a default stdvga, which becomes console 0, while
-  nvkvm's scanout console is registered second. A `-display gtk` window
+- **Console selection.** QEMU adds a default stdvga, which becomes console 0,
+  while nvkvm's scanout console is registered second. A `-display gtk` window
   therefore opens on the *text* console and shows a **black screen** while the
-  guest desktop runs perfectly on console 1 — and `screendump` silently
-  captures the 720x400 text console instead of the 1920x1080 desktop. With
-  `-vga none` nvkvm's console is the only one and both problems vanish.
+  guest desktop runs perfectly on console 1 — and a bare `screendump` captures
+  that console instead of the 1920x1080 desktop.
+
+  **This note used to say the fix was `-vga none`. It is not, and that advice
+  has been withdrawn.** Deleting the boot console costs more than it saves:
+  without it GRUB has no video device and stalls in `gfxterm` init with nothing
+  on any console to say so, and the guest gets no `/dev/fb0` for early kernel
+  messages. Both problems are *selection* problems, so name things instead of
+  removing them:
+  - `screendump <file> nvkvm0` targets our console by device id (hence `id=` in
+    `run_test_vm.sh`). Verified: bare `screendump` gives the 1280x800 boot
+    console and `screendump <file> nvkvm0` the 1920x1080 desktop, same VM.
+  - Inside the guest, select the DRM node by **driver**, not by index — with a
+    VGA present the guest sees `card0 -> bochs-drm` and `card1 -> nvidia`, and
+    a compositor taking `card0` silently renders on llvmpipe. This is the more
+    dangerous half and is now documented user-facing in `docs/howto/run.md`.
+
+  `tests/validate.sh` is 28/28 with the default VGA present. What remains open
+  is only *automatic* handover: `ui/gtk.c` builds one notebook page per console
+  in index order and never changes the current page, and there is no API for a
+  device to ask the front-end to switch. Real handover needs either a front-end
+  change or the hardware-accurate shape — nvkvm's own device carrying a boot
+  framebuffer so there is one console and nothing to select. Use
+  `-display gtk,show-tabs=on` to make the existing manual switch discoverable.
 - **A verified-animating client.** An idle compositor correctly stops flipping,
   so the rate reads ~0 with a perfectly healthy pipeline.
 
