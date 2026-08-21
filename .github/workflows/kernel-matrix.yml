@@ -44,7 +44,10 @@ jobs:
   build:
     name: guest module @ ${{ matrix.image }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # kernel_matrix.sh puts its own 1800s timeout around each container and
+    # reports "container did not run" as a failure. Give the job more than that
+    # so the script's message wins rather than Actions killing it mid-sentence.
+    timeout-minutes: 45
     strategy:
       # Every row is an independent question. Stopping the others because one
       # failed just means a second push to find out about the second failure.
