@@ -702,8 +702,12 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 		have_memfd = true;
 		if (orig_memfd >= 0) {
 			__s32 hid = guest_fd_to_handle_id(orig_memfd);
-			if (hid >= 0)
-				memcpy(aux, &hid, sizeof(hid));
+			/* FAIL CLOSED: an untranslated value would be forwarded
+			 * as a VM-global handle_id, which QEMU's cross-isolate
+			 * relay treats as an entitlement.  See nvkvm_main.c. */
+			if (hid < 0)
+				return -EBADF;
+			memcpy(aux, &hid, sizeof(hid));
 		}
 		p->nvkms_params_ptr = 0;   /* stub fills host VA at offset 8 */
 	}
@@ -774,8 +778,12 @@ static int nvkvm_drm_fwd_gem_import_nvkms_memory(struct drm_device *dev,
 		have_memfd = true;
 		if (orig_memfd >= 0) {
 			__s32 hid = guest_fd_to_handle_id(orig_memfd);
-			if (hid >= 0)
-				memcpy(aux, &hid, sizeof(hid));
+			/* FAIL CLOSED: an untranslated value would be forwarded
+			 * as a VM-global handle_id, which QEMU's cross-isolate
+			 * relay treats as an entitlement.  See nvkvm_main.c. */
+			if (hid < 0)
+				return -EBADF;
+			memcpy(aux, &hid, sizeof(hid));
 		}
 		p->nvkms_params_ptr = 0;   /* stub fills a host VA at offset 8 */
 	}

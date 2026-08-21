@@ -1468,9 +1468,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					regsurf_nfd++;
 					{
 						__s32 hid = guest_fd_to_handle_id(gfd);
-						if (hid >= 0)
-							memcpy((char *)aux_buf + off,
-							       &hid, sizeof(hid));
+						if (hid < 0)   /* fail closed */
+							return -EBADF;
+						memcpy((char *)aux_buf + off,
+						       &hid, sizeof(hid));
 					}
 				}
 			}
@@ -1515,9 +1516,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				have_export_fd = true;
 				if (gfd >= 0) {
 					__s32 hid = guest_fd_to_handle_id(gfd);
-					if (hid >= 0)
-						memcpy((char *)aux_buf + 16, &hid,
-						       sizeof(hid));
+					if (hid < 0)   /* fail closed -- see 0x3d06 below */
+						return -EBADF;
+					memcpy((char *)aux_buf + 16, &hid,
+					       sizeof(hid));
 				}
 			}
 
@@ -1548,9 +1550,21 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				have_import_fd = true;
 				if (gfd >= 0) {
 					__s32 hid = guest_fd_to_handle_id(gfd);
-					if (hid >= 0)
-						memcpy(aux_buf, &hid,
-						       sizeof(hid));
+					/* FAIL CLOSED.  guest_fd_to_handle_id()
+					 * returns -EBADF for any integer that is
+					 * not an open nvkvm fd, so letting the
+					 * untranslated value through would forward
+					 * a guest-chosen integer as a VM-global
+					 * handle_id -- and QEMU's cross-isolate
+					 * relay treats it as an entitlement.
+					 * Handle ids are sequential from 1, so it
+					 * would be guessable.  The legitimate path
+					 * never reaches this branch: a real
+					 * SCM_RIGHTS-received nvkvm fd always
+					 * translates. */
+					if (hid < 0)
+						return -EBADF;
+					memcpy(aux_buf, &hid, sizeof(hid));
 				}
 			}
 
