@@ -46,6 +46,7 @@ that it failed; those are early rows that predate the suite.
 | RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
 | A100 80GB PCIe | **Ampere GA100** (datacenter) | 580.126.09 | 580 | 28/28 \*\*\* |
 | 4x RTX 5060 | Blackwell GB206 | 580.95.05 | 580 | 28/28, `cuda_device_count 4` |
+| 6x RTX A4000 | **Ampere GA104** (workstation) | 570.124.06 | 570 | 28/28, `cuda_device_count 6` |
 
 
 \*\*\* First datacenter GA100, and it took two fixes that had been silently

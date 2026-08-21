@@ -19,7 +19,7 @@ rented for this run advertised 580.95.05 and all three came up on 575.51.03.
 | 535 | 535.43.08+, 535.86+ | — | yes (535.309.01) | already covered |
 | 545 | 545, 550.40.0x (<.53) | **545.23.08** | no | **newly booted, 28/28** |
 | 550 | 550.40.53–565 | **550.54.14** | no | **newly booted, 28/28** |
-| 570 | 570–575 | — | yes (575.51.03) | already covered |
+| 570 | 570–575 | **570.124.06** | yes (575.51.03) | already covered; 6-GPU boot 2026-08-21 |
 | 580 | 580–595 | **580.95.05, 595.84** | no | **newly booted** |
 | 610 | 610+ | **610.43.02** | no | **newly booted, 28/28** (27/28 before the cmdType-60 fix) |
 
@@ -193,11 +193,13 @@ ordinal remapping libcuda does on top of nvkvm's device list is consistent.
 
 ### Not covered
 
-Three or more GPUs; NVLink/P2P between guest GPUs; mixed GPU models in one
-host; `numa_status`, which stays `ENOENT` (as it was before this work — guest
-`nvidia-smi` probes it and tolerates its absence). Only one identity PCI device
-is created, so the guest PCI bus shows one NVIDIA card whatever the GPU count;
-CUDA/NVML/Vulkan go through RM and do not care.
+Mixed GPU models in one host; `numa_status`, which stays `ENOENT` (as it was
+before this work — guest `nvidia-smi` probes it and tolerates its absence).
+Only one identity PCI device is created, so the guest PCI bus shows one NVIDIA
+card whatever the GPU count; CUDA/NVML/Vulkan go through RM and do not care.
+
+Three-or-more GPUs and peer access between guest GPUs were open here and are
+now covered — see the 6x RTX A4000 section below.
 
 Exact strings, since a renderer check that does not print its renderer is not
 worth much:
@@ -209,6 +211,202 @@ worth much:
   and Mesa `llvmpipe`. The suite selects the NVIDIA one and would FAIL if only
   llvmpipe were present. That is not hypothetical; see the llvmpipe incident
   below.
+
+## Multi-GPU — 6x RTX A4000, 570.124.06 (measured 2026-08-21)
+
+Six GPUs in one guest: the most this project has run, and the first
+workstation-class card. Host: 6x RTX A4000 (Ampere GA104, sm_86, 16 GB each),
+driver 570.124.06, host BDFs `00:07.0`, `00:0a.0`, `00:0b.0`, `00:0d.0`,
+`00:0f.0`, `00:12.0`; guest Ubuntu 24.04 / kernel 6.8, 12 vCPU / 24 GB.
+QEMU selected **ABI profile 570** for host driver 570.124.06, as
+`docs/reference/abi-profiles.md` specifies for `566 <= major <= 579`.
+
+`validate.sh`: **28/28 PASS**, `cuda_device_count 6`. Guest `nvidia-smi -L`
+lists six A4000s whose UUIDs match the host's six exactly.
+
+### Sequential walk
+
+`tests/multi_gpu.c` over all six: **6/6 device(s) fully usable**, each with the
+guest-visible BDF equal to the host's and its own per-device bias verified
+(`bias=1000003` on device 0 through `bias=6000018` on device 5), so a
+misrouted launch could not have compared equal.
+
+### Six at once
+
+Six concurrent guest processes, one per GPU, `--device N --spin 30` so every
+process carries a *distinct* bias:
+
+```
+device 0  spin 30.0s: 699546 launches, bias=1000003, final result still correct
+device 1  spin 30.0s: 700242 launches, bias=2000006, final result still correct
+device 2  spin 30.0s: 696610 launches, bias=3000009, final result still correct
+device 3  spin 30.0s: 700641 launches, bias=4000012, final result still correct
+device 4  spin 30.0s: 702296 launches, bias=5000015, final result still correct
+device 5  spin 30.0s: 697904 launches, bias=6000018, final result still correct
+```
+
+Host during the overlap — all six cards busy simultaneously, so the six
+isolates are genuinely parallel rather than serialized behind one device:
+
+```
+0, 78 %   1, 79 %   2, 79 %   3, 79 %   4, 79 %   5, 78 %      (180 MiB each)
+```
+
+A `CUDA_VISIBLE_DEVICES` variant (six processes each pinned to one GPU, each
+therefore seeing its GPU as ordinal 0) also passed, ~930k launches per process
+over 40 s. That variant is the weaker of the two: with CVD every process shares
+`bias=1000003`, so it cannot detect a cross-GPU misroute. The `--device N` run
+above is the one that proves routing.
+
+### Peer access — host and guest agree exactly
+
+`tests/peer_gpu.c` run on the bare-metal host and in the guest. RTX A4000 has
+no NVLink connector and the six cards sit behind a PCIe host bridge (`PHB` for
+all 30 pairs in `nvidia-smi topo -m`), so no P2P is the *correct* answer:
+
+```
+MATRIX|canAccessPeer|src=0|self,0,0,0,0,0
+MATRIX|canAccessPeer|src=1|0,self,0,0,0,0
+MATRIX|canAccessPeer|src=2|0,0,self,0,0,0
+MATRIX|canAccessPeer|src=3|0,0,0,self,0,0
+MATRIX|canAccessPeer|src=4|0,0,0,0,self,0
+MATRIX|canAccessPeer|src=5|0,0,0,0,0,self
+TOTAL|pass=91 fail=0 skip=1
+VERDICT|PASS
+```
+
+The host and guest outputs are **byte-for-byte identical**, all 109 lines —
+including all 30 ordered pairs each of `cuMemcpyPeer`, `cuMemcpyPeerAsync` and
+device-to-device-via-host, every one byte-verified, and the same
+`peer_kernel SKIP` (no ordered pair reports P2P, so there is nothing to
+enable). Host says no P2P; guest says no P2P; nvkvm dropped nothing.
+
+### Render nodes
+
+The host's six NVIDIA render minors are **`renderD128`–`renderD133`,
+contiguous** — the third multi-GPU box in a row with no gap, so the
+non-contiguous renumbering path in `nvkvm_nvidia_render_minor()` is still
+unexercised anywhere. The guest exposes a single `renderD128` (graphics is one
+`drm_dev_alloc()`; compute nodes are per-GPU, `/dev/nvidia0`..`/dev/nvidia5`).
+Vulkan still enumerates all six A4000s plus llvmpipe (7 devices) because the
+ICD binds through the render node and then enumerates `/dev/nvidia*`.
+This is by design, not a shortfall.
+
+### QEMU log
+
+Clean apart from six `DENY ctrl cmd 0x00730102` lines — one per GPU, the
+`NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS` display control already recorded for
+545/550/595/610 and benign on a headless guest. No isolate deaths, no
+table-full, no map-VA errors; six devices did not strain the handle or
+mmap-token tables. Isolate sandbox reached its strongest rung
+(`auto -> namespace`).
+
+
+### Deep-learning workload: 20B tensor-parallel across all six GPUs
+
+96 GB aggregate VRAM is the point of a 6x A4000 box, so the probe is a model
+that does not fit on one card. `ibm-granite/granite-20b-code-instruct`
+(GPTBigCode, 48 heads, MQA `num_key_value_heads=1`, 38 GB bf16) is one of the
+few open models whose head count actually permits **TP=6** — 48 % 6 == 0 and
+6 % 1 == 0. Qwen2.5-14B/32B (40 heads) and starcoder2-15b (48 heads but 4 KV)
+are all TP=6-invalid; that is a model-geometry constraint, not an nvkvm limit.
+
+vLLM 0.10.2, torch 2.8.0+cu128, `--tensor-parallel-size 6`, bf16, identical
+script and model files on both sides (host path and guest 9p mount of the same
+directory).
+
+**It works: the guest runs a 20B model sharded across six GPUs and its output
+is byte-identical to the host's** under matched settings — all three sampled
+completions diff clean against `HOST_SHMOFF`. Throughput:
+
+| config (both sides identical) | host tok/s | guest tok/s | guest/host |
+|---|---|---|---|
+| eager, `NCCL_SHM_DISABLE=1` | 47.94 | 10.04 | **0.21x** |
+| CUDA graphs, `NCCL_SHM_DISABLE=1` | 36.01 | 13.30 | **0.37x** |
+| host's best (eager, SHM transport on) | **115.70** | not reachable | 0.12x |
+
+The last row is the honest headline: the guest's best (13.30) is **11.5% of the
+host's best (115.70)**, because the host may use NCCL's SHM transport and the
+guest may not — see the bug below. CUDA graphs *help* the guest (10.04 → 13.30)
+and *hurt* the host (47.94 → 36.01) at this batch size, which is what you would
+expect if per-launch forwarding is a real cost in the guest and pure overhead
+on bare metal.
+
+Collectives themselves are **not** the bottleneck. With matched settings the
+guest matches or beats the host:
+
+| world=6 all-reduce, `NCCL_SHM_DISABLE=1` | host | guest |
+|---|---|---|
+| sustained 64 MiB (aggregate payload) | 0.78 GB/s | **0.83 GB/s** |
+| 4 KiB latency | 237.9 us | 401.3 us |
+| 64 KiB latency | 753.9 us | **657.9 us** |
+| 1 MiB latency | 2528.9 us | **1653.4 us** |
+| 16 MiB latency | 19723 us | **18511 us** |
+
+`tests/nccl_allreduce.py --world 6` is VERDICT|PASS on both sides with every
+collective value-checked (all_reduce, broadcast, all_gather, reduce_scatter).
+Unlike the 4x RTX 5060 box, NCCL bootstraps fine on this host, so the host is a
+usable control here.
+
+Model load is much slower in the guest (1083 s vs 63 s) but that is a **9p
+artifact, not a GPU one**: each of the six TP workers reads all 38 GB through
+the `nvkvm_src` 9p mount, ~228 GB of 9p traffic, with QEMU pinned at ~870% CPU.
+Staging the weights on the guest's own disk would remove it.
+
+### Bug: NCCL's SHM transport fails in the guest (`cuMemImportFromShareableHandle`)
+
+**Guest-only, host is clean, so this one is ours.** With default settings any
+NCCL job of world >= 2 dies during connection setup:
+
+```
+transport/shm.cc:590 NCCL WARN Cuda failure 101 'invalid device ordinal'
+Channel 00 : 1[1] -> 0[0] via SHM/direct/direct
+```
+
+`shm.cc:590` in NCCL v2.27.3 is
+`cuMemImportFromShareableHandle(&handle, (void *)(uintptr_t)fd, type)` with
+`type == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` — the CUDA VMM
+shareable-handle import of an fd passed between ranks over a Unix socket. The
+identical stack (same torch, same NCCL 2.27.3, same six GPUs, same driver)
+completes on the bare-metal host, so this is a forwarding gap in the cuMem VMM
+export/import path, not hardware and not NCCL.
+
+Isolation is exact:
+
+| setting | guest result |
+|---|---|
+| default | **FAIL** — `Cuda failure 101` at shm.cc:590 |
+| `NCCL_P2P_DISABLE=1` alone | **FAIL** — identical error |
+| `NCCL_SHM_DISABLE=1` alone | **PASS** |
+
+So the defect is specifically the SHM transport's VMM import, not P2P (A4000
+has no P2P on either side anyway — see the peer matrix above). **Workaround:
+`NCCL_SHM_DISABLE=1`**, which restores full correctness at host-parity
+collective bandwidth, at the cost of the throughput shown in the table above.
+
+**A tempting one-line fix that does NOT work — do not retry it.** The QEMU log
+during these runs carries 60 x `DENY ctrl cmd 0x00003d08`, and `0x3d08` is
+`NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO` — the control libcuda issues
+just before `IMPORT_OBJECT_FROM_FD` to learn which device an exported fd's
+objects are parented by (`deviceInstance` / `gpuInstanceId`). That reads like
+an exact explanation for `CUDA_ERROR_INVALID_DEVICE`, and `0x3d05`/`0x3d06`
+(the export/import pair it sits between) are already allowed. It is not the
+cause: adding `0x00003d08u` to `nvkvm_ctrl_allowlist.h` and rebuilding removes
+the denial completely (`grep -c DENY /tmp/qemu.log` → 0) and NCCL still fails
+at the same `transport/shm.cc:590` with the same CUDA 101. The change was
+reverted rather than kept, since widening the allowlist that guards the host
+is not justified by a fix that does not fix anything. Whatever is wrong lives
+in the cuMem VMM export/import forwarding itself, not in the control allowlist.
+
+### Second guest-only difference: NVML after fork in vLLM workers
+
+vLLM's default `VLLM_WORKER_MULTIPROC_METHOD=fork` makes each worker call
+`nvmlDeviceGetHandleByIndex()`, which raises `NVMLError_Unknown` in the guest
+while succeeding on the host. NVML itself is healthy in the guest — a direct
+`nvmlInit()` + handle walk returns all six A4000s — so this is specific to
+NVML being used after a fork of a process that had already initialised it.
+`VLLM_WORKER_MULTIPROC_METHOD=spawn` fixes it. Not yet root-caused; recorded
+here because it is the second thing a multi-GPU DL user will hit.
 
 ## Finding: offscreen GL rendering is broken on 595 and 610
 
@@ -434,6 +632,7 @@ control commands the allowlist was generated without:
 |---|---|
 | 545.23.08 | `0x00730102`, `0x00730138` |
 | 550.54.14 | `0x00730102` |
+| 570.124.06 | `0x00730102` (6x, one per GPU) |
 | 580.95.05 | none observed |
 | 595.84 | ~~none observed~~ → `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
 | 610.43.02 | `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
