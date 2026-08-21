@@ -980,14 +980,16 @@ static void worker_thread(void *arg)
 					if (hid <= 0)
 						continue;
 					int lfd = handle_lookup((uint32_t)hid);
-					if (lfd >= 0) {
-						int32_t lfd32 = lfd;
-						__builtin_memcpy((char *)job.aux_buf + off,
-								 &lfd32, sizeof(lfd32));
-						regsurf_off[regsurf_n] = (int)off;
-						regsurf_hid[regsurf_n] = hid;
-						regsurf_n++;
+					if (lfd < 0) {
+						resp.retval = -EBADF;
+						goto send_resp;
 					}
+					int32_t lfd32 = lfd;
+					__builtin_memcpy((char *)job.aux_buf + off,
+							 &lfd32, sizeof(lfd32));
+					regsurf_off[regsurf_n] = (int)off;
+					regsurf_hid[regsurf_n] = hid;
+					regsurf_n++;
 				}
 			}
 		}
@@ -1009,13 +1011,15 @@ static void worker_thread(void *arg)
 			__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
 			if (hid > 0) {
 				int lfd = handle_lookup((uint32_t)hid);
-				if (lfd >= 0) {
-					int32_t lfd32 = lfd;
-					__builtin_memcpy(job.aux_buf, &lfd32,
-							 sizeof(lfd32));
-					drm_export_fd_off = 0;
-					drm_export_fd_hid = hid;
+				if (lfd < 0) {
+					resp.retval = -EBADF;
+					goto send_resp;
 				}
+				int32_t lfd32 = lfd;
+				__builtin_memcpy(job.aux_buf, &lfd32,
+						 sizeof(lfd32));
+				drm_export_fd_off = 0;
+				drm_export_fd_hid = hid;
 			}
 		}
 
@@ -1105,12 +1109,16 @@ static void worker_thread(void *arg)
 						 sizeof(hid));
 				export_fd_saved = hid;
 				int lfd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
-				if (lfd >= 0) {
-					int32_t lfd32 = lfd;
-					__builtin_memcpy((char *)job.aux_buf + 16,
-							 &lfd32, sizeof(lfd32));
-					export_fd_off = 16;
+				if (lfd < 0) {
+					/* Never let an unresolvable handle_id fall through as
+					 * an isolate-local fd number. */
+					resp.retval = -EBADF;
+					goto send_resp;
 				}
+				int32_t lfd32 = lfd;
+				__builtin_memcpy((char *)job.aux_buf + 16,
+						 &lfd32, sizeof(lfd32));
+				export_fd_off = 16;
 			}
 			if ((inner_cmd == 0x00003d06U ||
 			     inner_cmd == 0x00003d08U) &&
@@ -1134,12 +1142,16 @@ static void worker_thread(void *arg)
 				__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
 				export_fd_saved = hid;
 				int lfd = (hid > 0) ? handle_lookup((uint32_t)hid) : -1;
-				if (lfd >= 0) {
-					int32_t lfd32 = lfd;
-					__builtin_memcpy(job.aux_buf, &lfd32,
-							 sizeof(lfd32));
-					export_fd_off = 0;
+				if (lfd < 0) {
+					/* The guest kernel is untrusted.  Passing `hid`
+					 * unchanged would reinterpret it as whichever real fd
+					 * has that number in this isolate. */
+					resp.retval = -EBADF;
+					goto send_resp;
 				}
+				int32_t lfd32 = lfd;
+				__builtin_memcpy(job.aux_buf, &lfd32, sizeof(lfd32));
+				export_fd_off = 0;
 			}
 			if (inner_cmd == 0x0080170dU) {
 				/* NV0080_CTRL_CMD_FIFO_GET_CHANNELLIST.  Layout:
