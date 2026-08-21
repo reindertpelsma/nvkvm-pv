@@ -1319,6 +1319,38 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->ring_gpa     = 0;
 			iso->ring_kvm_slot = -1;
 			iso->ring_ready   = false;
+			/*
+			 * Reset the cross-isolate RM relay list.  It was the one
+			 * piece of per-slot state nothing cleared, and the usual
+			 * "is this still the isolate I mean" guard does not catch
+			 * it: ids are handed out modulo NVKVM_ISOLATE_MAX and the
+			 * slot index is `id % NVKVM_ISOLATE_MAX`, so a slot reused
+			 * after a full lap of the id space comes back with the
+			 * IDENTICAL id.  iso->id == isolate_id in
+			 * nvkvm_isolate_note_foreign_handle() is therefore true for
+			 * the new occupant, which inherits the dead one's list and
+			 * is told "already relayed" for handles it has never seen.
+			 * The relay is skipped, the fd never arrives, and
+			 * cross-isolate sharing (CUDA VMM shareable handles / the
+			 * NCCL SHM transport) is broken for that slot until the VM
+			 * restarts.  A guest forces it deterministically with
+			 * NVKVM_ISOLATE_MAX short-lived processes.
+			 *
+			 * Under xrm_lock because the broker runs on QEMU's pooled
+			 * IOCTL workers, not on this thread.  No cycle: the two xrm
+			 * helpers take xrm_lock and nothing else, and this is the
+			 * only place that takes it under t->lock.
+			 *
+			 * Here rather than in nvkvm_isolate_kill(): this is the one
+			 * site that claims a slot (the only `in_use = true` in the
+			 * file), so clearing here makes "a fresh occupant starts
+			 * with an empty relay list" structural rather than a
+			 * property of whichever teardown path ran last.
+			 */
+			pthread_mutex_lock(&iso->xrm_lock);
+			iso->xrm_n = 0;
+			memset(iso->xrm_handles, 0, sizeof(iso->xrm_handles));
+			pthread_mutex_unlock(&iso->xrm_lock);
 			*id_out = id;
 			return iso;
 		}

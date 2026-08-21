@@ -3887,9 +3887,36 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	 * in-window branch simply sparse_gpa_free()s it — no munmap/slot touch.
 	 * Previously this allocation was never tracked or freed → unprivileged
 	 * guest realize churn exhausted the 128 GiB window (VM-wide GPU DoS). */
-	(void)iso_mmap_alloc(req->isolate_id, gpa, /*qva=*/NULL, (size_t)len,
-			     NVKVM_IN_WINDOW_SLOT, gpa, /*stub_mirrored=*/false,
-			     /*handle_id=*/0);
+	uint32_t mmap_token = iso_mmap_alloc(req->isolate_id, gpa,
+					     /*qva=*/NULL, (size_t)len,
+					     NVKVM_IN_WINDOW_SLOT, gpa,
+					     /*stub_mirrored=*/false,
+					     /*handle_id=*/0);
+	if (mmap_token == 0) {
+		/*
+		 * Table full.  This return was discarded with a (void) cast,
+		 * which silently reintroduced the exact leak the comment above
+		 * exists to prevent: the extent goes untracked, so the reaper
+		 * never reclaims it, and the guest gets a GPA it can never
+		 * release.  Once iso_mmap_tbl is full, EVERY subsequent realize
+		 * leaked another extent -- turning a full table into the
+		 * window-exhaustion DoS rather than a bounded failure.  The
+		 * MMAP_ON_ISOLATE path a few hundred lines up checks this token
+		 * and unwinds; this one must too.
+		 *
+		 * Unwinding a realize is just the GPA extent: it rides the
+		 * sparse window's pre-installed memslot, so there is no per-mmap
+		 * memslot to remove and no standalone QEMU qva to munmap (that
+		 * is why the reaper's in-window branch only sparse_gpa_free()s
+		 * it).  The stub-side mapping lives in the isolate's own mm with
+		 * stub_mirrored=false -- normal MUNMAP_ON_ISOLATE would not
+		 * touch it either -- and is reclaimed when the isolate exits.
+		 */
+		fprintf(stderr, "nvkvm: iso_mmap_tbl full — undoing realize\n");
+		nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
+		resp->status = (uint32_t)-ENOMEM;
+		return 0;
+	}
 
 	resp->gpa_base      = gpa;
 	resp->length        = len;
