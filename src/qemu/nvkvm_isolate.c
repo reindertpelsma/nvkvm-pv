@@ -31,6 +31,7 @@
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <linux/capability.h>
 
@@ -462,38 +463,111 @@ static int nvkvm_fd_clear_of_stdio(int fd)
 	return nfd;
 }
 
-static void nvkvm_isolate_closefrom(int first)
+/*
+ * Park a /proc/self/fd directory fd for the fallback below, BEFORE the pivot.
+ *
+ * The fallback used to open "/proc/self/fd" at the point of use, which is
+ * after nvkvm_child_enter_mount_ns()/nvkvm_iso_enter_chroot() have already put
+ * the child in an empty root with no /proc.  The open therefore could not
+ * succeed there, and the old code treated that as "nothing to do" and
+ * returned.  So on any host where close_range(2) is unavailable (pre-5.9) or
+ * denied by an outer seccomp policy, closefrom did nothing at all and the stub
+ * inherited QEMU's descriptors -- the exact M6 exposure the function exists to
+ * prevent, failing OPEN.
+ *
+ * Call this in the child while /proc still resolves.  The returned dirfd is
+ * lifted clear of the fixed descriptor range that nvkvm_child_park_drm_fds()
+ * and NVKVM_DEV_DIRFD dup2() into, so parking cannot silently overwrite it.
+ * Returns -1 if /proc is unavailable; the caller then relies on close_range or
+ * the RLIMIT_NOFILE loop.
+ */
+static int nvkvm_isolate_open_procfd(void)
+{
+	int dfd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dfd < 0)
+		return -1;
+
+	int minfd = NVKVM_DRM_FD(NVKVM_DRM_FD_MAX - 1) + 1;
+	if (dfd < minfd) {
+		int high = fcntl(dfd, F_DUPFD_CLOEXEC, minfd);
+		close(dfd);
+		dfd = high;
+	}
+	return dfd;
+}
+
+/*
+ * Returns 0 if every inherited fd at or above `first` is now closed, -1 if
+ * that could not be established.  `procfd` is the dirfd from
+ * nvkvm_isolate_open_procfd() (may be -1); this function consumes it.
+ *
+ * -1 is not advisory.  The caller must _exit() rather than exec the stub:
+ * "we could not prove the descriptors are gone" and "the descriptors are gone"
+ * are not the same statement, and only one of them is safe to exec on.
+ */
+static int nvkvm_isolate_closefrom(int first, int procfd)
 {
 	long r = syscall(__NR_close_range, first, ~0U, 0);
 	if (r == 0)
-		return;
-	/* Fallback: iterate /proc/self/fd.  We can't use opendir here
-	 * (allocates), so dump a getdents64 buffer.  Best-effort. */
-	int dfd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (dfd < 0)
-		return;
-	char buf[4096];
-	while (1) {
-		long n = syscall(__NR_getdents64, dfd, buf, sizeof(buf));
-		if (n <= 0)
-			break;
-		for (long off = 0; off < n; ) {
-			struct linux_dirent64 {
-				unsigned long  d_ino;
-				long           d_off;
-				unsigned short d_reclen;
-				unsigned char  d_type;
-				char           d_name[];
-			} *de = (void *)(buf + off);
-			off += de->d_reclen;
-			if (de->d_name[0] == '.')
-				continue;
-			int fd = atoi(de->d_name);
-			if (fd >= first && fd != dfd)
-				close(fd);
+		return 0;
+
+	/* Fallback 1: walk the dirfd parked before the pivot.  We can't use
+	 * opendir here (allocates), so dump a getdents64 buffer.  This is exact
+	 * -- it names every open descriptor -- so it is preferred over the
+	 * RLIMIT_NOFILE sweep below when it completes. */
+	int dfd = procfd;
+	if (dfd >= 0) {
+		bool failed = false;
+		char buf[4096];
+		while (1) {
+			long n = syscall(__NR_getdents64, dfd, buf, sizeof(buf));
+			if (n == 0)
+				break;
+			/* A short read is end-of-directory; an error is NOT, and
+			 * the old `n <= 0` conflated the two and reported success
+			 * for a failed walk. */
+			if (n < 0) {
+				failed = true;
+				break;
+			}
+			for (long off = 0; off < n; ) {
+				struct linux_dirent64 {
+					unsigned long  d_ino;
+					long           d_off;
+					unsigned short d_reclen;
+					unsigned char  d_type;
+					char           d_name[];
+				} *de = (void *)(buf + off);
+				if (de->d_reclen == 0 ||
+				    off + de->d_reclen > n) {
+					failed = true;
+					break;
+				}
+				off += de->d_reclen;
+				if (de->d_name[0] == '.')
+					continue;
+				int fd = atoi(de->d_name);
+				if (fd >= first && fd != dfd)
+					close(fd);
+			}
+			if (failed)
+				break;
 		}
+		close(dfd);
+		if (!failed)
+			return 0;
 	}
-	close(dfd);
+
+	/* Fallback 2: a finite RLIMIT_NOFILE still bounds the descriptor space,
+	 * so closing every number in it is complete, if slower.  An infinite or
+	 * unreadable limit gives no such bound -- report failure instead of
+	 * pretending. */
+	struct rlimit lim;
+	if (getrlimit(RLIMIT_NOFILE, &lim) != 0 || lim.rlim_cur == RLIM_INFINITY)
+		return -1;
+	for (rlim_t fd = (rlim_t)first; fd < lim.rlim_cur; fd++)
+		close((int)fd);
+	return 0;
 }
 
 /* ── Bounded waits (audit F1-1 / F2-1, hang audit 2026-08) ───────────────── */
@@ -1691,6 +1765,10 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 * every DRM ioctl with EINVAL.  See the --drm-fds argv
 			 * below, which stops the stub guessing either way. */
 			unsigned drm_n = nvkvm_child_park_drm_fds();
+			/* Park the /proc dirfd for closefrom's fallback while
+			 * /proc still resolves -- after the pivot below it does
+			 * not.  See nvkvm_isolate_open_procfd(). */
+			int procfd = nvkvm_isolate_open_procfd();
 			/* Empty RO mount ns (parks /dev O_PATH at NVKVM_DEV_DIRFD). */
 			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
@@ -1710,7 +1788,8 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 						close(NVKVM_DEV_DIRFD);
 					keep = NVKVM_DRM_FD(drm_n - 1) + 1;
 				}
-				nvkvm_isolate_closefrom(keep);
+				if (nvkvm_isolate_closefrom(keep, procfd) < 0)
+					_exit(126);
 			}
 			/* no_new_privs + bounding set, while CAP_SETPCAP is still
 			 * held; then the uid drop (needs CAP_SETUID, which it then
@@ -1804,6 +1883,10 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 * every DRM ioctl with EINVAL.  See the --drm-fds argv
 			 * below, which stops the stub guessing either way. */
 			unsigned drm_n = nvkvm_child_park_drm_fds();
+			/* Park the /proc dirfd for closefrom's fallback while
+			 * /proc still resolves -- after the pivot below it does
+			 * not.  See nvkvm_isolate_open_procfd(). */
+			int procfd = nvkvm_isolate_open_procfd();
 			if (use_ns && nvkvm_child_enter_mount_ns() < 0)
 				_exit(126);
 			if (use_chroot && nvkvm_iso_enter_chroot(NVKVM_DEV_DIRFD) < 0)
@@ -1819,7 +1902,8 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 						close(NVKVM_DEV_DIRFD);
 					keep = NVKVM_DRM_FD(drm_n - 1) + 1;
 				}
-				nvkvm_isolate_closefrom(keep);
+				if (nvkvm_isolate_closefrom(keep, procfd) < 0)
+					_exit(126);
 			}
 			if (harden)
 				nvkvm_drop_caps_pre();
