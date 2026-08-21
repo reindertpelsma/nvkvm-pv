@@ -489,24 +489,27 @@ At temperature 0 the guest produced **token-id identical** output to the host on
 all three tasks (long-chain reasoning, C11 lock-free ring codegen, 8k-token
 summarisation).
 
-### Multi-GPU serving: correct, not yet fast
+### Multi-GPU serving: correct, and no longer forced off the fast path
 
 vLLM with `--tensor-parallel-size 6` on six RTX A4000s runs a 38 GB model that
 does not fit on any one 16 GB card, and the guest's output is **byte-identical
-to the host's** under matched settings. So it works and it is correct. It is
-also slow:
+to the host's** under matched settings. So it works and it is correct.
 
-| identical flags on both sides | host | guest | ratio |
-|---|---|---|---|
-| eager | 47.9 | 10.0 tok/s | 0.21x |
-| CUDA graphs | 36.0 | 13.3 tok/s | 0.37x |
-| host's best configuration | 115.7 | not reachable | 0.12x |
+It used to also be *slow for a specific, fixable reason*: NCCL's shared-memory
+transport failed in the guest inside `cuMemImportFromShareableHandle`, so every
+world>=2 NCCL job needed `NCCL_SHM_DISABLE=1` and the host's fastest path was
+simply unavailable. **That bug is fixed** (2026-08-21) — the CUDA VMM
+shareable-handle fd is now brokered across isolates the same way #110 brokers
+dma-bufs. NCCL world=6 passes in the guest with **default settings**, and the
+SHM transport being available roughly doubles collective bandwidth:
 
-The collectives are not the problem — matched, the guest matches or beats the
-host on both bandwidth and latency, and an NCCL world=6 check passes on both
-sides. The cause is a **guest-only bug**: NCCL's shared-memory transport fails
-in `cuMemImportFromShareableHandle`, so `NCCL_SHM_DISABLE=1` is required and the
-host's fastest path is unavailable in the guest. Single-GPU serving is
+| world=6 all-reduce, 64 MiB sustained | before (`NCCL_SHM_DISABLE=1`) | after (default) |
+|---|---|---|
+| guest aggregate payload | 0.83 GB/s | **1.52 GB/s** |
+
+There is still a residual multi-GPU serving gap that is **not** explained by
+this bug — it shows up with `NCCL_SHM_DISABLE=1` on *both* sides, so it is a
+separate issue and is being investigated separately. Single-GPU serving is
 unaffected.
 
 ### Fine-tuning

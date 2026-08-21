@@ -295,6 +295,97 @@ path is the DRM one above — but the constant is wrong if anyone re-enables it.
   libnvidia-allocator" on every current box and left the GBM backend as
   Mesa/llvmpipe. Now auto-detects, as `stage_guest_libs.sh` does.
 
+## The same shape again: RM export/import (CUDA VMM shareable handles)
+
+**Resolved 2026-08-21.** The design above was written for dma-bufs and a
+compositor. The identical problem turned up in a completely different consumer
+— NCCL's shared-memory transport — and the same answer worked, which is the
+useful thing to record here.
+
+`cuMemExportToShareableHandle(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR)` parks
+an RM object on a freshly-opened `/dev/nvidiactl` fd via RM control **0x3d05**
+(fd at inner offset 16). The exporter hands that fd to a peer **process** over a
+Unix socket with `SCM_RIGHTS`; the peer then calls **0x3d08**
+(`GET_EXPORT_OBJECT_INFO`) and **0x3d06** (`IMPORT_OBJECT_FROM_FD`), both with
+the fd at inner offset 0. That is NCCL v2.27.3 `transport/shm.cc:590`, and it is
+what every world>=2 NCCL job does during connection setup.
+
+The order is MEASURED, not assumed — `tools/nv_ioctl_trace.c` on the bare-metal
+host:
+
+```
+exporter  TRACE OPEN  fd=54 path=/dev/nvidiactl
+exporter  TRACE CTRL  cmd=0x00003d05 params[24]=01000000 0200005c 0200005c b000005c 36000000 ...
+                                                                          ^^^^^^^^ fd=0x36=54 @16
+importer  TRACE CTRL  cmd=0x00003d08 params[80]
+importer  TRACE CTRL  cmd=0x00003d06 params[20]=37000000 01000000 0200005c 0200005c b000005c
+                                               ^^^^^^^^ fd=0x37=55 @0
+```
+
+Two guest processes are two isolates, so this is exactly the situation at the
+top of this page: the guest kernel rewrites the embedded fd to a VM-global
+`handle_id` (so no guest fd number and no guest VA crosses the boundary), but
+the fd behind that handle was opened by the **exporter's** stub, and the
+importer stub's `handle_lookup()` missed.
+
+Three things were wrong, and the first two are what made this look like an
+allowlist problem when it was not:
+
+| | symptom |
+|---|---|
+| guest never translated the fd for 0x3d08 (only 0x3d05/0x3d06) | a raw guest fd *number* forwarded to a stub where it means something else |
+| 0x3d08 not in `nvkvm_ctrl_allowlist.h` | `DENY` x6 per import; libcuda gave up before ever issuing 0x3d06 |
+| the handle named a **foreign isolate's** fd | the real defect |
+
+**Allowing 0x3d08 alone is a non-fix** — that was tried, recorded in
+`tests/BOOT_MATRIX.md`, and correctly reverted. It is necessary but not
+sufficient, and the fd relay is the other half. Both halves land together or
+neither does.
+
+### Why no new mechanism was needed
+
+QEMU already holds a copy of every handle's fd (`struct nvkvm_handle.fd`), so
+unlike the dma-buf case there is not even a stub round-trip to arrange: the
+broker is `ISOLATE_CMD_RECEIVE_FD`, which already exists, relaying a dup into
+the importing stub. The stub's existing `handle_lookup()` then resolves it on
+the 0x3d05/0x3d06 path that was already there. The whole cross-isolate half is
+`nvkvm_xrm_materialise()` in `src/qemu/nvkvm_isolate_handlers.c`.
+
+Confinement is the same argument as for xiso and is structural rather than
+checked: `nv->handles` hangs off the per-guest `VirtIONvgpu`, so there is no
+namespace in which one guest could name another guest's handle. QEMU re-derives
+the owning isolate from the handle itself rather than trusting anything the
+guest said about it. Within the VM, entitlement stays the guest kernel's call
+and is enforced by fd possession — the importer can only name this handle
+because it was handed a real fd through a real kernel fd-passing mechanism.
+
+Relays are recorded per isolate (`xrm_handles`) because the stub's
+`handle_store()` overwrites without closing: pushing a second dup of the same
+handle would leak the first inside the stub.
+
+### Evidence
+
+`tests/repro/cumem_export_import.c` is the oracle — the smallest thing that does
+export / `SCM_RIGHTS` / import across two *separate* processes. It `dlopen`s
+libcuda and declares the entry points itself, so the same binary runs on the
+host and in the guest with no CUDA toolkit installed.
+
+Measured on 6x RTX A4000, driver 570.124.06:
+
+| | host | guest before | guest after |
+|---|---|---|---|
+| `cuMemImportFromShareableHandle` (same GPU) | PASS | **FAIL** CUDA 101 | **PASS** |
+| 2 MiB readback of the exporter's pattern | 0 mismatch | — | **0 mismatch** |
+| cross-GPU (dev0 -> dev1) | import OK, `cuMemSetAccess` 101 | import FAIL | import OK, `cuMemSetAccess` 101 |
+
+The cross-GPU row is host *parity*, not a bug: the A4000 has no P2P, so mapping
+device-0 memory for device-1 access is invalid on this hardware on both sides.
+Import succeeding and `cuMemSetAccess` then failing is what the host does too.
+
+Note the readback: import returning success is not sufficient evidence, for the
+same reason it was not in Rung 2 above — the importer has to be shown looking at
+the *exporter's bytes*. It is.
+
 ## Reproducing
 
 In the guest, after `stage_guest_libs.sh` and `stage_gbm_backend.sh`:

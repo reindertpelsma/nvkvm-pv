@@ -384,19 +384,79 @@ has no P2P on either side anyway — see the peer matrix above). **Workaround:
 `NCCL_SHM_DISABLE=1`**, which restores full correctness at host-parity
 collective bandwidth, at the cost of the throughput shown in the table above.
 
-**A tempting one-line fix that does NOT work — do not retry it.** The QEMU log
-during these runs carries 60 x `DENY ctrl cmd 0x00003d08`, and `0x3d08` is
-`NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO` — the control libcuda issues
-just before `IMPORT_OBJECT_FROM_FD` to learn which device an exported fd's
-objects are parented by (`deviceInstance` / `gpuInstanceId`). That reads like
-an exact explanation for `CUDA_ERROR_INVALID_DEVICE`, and `0x3d05`/`0x3d06`
-(the export/import pair it sits between) are already allowed. It is not the
-cause: adding `0x00003d08u` to `nvkvm_ctrl_allowlist.h` and rebuilding removes
-the denial completely (`grep -c DENY /tmp/qemu.log` → 0) and NCCL still fails
-at the same `transport/shm.cc:590` with the same CUDA 101. The change was
-reverted rather than kept, since widening the allowlist that guards the host
-is not justified by a fix that does not fix anything. Whatever is wrong lives
-in the cuMem VMM export/import forwarding itself, not in the control allowlist.
+**FIXED 2026-08-21 — see the branch `nccl-shm-fix`.** The three sentences below
+are kept because the dead end they describe is still a dead end *on its own*,
+and because it is the clue that pointed at the real defect.
+
+The QEMU log during these runs carries 60 x `DENY ctrl cmd 0x00003d08`, and
+`0x3d08` is `NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO` — the control
+libcuda issues just before `IMPORT_OBJECT_FROM_FD` to learn which device an
+exported fd's objects are parented by. Adding `0x00003d08u` to
+`nvkvm_ctrl_allowlist.h` and rebuilding removes the denial completely
+(`grep -c DENY /tmp/qemu.log` -> 0) and NCCL still fails at the same
+`transport/shm.cc:590` with the same CUDA 101. **That remains true.** Allowing
+0x3d08 is *necessary but not sufficient*, which is why allowing it alone looked
+like a refutation of the whole idea.
+
+What the earlier attempt was missing is that there are **three** faults on this
+path, not one, and they only disappear together:
+
+1. the guest never translated the embedded fd for 0x3d08 at all (it handled
+   only 0x3d05 @16 and 0x3d06 @0), so a raw guest fd *number* was forwarded to a
+   stub in which it means something else — the control reached the driver and
+   came back `NV_ERR_INVALID_PARAMETER` (0x3b);
+2. 0x3d08 was not in the control allowlist, so it was denied before that could
+   even be observed;
+3. **the real defect:** the fd names an object parked in the *exporter's*
+   isolate, and the importer is a different guest process, hence a different
+   isolate with a different stub and a different RM client. The importer stub's
+   `handle_lookup()` missed.
+
+Fault 3 is the #110 cross-isolate problem in a second guise, and it takes the
+answer `docs/internal/cross-isolate-sharing.md` already documents: QEMU is the
+broker. QEMU already holds a copy of every handle's fd, so
+`ISOLATE_CMD_RECEIVE_FD` relays a dup into the importing stub and the existing
+0x3d05/0x3d06 translation resolves it. See that page for the design, the host
+ioctl trace the offsets were read off, and the confinement argument.
+
+Oracle: `tests/repro/cumem_export_import.c` — two separate processes, export /
+`SCM_RIGHTS` / import, `dlopen`ing libcuda so the same binary runs on both
+sides. On this box (6x A4000, 570.124.06):
+
+| | host | guest before | guest after |
+|---|---|---|---|
+| `cuMemImportFromShareableHandle` | PASS | **FAIL** CUDA 101 | **PASS** |
+| 2 MiB readback of exporter's pattern | 0 mismatch | — | **0 mismatch** |
+
+`tests/validate.sh` after the fix: **28/28 PASS, 0 FAIL, 0 SKIP**.
+
+NCCL itself, re-measured in the guest on the same box with the *default*
+settings that previously always failed (vLLM 0.10.2, torch 2.8.0+cu128, NCCL
+2.27.3 — the identical stack that produced the failure above):
+
+```
+CHECK|nccl_all_reduce|PASS|10 iters x 1048576 fp32 elems across 6 GPUs, every element == 21
+CHECK|nccl_broadcast|PASS|1048576 elems from rank 0 identical on all ranks
+CHECK|nccl_all_gather|PASS|6 slices each tagged with its owning rank
+CHECK|nccl_reduce_scatter|PASS|each rank's slice == 21
+CHECK|nccl_sustained|PASS|20 all_reduce of 64 MiB in 881 ms (1.52 GB/s aggregate payload)
+VERDICT|PASS
+```
+
+Note the bandwidth: **1.52 GB/s** with the SHM transport available, against the
+**0.83 GB/s** recorded above under `NCCL_SHM_DISABLE=1`. That is the throughput
+this bug was costing at the collective level.
+
+A partial TP=6 serving measurement was taken before this line of work was handed
+off (8 prompts x 256 greedy tokens, `VLLM_WORKER_MULTIPROC_METHOD=spawn` and 16
+CPUs on both sides): **guest 140.15 tok/s vs host 163.57 tok/s, eager, both with
+the SHM transport on and neither using `NCCL_SHM_DISABLE=1`**. It is recorded as
+a data point, not as the closing number — the remaining matched-flags gap is a
+separate investigation. One caveat that deserves following up rather than
+burying: the generated text hashes differed between host and guest in that run,
+where the earlier `NCCL_SHM_DISABLE=1` comparison reported byte-identical
+output. That was not chased down and should not be read as either a
+confirmation or a refutation of output parity on the SHM path.
 
 ### Second guest-only difference: NVML after fork in vLLM workers
 
