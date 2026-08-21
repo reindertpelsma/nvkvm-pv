@@ -579,6 +579,12 @@ GPU-accelerated through NVIDIA's own GLX vendor library:
 The 5x gap against llvmpipe is what rules out a silent software fallback; the
 renderer string on its own would not.
 
+![XFCE on the nvkvm head, guest Xorg, AccelMethod none](../img/guest-xorg-noaccel-xfce.png)
+
+The xterm in that capture is running `glxinfo -B` *without* the two variables,
+so it honestly shows `llvmpipe` while the glxgears window beside it is on the
+RTX 3070 — that is the whole shape of this configuration in one screenshot.
+
 Three things about this that matter:
 
 - **It does not need the distro's `10-nvidia.conf` removed.**  An explicit
