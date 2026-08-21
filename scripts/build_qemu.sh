@@ -420,6 +420,69 @@ print("  ui/egl-helpers.c patched.")
 EGLPATCH
 fi
 
+# ── 6c. Patch ui/console.c: do not abort when a console has no "device" ──────
+#
+# `screendump <file> nvkvm0` killed QEMU outright:
+#
+#   Unexpected error in object_property_find_err() at ../qom/object.c:1349:
+#   Property 'qemu-fixed-text-console.device' not found
+#
+# qemu_console_lookup_by_device() walks EVERY console and reads the "device"
+# link with &error_abort.  But "device" (and "head") are class properties of
+# qemu-graphic-console only -- text consoles never have them -- so the walk
+# aborts the moment it steps over a text console on the way to the console it
+# was asked for.  The sibling loop at qemu_graphic_console_lookup_unused()
+# already guards with QEMU_IS_GRAPHIC_CONSOLE(); this one simply forgot.
+#
+# It is order-dependent, not device-specific: a VGA whose console happens to be
+# first in the list is found before the walk reaches any text console and so
+# survives, which is exactly why this went unnoticed.  nvkvm's console is
+# registered later and sits behind one.
+#
+# Non-graphic consoles can never be the answer here anyway, so skipping them is
+# both the minimal fix and the upstream-shaped one.
+echo "[6c/9] Patching ui/console.c for console lookup abort..."
+if grep -q "nvkvm: .device. and .head. are class properties" "$QEMU_SRC/ui/console.c"; then
+    echo "  console.c already patched -- skipping."
+else
+    python3 - "$QEMU_SRC/ui/console.c" <<'CONPATCH'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = """    QTAILQ_FOREACH(con, &consoles, next) {
+        obj = object_property_get_link(OBJECT(con),
+                                       "device", &error_abort);
+        if (DEVICE(obj) != dev) {
+            continue;
+        }
+        h = object_property_get_uint(OBJECT(con),
+                                     "head", &error_abort);"""
+new = """    QTAILQ_FOREACH(con, &consoles, next) {
+        /* nvkvm: "device" and "head" are class properties of
+         * qemu-graphic-console ONLY.  Text consoles do not have them, and both
+         * reads below pass &error_abort -- so walking past a text console on
+         * the way to the requested one aborts QEMU ("Property
+         * 'qemu-fixed-text-console.device' not found").  A device whose
+         * console happens to come first is found before the walk gets there,
+         * which is why this is order-dependent rather than device-specific.
+         * A non-graphic console can never be the match, so skip it. */
+        if (!QEMU_IS_GRAPHIC_CONSOLE(con)) {
+            continue;
+        }
+        obj = object_property_get_link(OBJECT(con),
+                                       "device", &error_abort);
+        if (DEVICE(obj) != dev) {
+            continue;
+        }
+        h = object_property_get_uint(OBJECT(con),
+                                     "head", &error_abort);"""
+if old not in src:
+    sys.exit("console.c: qemu_console_lookup_by_device() body not found as expected")
+open(path, 'w').write(src.replace(old, new, 1))
+print("  ui/console.c patched.")
+CONPATCH
+fi
+
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────
 #
 # Window backends are OFF by default: the normal deployment is headless (a

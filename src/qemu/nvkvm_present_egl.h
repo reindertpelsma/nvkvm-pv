@@ -40,6 +40,17 @@ struct VirtIONvgpu;
 struct DeviceState;
 int  nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv);
 void nvkvm_present_console_fini(struct VirtIONvgpu *nv);
+/* Re-point the scanout console's "device" link at `dev`.
+ *
+ * graphic_console_init() binds the console to the device that registered it —
+ * for us the inner virtio device, which carries no user-visible id.  But
+ * `-device virtio-nvgpu-pci-...,id=X` puts X on the PCI PROXY, and QEMU's
+ * screendump resolves X to the proxy and then asks which console is bound to
+ * it.  Without this the answer is "none" and screendump cannot name our
+ * console at all.  hw/display/virtio-gpu-pci.c does exactly the same re-point
+ * for the same reason; this is that idiom, not a workaround. */
+void nvkvm_present_console_set_device(struct VirtIONvgpu *nv,
+                                      struct DeviceState *dev);
 /* Hand a freshly exported scanout dma-buf to the console.  TAKES OWNERSHIP of
  * `dmabuf_fd` (closes it when the frame is retired).  Returns true if the fd
  * was accepted (caller must not close it), false if the console is inactive
