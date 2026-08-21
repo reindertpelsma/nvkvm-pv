@@ -151,41 +151,6 @@ Verified end to end on an RTX 3060: cold `docker compose up` to `nvidia-smi`
 inside the guest, surviving a guest reboot and a guest `apt` install of a
 conflicting NVIDIA package.
 
-## Continuous integration
-
-Everything that can be checked without a GPU is checked on every push, in about
-a minute:
-
-| Workflow | What it is for |
-|---|---|
-| [`ci.yml`](.github/workflows/ci.yml) | The unit suite, a two-second compile check over `src/qemu/`, and `shellcheck` on `scripts/` |
-| [`kernel-matrix.yml`](.github/workflows/kernel-matrix.yml) | Builds `nvkvm-guest.ko` against seven distro kernels — both ends of the supported 5.15–7.0 range, plus a non-Debian toolchain |
-| [`qemu-build.yml`](.github/workflows/qemu-build.yml) | The full `build_qemu.sh` — nightly and on `main`, because it takes ~35 minutes |
-
-Run the fast lane yourself:
-
-```bash
-bash tests/unit/run_tests.sh        # or: make -C tests/unit check
-bash tests/qemu_syntax_check.sh
-bash tests/kernel_matrix.sh         # needs Docker
-```
-
-Use `run_tests.sh`, not `make run`. `make run` exits non-zero by design —
-`test_isolate` fails 5 of its 7 cases on pre-existing API drift, documented in
-`tests/unit/Makefile` — which makes it useless as a pass/fail signal.
-`run_tests.sh` names those five cases explicitly, so the suite is green when
-exactly those fail and red for anything else: a sixth failure, one of the five
-starting to pass, a suite that fails to build, or a suite that quietly loses
-assertions.
-
-**No GPU work runs in CI.** GitHub-hosted runners have no NVIDIA device, so
-[`tests/validate.sh`](tests/validate.sh) is not attempted there; hardware
-coverage comes from [`scripts/sweep_matrix.py`](scripts/sweep_matrix.py) against
-rented boxes. That script tars the *working tree*, not `HEAD`, so it refuses to
-spend money when the two differ — check it yourself with
-`scripts/sweep_matrix.py --check-tree`, and override deliberately with
-`--allow-dirty`.
-
 ## First result
 
 ```bash
@@ -251,30 +216,32 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-- **A stock distro cannot boot into its own Xorg session on the nvkvm head.**
-  That path uses `modesetting` + glamor, and NVIDIA's EGL rejects glamor's
-  scanout-pixmap import **on bare metal too** — measured host and guest side by
-  side. The real Mint Cinnamon desktop does run accelerated, via its X11 session
-  inside a rootful Xwayland
-  ([how](docs/internal/mint-guest-desktop.md) ·
-  [the measurement](tests/repro/gbm_egl_import.c)).
-- **`kvm run failed Bad address`** — a GL client taking the guest down 10–60 s
-  in. Has **not reproduced** since several unrelated fixes landed, across a
-  five-minute soak at 190,013 frames and an interactive desktop session. Treat
-  it as open-and-unreproduced rather than closed
+- **A stock distro will not boot straight into its own desktop.** An accelerated
+  desktop works — the real Linux Mint Cinnamon desktop runs at full speed on the
+  GPU — but the session has to be started a particular way rather than by the
+  distro's own login screen. The path that a distro picks by itself relies on
+  something NVIDIA's driver does not support, **on bare metal either**; we
+  measured it host and guest side by side.
+  [How to run a desktop](docs/howto/run.md).
+- **One rare crash is unexplained.** A GL client once took a guest down within a
+  minute. It has not reproduced since — through a five-minute soak at 190,013
+  frames and a full interactive desktop session — but several unrelated things
+  changed in between, so treat it as open rather than fixed
   ([detail](docs/internal/known-limitations.md)).
-- **`28/28` is not evidence that your workload computes correctly.** The suite
-  covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL. A real
-  correctness bug has passed it before
-  ([what it was](docs/reference/correctness.md)). Check your own results against
-  a host run.
-- **Pinning host memory is slower than native**, and one registration is capped
-  at 2 GiB ([numbers](docs/internal/known-limitations.md#pinned-host-memory)).
+- **`28/28` is not proof that your workload is correct.** The test suite covers
+  bring-up, CUDA, Vulkan compute and offscreen GL. It does not cover everything,
+  and a real correctness bug has passed it before. Check your own results
+  against a host run ([what that bug was](docs/reference/correctness.md)).
+- **Frameworks that pin large host buffers pay a penalty.** Registering pinned
+  memory is slower than native and a single registration is capped at 2 GiB —
+  noticeable in data loaders and serving stacks that pin aggressively. Stock
+  vLLM starts and runs
+  ([numbers](docs/internal/known-limitations.md#pinned-host-memory)).
 
-Recently closed: Vulkan compute on Hopper, guest kernels 6.12+ being unable to
-open the DRM nodes, X11 clients under Xwayland getting no window, and GL under
-Wayland. Two of those looked like NVIDIA's bugs until the same test was run on
-bare metal — [what broke and how](docs/reference/correctness.md).
+Recently fixed: Vulkan compute on Hopper, guest kernels 6.12 and newer being
+unable to use the GPU's DRM nodes, X11 windows not appearing, and GL under
+Wayland. Two of those looked like NVIDIA bugs until the same test was run on
+bare metal ([what broke and how](docs/reference/correctness.md)).
 
 ## Tested applications
 
@@ -309,35 +276,22 @@ sustained compute or bandwidth.
 
 ### Desktop graphics
 
-A Wayland compositor runs on the GPU inside the guest, and its desktop can be
-displayed and driven in a window on the host — see
-[running a guest desktop in a window](docs/howto/run.md#running-the-guest-desktop-in-a-window).
-Measured on an RTX 4070, driver 595.84, guest `weston --backend=drm
---renderer=gl`:
+A full desktop runs on the GPU inside the guest and can be displayed and driven
+in a window on the host — including the stock Linux Mint Cinnamon desktop
+([how](docs/howto/run.md#running-the-guest-desktop-in-a-window)).
 
-```
-Using rendering device: /dev/dri/renderD128
-EGL vendor: NVIDIA
-GL renderer: NVIDIA GeForce RTX 4070/PCIe/SSE2
-GL version: OpenGL ES 3.2 NVIDIA 595.84
-```
-
-The guest's composited frame reaches the host window as a dma-buf with no
-readback (`NVKVM_PRESENT_MODE=gl`). At 1920x1080 the guest's KMS head flips at
-59.9 Hz and **every one of those frames reaches the host window: 60.0 swaps/s,
-zero dropped**, holding with 8 concurrent EGL clients. Measured with per-frame
-counters compiled into the present path, over 60 consecutive one-second samples
-of which every sample was exactly 60 frames.
-
-The pipeline is display-refresh-bound, not overhead-bound: the per-present
-PRIME export costs 0.07 ms. (An earlier figure of ~637 frames/s here came from
-an unthrottled configuration and is superseded by the counter-based
-measurement above, which is the one to quote.)
+On an RTX 4070 the guest's display flips at 59.9 Hz and **every one of those
+frames reaches the host window: 60.0 swaps/s, zero dropped**, holding with a
+browser rendering real pages and eight concurrent GPU clients. Measured with
+per-frame counters over 60 consecutive one-second samples, every one of which
+was exactly 60 frames. The pipeline is limited by display refresh, not by
+forwarding overhead.
 
 Graphics is the one area where the guest is well short of the host rather than
 at parity: `glmark2-wayland` scores **6857 in the guest vs 21571 on the host**
-on the same box (~32%). Compute and bandwidth are at 1.00x, as above; the
-graphics present path has real overhead and is the honest number to quote.
+on the same box (~32%), while compute and bandwidth are at 1.00x. That gap is
+under investigation and is not yet explained
+([detail](docs/internal/known-limitations.md)).
 
 ### Containers
 
@@ -417,118 +371,32 @@ construction — reports from hardware not listed are genuinely wanted, and a
 
 **Is this vGPU or SR-IOV?**
 No. There is no hardware partitioning and no vendor licence. nvkvm forwards the
-driver's ioctl interface, so it runs on consumer cards that have no vGPU support
-at all.
-
-**So how are resources divided between guests?**
-They are not. Nothing is partitioned: guests share VRAM, SMs and bandwidth
-dynamically, exactly as GPU containers on one card do today. There is no
-per-guest VRAM reservation and no quota, so one guest can exhaust the card for
-the others. If you need hard partitioning, MIG sits *below* the interface nvkvm
-forwards and should compose with it — but that is untested.
+driver interface; the GPU is shared cooperatively, the way two processes on one
+machine share it.
 
 **Will my GPU work?**
-If it is **Turing or newer** (GTX 16xx, RTX 20/30/40/50, and the datacenter
-parts), yes — that is a hard requirement, not a guess. Pascal and older are out:
-the open kernel module will not even probe them, and NVIDIA's 580 branch is the
-last to support them at all. A card of the same architecture as one in
-[Tested platforms](#tested-platforms) is expected to behave the same — the
-forwarded interface is per-architecture, not per-die — so an untested RTX 4080
-should match the tested RTX 4070. See
-[supported drivers](docs/reference/supported-drivers.md) for the reasoning.
+Turing (GTX 16xx / RTX 20xx) or newer. Six architectures are tested, from GTX
+1660 to H100 — see [tested platforms](#tested-platforms). Pascal and older do
+not work.
 
-**Which host driver versions are covered?**
-Eight ABI profiles span every published open-driver release; six of them have
-been booted here, including all the ones in common use (535 LTS, 545, 550–565,
-570/575, 580–595, 610). The two unbooted ones cover 515–530, whose drivers no
-longer build against a modern kernel. Full matrix, and what "unbooted" means for
-your risk, in [supported drivers](docs/reference/supported-drivers.md).
-
-**Does the guest need an NVIDIA driver?**
-No kernel driver — the guest loads `nvkvm-guest.ko`, which presents `/dev/nvidia*`
-itself. It does need the matching userspace libraries, staged from the host by
-[`stage_guest_libs.sh`](scripts/stage_guest_libs.sh).
-
-**Which guest distros are supported?**
-The distro does not matter; the **kernel version** does. `nvkvm-guest.ko` is
-built against the guest's own headers, and it builds on **5.15, 6.1, 6.6, 6.8,
-6.12, 6.14, 6.19 and 7.0** — every LTS in the range NVIDIA's driver supports,
-plus current stable — in both the graphics and compute-only variants. Verify any
-kernel yourself with `bash tests/kernel_matrix.sh`, which needs Docker and
-nothing else. Table and the API differences it papers over:
-[guest kernels](docs/reference/guest-kernels.md).
-
-Caveat worth stating: those are **build** results. Ubuntu 24.04 (6.8) is the
-one that gets booted and run through `validate.sh`; a compile pass says the API
-surface matches, not that the module behaves. Windows guests are not
-supported.
-
-**Does the host driver version have to match the guest's?**
-Yes. The libraries staged into the guest come from the host, so they are the same
-build by construction. See [ABI profiles](docs/reference/abi-profiles.md).
+**Does the guest need a special driver?**
+No. The guest runs stock NVIDIA userspace — its own `libcuda`, unmodified. What
+it does need is a small kernel module, and userspace libraries matching your
+**host** driver version, which `scripts/` stages for you.
 
 **Can several VMs share one GPU?**
-Yes — each guest process gets its own isolate on the host, so they are separate
-address spaces sharing the device the same way host processes do.
+Yes, and the host keeps using it at the same time.
 
 **What's the performance cost?**
-Close to nothing on throughput, and a real cost on latency. Sustained compute
-and bandwidth measure at parity (1.00x) on every workload in
-[Tested applications](#tested-applications), and Geekbench 7 GPU — an
-independent benchmark, both runs public — scores
-[99.9% of bare metal](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862).
-
-What costs is any workload dominated by small serialized control calls, because
-each one is a forwarded round trip. The sharpest measured case is LLM prefill on
-a *tiny* (~5-token) prompt: 0.71x, which is launch latency rather than prefill
-compute — on a realistic long prompt the same measurement is 0.98x. Alloc churn
-behaves the same way. If your workload is a stream of tiny GPU calls rather than
-sustained work, budget for that; otherwise you will not notice.
+Close to nothing for work that batches — a 32B model through vLLM runs at
+0.99–1.00x of host speed. Single-stream, launch-bound workloads pay more; see
+[reading the parity numbers](docs/reference/parity.md).
 
 **Is it safe to run untrusted guests?**
-Not yet — treat it as experimental. The ioctl and alloc-class gates are
-default-deny and the guest kernel module is untrusted by design, but the code
-has had no *external* security review. It has had two internal ones, both
-published with their open findings rather than only their fixed ones: the
-[pointer audit](docs/internal/audit-guest-pointers.md) and the
-[boundary audit](docs/internal/audit-boundaries-2026-08-20.md). Read the second
-before deciding: it found that an unprivileged guest could hang the entire VMM
-without corrupting a single byte, which is the kind of thing a "no known memory
-bugs" summary hides. See also
-[the isolate model](docs/internal/isolate-model.md).
+Not yet. Read [`SECURITY.md`](SECURITY.md) before deciding where to run this.
 
-**Can nvkvm itself run inside a container?**
-Yes, and much of the testing is done that way — there is a
-[`Dockerfile`](Dockerfile) and a [`docker-compose.yml`](docker-compose.yml) for
-exactly this. A default container is enough:
-
-```bash
-docker run --gpus all --device /dev/kvm ...
-```
-
-No `--privileged`, no added capabilities, default seccomp and AppArmor. Rootless
-Docker works on the same terms, as long as your user can open `/dev/kvm`.
-
-This is a useful way to run it today: the isolates are weaker inside a container
-(namespaces are usually blocked, so they fall back to UID separation), but the
-container boundary sits *outside* the VMM, so breaking out of the VMM lands the
-attacker in the container rather than on the host.
-
-**Why is my GPU showing as llvmpipe?**
-Two causes, and the second is easy to miss. Either the NVIDIA userspace
-libraries did not stage — see
-[staging guest libraries](docs/howto/stage-guest-libraries.md) — or the user
-running the client is not in the guest's `video` and `render` groups, so opening
-the render node returns `EACCES` and the stack falls back silently. Nothing
-errors; you simply get software rendering that looks like a working GPU until
-you check the renderer string. `scripts/setup_guest.sh` puts the default user in
-both groups.
-
-**Does CUDA give bit-identical results to the host?**
-On everything measured, yes — including token-identical LLM output at
-temperature 0, and Geekbench 7 GPU at 99.9% of bare metal with every workload
-validating. Verify your own workload against a host run all the same; see
-[Known issues](#known-issues).
+[More questions](docs/faq.md) — driver version coverage, guest distros,
+container support, llvmpipe, bit-identical results.
 
 ## Documentation
 
@@ -537,6 +405,7 @@ validating. Verify your own workload against a host run all the same; see
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The request path end to end, and how the hard problems are solved |
 | [`docs/howto/`](docs/howto/) | Building, running, staging guest libraries, adding a driver version |
 | [`docs/reference/`](docs/reference/) | ABI profiles, allowlists, virtio protocol, device nodes |
+| [FAQ](docs/faq.md) | The full set — driver coverage, guest distros, containers, llvmpipe |
 | [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |
 | [Reading the parity numbers](docs/reference/parity.md) | What the host/guest ratios do and do not establish |
 | [Tested platforms, full matrix](docs/reference/tested-platforms.md) | Every box, driver and footnote |
