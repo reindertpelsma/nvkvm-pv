@@ -151,7 +151,7 @@ a minute:
 | Workflow | What it is for |
 |---|---|
 | [`ci.yml`](.github/workflows/ci.yml) | The unit suite, a two-second compile check over `src/qemu/`, and `shellcheck` on `scripts/` |
-| [`kernel-matrix.yml`](.github/workflows/kernel-matrix.yml) | Builds `nvkvm-guest.ko` against six distro kernels spanning the supported 5.15–7.0 range |
+| [`kernel-matrix.yml`](.github/workflows/kernel-matrix.yml) | Builds `nvkvm-guest.ko` against seven distro kernels — both ends of the supported 5.15–7.0 range, plus a non-Debian toolchain |
 | [`qemu-build.yml`](.github/workflows/qemu-build.yml) | The full `build_qemu.sh` — nightly and on `main`, because it takes ~35 minutes |
 
 Run the fast lane yourself:
