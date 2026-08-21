@@ -348,12 +348,13 @@ pointer-carrying fields rather than trusting the guest to have done it — and w
 audited how completely, open items included, in
 [the pointer audit](docs/internal/audit-guest-pointers.md).
 
-**In steady state there is no forwarded call at all.** Control operations cross
-the boundary; work does not. A kernel launch reaches the GPU as a write-combining
-store to a mapped BAR doorbell page — there is no doorbell interception anywhere
-in this codebase. Control-RTT is 1–2% of per-token LLM decode time for a
-stack that uses CUDA graphs, and about 20% for one that launches kernels
-individually — which is why most numbers below are near 1.00 and a few are not.
+**The work itself is never forwarded.** Setting a job up crosses the boundary;
+running it does not — launching a kernel is a write to memory the guest already
+has mapped, and nvkvm is not in that path at all. That is why the numbers below
+are ratios near 1.00 rather than a fraction of host speed. What you pay for is
+the *number of setup calls*: a stack that batches them (any modern serving
+runtime) pays 1–2% on LLM decode, one that issues them individually pays about
+20%.
 
 Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
