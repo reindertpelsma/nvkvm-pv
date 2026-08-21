@@ -301,6 +301,99 @@ table-full, no map-VA errors; six devices did not strain the handle or
 mmap-token tables. Isolate sandbox reached its strongest rung
 (`auto -> namespace`).
 
+
+### Deep-learning workload: 20B tensor-parallel across all six GPUs
+
+96 GB aggregate VRAM is the point of a 6x A4000 box, so the probe is a model
+that does not fit on one card. `ibm-granite/granite-20b-code-instruct`
+(GPTBigCode, 48 heads, MQA `num_key_value_heads=1`, 38 GB bf16) is one of the
+few open models whose head count actually permits **TP=6** — 48 % 6 == 0 and
+6 % 1 == 0. Qwen2.5-14B/32B (40 heads) and starcoder2-15b (48 heads but 4 KV)
+are all TP=6-invalid; that is a model-geometry constraint, not an nvkvm limit.
+
+vLLM 0.10.2, torch 2.8.0+cu128, `--tensor-parallel-size 6`, bf16, identical
+script and model files on both sides (host path and guest 9p mount of the same
+directory).
+
+**It works: the guest runs a 20B model sharded across six GPUs and its output
+is byte-identical to the host's** under matched settings — all three sampled
+completions diff clean against `HOST_SHMOFF`. Throughput:
+
+| config (both sides identical) | host tok/s | guest tok/s | guest/host |
+|---|---|---|---|
+| eager, `NCCL_SHM_DISABLE=1` | 47.94 | 10.04 | **0.21x** |
+| CUDA graphs, `NCCL_SHM_DISABLE=1` | 36.01 | 13.30 | **0.37x** |
+| host's best (eager, SHM transport on) | **115.70** | not reachable | 0.12x |
+
+The last row is the honest headline: the guest's best (13.30) is **11.5% of the
+host's best (115.70)**, because the host may use NCCL's SHM transport and the
+guest may not — see the bug below. CUDA graphs *help* the guest (10.04 → 13.30)
+and *hurt* the host (47.94 → 36.01) at this batch size, which is what you would
+expect if per-launch forwarding is a real cost in the guest and pure overhead
+on bare metal.
+
+Collectives themselves are **not** the bottleneck. With matched settings the
+guest matches or beats the host:
+
+| world=6 all-reduce, `NCCL_SHM_DISABLE=1` | host | guest |
+|---|---|---|
+| sustained 64 MiB (aggregate payload) | 0.78 GB/s | **0.83 GB/s** |
+| 4 KiB latency | 237.9 us | 401.3 us |
+| 64 KiB latency | 753.9 us | **657.9 us** |
+| 1 MiB latency | 2528.9 us | **1653.4 us** |
+| 16 MiB latency | 19723 us | **18511 us** |
+
+`tests/nccl_allreduce.py --world 6` is VERDICT|PASS on both sides with every
+collective value-checked (all_reduce, broadcast, all_gather, reduce_scatter).
+Unlike the 4x RTX 5060 box, NCCL bootstraps fine on this host, so the host is a
+usable control here.
+
+Model load is much slower in the guest (1083 s vs 63 s) but that is a **9p
+artifact, not a GPU one**: each of the six TP workers reads all 38 GB through
+the `nvkvm_src` 9p mount, ~228 GB of 9p traffic, with QEMU pinned at ~870% CPU.
+Staging the weights on the guest's own disk would remove it.
+
+### Bug: NCCL's SHM transport fails in the guest (`cuMemImportFromShareableHandle`)
+
+**Guest-only, host is clean, so this one is ours.** With default settings any
+NCCL job of world >= 2 dies during connection setup:
+
+```
+transport/shm.cc:590 NCCL WARN Cuda failure 101 'invalid device ordinal'
+Channel 00 : 1[1] -> 0[0] via SHM/direct/direct
+```
+
+`shm.cc:590` in NCCL v2.27.3 is
+`cuMemImportFromShareableHandle(&handle, (void *)(uintptr_t)fd, type)` with
+`type == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR` — the CUDA VMM
+shareable-handle import of an fd passed between ranks over a Unix socket. The
+identical stack (same torch, same NCCL 2.27.3, same six GPUs, same driver)
+completes on the bare-metal host, so this is a forwarding gap in the cuMem VMM
+export/import path, not hardware and not NCCL.
+
+Isolation is exact:
+
+| setting | guest result |
+|---|---|
+| default | **FAIL** — `Cuda failure 101` at shm.cc:590 |
+| `NCCL_P2P_DISABLE=1` alone | **FAIL** — identical error |
+| `NCCL_SHM_DISABLE=1` alone | **PASS** |
+
+So the defect is specifically the SHM transport's VMM import, not P2P (A4000
+has no P2P on either side anyway — see the peer matrix above). **Workaround:
+`NCCL_SHM_DISABLE=1`**, which restores full correctness at host-parity
+collective bandwidth, at the cost of the throughput shown in the table above.
+
+### Second guest-only difference: NVML after fork in vLLM workers
+
+vLLM's default `VLLM_WORKER_MULTIPROC_METHOD=fork` makes each worker call
+`nvmlDeviceGetHandleByIndex()`, which raises `NVMLError_Unknown` in the guest
+while succeeding on the host. NVML itself is healthy in the guest — a direct
+`nvmlInit()` + handle walk returns all six A4000s — so this is specific to
+NVML being used after a fork of a process that had already initialised it.
+`VLLM_WORKER_MULTIPROC_METHOD=spawn` fixes it. Not yet root-caused; recorded
+here because it is the second thing a multi-GPU DL user will hit.
+
 ## Finding: offscreen GL rendering is broken on 595 and 610
 
 > **RESOLVED 2026-08-17 — this was ours, and it is fixed.** The cause is
