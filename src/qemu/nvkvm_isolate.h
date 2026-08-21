@@ -58,6 +58,36 @@ struct nvkvm_xrm_handle {
 };
 
 /*
+ * Every live NVKMS vblank semaphore control is persistent host-side state: it
+ * allocates a kernel object, pins and maps the semaphore surface, and installs
+ * one list entry per physical display head that the host walks on EVERY
+ * vblank.  Nothing in the guest path bounded how many a VM could accumulate.
+ *
+ * The cap is VM-WIDE, not per isolate.  A per-isolate cap is not a cap: the
+ * guest creates isolates, so it would multiply by up to NVKVM_ISOLATE_MAX.
+ * The per-isolate array below only records ownership, so a handle close or an
+ * isolate death can return exactly the right number of slots to the budget.
+ *
+ * 64 is a compatibility guess, not a measured limit -- one control per
+ * surface per head is the shape a real compositor issues, and 64 is far above
+ * anything observed while still being a bound.
+ */
+#define NVKVM_NVKMS_VBLANK_MAX 64
+
+/*
+ * One reserved or live vblank semaphore control.  reservation != 0 marks the
+ * entry occupied and holds one unit of the VM-wide budget; control_handle == 0
+ * means the ENABLE ioctl has not answered yet, so a DISABLE cannot match it.
+ */
+struct nvkvm_nvkms_vblank {
+	uint64_t reservation;
+	uint32_t handle_id;
+	uint32_t device_handle;
+	uint32_t disp_handle;
+	uint32_t control_handle;
+};
+
+/*
  * Forward declaration — fully defined in nvkvm_isolate.c.
  * Callers of nvkvm_isolate_ioctl never touch this directly; it lives on
  * the caller's stack and is registered/deregistered internally.
@@ -199,6 +229,13 @@ struct nvkvm_isolate {
 	 * already being torn down and have its reference outlive the drain.
 	 */
 	bool        xrm_accepting;
+	/*
+	 * NVKMS vblank-semaphore ownership for this isolate, under xrm_lock
+	 * (same lock, same "runs on pooled IOCTL workers" reason -- not the
+	 * VM-wide counter's lock, which is in the table below).
+	 */
+	struct nvkvm_nvkms_vblank nvkms_vblank[NVKVM_NVKMS_VBLANK_MAX];
+	uint64_t    nvkms_vblank_seq;
 
 	/*
 	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
@@ -221,6 +258,10 @@ struct nvkvm_isolate {
 
 struct nvkvm_isolate_table {
 	pthread_mutex_t      lock;
+	/* VM-wide NVKMS vblank budget.  Its own lock, taken without any
+	 * per-isolate lock held, so it can never be part of a cycle. */
+	pthread_mutex_t      nvkms_vblank_lock;
+	unsigned             nvkms_vblank_total;
 	struct nvkvm_isolate isolates[NVKVM_ISOLATE_MAX];
 	uint32_t             next_id;
 	uint32_t             abi_profile;  /* #81: per-VM ABI id stamped into IOCTLs */
@@ -413,6 +454,40 @@ bool nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
 					 uint32_t isolate_id,
 					 uint32_t handle_id,
 					 uint64_t *generation_out);
+
+/*
+ * NVKMS vblank semaphore quota.
+ *
+ * reserve() takes one unit of the VM-wide budget and one per-isolate ownership
+ * slot BEFORE the ENABLE ioctl is forwarded, and returns an opaque nonzero
+ * reservation, or 0 when the budget is exhausted (the caller must then fail
+ * the ioctl rather than forward it).  Reserving first is what stops concurrent
+ * workers from all passing the check and then all succeeding.
+ *
+ * finish() closes out that reservation once the ioctl has answered: on failure
+ * it returns the unit, on success it records the handles a later DISABLE will
+ * be matched against.
+ *
+ * retire() releases the entry a successful DISABLE names.  purge_handle()
+ * releases every entry owned by a modeset fd that is being closed; isolate
+ * teardown drains the rest.
+ */
+uint64_t nvkvm_isolate_nvkms_vblank_reserve(struct nvkvm_isolate_table *t,
+					    uint32_t isolate_id,
+					    uint32_t handle_id);
+void nvkvm_isolate_nvkms_vblank_finish(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint64_t reservation,
+				       bool success, uint32_t device_handle,
+				       uint32_t disp_handle,
+				       uint32_t control_handle);
+void nvkvm_isolate_nvkms_vblank_retire(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint32_t handle_id,
+				       uint32_t device_handle,
+				       uint32_t disp_handle,
+				       uint32_t control_handle);
+void nvkvm_isolate_nvkms_vblank_purge_handle(struct nvkvm_isolate_table *t,
+					     uint32_t isolate_id,
+					     uint32_t handle_id);
 
 /*
  * Ask the isolate to open /dev/nvidia* (or eventfd) on QEMU's behalf so the

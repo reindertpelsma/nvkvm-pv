@@ -2056,6 +2056,15 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * straight through to the raw ioctl() in the stub — the kmd dispatches
 	 * on _IOC_NR, so that could reach a denied privileged escape.
 	 */
+	/*
+	 * NVKMS vblank-semaphore quota, set in the NVKMS branch below and acted
+	 * on around the forwarded ioctl.  Declared out here because the
+	 * reservation has to be taken before the ioctl and closed out after it,
+	 * and both of those are well past the end of that branch.
+	 */
+	bool nvkms_vblank_enable  = false;
+	bool nvkms_vblank_disable = false;
+
 	/* Graphics gate (defense-in-depth; handle_open already blocks the device
 	 * opens). Refuse all DRM ('d') and NVKMS ('m') ioctls on compute-only VMs. */
 	if (!nv->graphics &&
@@ -2117,6 +2126,17 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
 			resp->fault_addr = 0;
 			return 0;
+		}
+		/* Which of the allowed cmdTypes are the vblank-semaphore
+		 * enable/disable pair depends on the branch, for the same
+		 * reason the gate itself does -- ask the same table. */
+		struct nvkvm_nvkms_ops nvkms_ops =
+			nvkvm_nvkms_ops_for_version(nvkms_major, nvkms_minor);
+		if (nvkms_ops.known && nvkms_ops.vblank_enable >= 0) {
+			nvkms_vblank_enable =
+				(int32_t)nvkms_cmd == nvkms_ops.vblank_enable;
+			nvkms_vblank_disable =
+				(int32_t)nvkms_cmd == nvkms_ops.vblank_disable;
 		}
 	} else if (_IOC_TYPE(req->cmd) != 'F') {
 		NVKVM_DBG("nvkvm: DENY non-'F' cmd 0x%x (type=0x%x)\n",
@@ -2516,6 +2536,27 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 */
 	nvkvm_xrm_prepare(nv, req, param_buf, aux_buf);
 
+	/*
+	 * A successful ENABLE_VBLANK_SEM_CONTROL allocates a persistent host
+	 * kernel object, pins and maps the semaphore surface, and adds work the
+	 * host does on every physical vblank.  Nothing bounded how many of those
+	 * a VM could accumulate.  Reserve VM-wide capacity BEFORE forwarding, so
+	 * concurrent workers cannot all read the same under-limit count and all
+	 * then succeed.
+	 */
+	uint64_t nvkms_vblank_reservation = 0;
+	if (nvkms_vblank_enable) {
+		nvkms_vblank_reservation = nvkvm_isolate_nvkms_vblank_reserve(
+			&nv->isolates, req->isolate_id, req->handle_id);
+		if (nvkms_vblank_reservation == 0) {
+			resp->retval     = (uint64_t)(int64_t)(-ENOSPC);
+			resp->status     = 0;
+			resp->nvstatus   = 0;
+			resp->fault_addr = 0;
+			return 0;
+		}
+	}
+
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
 				      req->isolate_id,
 				      req->handle_id,
@@ -2525,6 +2566,44 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				      req->flags,
 				      &nvstatus,
 				      &fault_addr);
+
+	/*
+	 * Close out the reservation.  The offsets are the inner NVKMS params
+	 * block (aux_buf), read from the vendor header at every tag where these
+	 * commands exist -- 550.54.14, 565.57.01, 570.195.03, 570.207,
+	 * 575.51.03, 580.178.04, 590.48.01, 610.43.02:
+	 *
+	 *   Enable  {device@0, disp@4, ... , reply.vblankSemControlHandle@24}
+	 *   Disable {device@0, disp@4, vblankSemControlHandle@8}
+	 *
+	 * The 550..570 Enable request carries an extra headMask before
+	 * surfaceHandle; that fills the alignment hole ahead of the 8-byte
+	 * surfaceOffset, so the request is 24 bytes and the reply sits at 24 in
+	 * every branch.  nvKmsIoctl requires the exact per-command parameter
+	 * size, so a short block cannot have succeeded -- the size guards below
+	 * are belt-and-braces on our own read, not on the driver's.
+	 */
+	if (nvkms_vblank_enable) {
+		uint32_t device = 0, disp = 0, control = 0;
+		bool ok = ret == 0 && aux_buf && req->aux_size >= 28;
+		if (ok) {
+			memcpy(&device,  (char *)aux_buf + 0,  4);
+			memcpy(&disp,    (char *)aux_buf + 4,  4);
+			memcpy(&control, (char *)aux_buf + 24, 4);
+		}
+		nvkvm_isolate_nvkms_vblank_finish(
+			&nv->isolates, req->isolate_id, nvkms_vblank_reservation,
+			ok, device, disp, control);
+	} else if (nvkms_vblank_disable && ret == 0 && aux_buf &&
+		   req->aux_size >= 12) {
+		uint32_t device, disp, control;
+		memcpy(&device,  (char *)aux_buf + 0, 4);
+		memcpy(&disp,    (char *)aux_buf + 4, 4);
+		memcpy(&control, (char *)aux_buf + 8, 4);
+		nvkvm_isolate_nvkms_vblank_retire(
+			&nv->isolates, req->isolate_id, req->handle_id,
+			device, disp, control);
+	}
 
 	/*
 	 * MAP: on success the driver wrote the isolate-side VA into

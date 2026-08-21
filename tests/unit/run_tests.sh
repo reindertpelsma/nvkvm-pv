@@ -84,7 +84,7 @@ declare -A MARKER_SUITES=(
 # immediately after exec rather than any command.  That is a REAL remaining
 # defect, not an id disagreement, and nobody has run it to ground yet.  Do not
 # replace this note with a guess.
-ISOLATE_TOTAL=8
+ISOLATE_TOTAL=9
 ISOLATE_KNOWN_FAIL="concurrent_ioctl out_of_order_ioctl sequential_ioctl sync_mmap_munmap"
 
 ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist mock_stub"

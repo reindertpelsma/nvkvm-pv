@@ -409,6 +409,61 @@ TEST(foreign_relay_cleanup_on_kill)
 	fixture_fini();
 }
 
+/* ── Test 9: NVKMS vblank semaphore quota ────────────────────────────────── */
+
+TEST(nvkms_vblank_quota_lifecycle)
+{
+	fixture_init();
+
+	const uint32_t iso_id = 8;
+	struct nvkvm_isolate *iso = &g_it.isolates[iso_id];
+	iso->id = iso_id;
+	iso->in_use = true;
+	iso->alive = true;
+	iso->pid = 0;
+	iso->sock_fd = -1;
+	iso->xrm_accepting = true;
+	iso->nvkms_vblank_seq = 1;
+
+	/* Fill the VM-wide budget, split across two modeset handles. */
+	uint64_t reservations[NVKVM_NVKMS_VBLANK_MAX];
+	for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX; i++) {
+		reservations[i] = nvkvm_isolate_nvkms_vblank_reserve(
+			&g_it, iso_id, 100 + (i & 1));
+		EXPECT_GE(reservations[i], 1);
+		nvkvm_isolate_nvkms_vblank_finish(&g_it, iso_id, reservations[i],
+						  true, 1, 2, 1000 + i);
+	}
+	/* The 65th enable is refused, which is the whole point. */
+	EXPECT_EQ(nvkvm_isolate_nvkms_vblank_reserve(&g_it, iso_id, 100), 0);
+	EXPECT_EQ(g_it.nvkms_vblank_total, NVKVM_NVKMS_VBLANK_MAX);
+
+	/* A matching disable releases exactly one slot, and a failed enable
+	 * gives its reservation straight back. */
+	nvkvm_isolate_nvkms_vblank_retire(&g_it, iso_id, 100, 1, 2, 1000);
+	uint64_t replacement = nvkvm_isolate_nvkms_vblank_reserve(&g_it, iso_id,
+								  100);
+	EXPECT_GE(replacement, 1);
+	nvkvm_isolate_nvkms_vblank_finish(&g_it, iso_id, replacement, false,
+					  0, 0, 0);
+	EXPECT_EQ(g_it.nvkms_vblank_total, NVKVM_NVKMS_VBLANK_MAX - 1);
+
+	/* Closing one modeset fd returns that fd's slots and nobody else's. */
+	nvkvm_isolate_nvkms_vblank_purge_handle(&g_it, iso_id, 100);
+	for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX / 2; i++)
+		EXPECT_GE(nvkvm_isolate_nvkms_vblank_reserve(&g_it, iso_id, 100),
+			  1);
+	EXPECT_EQ(nvkvm_isolate_nvkms_vblank_reserve(&g_it, iso_id, 100), 0);
+	EXPECT_EQ(g_it.nvkms_vblank_total, NVKVM_NVKMS_VBLANK_MAX);
+
+	/* Isolate death returns the rest, or a create/kill loop exhausts the
+	 * budget permanently. */
+	EXPECT_EQ(nvkvm_isolate_kill(&g_it, iso_id), 0);
+	EXPECT_EQ(g_it.nvkms_vblank_total, 0);
+
+	fixture_fini();
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -441,6 +496,7 @@ int main(void)
 	RUN(sync_mmap_munmap);
 	RUN(poll_unpoll);
 	RUN(foreign_relay_cleanup_on_kill);
+	RUN(nvkms_vblank_quota_lifecycle);
 
 	fprintf(stderr, "\n%d/%d tests passed\n", tests_passed, tests_run);
 	return tests_failed ? 1 : 0;

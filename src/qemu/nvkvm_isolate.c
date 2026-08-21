@@ -1382,6 +1382,7 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t,
 	memset(t, 0, sizeof(*t));
 	t->handles = handles;
 	pthread_mutex_init(&t->lock, NULL);
+	pthread_mutex_init(&t->nvkms_vblank_lock, NULL);
 	/* F1-1: every condvar below is waited on with a deadline now, so pin
 	 * them to CLOCK_MONOTONIC before creating any of them — a wall-clock
 	 * step must not be able to fire a timeout early or defer it. */
@@ -1433,6 +1434,7 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 		pthread_mutex_destroy(&iso->loop_sync_lock);
 		pthread_cond_destroy(&iso->loop_cond);
 	}
+	pthread_mutex_destroy(&t->nvkms_vblank_lock);
 	pthread_mutex_destroy(&t->lock);
 }
 
@@ -1514,6 +1516,13 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->xrm_n = 0;
 			memset(iso->xrm_handles, 0, sizeof(iso->xrm_handles));
 			iso->xrm_accepting = true;
+			/* Same argument as the relay list: a slot reused after a
+			 * full lap of the id space comes back with the identical
+			 * id, so a fresh occupant must not inherit the dead one's
+			 * vblank ownership records.  The VM-wide counter was
+			 * already returned by nvkvm_isolate_kill(). */
+			memset(iso->nvkms_vblank, 0, sizeof(iso->nvkms_vblank));
+			iso->nvkms_vblank_seq = 1;
 			pthread_mutex_unlock(&iso->xrm_lock);
 			*id_out = id;
 			return iso;
@@ -2065,6 +2074,8 @@ pid_t nvkvm_isolate_host_pid(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 
 static void ring_qva_unmap(void *nv, uint64_t ring_gpa, void *qva,
 			   uint64_t region);
+static void nvkvm_nvkms_vblank_release(struct nvkvm_isolate_table *t,
+				       unsigned count);
 
 int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 {
@@ -2215,11 +2226,21 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	 */
 	struct nvkvm_xrm_handle xrm[NVKVM_XRM_MAX];
 	unsigned xrm_n;
+	unsigned vblank_n = 0;
 	pthread_mutex_lock(&iso->xrm_lock);
 	xrm_n = iso->xrm_n;
 	memcpy(xrm, iso->xrm_handles, xrm_n * sizeof(xrm[0]));
 	iso->xrm_n = 0;
+	/* The stub is dead, so every NVKMS vblank control it held is gone with
+	 * its fds.  Return that many units to the VM-wide budget, or a guest
+	 * exhausts it permanently by creating and killing isolates. */
+	for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX; i++) {
+		if (iso->nvkms_vblank[i].reservation != 0)
+			vblank_n++;
+	}
+	memset(iso->nvkms_vblank, 0, sizeof(iso->nvkms_vblank));
 	pthread_mutex_unlock(&iso->xrm_lock);
+	nvkvm_nvkms_vblank_release(t, vblank_n);
 	if (t->handles) {
 		for (unsigned i = 0; i < xrm_n; i++) {
 			if (xrm[i].generation != 0)
@@ -2515,6 +2536,159 @@ bool nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
 	if (generation_out)
 		*generation_out = generation;
 	return found;
+}
+
+/* ── NVKMS vblank semaphore quota ────────────────────────────────────────── */
+
+static void nvkvm_nvkms_vblank_release(struct nvkvm_isolate_table *t,
+				       unsigned count)
+{
+	if (count == 0)
+		return;
+	pthread_mutex_lock(&t->nvkms_vblank_lock);
+	t->nvkms_vblank_total = count <= t->nvkms_vblank_total ?
+		t->nvkms_vblank_total - count : 0;
+	pthread_mutex_unlock(&t->nvkms_vblank_lock);
+}
+
+uint64_t nvkvm_isolate_nvkms_vblank_reserve(struct nvkvm_isolate_table *t,
+					    uint32_t isolate_id,
+					    uint32_t handle_id)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return 0;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	uint64_t reservation = 0;
+
+	/*
+	 * Take the VM-wide unit FIRST and unconditionally.  Checking a counter,
+	 * forwarding the ioctl, and incrementing afterwards lets every
+	 * concurrent worker read the same under-limit value and all succeed.
+	 */
+	pthread_mutex_lock(&t->nvkms_vblank_lock);
+	if (t->nvkms_vblank_total >= NVKVM_NVKMS_VBLANK_MAX) {
+		pthread_mutex_unlock(&t->nvkms_vblank_lock);
+		return 0;
+	}
+	t->nvkms_vblank_total++;
+	pthread_mutex_unlock(&t->nvkms_vblank_lock);
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id && iso->xrm_accepting) {
+		for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX; i++) {
+			struct nvkvm_nvkms_vblank *v = &iso->nvkms_vblank[i];
+			if (v->reservation != 0)
+				continue;
+			reservation = iso->nvkms_vblank_seq++;
+			if (reservation == 0)
+				reservation = iso->nvkms_vblank_seq++;
+			*v = (struct nvkvm_nvkms_vblank){
+				.reservation = reservation,
+				.handle_id   = handle_id,
+			};
+			break;
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+	if (reservation == 0)
+		nvkvm_nvkms_vblank_release(t, 1);
+	return reservation;
+}
+
+void nvkvm_isolate_nvkms_vblank_finish(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint64_t reservation,
+				       bool success, uint32_t device_handle,
+				       uint32_t disp_handle,
+				       uint32_t control_handle)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX ||
+	    reservation == 0)
+		return;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	bool released = false;
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id) {
+		for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX; i++) {
+			struct nvkvm_nvkms_vblank *v = &iso->nvkms_vblank[i];
+			if (v->reservation != reservation)
+				continue;
+			if (!success || control_handle == 0) {
+				/* Nothing was created host-side, or we could not
+				 * read back what identifies it -- either way we
+				 * could never retire this entry, so do not keep
+				 * charging for it. */
+				memset(v, 0, sizeof(*v));
+				released = true;
+			} else {
+				v->device_handle  = device_handle;
+				v->disp_handle    = disp_handle;
+				v->control_handle = control_handle;
+			}
+			break;
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+	if (released)
+		nvkvm_nvkms_vblank_release(t, 1);
+}
+
+void nvkvm_isolate_nvkms_vblank_retire(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint32_t handle_id,
+				       uint32_t device_handle,
+				       uint32_t disp_handle,
+				       uint32_t control_handle)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX ||
+	    control_handle == 0)
+		return;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	bool released = false;
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id) {
+		for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX; i++) {
+			struct nvkvm_nvkms_vblank *v = &iso->nvkms_vblank[i];
+			/* All four must match: a DISABLE naming someone else's
+			 * control must not free this isolate's quota. */
+			if (v->reservation != 0 && v->control_handle != 0 &&
+			    v->handle_id == handle_id &&
+			    v->device_handle == device_handle &&
+			    v->disp_handle == disp_handle &&
+			    v->control_handle == control_handle) {
+				memset(v, 0, sizeof(*v));
+				released = true;
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+	if (released)
+		nvkvm_nvkms_vblank_release(t, 1);
+}
+
+void nvkvm_isolate_nvkms_vblank_purge_handle(struct nvkvm_isolate_table *t,
+					     uint32_t isolate_id,
+					     uint32_t handle_id)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	unsigned released = 0;
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id) {
+		for (unsigned i = 0; i < NVKVM_NVKMS_VBLANK_MAX; i++) {
+			if (iso->nvkms_vblank[i].reservation != 0 &&
+			    iso->nvkms_vblank[i].handle_id == handle_id) {
+				memset(&iso->nvkms_vblank[i], 0,
+				       sizeof(iso->nvkms_vblank[i]));
+				released++;
+			}
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+	nvkvm_nvkms_vblank_release(t, released);
 }
 
 int nvkvm_isolate_send_handle_generation(struct nvkvm_isolate_table *t,
@@ -3140,6 +3314,9 @@ int nvkvm_isolate_close_handle(struct nvkvm_isolate_table *t,
 	};
 	int ret = sync_send_recv(iso, &cmd, sizeof(cmd));
 	if (ret == 0) {
+		/* Closing the modeset fd destroys every vblank control opened
+		 * through it, so the quota those controls held is free again. */
+		nvkvm_isolate_nvkms_vblank_purge_handle(t, isolate_id, handle_id);
 		/*
 		 * If this handle got here as a cross-isolate relay, drop the
 		 * record along with the reference -- and release exactly the
