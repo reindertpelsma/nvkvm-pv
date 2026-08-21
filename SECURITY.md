@@ -71,9 +71,19 @@ two processes running as the same user, there is nothing to preserve: they can
 already reach each other with `ptrace` or `/proc/<pid>/mem`, and nvkvm neither
 adds a boundary nor claims to.
 
-Also out of scope: side channels between guests sharing a GPU (timing,
-contention, residual VRAM contents). We have not studied them and you should
-assume they exist.
+Also out of scope: **timing and contention side channels** between guests sharing
+a GPU. We have not studied them and you should assume they exist.
+
+**Residual VRAM contents are a different case and should not be lumped in with
+those.** NVIDIA's resource manager scrubs video memory on free — enabled by
+default since GK110, `bScrubOnFreeEnabled` in the vendor source — so freed VRAM
+is not handed to the next allocation with the previous tenant's data in it.
+nvkvm inherits that property rather than providing it: every allocation goes
+through the same RM, and nvkvm has no allocator of its own to bypass it with.
+Two caveats worth stating rather than hiding: we have not independently verified
+the scrub end to end through nvkvm, and the driver disables it in several
+configurations of its own (simulation, SLI, vGPU host mode, and a broken
+framebuffer), none of which are the configuration this project targets.
 
 ## What we know is wrong today
 
