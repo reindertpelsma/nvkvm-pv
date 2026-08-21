@@ -218,10 +218,12 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 - **A stock distro will not boot straight into its own desktop.** An accelerated
   desktop works — the real Linux Mint Cinnamon desktop runs at full speed on the
-  GPU — but the session has to be started a particular way rather than by the
-  distro's own login screen. The path that a distro picks by itself relies on
-  something NVIDIA's driver does not support, **on bare metal either**; we
-  measured it host and guest side by side.
+  GPU — but the session has to be started a particular way rather than left to
+  the distro's login screen. On real hardware a distro drives the display with
+  NVIDIA's own X driver, which needs direct access to the card that a forwarded
+  GPU does not give it. Without it the X server falls back to a generic path
+  that NVIDIA's driver has never supported, on any machine. So this is a gap in
+  what nvkvm can present to an X server, not something broken about the distro.
   [How to run a desktop](docs/howto/run.md).
 - **One rare crash is unexplained.** A GL client once took a guest down within a
   minute. It has not reproduced since — through a five-minute soak at 190,013
