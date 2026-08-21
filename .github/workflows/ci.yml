@@ -21,6 +21,18 @@
 #                 rented boxes.  A quoting bug there fails at hour three of a
 #                 paid sweep, not at edit time.
 #
+#   abi-parity    The ABI profile table decides, for each host driver version,
+#                 how big every version-variant struct is.  Getting a row wrong
+#                 does not fail loudly -- it forwards a mis-sized parameter
+#                 block and the guest sees a plausible wrong answer.  That is
+#                 exactly how the HOPPER_USERMODE_A bug behaved (0492685): a
+#                 class with no size entry forwarded a NULL parameter block, RM
+#                 filled in defaults, and Vulkan died three calls later looking
+#                 like a driver bug.  These tests replay the whole measured
+#                 matrix through the selector via cgo against the real header,
+#                 so a bad edit to nvkvm_abi.h is caught in milliseconds instead
+#                 of on a rented H100.
+#
 # The GPU is deliberately absent.  GitHub-hosted runners have no NVIDIA device,
 # so tests/validate.sh cannot run here and is not attempted; hardware coverage
 # comes from scripts/sweep_matrix.py against rented boxes.  Kernel-module
@@ -131,3 +143,21 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 \
             scripts/*.sh tests/*.sh tests/unit/*.sh
+
+  # Go, cgo-including src/common/nvkvm_abi.h, so this tests the ACTUAL header
+  # rather than a copy of its numbers.  -count=1 is mandatory: Go's test-result
+  # cache will happily replay a stale pass after a header edit, which is the
+  # one failure mode that would make this gate worthless.
+  abi-parity:
+    name: ABI profile parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: false
+      - name: replay the measured ABI matrix through the selector
+        working-directory: tests/abi_parity
+        run: go test -count=1 -v ./...
