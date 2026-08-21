@@ -384,6 +384,16 @@ static int nvkvm_child_enter_mount_ns(void)
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS   1033
+#define F_SEAL_SEAL   0x0001
+#define F_SEAL_SHRINK 0x0002
+#define F_SEAL_GROW   0x0004
+#define F_SEAL_WRITE  0x0008
+#endif
 static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 {
 	return (int)syscall(SYS_memfd_create, name, (unsigned long)flags);
@@ -1460,7 +1470,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	}
 
 	if (stub_elf && stub_elf_len > 0) {
-		int mfd = nvkvm_memfd_create("nvkvm_stub", MFD_CLOEXEC);
+		/*
+		 * MFD_ALLOW_SEALING so we can seal the image WRITE-shut below.
+		 * A memfd is always O_RDWR -- there is no O_RDONLY memfd -- and
+		 * this fd is dup2()'d to fd 3 for fexecve, which clears
+		 * FD_CLOEXEC, and closefrom() starts at 4.  So the stub runs with
+		 * a live read-write descriptor for its own text.  Without the
+		 * seal it can mmap(PROT_WRITE, MAP_SHARED, 3, 0) a writable alias
+		 * of its own running image and rewrite itself, which defeats the
+		 * seccomp PROT_EXEC denial that bounds the severity of every
+		 * other stub finding.  (The on-disk spawn path below opens the
+		 * binary O_RDONLY, so only this path is affected.)
+		 */
+		int mfd = nvkvm_memfd_create("nvkvm_stub",
+					     MFD_CLOEXEC | MFD_ALLOW_SEALING);
 		if (mfd < 0) {
 			close(sv[0]);
 			close(sv[1]);
@@ -1473,6 +1496,28 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			close(sv[1]);
 			iso->in_use = false;
 			return -EIO;
+		}
+		/*
+		 * Seal before fork/exec, while the image is still ours alone.
+		 * F_SEAL_WRITE makes mmap(PROT_WRITE, MAP_SHARED) return EPERM
+		 * and write() return EPERM for every holder of the fd, forever;
+		 * SHRINK|GROW pin the length; SEAL stops the set being reopened.
+		 * F_SEAL_WRITE requires no outstanding writable mapping -- we
+		 * only ever write(2) this fd, never mmap it -- and does not
+		 * affect execve.  Fail CLOSED: if the seal does not take, the
+		 * writable alias exists and we must not spawn.
+		 */
+		if (fcntl(mfd, F_ADD_SEALS,
+			  F_SEAL_SEAL | F_SEAL_SHRINK |
+			  F_SEAL_GROW | F_SEAL_WRITE) < 0) {
+			int e = errno;
+			fprintf(stderr, "nvkvm: refusing to spawn isolate: "
+				"could not seal stub memfd: %s\n", strerror(e));
+			close(mfd);
+			close(sv[0]);
+			close(sv[1]);
+			iso->in_use = false;
+			return -e;
 		}
 		lseek(mfd, 0, SEEK_SET);
 
