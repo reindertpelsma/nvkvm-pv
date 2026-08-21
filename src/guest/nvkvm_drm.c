@@ -87,13 +87,58 @@ struct nvkvm_gem_object {
 	 * re-brokering.  Single entry: the common case is one compositor. */
 	__u32                 xiso_importer_iso;  /* importer's isolate_id, 0=none */
 	__u32                 xiso_gem;           /* stub GEM handle in that isolate */
+	/* The importer's ctx, holding a reference for exactly the reason ->ctx
+	 * above does: xiso_gem only means anything in the host render fd THIS ctx
+	 * owns, and nvkvm_gem_free has to forward a GEM_CLOSE there even if the
+	 * importer's drm_file -- or the whole compositor -- went away first.
+	 * Caching the bare (isolate_id, handle_id) instead would be a fail-open
+	 * bug: both ids are table-allocated and reusable, so a close issued after
+	 * the importer died could land on an unrelated isolate's GEM. */
+	struct nvkvm_fd_ctx  *xiso_ctx;
+	/* Serialises broker-and-install against a second importer, so a replace
+	 * cannot orphan or double-close the entry it evicts. */
+	struct mutex          xiso_lock;
 };
 
 #define to_nvkvm_gem(o) container_of(o, struct nvkvm_gem_object, base)
 
+/* Drop one cached cross-isolate import: close the brokered GEM in the importer's
+ * stub, then drop the ctx ref that kept that stub fd addressable.  Takes
+ * ownership of the (ctx, gem) pair the caller has already detached from the
+ * cache, and must be called WITHOUT xiso_lock held -- it forwards a blocking
+ * virtio round-trip. */
+static void nvkvm_gem_xiso_release(struct nvkvm_fd_ctx *ctx, __u32 gem)
+{
+	struct drm_gem_close close = { .handle = gem };
+	__u64 fault = 0;
+
+	if (!ctx)
+		return;
+	if (gem)
+		nvkvm_virtio_ioctl_on_isolate(ctx, DRM_IOCTL_GEM_CLOSE,
+					      &close, sizeof(close),
+					      NULL, 0, 0, &fault);
+	nvkvm_fd_ctx_put(ctx);
+}
+
 static void nvkvm_gem_free(struct drm_gem_object *obj)
 {
 	struct nvkvm_gem_object *ng = to_nvkvm_gem(obj);
+
+	/* Release the cross-isolate import first, if a compositor ever brokered
+	 * this bo into its own stub (nvkvm_gem_resolve_fwd).  Nothing else ever
+	 * closed it: there is no XISO_RELEASE in the protocol and QEMU keeps no
+	 * per-importer record, so without this the importer's stub kept every
+	 * client buffer it had ever touched alive for its whole life, and the
+	 * owner's GEM_CLOSE could not reclaim that memory because the importer's
+	 * PRIME reference still held it.  Freed before the owner's handle so the
+	 * import goes away before the thing it references.  No lock: we are the
+	 * last reference to the object, so no lookup can reach the cache. */
+	nvkvm_gem_xiso_release(ng->xiso_ctx, ng->xiso_gem);
+	ng->xiso_ctx          = NULL;
+	ng->xiso_gem          = 0;
+	ng->xiso_importer_iso = 0;
+	mutex_destroy(&ng->xiso_lock);
 
 	/* Release the real object in the stub on the ctx that owns the handle,
 	 * then drop the ctx reference taken in nvkvm_gem_proxy_create.  Holding
@@ -182,6 +227,7 @@ static int nvkvm_gem_proxy_create(struct drm_file *file,
 		return -ENOMEM;
 	drm_gem_private_object_init(file->minor->dev, &ng->base, size);
 	ng->base.funcs = &nvkvm_gem_funcs;
+	mutex_init(&ng->xiso_lock);
 	/*
 	 * Audit G-6 (fixed #110): take a ctx reference.  A proxy can outlive its
 	 * creating drm_file via a cross-file PRIME re-import (NVIDIA EGL opens
@@ -229,8 +275,17 @@ static __u32 nvkvm_gem_to_stub(struct drm_file *file, __u32 guest_handle)
  *    owner's ctx with the owner's stub_handle.
  *  - Different isolate (cross-process compositor import): QEMU brokers the bo
  *    into the caller's stub (owner PRIME-export → caller PRIME-import) and hands
- *    back a caller-local GEM handle; forward on the CALLER's ctx with that.
- *    Cached on the proxy so per-frame re-imports don't re-broker.
+ *    back a caller-local GEM handle; forward on the ctx it was brokered into
+ *    with that.  Cached on the proxy so per-frame re-imports don't re-broker,
+ *    and the cached handle is closed when the proxy is freed or the entry is
+ *    evicted -- it is the only thing that ever releases it.
+ *
+ * The cache is one entry deep, so two importers alternating on one bo evict
+ * each other, and an eviction can close a handle a third thread has already
+ * been handed and is about to forward on.  That loses a frame (the stub fails
+ * the op closed on an unresolvable handle) rather than corrupting anything
+ * outside the evicted importer's own fd; a deeper or per-use-refcounted cache
+ * is the real answer if a two-compositor workload ever matters.
  *
  * Returns 0 and fills *stub_h_out / *fwd_ctx_out on success; -errno on a failed
  * cross-isolate broker; -ENOENT if the handle is not one of our proxies. */
@@ -268,20 +323,41 @@ static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
 		return 0;
 	}
 
-	/* Cross-isolate: reuse the cached broker result, else broker now. */
+	/* Cross-isolate: reuse the cached broker result, else broker now.  The
+	 * lock spans the broker so two importers racing on the same bo cannot
+	 * both install (which would leak whichever lost) -- the second one waits
+	 * and then evicts the first. */
+	mutex_lock(&ng->xiso_lock);
 	if (ng->xiso_importer_iso == caller_iso && ng->xiso_gem) {
+		/* Forward on the ctx the handle was brokered INTO, not merely on
+		 * some ctx in the same isolate: a stub GEM handle is scoped to
+		 * one host render fd, and an isolate may hold several (NVIDIA's
+		 * EGL opens renderD128 more than once).  Same rule the owner
+		 * branch above follows, and the same ctx nvkvm_gem_free closes
+		 * the handle on. */
 		*stub_h_out  = ng->xiso_gem;
-		*fwd_ctx_out = caller_ctx;
+		*fwd_ctx_out = ng->xiso_ctx ? ng->xiso_ctx : caller_ctx;
+		mutex_unlock(&ng->xiso_lock);
 		drm_gem_object_put(obj);
 		return 0;
 	}
 
 	{
+		struct nvkvm_fd_ctx *old_ctx = NULL;
+		__u32 old_gem = 0;
 		__u32 gem = 0;
+
 		ret = nvkvm_virtio_xiso_import(caller_ctx, owner_iso,
 					       owner_ctx->handle_id,
 					       ng->stub_handle, &gem);
 		if (ret == 0 && gem) {
+			/* Detach whatever the single-entry cache held so it is
+			 * closed rather than orphaned, and pin the new importer's
+			 * ctx until this proxy is freed (or evicted below). */
+			old_ctx = ng->xiso_ctx;
+			old_gem = ng->xiso_gem;
+			nvkvm_fd_ctx_get(caller_ctx);
+			ng->xiso_ctx          = caller_ctx;
 			ng->xiso_importer_iso = caller_iso;
 			ng->xiso_gem          = gem;
 			*stub_h_out  = gem;
@@ -289,6 +365,9 @@ static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
 		} else if (ret == 0) {
 			ret = -EIO;
 		}
+		mutex_unlock(&ng->xiso_lock);
+		/* Outside the lock: this forwards a blocking GEM_CLOSE. */
+		nvkvm_gem_xiso_release(old_ctx, old_gem);
 	}
 	drm_gem_object_put(obj);
 	return ret;

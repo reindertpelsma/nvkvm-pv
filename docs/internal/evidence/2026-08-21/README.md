@@ -64,3 +64,41 @@ the missing free existed is certain from source. That it was the *dominant* term
 in the 4 GB/h is **inferred, not demonstrated** — nothing here measures memory
 coming back after clients exit. The experiment that would settle it is in the
 commit message.
+
+## Leak fix verified on hardware, 2026-08-21 ~21:00
+
+The cross-isolate GEM fix (`xiso: close the brokered GEM, because nothing else
+ever did`) was **run on the RTX 4070 box and measured**, which is what it was
+missing.
+
+Confirmed live first, rather than assumed: the guest's `nvkvm-guest.service`
+rebuilds the module from the 9p-mounted repo at every boot, and the LOADED
+module's srcversion matched a fresh build of the fixed source exactly
+(`8B7D3B7626B16288ABBC251`). So the fix was in the running kernel module, not
+merely in the checkout.
+
+Then 40 short-lived GL clients (`glxgears`, 1 s each at 1280x720), created and
+destroyed, twice, with the GPU allowed to settle 30 s afterwards:
+
+| round | before | after | delta |
+|---|---|---|---|
+| 1 | 2121 MiB | 2136 MiB | +15 MiB |
+| 2 | 2132 MiB | 2131 MiB | -1 MiB |
+
+Round 2 is the control that matters: it separates a one-off from a linear leak.
+Round 1's +15 MiB did not repeat, so it was warm-up, not accumulation. **80
+create/destroy cycles, net +14 MiB.**
+
+For scale: each client's buffer is ~3.5 MiB at 1280x720. With the leak live, 80
+clients would have pinned 280 MiB and it would have grown with every round. It
+did not.
+
+**The memory comes back.** This is the "does it come back when clients exit"
+experiment that earlier rounds could not run, and it is why the fix was restored
+to main after being held.
+
+Still not shown: that this was the *dominant* term in the original ~4 GB/h
+desktop growth. This measures the mechanism the fix addresses -- surface churn
+by clients a compositor imports -- and that mechanism no longer leaks. A long
+real-desktop session would be needed to claim the rest, and no such machine
+remains.

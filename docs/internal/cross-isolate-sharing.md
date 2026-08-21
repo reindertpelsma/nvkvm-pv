@@ -43,6 +43,33 @@ guest process A                 guest process B (compositor)
                      cached on the proxy (xiso_importer_iso / xiso_gem)
 ```
 
+### Releasing the brokered handle
+
+The broker mints a real GEM in the importer's stub. Nothing used to close it:
+there is no `XISO_RELEASE` opcode, and QEMU keeps no record of brokered GEMs the
+way it records relayed RM handles (`xrm_handles`). So the importer's stub held a
+PRIME reference to every client buffer it had ever imported, for the
+compositor's whole life, and the owner's `GEM_CLOSE` could not reclaim that
+memory. The single-entry cache made it worse: a second importer overwrote the
+entry without closing it, orphaning the handle for good.
+
+The release lives with the proxy, not with the isolate. `xiso_ctx` holds a
+reference on the importer's fd context -- the same reason the owner ctx is
+referenced -- so the importer's stub fd stays addressable, and
+`nvkvm_gem_free()` forwards `GEM_CLOSE` there before dropping the ref. Evicting
+a cached entry closes it first. Caching the bare `(isolate_id, handle_id)`
+instead of the ctx would be fail-open: both ids are table-allocated and
+reusable, so a close issued after the importer died could land on an unrelated
+isolate's GEM.
+
+The cost of that reference is a lifetime inversion worth knowing about: a proxy
+that outlives its importer pins the importer's ctx, hence its session, hence its
+isolate process, until the owner frees the buffer. That is the same trade the
+owner ctx reference already makes. The alternative -- a QEMU-side per-isolate
+record of brokered GEMs, reclaimed on isolate death, mirroring `xrm_handles` --
+has not been built: it is only a backstop against a guest that never frees,
+which is a guest DoS on its own isolate's memory.
+
 ### Why there is no cookie
 
 The obvious design is a guest-minted unguessable cookie naming {isolate, RM
