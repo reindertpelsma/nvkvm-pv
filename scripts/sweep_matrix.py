@@ -43,6 +43,18 @@ import argparse, json, os, re, shlex, subprocess, sys, time, datetime
 
 KVM_IMAGE = "docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16"
 SWEEP_LABEL = "nvkvm-sweep"
+
+# Instances this script must NEVER destroy, whatever else happens.
+#
+# reap_strays() already filters on SWEEP_LABEL, so in principle nothing else is
+# reachable.  This is the second lock: label filtering is one typo (or one
+# accidentally-labelled rental) away from destroying someone else's running
+# work, and these are long-lived boxes other people are actively using.  A
+# destroy is irreversible and a rented GPU box can hold hours of state.
+#
+#   48097794, 48210901  other nvkvm work
+#   48251528            Blackwell 4x RTX 5060 multi-GPU / peer-access test
+PROTECTED_INSTANCES = {"48097794", "48210901", "48251528"}
 RESULTS   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                          "tests", "sweep-results.json")
 REPO      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -230,6 +242,42 @@ def installed_driver_version(S):
     return m.group(1) if m else ""
 
 
+def kernel_cc(S):
+    """Path to the compiler the RUNNING KERNEL was built with, installing it if
+    needed.  Returns "" if it cannot be determined.
+
+    THIS IS NOT A DETAIL.  The vast image runs Ubuntu 22.04 with the 6.8 HWE
+    kernel, which was built by gcc-12 and whose Kbuild therefore passes
+    -ftrivial-auto-var-init=zero.  The image's DEFAULT cc is gcc-11, which does
+    not know that flag, so EVERY .run kernel-module build dies with
+
+        cc: error: unrecognized command-line option '-ftrivial-auto-var-init=zero'
+
+    ...thousands of times, and the installer reports only "The nvidia kernel
+    module was not created."  Measured on instance 48252610: 535.54.03 failed
+    exactly this way for both -m=kernel and -m=kernel-open, and it looks
+    precisely like "this old driver cannot build on this kernel" -- a GPU/driver
+    conclusion -- when the real cause is that we handed it the wrong compiler.
+    The preinstalled 575.51.03 module reports "GCC version: gcc version 12.3.0",
+    i.e. the image itself was built with gcc-12; only our invocation was not.
+
+    gcc-12 is already present on the image, so this is usually just a matter of
+    naming it.
+    """
+    ver, _ = sh(f"{S} 'cat /proc/version'", timeout=60)
+    m = re.search(r"gcc-(\d+)", ver) or re.search(r"gcc[^0-9]*(\d+)\.", ver)
+    if not m:
+        return ""
+    maj = m.group(1)
+    path = f"/usr/bin/gcc-{maj}"
+    out, _ = sh(rsh(S, f"test -x {path} && echo HAVE || echo NEED"), timeout=60)
+    if "NEED" in out:
+        sh(rsh(S, f"DEBIAN_FRONTEND=noninteractive apt-get install -y -q gcc-{maj} "
+                  f">> /root/prereq.log 2>&1; true"), timeout=900)
+    out, _ = sh(rsh(S, f"test -x {path} && echo HAVE || echo NEED"), timeout=60)
+    return path if "HAVE" in out else ""
+
+
 def install_driver(S, ver, arch, log):
     """Replace the host driver in the rented VM.  Returns (ok, detail, actual).
 
@@ -294,23 +342,49 @@ def install_driver(S, ver, arch, log):
               "pkill -f '[q]emu-system-x86_64' 2>/dev/null; true"), timeout=180)
     sh(f"{S} 'rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null; true'", timeout=180)
 
-    mod = "-m=kernel-open" if kernel_open else "-m=kernel"
-    flags = (f"--silent --no-questions --ui=none --disable-nouveau "
-             f"--no-cc-version-check --install-libglvnd {mod}")
+    mod   = "-m=kernel-open" if kernel_open else "-m=kernel"
+    other = "-m=kernel" if kernel_open else "-m=kernel-open"
+    base  = "--silent --no-questions --ui=none --disable-nouveau --install-libglvnd"
+
+    cc = kernel_cc(S)
+    ccenv = f"CC={cc} " if cc else ""
+
+    # Attempt order is diagnostic, not just hopeful.
+    #
+    # --no-cc-version-check is DELIBERATELY absent from the first two attempts.
+    # That check is the one thing that would have named the gcc-11/gcc-12
+    # mismatch out loud instead of letting it become 4000 lines of
+    # "unrecognized command-line option" and a bare "module was not created".
+    # Suppressing it by default converted a clear toolchain error into
+    # something that reads like a driver/kernel incompatibility.  So: let it
+    # speak first, and only disable it as a last resort for the case where the
+    # check is merely being pedantic about a minor version.
+    #
     # Per-driver log.  This used to write every install to one hardcoded
     # /root/drvinstall.log, so the log for a failed install was overwritten by
     # the next driver before anyone could read it -- and `log`, the parameter
     # naming the file, was accepted and then ignored.
-    _, rc = sh(f"{S} '/root/drv.run {flags} > {log} 2>&1'", timeout=2400)
+    attempts = [
+        f"{ccenv}/root/drv.run {base} {mod}",
+        f"{ccenv}/root/drv.run {base} {other}",
+        f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
+    ]
+    rc = 1
+    for i, cmd in enumerate(attempts):
+        redir = ">" if i == 0 else ">>"
+        _, rc = sh(rsh(S, f"{cmd} {redir} {log} 2>&1"), timeout=2400)
+        if rc == 0:
+            break
     if rc != 0:
-        # Retry with the other module flavour before believing the version is
-        # unusable -- the open/proprietary split moved over these branches and
-        # our arch guess is a heuristic, not an oracle.
-        other = "-m=kernel" if kernel_open else "-m=kernel-open"
-        _, rc = sh(f"{S} '/root/drv.run {flags.replace(mod, other)} >> {log} 2>&1'", timeout=2400)
-    if rc != 0:
-        tail, _ = sh(f"{S} 'tail -25 {log}'", timeout=60)
-        return False, tail[-1200:], None
+        tail, _ = sh(rsh(S, f"tail -25 {log}"), timeout=60)
+        hint = ""
+        gt, _ = sh(rsh(S, f"grep -c 'ftrivial-auto-var-init' {log} 2>/dev/null || echo 0"),
+                   timeout=60)
+        if gt.strip().isdigit() and int(gt.strip()) > 0:
+            hint = (f"\n[HARNESS] kernel-module build used the wrong compiler "
+                    f"(kernel_cc={cc or 'UNDETECTED'}); this is a toolchain "
+                    f"failure, NOT a driver/GPU result.")
+        return False, (tail[-1100:] + hint), None
 
     sh(f"{S} 'modprobe nvidia; modprobe nvidia_uvm; true'", timeout=180)
     got = installed_driver_version(S)
@@ -465,6 +539,9 @@ def destroy_verified(iid, tries=5):
          the instance no longer appearing in `show instances`.
     Returns True only when the id is actually absent from the listing.
     """
+    if str(iid) in PROTECTED_INSTANCES:
+        print(f"  !! REFUSING to destroy protected instance {iid}", file=sys.stderr, flush=True)
+        return False
     for _ in range(tries):
         sh(f"vastai destroy instance {iid} -y", timeout=90)
         time.sleep(8)
@@ -487,7 +564,8 @@ def reap_strays():
     data = vast_json("show instances") or []
     if isinstance(data, dict):
         data = data.get("instances", []) or []
-    strays = [i for i in data if (i.get("label") or "") == SWEEP_LABEL]
+    strays = [i for i in data if (i.get("label") or "") == SWEEP_LABEL
+              and str(i.get("id")) not in PROTECTED_INSTANCES]
     for i in strays:
         iid = i.get("id")
         print(f"  !! STRAY {iid} ({i.get('gpu_name')}) alive -- destroying", file=sys.stderr, flush=True)
@@ -693,6 +771,26 @@ def run_one(offer, args):
                                 detail="ERRORS:\n" + errs[-1500:] + "\n\nTAIL:\n" + tail[-1500:])]
 
         todo = drivers_for(gpu, args.drivers)
+
+        # ORDER MATTERS, and getting it wrong silently destroys the baseline.
+        #
+        # The image's driver is DKMS-managed (nvidia-dkms-575,
+        # nvidia-kernel-source-575), so purge_distro_driver() removes it for
+        # good -- and 575.51.03 is NOT downloadable from NVIDIA any more.  In
+        # plain DRIVER_MATRIX order 575.51.03 is tested LAST, i.e. after the
+        # purge, so the one row that is a KNOWN-GOOD CONTROL would report
+        # driver-install-failed on every box.  Without it there is no way to
+        # separate "this old driver cannot build on this kernel" from "the
+        # harness is broken", which is the whole point of having a baseline.
+        #
+        # So: whatever is already installed gets measured FIRST, for free,
+        # before anything is purged.  Stable sort, so the rest of the matrix
+        # keeps its documented order.
+        cur0 = installed_driver_version(S)
+        if cur0:
+            todo.sort(key=lambda t: 0 if t[0] == cur0 else 1)
+            if todo and todo[0][0] == cur0:
+                print(f"    (testing preinstalled {cur0} first, before any purge)", flush=True)
         if not todo:
             return [rec_for("-", "-", "-", status="no-applicable-drivers",
                             detail=f"arch={base['arch']} floor={ARCH_FLOOR.get(base['arch'])}")]
