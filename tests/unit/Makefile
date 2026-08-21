@@ -36,7 +36,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -66,6 +66,13 @@ test_open_scm: $(OPEN_SCM_SRCS)
 test_ctrl_gate: $(CTRL_GATE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(CTRL_GATE_SRCS)
 
+# Header-only gate, so this needs no sources beyond the test itself.  It pins
+# the NVKMS command numbering at every vendor tag nvkvm supports -- see the
+# table in the test; the gate is version-keyed precisely because those numbers
+# move between branches.
+test_nvkms_allowlist: test_nvkms_allowlist.c ../../src/qemu/nvkvm_nvkms_allowlist.h
+	$(CC) $(CFLAGS) -o $@ test_nvkms_allowlist.c
+
 # NOTE: test_isolate currently fails 4 of its 7 cases at RUNTIME.  It is not a
 # build problem -- all seven binaries compile and the other six suites pass.
 # It is also NOT the "isolate id disagreement" this note used to claim; that
@@ -73,7 +80,7 @@ test_ctrl_gate: $(CTRL_GATE_SRCS)
 # socket when fd 0 was free).  run_tests.sh carries the full diagnosis and the
 # list of what is still genuinely broken.  Until that is run to ground `make
 # run` exits non-zero -- use `make check` / run_tests.sh for a pass/fail signal.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist
 	./test_dispatch
 	./test_frontend
 	./test_handle
@@ -81,6 +88,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_tables
 	./test_open_scm
 	./test_ctrl_gate
+	./test_nvkms_allowlist
 
 # `check` is what CI runs, and what you should run too.  `run` above is the
 # raw thing: it exits non-zero because of the test_isolate drift documented
@@ -92,4 +100,4 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist

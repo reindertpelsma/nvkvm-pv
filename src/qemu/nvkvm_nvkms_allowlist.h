@@ -137,22 +137,102 @@ static inline bool nvkvm_nvkms_extra_allow(uint32_t cmd_type)
 	return false;
 }
 
-static inline bool nvkvm_nvkms_cmd_allowed(uint32_t cmd_type)
+/*
+ * The allowlist is keyed on the DRIVER VERSION, because `enum NvKmsIoctlCommand`
+ * is a plain unvalued enum -- position IS the wire value -- and NVIDIA edits it
+ * in the MIDDLE, not only by appending.  A bare `case 18:` therefore names a
+ * different command on different hosts.
+ *
+ * Measured from `enum NvKmsIoctlCommand` in
+ * src/nvidia-modeset/interface/nvkms-api.h at each vendor tag (515.105.01,
+ * 525.105.17, 535.104.05, 545.23.06, 550.54.14, 565.57.01, 570.86.16,
+ * 575.51.03, 580.178.04, 590.48.01, 595.84, 610.43.02).  Three regimes:
+ *
+ *   major        REGISTER  UNREGISTER  GRANT   vblank en/dis/accel  FLIPLOCK
+ *   ---------------------------------------------------------------------
+ *   515..549       16         17        18       (absent)              -
+ *   550..574       16         17        18       60 / 61 / 62         59
+ *   575..589       17         18        19       61 / 62 / 63         60
+ *   590..610       17         18        19       60 / 61 / 62         59
+ *
+ * 575 INSERTED NVKMS_IOCTL_DECLARE_DYNAMIC_DPY_INTEREST at 16, pushing
+ * everything above it up by one; 590 removed two members below 64, pulling the
+ * tail back down.  Note that the 570->575 step falls INSIDE the NVKVM_ABI_570
+ * profile bucket ("== 575 layouts"), so the RM/UVM profile id cannot express
+ * this boundary -- that is why this takes the parsed major and not `nv->abi`.
+ *
+ * What the old hardcoded list {0,1,17,18,60,61,62} actually admitted:
+ *
+ *   - on 515..574 value 18 is GRANT_SURFACE -- one of the cross-client sharing
+ *     verbs this gate exists to deny, and named as such in its own header
+ *     comment -- while REGISTER_SURFACE (16) was NOT admitted, so the gate both
+ *     leaked the dangerous command and blocked the intended one;
+ *   - on 575..589 value 60 is SET_FLIPLOCK_GROUP, a host-global display
+ *     operation reachable after the accepted ALLOC_DEVICE;
+ *   - only on 590+ was it correct, which is where it was captured.
+ *
+ * SET_FLIPLOCK_GROUP and GRANT_SURFACE are never named here in any regime.
+ *
+ * An unrecognised or unparseable version admits ALLOC_DEVICE/FREE_DEVICE only
+ * (indices 0 and 1, which have never moved) and denies the rest.  That is
+ * deliberate: extrapolating the numbering onto an unverified branch is exactly
+ * how SET_FLIPLOCK_GROUP got in.  Adding a branch is one row below, once its
+ * enum has actually been read.  NVKVM_NVKMS_EXTRA_ALLOW remains the one-run
+ * escape hatch for bringing a new branch up.
+ */
+struct nvkvm_nvkms_ops {
+	bool     known;
+	uint32_t reg_surface;
+	uint32_t unreg_surface;
+	int32_t  vblank_enable;    /* -1 when the branch has no vblank-sem ops */
+	int32_t  vblank_disable;
+	int32_t  vblank_accel;
+};
+
+static inline struct nvkvm_nvkms_ops nvkvm_nvkms_ops_for_major(unsigned major)
 {
+	struct nvkvm_nvkms_ops o = { false, 0, 0, -1, -1, -1 };
+
+	if (major >= 515 && major <= 549) {
+		o.known = true; o.reg_surface = 16; o.unreg_surface = 17;
+	} else if (major >= 550 && major <= 574) {
+		o.known = true; o.reg_surface = 16; o.unreg_surface = 17;
+		o.vblank_enable = 60; o.vblank_disable = 61; o.vblank_accel = 62;
+	} else if (major >= 575 && major <= 589) {
+		o.known = true; o.reg_surface = 17; o.unreg_surface = 18;
+		o.vblank_enable = 61; o.vblank_disable = 62; o.vblank_accel = 63;
+	} else if (major >= 590 && major <= 610) {
+		o.known = true; o.reg_surface = 17; o.unreg_surface = 18;
+		o.vblank_enable = 60; o.vblank_disable = 61; o.vblank_accel = 62;
+	}
+	return o;
+}
+
+static inline bool nvkvm_nvkms_cmd_allowed_major(uint32_t cmd_type, unsigned major)
+{
+	struct nvkvm_nvkms_ops o;
+
 	if (nvkvm_nvkms_extra_allow(cmd_type))
 		return true;
-	switch (cmd_type) {
-	case 0:   /* NVKMS_IOCTL_ALLOC_DEVICE      */
-	case 1:   /* NVKMS_IOCTL_FREE_DEVICE       */
-	case 17:  /* NVKMS_IOCTL_REGISTER_SURFACE  */
-	case 18:  /* NVKMS_IOCTL_UNREGISTER_SURFACE*/
-	case 60:  /* per-surface, 595+ ICD; see header note   */
-	case 61:  /* query-class (captured)        */
-	case 62:  /* query-class (captured)        */
+
+	/* ALLOC_DEVICE / FREE_DEVICE sit at 0 and 1 in every tag measured. */
+	if (cmd_type == 0 || cmd_type == 1)
 		return true;
-	default:
+
+	o = nvkvm_nvkms_ops_for_major(major);
+	if (!o.known)
 		return false;
-	}
+
+	if (cmd_type == o.reg_surface || cmd_type == o.unreg_surface)
+		return true;
+
+	if (o.vblank_enable >= 0 &&
+	    ((int32_t)cmd_type == o.vblank_enable ||
+	     (int32_t)cmd_type == o.vblank_disable ||
+	     (int32_t)cmd_type == o.vblank_accel))
+		return true;
+
+	return false;
 }
 
 #endif /* NVKVM_NVKMS_ALLOWLIST_H */

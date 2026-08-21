@@ -44,6 +44,7 @@ declare -A TALLY_SUITES=(
     [test_frontend]=8
     [test_handle]=9
     [test_tables]=17
+    [test_nvkms_allowlist]=470
 )
 
 # Suites with their own ad-hoc output.  Value is a line that must appear.
@@ -86,7 +87,7 @@ declare -A MARKER_SUITES=(
 ISOLATE_TOTAL=7
 ISOLATE_KNOWN_FAIL="concurrent_ioctl out_of_order_ioctl sequential_ioctl sync_mmap_munmap"
 
-ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate mock_stub"
+ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist mock_stub"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }
@@ -179,7 +180,7 @@ fi
 
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "UNIT SUITE OK — all 7 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
+    echo "UNIT SUITE OK — all 8 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
     echo "ran with exactly the ${ISOLATE_KNOWN_FAIL// /, } drift failures."
 else
     echo "UNIT SUITE FAILED"

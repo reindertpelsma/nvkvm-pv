@@ -1,7 +1,8 @@
 # Known issue: the NVKMS allowlist compares raw enum indices that shift between driver branches
 
-**Status:** open. Not fixed for the current release — the fix is ABI-profile
-plumbing, not an edit.
+**Status:** FIXED 2026-08-21, see "Resolution" at the end. Independently
+re-reported the same day by an external Codex review (finding 3), which caught
+the 575/580 `SET_FLIPLOCK_GROUP` admission but not the `GRANT_SURFACE` one.
 **Component:** `src/qemu/nvkvm_nvkms_allowlist.h`
 **Found:** pre-release audit, 2026-08-21.
 **Severity:** medium as shipped, high on an untested driver branch. The gate can
@@ -46,8 +47,8 @@ Enum members extracted from `enum NvKmsIoctlCommand` in each tag's
 | 515.105.01 → 575.51.03 | **insert** `CHECK_LUT_NOTIFIER` at index 13 | every command ≥ 13 shifts **+1** |
 | 515.105.01 → 575.51.03 | append 7 members at 59–65 | (benign, this is the "appending" the header assumed) |
 | 575.51.03 → 580.159.04 | *none* | identical enums |
-| 580.159.04 → 610.43.02 | **delete** `EXPORT_VRR_SEMAPHORE_SURFACE` at 56 | every command > 56 shifts **−1** |
-| 580.159.04 → 610.43.02 | **delete** `VRR_SIGNAL_SEMAPHORE` at 64 | every command > 64 shifts **−1** again |
+| 580.159.04 → **590.48.01** | **delete** `EXPORT_VRR_SEMAPHORE_SURFACE` at 56 | every command > 56 shifts **−1** (measured: 590 already has it, so the edit lands at 590, not 610) |
+| 580.159.04 → **590.48.01** | **delete** `VRR_SIGNAL_SEMAPHORE` at 64 | every command > 64 shifts **−1** again |
 | 580.159.04 → 610.43.02 | append `REGISTER_VBLANK_INTR_CALLBACK`, `UNREGISTER_VBLANK_INTR_CALLBACK` | — |
 
 What nvkvm's seven allowed values actually mean, per tag:
@@ -131,3 +132,67 @@ Extract `enum NvKmsIoctlCommand` from
 and compare the member lists positionally. The enum is unvalued throughout every
 tag checked (no `= N` on any member), so index equals wire value and a plain
 positional diff is sufficient.
+
+---
+
+## Resolution (2026-08-21)
+
+Fixed, along the lines the section above proposed, but keyed on the parsed
+driver **major** rather than on `enum nvkvm_abi_id`. That detail is
+load-bearing: the NVKMS renumbering happens between **570.86.16 and 575.51.03**,
+which falls *inside* the `NVKVM_ABI_570` bucket ("== 575 layouts"). The RM/UVM
+profile id therefore cannot express this boundary, and a fix written against
+`nv->abi` would still have admitted `SET_FLIPLOCK_GROUP` on 575.
+
+### The full measured table
+
+Extracted from `enum NvKmsIoctlCommand` at twelve vendor tags rather than the
+four the original note sampled, which is what pinned both boundaries:
+
+| tag | REGISTER | UNREGISTER | GRANT | enable/disable/accel vblank-sem | FLIPLOCK |
+|---|---|---|---|---|---|
+| 515.105.01 | 16 | 17 | 18 | — | — |
+| 525.105.17 | 16 | 17 | 18 | — | — |
+| 535.104.05 | 16 | 17 | 18 | — | — |
+| 545.23.06 | 16 | 17 | 18 | — | 59 |
+| 550.54.14 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
+| 565.57.01 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
+| 570.86.16 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
+| 575.51.03 | 17 | 18 | 19 | 61 / 62 / 63 | 60 |
+| 580.178.04 | 17 | 18 | 19 | 61 / 62 / 63 | 60 |
+| 590.48.01 | 17 | 18 | 19 | 60 / 61 / 62 | 59 |
+| 595.84 | 17 | 18 | 19 | 60 / 61 / 62 | 59 |
+| 610.43.02 | 17 | 18 | 19 | 60 / 61 / 62 | 59 |
+
+Three regimes: 515–574 (REGISTER at 16), 575–589 (everything above 15 pushed up
+one by the `DECLARE_DYNAMIC_DPY_INTEREST` insertion), and 590+ (the tail pulled
+back down by the two deletions).
+
+### What the old list actually admitted
+
+`{0, 1, 17, 18, 60, 61, 62}` was captured on a 590+ host, where it is exactly
+right. Everywhere else it was wrong, in both directions:
+
+- **515–574 (six of the eight supported profiles): value 18 is `GRANT_SURFACE`** —
+  a cross-client sharing verb the gate's own header names as precisely what it
+  exists to deny — while `REGISTER_SURFACE` at 16 was *not* admitted. The gate
+  leaked the dangerous command and blocked the intended one.
+- **575–589: value 60 is `SET_FLIPLOCK_GROUP`**, a host-global display operation
+  reachable after the accepted `ALLOC_DEVICE`.
+
+### The fix
+
+`nvkvm_nvkms_cmd_allowed_major()` resolves the four permitted operations and the
+vblank-sem trio per regime and compares against those. `SET_FLIPLOCK_GROUP` and
+`GRANT_SURFACE` are never named in any regime. An unrecognised or unparseable
+version admits `ALLOC_DEVICE`/`FREE_DEVICE` only (indices 0 and 1, stable across
+every tag measured) and denies the rest — extrapolating the numbering onto an
+unverified branch is exactly how `SET_FLIPLOCK_GROUP` got in, so a new branch
+costs one table row after its enum has actually been read.
+`NVKVM_NVKMS_EXTRA_ALLOW` stays as the one-run escape hatch for bringing a new
+branch up.
+
+`tests/unit/test_nvkms_allowlist.c` pins all twelve tags (470 assertions),
+including explicit regression cases for `GRANT_SURFACE(18)@570` and
+`SET_FLIPLOCK_GROUP(60)@575/580`, and asserts that unknown majors admit nothing
+beyond 0 and 1.

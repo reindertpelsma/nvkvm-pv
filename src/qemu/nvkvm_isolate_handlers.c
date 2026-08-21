@@ -2077,13 +2077,23 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			? *(const uint32_t *)param_buf : 0xffffffffu;
 		uint32_t nvkms_sz = (param_buf && req->param_size >= 8)
 			? *(const uint32_t *)((const char *)param_buf + 4) : 0;
+		/* Key the gate on the host driver's MAJOR: NvKmsIoctlCommand is
+		 * an unvalued enum that NVIDIA edits in the middle, so the same
+		 * number names different commands on different branches.  The
+		 * RM/UVM profile id cannot stand in for this -- the 570->575
+		 * NVKMS renumbering falls inside the NVKVM_ABI_570 bucket. */
+		unsigned nvkms_major = 0, nvkms_minor = 0, nvkms_patch = 0;
+		nvkvm_abi_parse_version(nv->driver_version, &nvkms_major,
+					&nvkms_minor, &nvkms_patch);
+		bool nvkms_ok = nvkvm_nvkms_cmd_allowed_major(nvkms_cmd, nvkms_major);
 		if (getenv("NVKVM_NVKMS_TRACE"))
-			fprintf(stderr, "nvkvm: nvkms cmdType=%u size=%u %s\n",
-				nvkms_cmd, nvkms_sz,
-				nvkvm_nvkms_cmd_allowed(nvkms_cmd) ? "allow" : "DENY");
-		if (!nvkvm_nvkms_cmd_allowed(nvkms_cmd)) {
-			fprintf(stderr, "nvkvm: DENY nvkms cmdType=%u size=%u\n",
-				nvkms_cmd, nvkms_sz);
+			fprintf(stderr, "nvkvm: nvkms cmdType=%u size=%u drv=%u %s\n",
+				nvkms_cmd, nvkms_sz, nvkms_major,
+				nvkms_ok ? "allow" : "DENY");
+		if (!nvkms_ok) {
+			fprintf(stderr,
+				"nvkvm: DENY nvkms cmdType=%u size=%u (driver major %u)\n",
+				nvkms_cmd, nvkms_sz, nvkms_major);
 			resp->retval     = (uint64_t)(int64_t)(-EACCES);
 			resp->status     = 0;
 			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
