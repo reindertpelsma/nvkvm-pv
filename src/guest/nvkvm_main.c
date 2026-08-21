@@ -1487,14 +1487,26 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			}
 
 			/* NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD (0x3d06,
-			 * #110): the dma-buf import counterpart of 0x3d05.  The
-			 * inner params carry the source nv-export fd at offset 0
-			 * (NvS32 fd; then the NV0000_CTRL_OS_UNIX_EXPORT_OBJECT).
-			 * Swap our handle_id in so the stub resolves its own local
-			 * fd and imports the object into the caller's RM client;
-			 * the fd is IN (unchanged), so save it to restore on the
-			 * response. */
-			if (ctrl->cmd == 0x3d06 && aux_size >= 4) {
+			 * #110) and _GET_EXPORT_OBJECT_INFO (0x3d08).  Both are
+			 * the read side of 0x3d05 and both carry the source
+			 * nv-export fd at inner offset 0 (NvS32 fd; 0x3d06 then
+			 * has the NV0000_CTRL_OS_UNIX_EXPORT_OBJECT, 0x3d08 the
+			 * deviceInstance/maxObjects it fills in).  Swap our
+			 * handle_id in so the stub resolves its own local fd; the
+			 * fd is IN (unchanged), so save it to restore on the
+			 * response.
+			 *
+			 * 0x3d08 was missing here, and it is the FIRST of the two
+			 * libcuda issues: cuMemImportFromShareableHandle calls it
+			 * to learn which device an exported fd's objects are
+			 * parented by, before it calls 0x3d06 at all.  MEASURED on
+			 * the bare-metal host with tools/nv_ioctl_trace.c: the
+			 * order is 0x3d05 (exporter) -> 0x3d08 -> 0x3d06
+			 * (importer).  Without the translation the guest's own fd
+			 * NUMBER was forwarded to a stub in which it means
+			 * something else entirely. */
+			if ((ctrl->cmd == 0x3d06 || ctrl->cmd == 0x3d08) &&
+			    aux_size >= 4) {
 				__s32 gfd;
 				memcpy(&gfd, aux_buf, sizeof(gfd));
 				orig_import_fd = gfd;

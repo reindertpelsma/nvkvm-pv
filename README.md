@@ -57,8 +57,8 @@ numbers](#tested-applications).
 
 That is one GPU, with CUDA graphs, on throughput. Three shapes cost more, all
 measured: single-stream greedy decode without graphs (0.73–0.82x), tensor-parallel
-serving across several GPUs ([correct but not yet
-fast](#multi-gpu-serving-correct-not-yet-fast)), and NVENC video encode, which
+serving across several GPUs ([about
+0.86x](#multi-gpu-serving-correct-and-no-longer-forced-off-the-fast-path)), and NVENC video encode, which
 hangs outright on one driver.
 
 ## What it is not
@@ -389,12 +389,12 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   bring-up, CUDA, Vulkan compute and offscreen GL. It does not cover everything,
   and a real correctness bug has passed it before. Check your own results
   against a host run ([what that bug was](docs/reference/correctness.md)).
-- **Multi-GPU tensor-parallel serving is correct but slow** — 0.12–0.37x of
-  host. Part of that is a confirmed bug (NCCL's shared-memory transport fails in
-  the guest, so its fastest path is unreachable); the rest shows up even with
-  identical NCCL settings on both sides and is **not yet explained**. Single-GPU
-  serving is at parity
-  ([numbers](#multi-gpu-serving-correct-not-yet-fast)).
+- **Multi-GPU tensor-parallel serving is correct, and about 0.86x of host** on
+  the one measurement taken since the NCCL shared-memory fix (2026-08-21). The
+  earlier 0.12–0.37x figures were measured with that transport disabled and are
+  superseded. Output parity on the fast path is **not yet confirmed** — see the
+  section. Single-GPU serving is at parity
+  ([numbers](#multi-gpu-serving-correct-and-no-longer-forced-off-the-fast-path)).
 - **Frameworks that pin large host buffers pay a penalty.** Registering pinned
   memory is slower than native and a single registration is capped at 2 GiB —
   noticeable in data loaders and serving stacks that pin aggressively. Stock
@@ -504,30 +504,37 @@ At temperature 0 the guest produced **token-id identical** output to the host on
 all three tasks (long-chain reasoning, C11 lock-free ring codegen, 8k-token
 summarisation).
 
-### Multi-GPU serving: correct, not yet fast
+### Multi-GPU serving: correct, and no longer forced off the fast path
 
 vLLM with `--tensor-parallel-size 6` on six RTX A4000s runs a 38 GB model that
 does not fit on any one 16 GB card, and the guest's output is **byte-identical
-to the host's** under matched settings. So it works and it is correct. It is
-also slow:
+to the host's** under matched settings. So it works and it is correct.
 
-| identical flags on both sides | host | guest | ratio |
-|---|---|---|---|
-| eager | 47.9 | 10.0 tok/s | 0.21x |
-| CUDA graphs | 36.0 | 13.3 tok/s | 0.37x |
-| host's best configuration | 115.7 | not reachable | 0.12x |
+It used to also be *slow for a specific, fixable reason*: NCCL's shared-memory
+transport failed in the guest inside `cuMemImportFromShareableHandle`, so every
+world>=2 NCCL job needed `NCCL_SHM_DISABLE=1` and the host's fastest path was
+simply unavailable. **That bug is fixed** (2026-08-21) — the CUDA VMM
+shareable-handle fd is now brokered across isolates the same way #110 brokers
+dma-bufs. NCCL world=6 passes in the guest with **default settings**, and the
+SHM transport being available roughly doubles collective bandwidth:
 
-Note the first two rows have `NCCL_SHM_DISABLE=1` on **both** sides, so most of
-this gap is not explained by the SHM bug below — with identical NCCL settings
-the guest is still 3-5x slower, and **we do not yet know why**. The collectives
-themselves are not it: matched, the guest matches or beats the host on both
-bandwidth and latency, and an NCCL world=6 check passes on both sides.
+| world=6 all-reduce, 64 MiB sustained | before (`NCCL_SHM_DISABLE=1`) | after (default) |
+|---|---|---|
+| guest aggregate payload | 0.83 GB/s | **1.52 GB/s** |
 
-What the third row shows is a separate, **confirmed guest-only bug**: NCCL's
-shared-memory transport fails in `cuMemImportFromShareableHandle`, so
-`NCCL_SHM_DISABLE=1` is required in the guest and the host's fastest
-configuration is simply unreachable there. Fixing it closes the gap between rows
-one and three; it does not by itself explain rows one and two.
+**End-to-end serving improves far more than that suggests, because the guest was
+hurt worse by the workaround than the host was.** One TP=6 measurement with the
+fix and SHM enabled on both sides: **guest 140.15 vs host 163.57 tok/s, about
+0.86x**. The same comparison with `NCCL_SHM_DISABLE=1` forced on both sides had
+read 0.21x — the host fell from 115.7 to 47.9 without SHM, the guest fell to
+10.0. Those older figures are superseded and should not be quoted.
+
+Two honest caveats. That is **one** datapoint, not a re-measured matrix; TP=1/2/4
+scaling on the fixed stack is still being measured. And in that run the
+**generated-text hashes differed between host and guest**, where the earlier
+comparison was byte-identical — that may be reduction-order nondeterminism in
+tensor-parallel collectives, which is common, but we have not shown it either
+way and are not claiming output parity on this path until we have.
 
 Single-GPU serving is unaffected.
 
