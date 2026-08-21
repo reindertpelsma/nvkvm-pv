@@ -539,11 +539,14 @@ long nvkvm_virtio_ioctl(struct nvkvm_fd_ctx *ctx,
 	long ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
+	if (!msg) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
+	}
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -812,8 +815,10 @@ static int simple_req(__u32 req_type,
 	 * scatter-gather DMA.  Copy into a kmalloc'd buffer first.
 	 */
 	buf = kmalloc(req_len, GFP_KERNEL);
-	if (!buf)
+	if (!buf) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
+	}
 	memcpy(buf, req_buf, req_len);
 
 	((struct nvkvm_hdr *)buf)->type   = cpu_to_le32(req_type);
@@ -822,6 +827,7 @@ static int simple_req(__u32 req_type,
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(buf);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -929,6 +935,7 @@ int nvkvm_virtio_setup_ring(unsigned int session_id, u64 *ring_gpa_out,
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(buf);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -974,6 +981,7 @@ int nvkvm_virtio_enter_loop(unsigned int session_id, u32 idle_us, u64 *head_out)
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(buf);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -1042,6 +1050,7 @@ int nvkvm_virtio_present(struct nvkvm_fd_ctx *ctx, __u32 stub_handle,
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(buf);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -1189,11 +1198,14 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	long ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
+	if (!msg) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
+	}
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 	/* Mark this wait interruptible: on a guest signal, send_sync will ask
@@ -1394,11 +1406,14 @@ int nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
+	if (!msg) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
+	}
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -1430,11 +1445,14 @@ int nvkvm_virtio_read_memory_handle(__u32 handle_id, __u64 offset,
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
+	if (!msg) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
+	}
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
@@ -1470,11 +1488,14 @@ int nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
 	int ret;
 
 	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
-	if (!msg)
+	if (!msg) {
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
+	}
 	inf = inflight_alloc_legacy(txn_id);
 	if (!inf) {
 		kfree(msg);
+		nvkvm_txn_id_free(&nvkvm, txn_id);
 		return -ENOMEM;
 	}
 
