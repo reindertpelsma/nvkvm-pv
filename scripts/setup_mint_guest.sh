@@ -175,6 +175,10 @@ AL
 # login path once the cursor-plane gap is closed.
 cat > /home/$GUEST_USER/run-session.sh <<'RS'
 #!/bin/bash
+# Session launcher for VT1.  ~/session-choice picks which one:
+#   cinnamon-x11  (default) - the real Mint Cinnamon desktop; see below
+#   weston                  - bare weston + Xwayland; the control path
+#   cinnamon                - Cinnamon's own Wayland session (crashes, see docs)
 exec > ~/session.log 2>&1
 echo "=== $(date) session: $(cat ~/session-choice 2>/dev/null) ==="
 export XDG_SESSION_TYPE=wayland
@@ -193,21 +197,103 @@ for c in /sys/class/drm/card[0-9]*; do
 done
 echo "nvkvm DRM device: ${NVCARD:-NOT FOUND}"
 
+# --idle-time=0 is load-bearing for an unattended head, and its absence does NOT
+# look like a timeout.  weston's default is 300s of no INPUT -- animating clients
+# do not count -- after which weston-desktop-shell LOCKS the session, draws its
+# own "Unlock your desktop" dialog and stops repainting.  The nvkvm scanout then
+# holds that last frame forever: screendump returns a plausible desktop that is
+# byte-identical every time and reads exactly like a dead present path.
+start_weston() {
+    weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} --idle-time=0 "$@" &
+    WESTON_PID=$!
+    for _ in $(seq 1 60); do
+        [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/wayland-1" ] && return 0
+        sleep 0.5
+    done
+    echo "weston socket never appeared"; return 1
+}
+
 case "$(cat ~/session-choice 2>/dev/null)" in
-  cinnamon) exec cinnamon-session-cinnamon --wayland ;;
-  # --idle-time=0 is load-bearing for an unattended head, and its absence does
-  # NOT look like a timeout.  weston's default is 300s of no INPUT -- animating
-  # clients do not count -- after which weston-desktop-shell LOCKS the session,
-  # draws its own "Unlock your desktop" dialog and stops repainting.  The nvkvm
-  # scanout then holds that last frame forever, so screendump returns a
-  # plausible desktop that is byte-identical every time and reads exactly like
-  # a dead present path.  docs/howto/run.md already warned about this.
-  *)        exec weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} \
+  weston)   exec weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} \
                         --xwayland --idle-time=0 ;;
+  cinnamon) exec cinnamon-session-cinnamon --wayland ;;
+  *)
+    # The real Mint desktop: Cinnamon's X11 session -- the one a stock Mint
+    # install boots into -- inside a ROOTFUL Xwayland that is itself a client of
+    # the weston session driving the nvkvm KMS head.
+    #
+    # Rootful is the trick.  weston's own --xwayland is ROOTLESS: X clients
+    # become individual weston windows and there is no X root window for a
+    # window manager to own, which is why running Cinnamon against it renders a
+    # black box.  A rootful Xwayland owns a real root window, so a complete X
+    # session (muffin + panel + desktop) runs inside it as it would on Xorg.
+    #
+    # This needs no Xorg, no modesetting driver and no glamor pixmap import --
+    # which is what makes it work at all, since NVIDIA's EGL refuses the
+    # EGL_NATIVE_PIXMAP_KHR import that Xorg's modesetting+glamor requires.
+    start_weston || exit 1
+    ~/start-cinnamon-x11.sh &
+    wait $WESTON_PID
+    ;;
 esac
 RS
-chmod +x /home/$GUEST_USER/run-session.sh
-echo weston > /home/$GUEST_USER/session-choice
+
+cat > /home/$GUEST_USER/start-cinnamon-x11.sh <<'CX'
+#!/bin/bash
+# Rootful Xwayland on the running weston session + Cinnamon's X11 session inside
+# it.  Invoked by run-session.sh; safe to run by hand too.
+exec > ~/cinnamon-x11.log 2>&1
+set -x
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+
+pkill -f "Xwayland :2" 2>/dev/null
+sleep 1
+
+Xwayland :2 -fullscreen -geometry 1920x1080 &
+for _ in $(seq 1 60); do
+    [ -S /tmp/.X11-unix/X2 ] && break
+    sleep 0.5
+done
+[ -S /tmp/.X11-unix/X2 ] || { echo "Xwayland :2 never came up"; exit 1; }
+
+export PATH="$HOME/bin:$PATH"     # for the cinnamon --x11 shim, see ~/bin/cinnamon
+export DISPLAY=:2
+export XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=X-Cinnamon
+export XDG_SESSION_DESKTOP=cinnamon
+export DESKTOP_SESSION=cinnamon
+unset WAYLAND_DISPLAY             # so the session does not start as a wayland one
+
+# Prove the X server is on the GPU before putting a desktop on it.  A silent
+# llvmpipe fallback here would look completely normal in a screenshot.
+glxinfo -B 2>&1 | grep -iE "vendor string|renderer string|OpenGL version" | head -3
+
+exec cinnamon-session-cinnamon
+CX
+
+# muffin asks logind what session it is in.  Launched from the VT1 seat session
+# it sees a seat with a VT, picks the NATIVE (KMS) backend, and then dies on
+# TakeControl because weston -- which is driving that very KMS head -- already
+# holds the seat:
+#     Failed to create backend: Could not take control: ... EBUSY
+# The session then comes up with no shell at all: no panel, no wallpaper, just
+# whatever autostart apps mapped.  Note logind resolves a process to a session
+# by CGROUP, so unsetting XDG_SESSION_ID/XDG_SEAT/XDG_VTNR does not help, and
+# neither does a systemd --user scope.
+#
+# This session genuinely IS an X11 session -- it runs inside a rootful Xwayland
+# that is a weston client -- so --x11 tells muffin the truth rather than
+# overriding it.  cinnamon-launcher execvp()s "cinnamon" by PATH, so a shim
+# ahead of /usr/bin is enough and nothing Mint ships is modified.
+mkdir -p /home/$GUEST_USER/bin
+cat > /home/$GUEST_USER/bin/cinnamon <<'SHIM'
+#!/bin/sh
+exec /usr/bin/cinnamon --x11 "$@"
+SHIM
+chmod +x /home/$GUEST_USER/bin/cinnamon
+chmod +x /home/$GUEST_USER/run-session.sh /home/$GUEST_USER/start-cinnamon-x11.sh
+echo cinnamon-x11 > /home/$GUEST_USER/session-choice
 
 # The guard is NOT optional.  /usr/bin/cinnamon-session is a shell wrapper that,
 # for a wayland session, re-execs itself through a LOGIN shell:
@@ -224,7 +310,8 @@ if [ -z "$NVKVM_SESSION_LAUNCHED" ] && [ -z "$WAYLAND_DISPLAY" ] && [ "$XDG_VTNR
   exec ~/run-session.sh
 fi
 BP
-chown $GUEST_USER:$GUEST_USER /home/$GUEST_USER/run-session.sh \
+chown -R $GUEST_USER:$GUEST_USER /home/$GUEST_USER/run-session.sh \
+      /home/$GUEST_USER/start-cinnamon-x11.sh /home/$GUEST_USER/bin \
       /home/$GUEST_USER/session-choice /home/$GUEST_USER/.bash_profile
 
 # Build and load the guest module at boot.  RequiresMountsFor is load-bearing:

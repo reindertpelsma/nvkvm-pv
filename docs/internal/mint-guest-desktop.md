@@ -1,13 +1,27 @@
 # A Linux Mint desktop on the nvkvm head
 
-Status: **an accelerated Mint desktop runs unattended via weston.**  Stock
-Mint's *own* Xorg session does not, and this file records exactly why — with
-the host checked as a control in every case.
+Status: **the real Mint Cinnamon desktop runs, accelerated, unattended.**
+Cinnamon's own X11 session — panel, menu, wallpaper, the lot — inside a rootful
+Xwayland hosted by weston on the nvkvm KMS head.  See "The Mint desktop" below.
 
-The headline goal is stock Mint on its native Xorg session.  weston is not that
-goal; it is a working control that proves the nvkvm head, the DRM node and the
-NVIDIA EGL/GBM stack are all healthy, which is what makes the Xorg findings
-below trustworthy rather than "something in the guest is broken".
+What does *not* work is Mint booting into that desktop entirely on its own via
+Xorg, and this file records exactly why, with the host checked as a control in
+every case.
+
+### A correction, because the earlier phrasing here was wrong
+
+Earlier revisions of this file said things that read as "Mint's X11 is broken".
+That is not true and it misled people, including the maintainer.  Stock Mint on
+a real NVIDIA GPU obviously works — millions of people run it.  What it uses
+there is the **NVIDIA DDX**, which is exactly the path a guest cannot provide.
+The accurate statement is narrower:
+
+> The one Xorg path reachable from a virtual KMS head — `modesetting` + glamor —
+> is the one NVIDIA's proprietary EGL does not support.  On nouveau, or on any
+> Mesa driver, that same call works fine.
+
+So this is not "Mint fails", it is "the intersection of *virtual KMS head* and
+*NVIDIA proprietary EGL* has no Xorg driver in it".
 
 ![Mint apps on the nvkvm head](../img/mint-guest-weston-desktop.png)
 
@@ -282,3 +296,82 @@ consoles), which nvkvm's console reaches because it is registered after one.
 The fix belongs in that lookup — skip consoles that are not graphic consoles —
 and it needs a QEMU rebuild plus a full `validate.sh` re-run, so it is written
 down here rather than half-done.
+
+
+## The Mint desktop — Cinnamon X11 inside a rootful Xwayland
+
+![the Mint Cinnamon desktop on the nvkvm head](../img/mint-cinnamon-desktop.png)
+
+This is the genuine Cinnamon desktop, not Mint applications on someone else's
+shell: the Cinnamon panel, the Mint menu open with its real categories, Software
+Manager and System Settings, the system tray and clock, on Mint's wallpaper.
+It comes up **unattended after a cold guest reboot** — nothing typed.
+
+Verified accelerated rather than assumed, which matters because a silent
+llvmpipe fallback would look identical in the screenshot above:
+
+| checked | result |
+|---|---|
+| weston on the nvkvm head | `using /dev/dri/card1`, `GL renderer: NVIDIA GeForce RTX 4070/PCIe/SSE2` |
+| the X server the desktop runs on (`DISPLAY=:2 glxinfo -B`) | `NVIDIA Corporation`, `NVIDIA GeForce RTX 4070/PCIe/SSE2`, `4.6.0 NVIDIA 595.84` |
+| `glxgears` **inside** the Cinnamon session | `GL_RENDERER = NVIDIA GeForce RTX 4070/PCIe/SSE2`, **68.9 FPS** |
+| `grep -ci llvmpipe` over both session logs | `0` and `0` |
+| frames actually flowing | three screendumps 4 s apart, three distinct checksums |
+| `tests/validate.sh` with the desktop running | 28 PASS, 0 FAIL, 0 SKIP |
+
+**Be honest about what this is.** It is the real Mint desktop rendering on the
+GPU through nvkvm.  It is *not* stock Mint booting into its own session
+unassisted: the guest is configured to start weston on the KMS head and run
+Cinnamon's X11 session inside a rootful Xwayland on top of it.  A stock Mint
+install left alone would try lightdm → Xorg → modesetting + glamor and fail, for
+the reason above.
+
+Three things are load-bearing, and each failed in a way that did not look like
+its cause:
+
+- **Rootful, not rootless, Xwayland.**  weston's own `--xwayland` is rootless: X
+  clients become individual weston windows and there is no X root window for a
+  window manager to own.  Running Cinnamon against that renders a black box —
+  which is what the earlier `cinnamon --wayland --nested` attempt produced, and
+  it was misread as a rendering bug.  `Xwayland :2 -fullscreen` owns a real root
+  window, and a complete X session runs inside it exactly as it would on Xorg.
+
+- **`cinnamon --x11`.**  muffin asks logind what session it is in.  Started from
+  the VT1 seat session it sees a seat with a VT, picks the **native (KMS)**
+  backend, and dies on `TakeControl` because weston — driving that very head —
+  already holds the seat:
+
+      Failed to create backend: Could not take control:
+      GDBus.Error:System.Error.EBUSY: Device or resource busy
+
+  The session then comes up with *no shell at all*: no panel, no wallpaper, just
+  whatever autostart apps mapped, which looks like a broken desktop rather than
+  a backend selection problem.  Note logind resolves a process to a session by
+  **cgroup**, so unsetting `XDG_SESSION_ID`/`XDG_SEAT`/`XDG_VTNR` does not help
+  and neither does a `systemd --user` scope; both were tried.  Forcing `--x11`
+  is telling muffin the truth — this session really is an X11 session inside
+  Xwayland — so the shim sits ahead of `/usr/bin` on `PATH` and nothing Mint
+  ships is modified.
+
+  This is also why launching the session by hand over ssh appeared to work while
+  the boot path did not: an ssh session carries no seat, so muffin picked X11 on
+  its own.  Same commands, different logind session, opposite outcome.
+
+- **The DRM node picked by driver, and `--idle-time=0`** — as elsewhere in this
+  file.
+
+### Cinnamon's own Wayland session — still blocked, and it is our gap
+
+`session-choice=cinnamon` selects it.  It fails, and the `chvt 1` theory was
+wrong: with VT1 foreground and the seat `active`, it still dies at exactly the
+same place —
+
+    muffin-WARNING: Failed to set hardware cursor
+                    (drmModeSetCursor failed: No such device or address),
+                    using OpenGL from now on
+    cinnamon killed by signal 11
+
+— i.e. the cursor-plane gap above, not a seat problem.  muffin has no
+HW-cursor kill switch to work around it (`strings` over `libmuffin.so.0` shows
+no such `MUFFIN_*` variable, and there is no gsettings key), so closing this
+needs the cursor plane on our side.

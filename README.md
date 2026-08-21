@@ -267,21 +267,31 @@ was involved"** — inferred by elimination without a pre-580 box, and wrong on
 both counts.
 [Root cause and trace](docs/reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug).
 
-**Graphics: Wayland works. Native Xorg does not, and that part is not ours.**
+**Graphics: the Mint Cinnamon desktop runs accelerated. Stock Xorg-on-KMS does not, and that part is not ours.**
 A full desktop runs on the GPU inside the guest and is interactive in a host
 window at 60.0 frames/s with zero dropped frames — a browser rendering real
 pages, eight concurrent EGL clients. X11 clients under `weston --xwayland` work
 too; the earlier "X11 clients get no window" was a signal-restart bug in the
 guest module and is fixed.
 
-What does not work is a stock distro's own Xorg session driving nvkvm's display
-head, because that path uses `modesetting` + glamor, and glamor imports its
+The real Mint Cinnamon desktop — panel, menu, wallpaper — runs accelerated on
+the nvkvm head and comes up unattended after a cold guest reboot, with `glxgears`
+inside the session at 68.9 FPS on the RTX 4070 and no llvmpipe anywhere. It gets
+there via Cinnamon's **X11** session inside a rootful Xwayland hosted by weston,
+rather than via Xorg
+([how, and what is load-bearing](docs/internal/mint-guest-desktop.md)).
+
+What does not work is a stock distro booting into its own Xorg session on
+nvkvm's display head, because that path uses `modesetting` + glamor, and glamor imports its
 scanout pixmap with `eglCreateImageKHR(..., EGL_NATIVE_PIXMAP_KHR, gbm_bo)`.
 NVIDIA's EGL returns `EGL_BAD_PARAMETER` for that call **on bare metal too** —
 we measured host and guest side by side ([the repro](tests/repro/gbm_egl_import.c)),
 and dma-buf export itself survives the round trip perfectly. It is the
 long-standing reason `modesetting` + glamor is not the supported combination on
-NVIDIA's proprietary driver anywhere.
+NVIDIA's proprietary driver anywhere. To be precise, since earlier wording here
+overstated it: this is not "Mint's X11 is broken" — stock Mint on a real NVIDIA
+card works fine, using NVIDIA's own DDX. It is that the one Xorg path reachable
+from a *virtual* KMS head is the one NVIDIA's EGL does not serve.
 
 The combination that *is* supported on real NVIDIA hardware is NVIDIA's own X
 driver, and we tried it: staged by hand, `nvidia_drv.so` and the GLX server
