@@ -180,6 +180,19 @@ struct uvm_free_params {
 	__u32 reserved;
 };
 
+/* UVM_UNMAP_EXTERNAL (66) — the teardown half of UVM_MAP_EXTERNAL_ALLOCATION.
+ * Driver layout is base/length/gpuUuid/rmStatus; rmStatus sits at offset 32 and
+ * the struct is 8-aligned, so the trailing pad is part of the ABI size (40).
+ * Verified against nvidia-uvm/uvm_ioctl.h on 580.95.05:
+ *   sizeof=40 base=0 length=8 uuid=16 rmStatus=32 */
+struct uvm_unmap_external_params {
+	__u64 base;
+	__u64 length;
+	struct uvm_uuid gpu_uuid;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
 struct uvm_migrate_params {
 	__u64 base;
 	__u64 length;
