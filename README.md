@@ -92,6 +92,7 @@ Not yet for untrusted multi-tenant hosting — see below.
 | Host | Linux with **working KVM** (see below), an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
 | Guest | Linux, kernel 5.15 – 7.0 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
+| Size | ~16 GB RAM and 4 vCPUs free for the guest (the defaults), plus ~40 GB disk for the guest image and QEMU |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script |
 
@@ -141,7 +142,7 @@ come from this repository?" is a question you can answer rather than assume.
 docker run --rm -it --device /dev/kvm --gpus all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \
     -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \
-    ghcr.io/reindertpelsma/nvkvm-pv:latest
+    ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2
 ssh -p 2222 ubuntu@127.0.0.1    # into the guest -- nvidia-smi already works
 ```
 
@@ -197,9 +198,19 @@ The full sandbox rung, without building QEMU yourself. From the
 [releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
 
 ```bash
+# runtime dependencies -- the tarball ships QEMU, not what QEMU links against
+sudo apt install -y libglib2.0-0t64 libpixman-1-0 libslirp0 \
+                    qemu-utils genisoimage sshpass
+
 tar xzf nvkvm-<version>-linux-x86_64.tar.gz && cd nvkvm-<version>
 sudo cp -a qemu-nvkvm /opt/qemu-nvkvm
 sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
+```
+
+Built on Ubuntu 24.04, so it needs **glibc 2.38 or newer** — on an older host
+(Ubuntu 22.04 is glibc 2.35) use the container, which brings its own userspace.
+
+```bash
 bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image
 ```
 
@@ -252,7 +263,7 @@ built it, from which commit, in which workflow run — and
 
 ```bash
 # the image, resolved straight from the registry
-gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:latest \
+gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2 \
     --repo reindertpelsma/nvkvm-pv
 
 # the tarball, on disk
@@ -291,6 +302,21 @@ nvidia-smi
 ```
 
 That is a guest enumerating a GPU the host has not given up.
+
+Then run the suite the tables on this page are quoting, still inside the guest:
+
+```bash
+bash /mnt/nvkvm/tests/validate.sh
+```
+
+```
+ TOTAL 28   PASS 28   FAIL 0   SKIP 0
+
+ VERDICT: PASS (all 28 checks passed)
+```
+
+It exits 0 on a full pass, 1 on a failure and 2 if anything was skipped, so it
+is usable in a script. Every `28/28` below is this command on that hardware.
 
 ## How it fits together
 

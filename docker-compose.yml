@@ -9,7 +9,9 @@ services:
     # and nobody has to build QEMU to try this; `build:` keeps `--build`
     # working for anyone changing src/ -- and the tag is what the release
     # workflow pushes, so the two are the same thing built two ways.
-    image: ghcr.io/reindertpelsma/nvkvm-pv:latest
+    # No `latest` tag is published until the first non-prerelease.  Check
+    # https://github.com/reindertpelsma/nvkvm-pv/releases for a newer tag.
+    image: ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2
     build: .
     # Capabilities: drop everything, then add back only what the isolate needs
     # to reach its STRONGEST sandbox rung.  This is not the same as dropping

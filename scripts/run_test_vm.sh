@@ -129,6 +129,25 @@ if [ "$VM_DISPLAY" != "none" ]; then
     INPUT_ARGS="-device virtio-keyboard-pci -device virtio-tablet-pci"
 fi
 
+# Preflight KVM before exec'ing QEMU.  Without this the user gets QEMU's bare
+# "Could not access KVM kernel module: No such file or directory" after having
+# already downloaded a release, installed dependencies and built a guest image
+# -- which does not tell them that most GPU cloud rentals are containers that
+# cannot provide the device, or that CPU vmx/svm flags prove nothing because a
+# container inherits its host's.  Open the device rather than stat it: group
+# membership granted since this shell started is not in effect here.
+if ! (exec 3<>/dev/kvm) 2>/dev/null; then
+    if [ ! -e /dev/kvm ]; then
+        echo "ERROR: /dev/kvm does not exist -- this host cannot run nvkvm." >&2
+        echo "  Most GPU cloud rentals are containers without it; CPU vmx/svm" >&2
+        echo "  flags are inherited from the host and prove nothing." >&2
+    else
+        echo "ERROR: /dev/kvm exists but this user cannot open it." >&2
+        echo "  sudo usermod -aG kvm \"$USER\"   # then log out and back in" >&2
+    fi
+    exit 1
+fi
+
 exec "$QEMU" \
     -enable-kvm \
     -m "$VM_MEM" \
