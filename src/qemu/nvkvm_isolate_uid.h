@@ -45,6 +45,7 @@
 #include <sys/syscall.h>
 #include <fcntl.h>
 #include <sched.h>
+#include <sys/mount.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <linux/capability.h>
@@ -430,8 +431,28 @@ static inline int nvkvm_iso_probe_namespaces(int *err_out)
 			      (unsigned long)SIGCHLD;
 	pid_t pid = (pid_t)syscall(SYS_clone, flags, (void *)0, (void *)0,
 				   (void *)0, 0UL);
-	if (pid == 0)
-		_exit(0);            /* probe child: touch nothing, just leave */
+	if (pid == 0) {
+		/*
+		 * USE the namespace, do not merely enter it.  A successful
+		 * clone(CLONE_NEWUSER|...) does NOT mean the namespace is
+		 * usable: on Ubuntu 24.04 and later, with the default
+		 * kernel.apparmor_restrict_unprivileged_userns=1, an
+		 * unprivileged process creates the user namespace fine and is
+		 * then refused the mount operations inside it.  A probe that
+		 * only clones reports "namespace available", auto selects the
+		 * strongest rung, and every isolate afterwards dies in
+		 * nvkvm_child_enter_mount_ns() -- measured as
+		 * mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL) = -1 EACCES,
+		 * with QEMU running as a non-root user, which is exactly how
+		 * libvirt runs it.
+		 *
+		 * So attempt the first privileged thing the real spawn does.
+		 * Cheap, and it is the operation that actually gets refused.
+		 */
+		if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+			_exit(errno & 0x7f ? errno & 0x7f : 1);
+		_exit(0);
+	}
 	if (pid < 0) {
 		if (err_out) *err_out = errno;
 		return -1;
@@ -439,8 +460,15 @@ static inline int nvkvm_iso_probe_namespaces(int *err_out)
 	/* Reap.  If QEMU's own SIGCHLD handling got there first waitpid fails
 	 * with ECHILD, which tells us nothing about the probe — the clone
 	 * already succeeded, and that is the whole answer. */
-	while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+	int status = 0;
+	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 		;
+	if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+		/* The namespace exists but cannot be used.  Treat exactly as
+		 * "namespace unavailable" so auto falls to the next rung. */
+		if (err_out) *err_out = WEXITSTATUS(status);
+		return -1;
+	}
 	if (err_out) *err_out = 0;
 	return 0;
 }

@@ -106,7 +106,14 @@ ISOLATE_KNOWN_FAIL=""
 #
 # This is a hole, and it is deliberate rather than accidental.  Do not add to
 # this list to silence a case you have not explained.
-ISOLATE_ENV_DEPENDENT="poll_unpoll"
+# Empty, and that is the goal state.  poll_unpoll lived here because it passed
+# as root and failed in CI; the cause turned out to be a real defect -- the
+# namespace probe only ran clone() and never checked the namespace was USABLE,
+# so on a host that refuses mounts inside an unprivileged userns (Ubuntu 24.04+
+# default) auto picked a rung every isolate then died in.  Fixed at the source,
+# so the exemption is no longer needed.  The mechanism stays: if a case really
+# is environment-dependent, name it here WITH the reason.
+ISOLATE_ENV_DEPENDENT=""
 
 ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist mock_stub"
 
