@@ -248,8 +248,21 @@ static inline void nvkvm_ring_pop(struct nvkvm_ring *r, uint64_t total)
  */
 static inline int nvkvm_ring_has_work(struct nvkvm_ring *r)
 {
+	/*
+	 * BOTH counters are atomically loaded, because this is the one helper
+	 * called from BOTH roles (see the paragraph above): for the consumer's
+	 * exit-edge re-check `head` is its own and `tail` is the peer's, and
+	 * for the producer's "is there pending work" test it is the other way
+	 * round.  The plain read of `head` that used to sit here was therefore
+	 * a plain read of a PEER-OWNED counter on the producer's side — a data
+	 * race against the consumer's release-store in pop()/peek(), and one
+	 * the untrusted peer writes, so the compiler is free to re-load or
+	 * fold it.  Symmetric acquire loads make the helper correct for either
+	 * caller and cost nothing on x86/arm64 (plain load + compiler barrier).
+	 */
 	uint64_t tail = __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
-	return tail != r->head;     /* head is consumer-owned: plain read */
+	uint64_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
+	return tail != head;
 }
 
 #endif /* NVKVM_RING_H */

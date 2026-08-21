@@ -326,16 +326,33 @@ static unsigned int nvkvm_ring_idle_us;
 module_param_named(ring_idle_us, nvkvm_ring_idle_us, uint, 0644);
 MODULE_PARM_DESC(ring_idle_us, "stub consumer-loop idle window in spin iters (0=default; capped in stub)");
 
+/*
+ * "Is there queued work?" for the pump.
+ *
+ * s->req_ring is NULL-stored by nvkvm_session_put() under sessions_lock —
+ * which this kthread does not hold, and which is released BEFORE
+ * nvkvm_session_stop_pump() runs, so the pump is deliberately still alive
+ * across that store.  The predicate therefore has to load the pointer exactly
+ * once and use that value; the previous form loaded s->req_ring twice per
+ * evaluation (test, then argument), leaving the compiler free to re-load a
+ * pointer that had become NULL in between and hand it to nvkvm_ring_has_work()
+ * to dereference.  READ_ONCE + a local closes the window.
+ */
+static bool nvkvm_pump_has_work(struct nvkvm_session *s)
+{
+	struct nvkvm_ring *r = READ_ONCE(s->req_ring);
+
+	return r && nvkvm_ring_has_work(r);
+}
+
 static int nvkvm_pump_fn(void *data)
 {
 	struct nvkvm_session *s = data;
 
 	while (!kthread_should_stop()) {
 		wait_event_interruptible(s->pump_wq,
-			kthread_should_stop() ||
-			(s->req_ring && nvkvm_ring_has_work(s->req_ring)));
-		while (!kthread_should_stop() &&
-		       s->req_ring && nvkvm_ring_has_work(s->req_ring)) {
+			kthread_should_stop() || nvkvm_pump_has_work(s));
+		while (!kthread_should_stop() && nvkvm_pump_has_work(s)) {
 			u64 head = 0;
 			int ret = nvkvm_virtio_enter_loop((unsigned int)s->id,
 							  nvkvm_ring_idle_us,
