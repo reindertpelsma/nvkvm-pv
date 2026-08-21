@@ -40,10 +40,40 @@ USAGE
     ./scripts/sweep_matrix.py --render        # re-render the table only
     ./scripts/sweep_matrix.py --check-tree    # does the tree match HEAD? (free)
 """
-import argparse, json, os, re, subprocess, sys, time, datetime
+import argparse, json, os, re, shlex, subprocess, sys, time, datetime
 
 KVM_IMAGE = "docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16"
 SWEEP_LABEL = "nvkvm-sweep"
+
+# Graceful cancellation, observed BY THE SCRIPT.
+#
+# Ctrl-C cannot be relied on here.  A run started as a background job inherits
+# SIGINT as ignored, so the signal is silently dropped and the run continues;
+# escalating to SIGKILL then bypasses the finally: block that destroys the
+# instance.  That is not hypothetical -- it orphaned instance 48253468, a box
+# created seconds before the kill, which billed until it was found by reading
+# `vastai show instances` rather than by trusting the kill.
+#
+# So: to stop a run, `touch /tmp/nvkvm-sweep.stop`.  It is checked between
+# drivers and between boxes, unwinds through the normal paths, and every
+# instance is destroyed on the way out.
+STOP_FILE = "/tmp/nvkvm-sweep.stop"
+
+
+def stop_requested():
+    return os.path.exists(STOP_FILE)
+
+# Instances this script must NEVER destroy, whatever else happens.
+#
+# reap_strays() already filters on SWEEP_LABEL, so in principle nothing else is
+# reachable.  This is the second lock: label filtering is one typo (or one
+# accidentally-labelled rental) away from destroying someone else's running
+# work, and these are long-lived boxes other people are actively using.  A
+# destroy is irreversible and a rented GPU box can hold hours of state.
+#
+#   48097794, 48210901  other nvkvm work
+#   48251528            Blackwell 4x RTX 5060 multi-GPU / peer-access test
+PROTECTED_INSTANCES = {"48097794", "48210901", "48251528"}
 RESULTS   = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                          "tests", "sweep-results.json")
 REPO      = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -85,6 +115,35 @@ DRIVER_MATRIX = [
     ("580.95.05",  "580", "V580 VASPACE + V580 NVOS46, each +8 bytes"),
     ("610.43.02",  "610", "V610 channel, 376 B, +hHandleVASpace"),
 ]
+
+# NOT EVERY VERSION IN THE MATRIX IS STILL DOWNLOADABLE.
+#
+# Checked 2026-08-21 with HEAD+ranged-GET against both paths in driver_urls():
+# three rows 404 at BOTH the tesla/ and XFree86/ paths and cannot be installed
+# from NVIDIA at all any more:
+#
+#   545.23.08   gone   -> 545.23.06 (published, also major 545 -> NVKVM_ABI_545)
+#   550.40.53   gone   -> 550.54.14 (published, minor!=40 -> NVKVM_ABI_550)
+#   575.51.03   gone   -> already PREINSTALLED on the vast KVM image, so it is
+#                         installed by doing nothing; see the fast path in
+#                         install_driver().
+#
+# The substitutes are chosen to land on the SAME profile as the row they
+# replace -- verified against nvkvm_abi_id_for_version() in
+# src/common/nvkvm_abi.h, not assumed -- so the ABI expectation in
+# DRIVER_MATRIX stays correct.
+#
+# CAVEAT, and it matters for how the 550 result is read: the 550 boundary is
+# defined at exactly 550.40.53, and 550.54.14 is merely the nearest published
+# version on the high side.  Substituting it still exercises both profiles and
+# still proves the selector splits *inside* major 550, but it no longer pins
+# the exact .53 cutoff.  Any run that used a substitute records it in
+# `driver_actual` and is flagged in the rendered table.
+DRIVER_ALTS = {
+    "545.23.08": ["545.23.06", "545.29.06"],
+    "550.40.53": ["550.54.14", "550.90.07"],
+    "575.51.03": [],   # preinstalled; nothing to download
+}
 
 # A driver older than the silicon cannot be a finding.  These are the majors at
 # which each architecture became supported at all; below the floor the install
@@ -140,59 +199,330 @@ def drivers_for(gpu_name, requested):
     return out
 
 
-def driver_urls(ver, kernel_open):
+def driver_urls(ver):
     """NVIDIA publishes datacenter and consumer drivers under different paths,
-    and neither is a superset.  Try both; the first that 404s is not an error."""
+    and neither is a superset.  Try both; the first that 404s is not an error.
+
+    (Took a kernel_open argument that it never used -- the module flavour is an
+    installer flag, not a URL component.)"""
     return [
         f"https://us.download.nvidia.com/tesla/{ver}/NVIDIA-Linux-x86_64-{ver}.run",
         f"https://us.download.nvidia.com/XFree86/Linux-x86_64/{ver}/NVIDIA-Linux-x86_64-{ver}.run",
     ]
 
 
+_PURGED_HOSTS = set()
+
+
+def rsh(S, cmd):
+    """Quote a remote command ONCE, correctly.
+
+    The f"{S} '...'" idiom used elsewhere in this file cannot express a command
+    that itself contains single quotes -- an inner ' closes the outer one and
+    the remainder is reinterpreted locally.  `apt-get remove '^nvidia-.*'` and
+    `pkill -f '[q]emu...'` both do, and both silently mangled into something
+    other than what was written.  shlex.quote handles the general case.
+    """
+    return f"{S} {shlex.quote(cmd)}"
+
+
+def purge_distro_driver(S):
+    """Remove the DISTRO-PACKAGED NVIDIA driver before the first .run install.
+
+    The vast KVM image does not ship a .run-installed driver: it ships Debian
+    packages, and they are HELD (`dpkg -l` shows `hi`, and there is no
+    /usr/bin/nvidia-uninstall).  That matters because the .run installer only
+    replaces the files IT owns.  The dpkg-owned userspace in
+    /usr/lib/x86_64-linux-gnu survives, so after installing, say, 535.86.05 the
+    box has a 535 kernel module and a leftover 575 libcuda/libnvidia-ml.
+
+    Every consumer of that pair then fails with "Driver/library version
+    mismatch" / cuInit 803 -- and make_host_bundle.sh would faithfully collect
+    the STALE 575 libraries (it globs $SYSLIB by version) and ship them to the
+    guest.  That is a false failure that looks exactly like an nvkvm bug, which
+    is the specific outcome this sweep must not produce.
+
+    Held packages are skipped by apt unless unheld first, so unhold, then purge.
+    """
+    sh(rsh(S, "apt-mark unhold $(dpkg -l | awk '/^hi/ {print $2}') 2>/dev/null; true"),
+       timeout=180)
+    sh(rsh(S, "DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y "
+              "'^nvidia-.*' '^libnvidia-.*' '^cuda-drivers.*' "
+              "'^xserver-xorg-video-nvidia.*' > /root/purge.log 2>&1; true"), timeout=900)
+    # libnvidia-container* belongs to the docker runtime, not the driver; if the
+    # purge above took it, nothing we do needs it back.
+    sh(rsh(S, "DEBIAN_FRONTEND=noninteractive apt-get install -y -q "
+              "build-essential dkms pkg-config libglvnd-dev linux-headers-$(uname -r) "
+              "> /root/prereq.log 2>&1; true"), timeout=1200)
+
+    # A previous .RUN install is not a dpkg package and survives the purge
+    # above.  nvidia-installer then refuses outright:
+    #
+    #   ERROR: The installation was canceled due to the availability or
+    #   presence of an alternate driver installation.
+    #
+    # MEASURED on instance 48277346 (RTX 3090, shipped 535.288.01): both
+    # 580.95.05 and 610.43.02 downloaded and self-checked clean, then aborted
+    # with exactly that line -- which lands in the table as
+    # driver-install-failed and reads like "these drivers will not install on
+    # Ampere".  They would; the box simply had a driver we had not removed.
+    # The installer ships its own uninstaller for precisely this, so use it.
+    sh(rsh(S, "test -x /usr/bin/nvidia-uninstall && "
+              "/usr/bin/nvidia-uninstall --silent --no-questions "
+              ">> /root/purge.log 2>&1; true"), timeout=900)
+    left, _ = sh(rsh(S, "ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.* "
+                       "/usr/lib/x86_64-linux-gnu/libcuda.so.* 2>/dev/null | wc -l"),
+                 timeout=120)
+    if left.strip().isdigit() and int(left.strip()) > 0:
+        print(f"    (warning: {left.strip()} nvidia userspace libs survived the purge)",
+              flush=True)
+
+
+def installed_driver_version(S):
+    """The running kernel module's version, or '' if none is loaded."""
+    got, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=60)
+    import re as _re
+    m = _re.search(r"Kernel Module\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)", got)
+    return m.group(1) if m else ""
+
+
+def kernel_cc(S):
+    """Path to the compiler the RUNNING KERNEL was built with, installing it if
+    needed.  Returns "" if it cannot be determined.
+
+    THIS IS NOT A DETAIL.  The vast image runs Ubuntu 22.04 with the 6.8 HWE
+    kernel, which was built by gcc-12 and whose Kbuild therefore passes
+    -ftrivial-auto-var-init=zero.  The image's DEFAULT cc is gcc-11, which does
+    not know that flag, so EVERY .run kernel-module build dies with
+
+        cc: error: unrecognized command-line option '-ftrivial-auto-var-init=zero'
+
+    ...thousands of times, and the installer reports only "The nvidia kernel
+    module was not created."  Measured on instance 48252610: 535.54.03 failed
+    exactly this way for both -m=kernel and -m=kernel-open, and it looks
+    precisely like "this old driver cannot build on this kernel" -- a GPU/driver
+    conclusion -- when the real cause is that we handed it the wrong compiler.
+    The preinstalled 575.51.03 module reports "GCC version: gcc version 12.3.0",
+    i.e. the image itself was built with gcc-12; only our invocation was not.
+
+    gcc-12 is already present on the image, so this is usually just a matter of
+    naming it.
+    """
+    ver, _ = sh(f"{S} 'cat /proc/version'", timeout=60)
+    m = re.search(r"gcc-(\d+)", ver) or re.search(r"gcc[^0-9]*(\d+)\.", ver)
+    if not m:
+        return ""
+    maj = m.group(1)
+    path = f"/usr/bin/gcc-{maj}"
+    out, _ = sh(rsh(S, f"test -x {path} && echo HAVE || echo NEED"), timeout=60)
+    if "NEED" in out:
+        sh(rsh(S, f"DEBIAN_FRONTEND=noninteractive apt-get install -y -q gcc-{maj} "
+                  f">> /root/prereq.log 2>&1; true"), timeout=900)
+    out, _ = sh(rsh(S, f"test -x {path} && echo HAVE || echo NEED"), timeout=60)
+    return path if "HAVE" in out else ""
+
+
+def _fetch_installer(S, candidates, tried):
+    """Download the first candidate that arrives INTACT.  Returns (ok, version).
+
+    Appends one human-readable line per URL to `tried`, carrying the observed
+    HTTP status and curl exit, so a failure says what actually happened
+    instead of being guessed at afterwards.
+    """
+    for cand in candidates:
+        for url in driver_urls(cand):
+            out, _ = sh(rsh(S,
+                f"curl -sS -L --max-time 1500 -w '\\nHTTP=%{{http_code}}' "
+                f"-o /root/drv.run {url} 2>&1; echo \" CURLRC=$?\"; "
+                f"df -P /root | tail -1"), timeout=1800)
+            m = re.search(r"HTTP=(\d+)", out)
+            code = m.group(1) if m else ""
+            m2 = re.search(r"CURLRC=(\d+)", out)
+            crc = m2.group(1) if m2 else "?"
+
+            # NB: curl's own exit code, not the ssh command's.  The ssh rc is
+            # the exit of the trailing `df`, which is always 0 -- checking it
+            # (as this once did) accepted every failed transfer as a success.
+            if code == "200" and crc == "0":
+                # VERIFY THE ARCHIVE rather than trusting HTTP 200.  The
+                # 610.43.02 installer once arrived with HTTP=200 and curl_rc=0
+                # and was still corrupt: it printed "Verifying archive
+                # integrity... Error in check sums 3400907251 3425542902" and
+                # the row was filed driver-install-failed -- which reads as
+                # "610 will not install", a driver conclusion, for what was a
+                # bad download of a perfectly good installer.  The .run is a
+                # makeself archive and can check itself; ask it.
+                _, ok1 = sh(rsh(S, "chmod +x /root/drv.run && test -s /root/drv.run"),
+                            timeout=120)
+                _, ok2 = sh(rsh(S, "/root/drv.run --check >/root/drvcheck.log 2>&1"),
+                            timeout=900)
+                if ok1 == 0 and ok2 == 0:
+                    return True, cand
+                tried.append(f"{url}  -> HTTP=200 but CORRUPT "
+                             f"(test -s rc={ok1}, --check rc={ok2})")
+                continue
+            tried.append(f"{url}  -> HTTP={code or '?'} curl_rc={crc}")
+    return False, None
+
+
 def install_driver(S, ver, arch, log):
-    """Replace the host driver in the rented VM.  Returns (ok, detail).
+    """Replace the host driver in the rented VM.  Returns (ok, detail, actual).
 
     This is only possible because the KVM template is a real VM with the GPU
     passed through -- the NVIDIA module is loaded inside the instance, so it is
     ours to replace.  (`systemd-detect-virt` returns `kvm`; on a CUDA-container
-    rental the module belongs to the physical host and none of this works.)
+    rental the module belongs to the physical host and none of this works.
+    VERIFIED on instance 48210901: systemd-detect-virt = kvm, driver 575.51.03
+    loaded inside the guest, /dev/kvm present.)
+
+    `actual` is the version that ended up installed, which is NOT always `ver`:
+    three matrix rows are no longer published and fall back to DRIVER_ALTS.
     """
     kernel_open = arch in OPEN_MODULE_ARCHES
-    fetched = False
-    for url in driver_urls(ver, kernel_open):
-        _, rc = sh(f"{S} 'curl -fsSL -o /root/drv.run {url} && chmod +x /root/drv.run'", timeout=900)
-        if rc == 0:
-            fetched = True
+
+    # FAST PATH.  575.51.03 is preinstalled on the vast KVM image and is no
+    # longer downloadable from either NVIDIA path, so the only way to test that
+    # row is to recognise that it is already installed.  This also saves a
+    # ~350 MB download plus a module rebuild whenever a swap is a no-op.
+    cur = installed_driver_version(S)
+    if cur == ver:
+        return True, f"already installed: {ver} (no download; preinstalled or prior step)", ver
+
+    candidates = [ver] + DRIVER_ALTS.get(ver, [])
+    if ver in DRIVER_ALTS and not DRIVER_ALTS[ver] and cur != ver:
+        return (False,
+                f"{ver} is not published at either NVIDIA path and is not preinstalled "
+                f"(box has {cur or 'no driver'})", None)
+
+    # The distro packages only need clearing once per box, before the first
+    # .run lands.  After that the .run owns the userspace.
+    # Keyed by BOX, not global.  This was a function attribute, so after the
+    # first box set it the second box never purged its distro driver at all --
+    # a .run would have been layered over a live dpkg userspace, which is the
+    # exact stale-library mismatch purge_distro_driver() exists to prevent.
+    if S not in _PURGED_HOSTS:
+        purge_distro_driver(S)
+        _PURGED_HOSTS.add(S)
+
+    # DO NOT collapse every curl failure into "not published".
+    #
+    # The first version of this said exactly that whenever curl returned
+    # non-zero, and it was wrong in a way that matters: on 2026-08-21 the sweep
+    # reported "no installer published at any path" for 570.124.06 and
+    # 535.54.03 -- both of which return HTTP 200 to a HEAD request from
+    # elsewhere, and one of which this very script had downloaded successfully
+    # an hour earlier.  A transport failure was being written down as a fact
+    # about what NVIDIA publishes.  That is a harness failure wearing the
+    # costume of a finding, which is the one thing this sweep must not produce.
+    #
+    # So classify: an HTTP 404 means genuinely absent; anything else (disk
+    # full, DNS, connection reset, rate-limiting, timeout) is transport and is
+    # labelled [HARNESS].
+    # NVIDIA's CDN returns intermittent HTTP 403 to some rented hosts.
+    # MEASURED on the RTX 4070 box: 550.40.07 got 403 at both paths, then
+    # 565.57.01 downloaded fine seconds later, then 570/580/610 got 403 again.
+    # That is throttling / IP reputation, not a missing file -- so retry the
+    # whole candidate list a few times with backoff before giving up on a row.
+    fetched, use_ver, tried = False, None, []
+    for _attempt in range(3):
+        if _attempt:
+            time.sleep(30 * _attempt)
+        fetched, use_ver = _fetch_installer(S, candidates, tried)
+        if fetched:
             break
+
     if not fetched:
-        return False, f"no installer published at either path for {ver}"
+        only404 = all("HTTP=404" in t for t in tried) and tried
+        if only404:
+            return False, ("not published by NVIDIA (HTTP 404 at every path); tried:\n  " +
+                           "\n  ".join(tried[-4:])), None
+        return False, ("[HARNESS] download failed for a TRANSPORT reason, not a missing "
+                       "file -- do NOT record this as 'NVIDIA no longer publishes X'. "
+                       "Check disk, DNS and CDN rate-limiting on the box; tried:\n  " +
+                       "\n  ".join(tried[-4:])), None
 
     # Nothing may hold the device or the module cannot be unloaded.
-    sh(f"{S} 'systemctl stop nvkvm-vm 2>/dev/null; pkill -f qemu-system-x86_64 2>/dev/null; "
-       f"nvidia-smi --gpu-reset 2>/dev/null; true'", timeout=180)
+    #
+    # NOTE the bracket in '[q]emu-system-x86_64'.  Written plainly, pkill -f
+    # matches the command line of the very `bash -c '...'` this runs inside --
+    # that string is literally in its argv -- so pkill kills its own parent
+    # shell and the rest of the command (the gpu-reset, the `true`) never runs.
+    # This project has a standing rule against `pkill -f qemu-system-x86` for
+    # exactly this reason; the bracket makes the pattern not match itself.
+    sh(rsh(S, "systemctl stop nvkvm-vm 2>/dev/null; "
+              "systemctl stop nvidia-persistenced 2>/dev/null; "
+              "pkill -f '[q]emu-system-x86_64' 2>/dev/null; true"), timeout=180)
     sh(f"{S} 'rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null; true'", timeout=180)
 
-    mod = "-m=kernel-open" if kernel_open else "-m=kernel"
-    flags = (f"--silent --no-questions --ui=none --disable-nouveau "
-             f"--no-cc-version-check --install-libglvnd {mod}")
-    _, rc = sh(f"{S} '/root/drv.run {flags} > /root/drvinstall.log 2>&1'", timeout=2400)
+    mod   = "-m=kernel-open" if kernel_open else "-m=kernel"
+    other = "-m=kernel" if kernel_open else "-m=kernel-open"
+    base  = "--silent --no-questions --ui=none --disable-nouveau --install-libglvnd"
+
+    cc = kernel_cc(S)
+    ccenv = f"CC={cc} " if cc else ""
+
+    # LESSON, recorded where the next person will be tempted to undo it:
+    # --no-cc-version-check exists to get past a COSMETIC compiler mismatch
+    # (kernel built by gcc 12.3, install running gcc 12.2 -- harmless).  It
+    # also hides a REAL one.  Passing it unconditionally is what turned a
+    # one-line "compiler version mismatch" abort into thousands of lines of
+    # "unrecognized command-line option" followed by the uninformative "The
+    # nvidia kernel module was not created" -- a message indistinguishable
+    # from a genuine driver/kernel incompatibility, and one that would have
+    # been written into a results table as a GPU finding.  If you re-add it to
+    # the first attempt, you are re-arming exactly that trap.
+    #
+    # Attempt order is diagnostic, not just hopeful.
+    #
+    # --no-cc-version-check is DELIBERATELY absent from the first two attempts.
+    # That check is the one thing that would have named the gcc-11/gcc-12
+    # mismatch out loud instead of letting it become 4000 lines of
+    # "unrecognized command-line option" and a bare "module was not created".
+    # Suppressing it by default converted a clear toolchain error into
+    # something that reads like a driver/kernel incompatibility.  So: let it
+    # speak first, and only disable it as a last resort for the case where the
+    # check is merely being pedantic about a minor version.
+    #
+    # Per-driver log.  This used to write every install to one hardcoded
+    # /root/drvinstall.log, so the log for a failed install was overwritten by
+    # the next driver before anyone could read it -- and `log`, the parameter
+    # naming the file, was accepted and then ignored.
+    attempts = [
+        f"{ccenv}/root/drv.run {base} {mod}",
+        f"{ccenv}/root/drv.run {base} {other}",
+        f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
+    ]
+    rc = 1
+    for i, cmd in enumerate(attempts):
+        redir = ">" if i == 0 else ">>"
+        _, rc = sh(rsh(S, f"{cmd} {redir} {log} 2>&1"), timeout=2400)
+        if rc == 0:
+            break
     if rc != 0:
-        # Retry with the other module flavour before believing the version is
-        # unusable -- the open/proprietary split moved over these branches and
-        # our arch guess is a heuristic, not an oracle.
-        other = "-m=kernel" if kernel_open else "-m=kernel-open"
-        _, rc = sh(f"{S} '/root/drv.run {flags.replace(mod, other)} "
-                   f"> /root/drvinstall.log 2>&1'", timeout=2400)
-    if rc != 0:
-        tail, _ = sh(f"{S} 'tail -25 /root/drvinstall.log'", timeout=60)
-        return False, tail[-1200:]
+        tail, _ = sh(rsh(S, f"tail -25 {log}"), timeout=60)
+        hint = ""
+        # Match the CLASS, not the symptom.  -ftrivial-auto-var-init=zero is
+        # merely the flag today's kernel/compiler pair happens to disagree
+        # about; any "cc: error:" or "unrecognized command-line option" in a
+        # driver install log means the module was compiled by the wrong
+        # toolchain, whatever the flag is called next year.
+        gt, _ = sh(rsh(S, f"grep -ciE 'unrecognized command-line option|cc: error:|"
+                          f"ftrivial-auto-var-init' {log} 2>/dev/null || echo 0"),
+                   timeout=60)
+        if gt.strip().isdigit() and int(gt.strip()) > 0:
+            hint = (f"\n[HARNESS] kernel-module build failed with compiler errors "
+                    f"(kernel_cc={cc or 'UNDETECTED'}); this is a TOOLCHAIN "
+                    f"failure, NOT a driver/GPU result.  Compare /proc/version's "
+                    f"compiler against the cc actually used.")
+        return False, (tail[-1100:] + hint), None
 
     sh(f"{S} 'modprobe nvidia; modprobe nvidia_uvm; true'", timeout=180)
-    got, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=60)
-    if ver not in got:
-        return False, f"installed but /proc reports: {got.strip()[:200]}"
-    return True, got.strip()
-
+    got = installed_driver_version(S)
+    if got != use_ver:
+        raw, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=60)
+        return False, f"installed {use_ver} but /proc reports: {raw.strip()[:200]}", None
+    detail = f"{use_ver}" + ("" if use_ver == ver else f" (SUBSTITUTE for unpublished {ver})")
+    return True, detail, use_ver
 
 
 def sh(cmd, timeout=120, check=False):
@@ -272,18 +602,39 @@ def search(filt, limit, max_price, include_unsupported=False, prefer_untested=No
     return picked
 
 
-def wait_ssh(iid, budget=900):
-    """Poll until the instance reports running AND accepts ssh."""
+def wait_ssh(iid, budget=2400):
+    """Poll until the instance reports running AND accepts ssh.
+
+    Two changes forced by measurement on 2026-08-21:
+
+    1. BUDGET.  900s was not enough.  An RTX 3060 (instance 48257135) never
+       answered inside it and was recorded `no-ssh`, costing the entire Ampere
+       row of that sweep -- and Ampere had zero coverage to begin with.  A box
+       in run 2 took roughly ten minutes just to start answering, so 15 minutes
+       total left almost no margin.  Provisioning here is genuinely slow and
+       waiting is far cheaper than re-renting.
+
+    2. PROXY FALLBACK.  We ask for --direct and connect to
+       public_ipaddr:<mapped 22/tcp>, but that path is not always reachable --
+       some hosts firewall the mapped port even though the rental is fine.
+       Vast always also exposes a jump-host route (ssh_host/ssh_port, i.e.
+       ssh N.vast.ai), so try direct first and fall back to it rather than
+       declaring the box dead.  Returns whichever pair actually answered.
+    """
     deadline = time.time() + budget
     while time.time() < deadline:
         d = vast_json(f"show instance {iid}") or {}
         if d.get("actual_status") == "running":
-            host = d.get("public_ipaddr")
-            port = (d.get("ports") or {}).get("22/tcp")
-            port = port[0]["HostPort"] if port else d.get("ssh_port")
-            if host and port:
+            cands = []
+            direct_port = (d.get("ports") or {}).get("22/tcp")
+            if d.get("public_ipaddr") and direct_port:
+                cands.append((d["public_ipaddr"], direct_port[0]["HostPort"]))
+            if d.get("ssh_host") and d.get("ssh_port"):
+                cands.append((d["ssh_host"], d["ssh_port"]))
+            for host, port in cands:
                 out, rc = sh(f"ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=no "
-                             f"-o UserKnownHostsFile=/dev/null -p {port} root@{host} 'echo OK'", timeout=40)
+                             f"-o UserKnownHostsFile=/dev/null -p {port} root@{host} 'echo OK'",
+                             timeout=40)
                 if "OK" in out:
                     return host, port
         time.sleep(20)
@@ -376,6 +727,9 @@ def destroy_verified(iid, tries=5):
          the instance no longer appearing in `show instances`.
     Returns True only when the id is actually absent from the listing.
     """
+    if str(iid) in PROTECTED_INSTANCES:
+        print(f"  !! REFUSING to destroy protected instance {iid}", file=sys.stderr, flush=True)
+        return False
     for _ in range(tries):
         sh(f"vastai destroy instance {iid} -y", timeout=90)
         time.sleep(8)
@@ -398,7 +752,8 @@ def reap_strays():
     data = vast_json("show instances") or []
     if isinstance(data, dict):
         data = data.get("instances", []) or []
-    strays = [i for i in data if (i.get("label") or "") == SWEEP_LABEL]
+    strays = [i for i in data if (i.get("label") or "") == SWEEP_LABEL
+              and str(i.get("id")) not in PROTECTED_INSTANCES]
     for i in strays:
         iid = i.get("id")
         print(f"  !! STRAY {iid} ({i.get('gpu_name')}) alive -- destroying", file=sys.stderr, flush=True)
@@ -409,9 +764,12 @@ def reap_strays():
     return [i.get("id") for i in strays]
 
 
-def boot_and_validate(S, args):
+def boot_and_validate(S, args, drv):
     """Boot the nvkvm guest, stage libs against the CURRENT host driver, run
     validate.sh.  Called once per driver, so everything here must be repeatable.
+
+    `drv` is the driver version actually installed -- needed because the bundle
+    directory is named after it and the guest must be staged from THAT one.
 
     Returns a dict; never raises."""
     r = {}
@@ -419,10 +777,31 @@ def boot_and_validate(S, args):
     # The bundle is the host driver's userspace, so it MUST be rebuilt after
     # every swap.  Staging a 580 bundle against a 535 kernel module would fail
     # in ways that look like an nvkvm bug and are not.
+    #
+    # Delete the previous bundles first.  make_host_bundle.sh writes to
+    # host-libs-<version>/, so sweeping N drivers on one box leaves N of them
+    # on the 9p share, and stage_guest_libs.sh REFUSES to guess between
+    # multiple candidates (it exits 1 having staged nothing).  Keeping exactly
+    # one bundle makes that ambiguity impossible instead of relying on the
+    # guest's dmesg parse to resolve it.
+    sh(f"{S} 'rm -rf /root/nvkvm/host-libs-*'", timeout=120)
     _, rc = sh(f"{S} 'cd /root/nvkvm && bash scripts/make_host_bundle.sh > /root/bundle.log 2>&1'", timeout=600)
     if rc != 0:
         tail, _ = sh(f"{S} 'tail -30 /root/bundle.log'", timeout=60)
         r["status"] = "bundle-failed"; r["detail"] = tail[-1200:]; return r
+
+    # VERIFY the bundle is the one we just built for THIS driver, rather than
+    # trusting that it happened.  A bundle carrying a different version than
+    # the loaded kernel module is the stale-bundle failure mode, and it
+    # presents as a GPU failure downstream.
+    bl, _ = sh(f"{S} 'ls -d /root/nvkvm/host-libs-* 2>/dev/null'", timeout=60)
+    bundles = [b.strip() for b in bl.splitlines() if b.strip()]
+    r["bundle"] = ",".join(os.path.basename(b) for b in bundles)
+    if len(bundles) != 1 or not bundles[0].endswith(f"host-libs-{drv}"):
+        r["status"] = "bundle-failed"
+        r["detail"] = (f"expected exactly one bundle host-libs-{drv}, found: "
+                       f"{r['bundle'] or '(none)'}")
+        return r
 
     sh(f"{S} 'systemctl stop nvkvm-vm 2>/dev/null; true'", timeout=120)
     sh(f"{S} 'apt-get install -y -q sshpass >/dev/null 2>&1; "
@@ -463,9 +842,20 @@ def boot_and_validate(S, args):
                  f"grep -oE 'ABI profile [0-9]+' | tail -1\"", timeout=90)
     r["abi_profile"] = (prof.strip().split()[-1] if prof.strip() else "?")
 
-    # stage_guest_libs.sh exits non-zero when an OPTIONAL library is absent
-    # (documented in setup_guest.sh), so a bad rc is recorded, not fatal.
-    _, r["stage_rc"] = sh(f'{S} "{G} \'sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh\'"', timeout=600)
+    # stage_guest_libs.sh exits 2 when an OPTIONAL library is absent
+    # (documented in setup_guest.sh), which is recorded and not fatal.  But it
+    # also exits 1 when it stages NOTHING AT ALL -- no libcuda in the bundle,
+    # or it refused to choose between bundles -- and the old code lumped those
+    # together as "a bad rc is recorded, not fatal".  A run that staged nothing
+    # then goes on to fail validate.sh for a reason that has nothing to do with
+    # the GPU, which is precisely the kind of false verdict this sweep exists
+    # to avoid.  Pass the bundle EXPLICITLY (removing the guess entirely) and
+    # treat rc=1 as the harness failure it is.
+    _stagecmd = "sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh " + f"/mnt/nvkvm/host-libs-{drv}"
+    so, rc = sh(f'{S} "{G} \'{_stagecmd}\' 2>&1"', timeout=600)
+    r["stage_rc"] = rc
+    if rc == 1:
+        r["status"] = "stage-failed"; r["detail"] = so[-1200:]; return r
 
     _, vrc = sh(f'{S} "{G} \'cd /mnt/nvkvm && bash tests/validate.sh --json /tmp/r.json\'"', timeout=1800)
     r["validate_rc"] = vrc
@@ -508,6 +898,20 @@ def run_one(offer, args):
     }
     out_recs = []
 
+    def bail(**kw):
+        """Record a whole-box failure AND make it visible to the finally block.
+
+        These used to `return [rec_for(...)]` directly, building a fresh list
+        that out_recs never saw -- so the finally block, which stamps
+        r["destroyed"] over out_recs, never touched them.  Every early failure
+        (no-ssh, build-failed, not-a-vm...) therefore reported destroyed=None
+        even when the instance had in fact been destroyed and verified, which
+        makes the one field that must be trustworthy in a spend report look
+        like an open question.
+        """
+        out_recs.append(rec_for("-", "-", "-", **kw))
+        return out_recs
+
     def rec_for(ver, prof, why, **kw):
         d = dict(base); d.update({"driver": ver, "abi_profile_expected": prof,
                                   "driver_rationale": why}); d.update(kw)
@@ -518,18 +922,18 @@ def run_one(offer, args):
                      f"--disk {args.disk} --ssh --direct --label {SWEEP_LABEL}", timeout=180)
         iid = parse_contract(out)
         if not iid:
-            return [rec_for("-", "-", "-", status="create-failed", detail=out[:300])]
+            return bail(status="create-failed", detail=out[:300])
         base["instance_id"] = iid
 
         host, port = wait_ssh(iid)
         if not host:
-            return [rec_for("-", "-", "-", status="no-ssh")]
+            return bail(status="no-ssh")
         S = (f"ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no "
              f"-o UserKnownHostsFile=/dev/null -p {port} root@{host}")
 
         kvm, _ = sh(f"{S} 'ls /dev/kvm 2>/dev/null && echo yes || echo no'", timeout=60)
         if "no" in kvm:
-            return [rec_for("-", "-", "-", status="no-kvm")]   # costs cents, not hours
+            return bail(status="no-kvm")   # costs cents, not hours
 
         # Driver swapping only works because this is a VM with the GPU passed
         # through.  Prove it rather than assume it: on a container rental the
@@ -538,8 +942,8 @@ def run_one(offer, args):
         virt, _ = sh(f"{S} 'systemd-detect-virt 2>/dev/null || echo unknown'", timeout=60)
         base["virt"] = virt.strip()
         if base["virt"] not in ("kvm", "qemu"):
-            return [rec_for("-", "-", "-", status="not-a-vm",
-                            detail=f"systemd-detect-virt={base['virt']}; cannot replace the driver")]
+            return bail(status="not-a-vm",
+                            detail=f"systemd-detect-virt={base['virt']}; cannot replace the driver")
 
         preinstalled, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=90)
         base["driver_preinstalled"] = preinstalled.strip()[:160]
@@ -556,26 +960,58 @@ def run_one(offer, args):
         sh(f"{S} 'mkdir -p /root/nvkvm && tar -xzf /root/sweep-tree.tgz -C /root/nvkvm'", timeout=180)
 
         # One-time: QEMU and the guest image do not depend on the host driver.
+        # NEEDRESTART_MODE=a / DEBIAN_FRONTEND=noninteractive: on instance
+        # 48254541 build_qemu.sh --install-deps died with needrestart's
+        # interactive "Services to be restarted" prompt in the log tail and
+        # nothing else -- recorded as build-failed, which is a harness result
+        # wearing the shape of an environment one.  apt must never be able to
+        # ask a question here.
+        ENV = ("DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "
+               "NEEDRESTART_SUSPEND=1 ")
         for step, cmd, tmo in [
-            ("build",  "cd /root/nvkvm && bash scripts/build_qemu.sh --install-deps", 3600),
-            ("guest",  "cd /root/nvkvm && bash scripts/setup_guest.sh",              1200),
+            ("build",  f"cd /root/nvkvm && {ENV} bash scripts/build_qemu.sh --install-deps", 3600),
+            ("guest",  f"cd /root/nvkvm && {ENV} bash scripts/setup_guest.sh",              2700),
         ]:
             _, rc = sh(f"{S} '{cmd} > /root/{step}.log 2>&1'", timeout=tmo)
             if rc != 0:
                 errs, _ = sh(f"{S} \"grep -niE 'error|fatal|cannot|No space|Killed|undefined reference' "
                              f"/root/{step}.log | tail -25\"", timeout=60)
                 tail, _ = sh(f"{S} 'tail -60 /root/{step}.log'", timeout=60)
-                return [rec_for("-", "-", "-", status=f"{step}-failed",
-                                detail="ERRORS:\n" + errs[-1500:] + "\n\nTAIL:\n" + tail[-1500:])]
+                return bail(status=f"{step}-failed",
+                                detail="ERRORS:\n" + errs[-1500:] + "\n\nTAIL:\n" + tail[-1500:])
 
         todo = drivers_for(gpu, args.drivers)
+
+        # ORDER MATTERS, and getting it wrong silently destroys the baseline.
+        #
+        # The image's driver is DKMS-managed (nvidia-dkms-575,
+        # nvidia-kernel-source-575), so purge_distro_driver() removes it for
+        # good -- and 575.51.03 is NOT downloadable from NVIDIA any more.  In
+        # plain DRIVER_MATRIX order 575.51.03 is tested LAST, i.e. after the
+        # purge, so the one row that is a KNOWN-GOOD CONTROL would report
+        # driver-install-failed on every box.  Without it there is no way to
+        # separate "this old driver cannot build on this kernel" from "the
+        # harness is broken", which is the whole point of having a baseline.
+        #
+        # So: whatever is already installed gets measured FIRST, for free,
+        # before anything is purged.  Stable sort, so the rest of the matrix
+        # keeps its documented order.
+        cur0 = installed_driver_version(S)
+        if cur0:
+            todo.sort(key=lambda t: 0 if t[0] == cur0 else 1)
+            if todo and todo[0][0] == cur0:
+                print(f"    (testing preinstalled {cur0} first, before any purge)", flush=True)
         if not todo:
-            return [rec_for("-", "-", "-", status="no-applicable-drivers",
-                            detail=f"arch={base['arch']} floor={ARCH_FLOOR.get(base['arch'])}")]
+            return bail(status="no-applicable-drivers",
+                            detail=f"arch={base['arch']} floor={ARCH_FLOOR.get(base['arch'])}")
 
         for ver, prof, why in todo:
+            if stop_requested():
+                print(f"    STOP requested ({STOP_FILE}) -- ending this box cleanly",
+                      flush=True)
+                break
             print(f"    driver {ver} (expect ABI {prof}) ...", flush=True)
-            ok, detail = install_driver(S, ver, base["arch"], f"/root/drv-{ver}.log")
+            ok, detail, actual = install_driver(S, ver, base["arch"], f"/root/drv-{ver}.log")
             if not ok:
                 out_recs.append(rec_for(ver, prof, why,
                                         status="driver-install-failed", detail=detail))
@@ -589,8 +1025,13 @@ def run_one(offer, args):
                                         detail=smi.strip()[:200]))
                 continue
 
-            r = boot_and_validate(S, args)
+            r = boot_and_validate(S, args, actual)
             rec = rec_for(ver, prof, why, driver_installed=detail, **r)
+            # Which version REALLY ran.  Differs from `driver` whenever the
+            # requested row was unpublished and DRIVER_ALTS supplied a stand-in;
+            # reporting the requested version alone would overstate the result.
+            rec["driver_actual"] = actual
+            rec["driver_substituted"] = (actual != ver)
             # Free correctness check on every single run: did nvkvm's selector
             # choose the profile the ABI table says it should for this version?
             got = rec.get("abi_profile", "?")
@@ -636,7 +1077,8 @@ def render(records):
     CELL = {"pass": "OK", "fail": "**FAIL**", "incomplete": "**INC**",
             "driver-install-failed": "inst-x", "driver-predates-gpu": "n/a",
             "guest-no-boot": "boot-x", "guest-module-not-loaded": "mod-x",
-            "bundle-failed": "bundle-x"}
+            "bundle-failed": "bundle-x", "stage-failed": "stage-x",
+            "validate-unparsed": "parse-x"}
 
     rows = ["| architecture | " + " | ".join(drivers) + " |",
             "|---" * (len(drivers) + 1) + "|"]
@@ -650,21 +1092,29 @@ def render(records):
             c = CELL.get(r.get("status"), r.get("status", "?"))
             if r.get("abi_profile_ok") is False:
                 c += " ABI!"
+            if r.get("driver_substituted"):
+                c += "*"
             cells.append(c)
         rows.append(f"| {a} | " + " | ".join(cells) + " |")
 
     rows += ["", "Legend: OK = 28/28. **FAIL**/**INC** = validate.sh said so. "
                  "`n/a` = driver predates the silicon. `inst-x`/`boot-x`/`mod-x`/"
                  "`bundle-x` = harness or environment, NOT a GPU verdict. "
+                 "`stage-x` = the guest staged NO libraries (harness). "
                  "`ABI!` = nvkvm selected a different ABI profile than "
-                 "docs/reference/abi-profiles.md predicts -- always investigate.", ""]
+                 "docs/reference/abi-profiles.md predicts -- always investigate. "
+                 "`*` = the requested version is no longer published by NVIDIA and a "
+                 "same-profile substitute ran instead (see `driver_actual`).", ""]
 
     rows += ["| GPU | driver | ABI (want/got) | result | detail |", "|---|---|---|---|---|"]
     for r in real:
         got = r.get("abi_profile", "?")
         want = r.get("abi_profile_expected", "?")
         abi = f"{want}/{got}" + ("" if r.get("abi_profile_ok") is not False else " **MISMATCH**")
-        rows.append(f"| {r.get('gpu','?')} | {r.get('driver')} | {abi} | "
+        dv = r.get("driver")
+        if r.get("driver_substituted"):
+            dv = f"{dv} -> {r.get('driver_actual')}"
+        rows.append(f"| {r.get('gpu','?')} | {dv} | {abi} | "
                     f"{CELL.get(r.get('status'), r.get('status'))} | "
                     f"{r.get('summary') or (r.get('detail') or '')[:80]} |")
     return "\n".join(rows)
@@ -761,6 +1211,10 @@ def main():
     recs = json.load(open(RESULTS)) if os.path.exists(RESULTS) else []
     try:
         for o in offers:
+            if stop_requested():
+                print(f"\nSTOP requested ({STOP_FILE}) -- not renting any further boxes",
+                      flush=True)
+                break
             print(f"\n=== {o.get('gpu_name')} (offer {o.get('id')}) ===", flush=True)
             got = run_one(o, args)          # a LIST now: one record per driver
             recs.extend(got)
