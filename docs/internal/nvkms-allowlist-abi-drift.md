@@ -138,11 +138,21 @@ positional diff is sufficient.
 ## Resolution (2026-08-21)
 
 Fixed, along the lines the section above proposed, but keyed on the parsed
-driver **major** rather than on `enum nvkvm_abi_id`. That detail is
-load-bearing: the NVKMS renumbering happens between **570.86.16 and 575.51.03**,
-which falls *inside* the `NVKVM_ABI_570` bucket ("== 575 layouts"). The RM/UVM
-profile id therefore cannot express this boundary, and a fix written against
-`nv->abi` would still have admitted `SET_FLIPLOCK_GROUP` on 575.
+**major AND minor**. That detail is load-bearing, and it took two attempts:
+
+- Keying on `enum nvkvm_abi_id` is not enough. The renumbering falls inside the
+  `NVKVM_ABI_570` bucket ("== 575 layouts"), so a fix written against `nv->abi`
+  would still have admitted `SET_FLIPLOCK_GROUP`.
+- **Keying on the major is not enough either.** The 570 branch renumbers
+  *mid-branch*, between **570.195.03 and 570.207** — the audit note above had
+  this right ("it shifts *within* one nvkvm profile") and the first version of
+  this fix did not, because it sampled 570.86.16 and assumed the whole major
+  matched. That version would have admitted `SET_FLIPLOCK_GROUP(60)` on
+  570.207+, i.e. reintroduced the exact bug it was closing. Caught by scanning
+  every 570 tag rather than one.
+
+Every other major measured is internally consistent from its first tag to its
+last; 570 is the only one that splits.
 
 ### The full measured table
 
@@ -158,15 +168,22 @@ four the original note sampled, which is what pinned both boundaries:
 | 550.54.14 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
 | 565.57.01 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
 | 570.86.16 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
+| 570.195.03 | 16 | 17 | 18 | 60 / 61 / 62 | 59 |
+| **570.207** | **17** | **18** | **19** | **61 / 62 / 63** | **60** |
+| 570.211.01 | 17 | 18 | 19 | 61 / 62 / 63 | 60 |
 | 575.51.03 | 17 | 18 | 19 | 61 / 62 / 63 | 60 |
 | 580.178.04 | 17 | 18 | 19 | 61 / 62 / 63 | 60 |
 | 590.48.01 | 17 | 18 | 19 | 60 / 61 / 62 | 59 |
 | 595.84 | 17 | 18 | 19 | 60 / 61 / 62 | 59 |
 | 610.43.02 | 17 | 18 | 19 | 60 / 61 / 62 | 59 |
 
-Three regimes: 515–574 (REGISTER at 16), 575–589 (everything above 15 pushed up
-one by the `DECLARE_DYNAMIC_DPY_INTEREST` insertion), and 590+ (the tail pulled
-back down by the two deletions).
+Four regimes: 515–549 (REGISTER at 16, no vblank-sem ops at all), 550 through
+570.195 (REGISTER at 16, vblank 60/61/62), 570.207 through 589 (everything above
+15 pushed up one by the `DECLARE_DYNAMIC_DPY_INTEREST` insertion), and 590+ (the
+tail pulled back down by the two deletions).
+
+Coverage: first and last tag of every major from 515 to 610, plus every 570 tag,
+which is how the mid-branch split was found.
 
 ### What the old list actually admitted
 
@@ -192,7 +209,9 @@ costs one table row after its enum has actually been read.
 `NVKVM_NVKMS_EXTRA_ALLOW` stays as the one-run escape hatch for bringing a new
 branch up.
 
-`tests/unit/test_nvkms_allowlist.c` pins all twelve tags (470 assertions),
-including explicit regression cases for `GRANT_SURFACE(18)@570` and
-`SET_FLIPLOCK_GROUP(60)@575/580`, and asserts that unknown majors admit nothing
-beyond 0 and 1.
+`tests/unit/test_nvkms_allowlist.c` pins 28 tags (618 assertions), including
+explicit regression cases for `GRANT_SURFACE(18)@570.86`,
+`SET_FLIPLOCK_GROUP(60)@575/580`, **`SET_FLIPLOCK_GROUP(60)@570.207` and
+`@570.211`** (the major-only mistake), and `ENABLE_VBLANK_SEM(60)@570.195` to
+prove the split did not cost the older 570s their vblank ops. Unknown majors are
+asserted to admit nothing beyond 0 and 1.

@@ -2085,7 +2085,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		unsigned nvkms_major = 0, nvkms_minor = 0, nvkms_patch = 0;
 		nvkvm_abi_parse_version(nv->driver_version, &nvkms_major,
 					&nvkms_minor, &nvkms_patch);
-		bool nvkms_ok = nvkvm_nvkms_cmd_allowed_major(nvkms_cmd, nvkms_major);
+		bool nvkms_ok = nvkvm_nvkms_cmd_allowed_ver(nvkms_cmd, nvkms_major, nvkms_minor);
 		if (getenv("NVKVM_NVKMS_TRACE"))
 			fprintf(stderr, "nvkvm: nvkms cmdType=%u size=%u drv=%u %s\n",
 				nvkms_cmd, nvkms_sz, nvkms_major,

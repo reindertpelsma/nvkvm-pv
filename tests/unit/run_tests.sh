@@ -44,7 +44,7 @@ declare -A TALLY_SUITES=(
     [test_frontend]=8
     [test_handle]=9
     [test_tables]=17
-    [test_nvkms_allowlist]=470
+    [test_nvkms_allowlist]=618
 )
 
 # Suites with their own ad-hoc output.  Value is a line that must appear.

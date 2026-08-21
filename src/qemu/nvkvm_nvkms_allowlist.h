@@ -148,18 +148,24 @@ static inline bool nvkvm_nvkms_extra_allow(uint32_t cmd_type)
  * 525.105.17, 535.104.05, 545.23.06, 550.54.14, 565.57.01, 570.86.16,
  * 575.51.03, 580.178.04, 590.48.01, 595.84, 610.43.02).  Three regimes:
  *
- *   major        REGISTER  UNREGISTER  GRANT   vblank en/dis/accel  FLIPLOCK
- *   ---------------------------------------------------------------------
- *   515..549       16         17        18       (absent)              -
- *   550..574       16         17        18       60 / 61 / 62         59
- *   575..589       17         18        19       61 / 62 / 63         60
- *   590..610       17         18        19       60 / 61 / 62         59
+ *   driver             REGISTER  UNREGISTER  GRANT   vblank en/dis/accel  FLIPLOCK
+ *   ------------------------------------------------------------------------
+ *   515, 525, 535         16         17        18       (absent)          -
+ *   545                   16         17        18       (absent)         59
+ *   550, 555, 560, 565    16         17        18       60 / 61 / 62     59
+ *   570  minor <  207     16         17        18       60 / 61 / 62     59
+ *   570  minor >= 207     17         18        19       61 / 62 / 63     60
+ *   575, 580              17         18        19       61 / 62 / 63     60
+ *   590, 595, 610         17         18        19       60 / 61 / 62     59
  *
- * 575 INSERTED NVKMS_IOCTL_DECLARE_DYNAMIC_DPY_INTEREST at 16, pushing
+ * The renumbering lands INSIDE the 570 branch, between 570.195.03 and 570.207 --
+ * not at 570->575 -- so this takes major AND minor.  Every other major measured
+ * is internally consistent from its first tag to its last.
+ * 570.207 INSERTED NVKMS_IOCTL_DECLARE_DYNAMIC_DPY_INTEREST at 16, pushing
  * everything above it up by one; 590 removed two members below 64, pulling the
- * tail back down.  Note that the 570->575 step falls INSIDE the NVKVM_ABI_570
- * profile bucket ("== 575 layouts"), so the RM/UVM profile id cannot express
- * this boundary -- that is why this takes the parsed major and not `nv->abi`.
+ * tail back down.  The insertion falls inside a single NVKVM_ABI_570 profile
+ * bucket AND inside a single major, so neither `nv->abi` nor the major alone can
+ * express it -- that is why this takes major and minor.
  *
  * What the old hardcoded list {0,1,17,18,60,61,62} actually admitted:
  *
@@ -189,16 +195,21 @@ struct nvkvm_nvkms_ops {
 	int32_t  vblank_accel;
 };
 
-static inline struct nvkvm_nvkms_ops nvkvm_nvkms_ops_for_major(unsigned major)
+static inline struct nvkvm_nvkms_ops
+nvkvm_nvkms_ops_for_version(unsigned major, unsigned minor)
 {
 	struct nvkvm_nvkms_ops o = { false, 0, 0, -1, -1, -1 };
+	/* 570 splits mid-branch: 570.195.03 and older number like 565, 570.207
+	 * and newer number like 575.  Everything else is stable per major. */
+	bool shifted = (major >= 575) || (major == 570 && minor >= 207) ||
+		       (major > 570 && major < 575);
 
 	if (major >= 515 && major <= 549) {
 		o.known = true; o.reg_surface = 16; o.unreg_surface = 17;
-	} else if (major >= 550 && major <= 574) {
+	} else if (major >= 550 && major <= 574 && !shifted) {
 		o.known = true; o.reg_surface = 16; o.unreg_surface = 17;
 		o.vblank_enable = 60; o.vblank_disable = 61; o.vblank_accel = 62;
-	} else if (major >= 575 && major <= 589) {
+	} else if (shifted && major <= 589) {
 		o.known = true; o.reg_surface = 17; o.unreg_surface = 18;
 		o.vblank_enable = 61; o.vblank_disable = 62; o.vblank_accel = 63;
 	} else if (major >= 590 && major <= 610) {
@@ -208,7 +219,8 @@ static inline struct nvkvm_nvkms_ops nvkvm_nvkms_ops_for_major(unsigned major)
 	return o;
 }
 
-static inline bool nvkvm_nvkms_cmd_allowed_major(uint32_t cmd_type, unsigned major)
+static inline bool nvkvm_nvkms_cmd_allowed_ver(uint32_t cmd_type,
+					       unsigned major, unsigned minor)
 {
 	struct nvkvm_nvkms_ops o;
 
@@ -219,7 +231,7 @@ static inline bool nvkvm_nvkms_cmd_allowed_major(uint32_t cmd_type, unsigned maj
 	if (cmd_type == 0 || cmd_type == 1)
 		return true;
 
-	o = nvkvm_nvkms_ops_for_major(major);
+	o = nvkvm_nvkms_ops_for_version(major, minor);
 	if (!o.known)
 		return false;
 
