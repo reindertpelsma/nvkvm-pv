@@ -11,21 +11,21 @@
 #     build_qemu.sh is the only thing that compiles nvkvm_mmap_host.c,
 #     virtio_nvgpu.c and virtio_nvgpu_pci.c -- tests/qemu_syntax_check.sh skips
 #     those three because they need real QEMU headers.  It is also the only
-#     check that patches/ still applies to a freshly cloned QEMU 9.2 and that
-#     the result compiles.  Those are the fragile parts: the script's own
-#     comments record several rebuild fixes (a missing header copy, a missing
-#     -D that failed SILENTLY at runtime), and a patch that stops applying is
-#     invisible to a compiler until the build runs.
+#     check on the patch steps themselves, which are the fragile part: the
+#     script's own comments record four separate rebuild fixes (a sed delimiter
+#     collision, an rfind that patched the wrong struct, a missing header copy,
+#     a missing -D that failed SILENTLY at runtime).  Those are all patch-time
+#     bugs against an upstream tree, and none of them are visible to a compiler
+#     until the build runs.
 #
 # NO CACHE, DELIBERATELY
 #     The obvious optimisation is to cache $QEMU_SRC and let the guarded
 #     re-entry make the rebuild incremental.  Rejected: the build directory is
-#     several GB, and worse, a cached tree is already patched -- step 3 would
-#     see `git apply --reverse --check` succeed for every patch, print "already
-#     applied" and write nothing.  The thing this job exists to test is exactly
-#     the thing the cache would skip.  A green run against a stale tree is worse
-#     than no run.  35 minutes of free runner time once a day is the cheaper
-#     trade.
+#     several GB, and worse, the patch steps are all idempotent-by-grep
+#     ("already patched — skipping").  A cached tree would carry LAST night's
+#     patches, so the thing this job exists to test is exactly the thing the
+#     cache would skip.  A green run against a stale tree is worse than no run.
+#     35 minutes of free runner time once a day is the cheaper trade.
 #
 # NO GPU, so nothing here is executed -- it builds and checks that the binary
 # exists and reports a version.  Running it needs hardware; see
@@ -89,9 +89,9 @@ jobs:
           test -x "$BIN" || { echo "no binary at $BIN"; exit 1; }
           "$BIN" --version
           # virtio-nvgpu is patched in by this script, not shipped by QEMU. If
-          # patch 0001 (hw/misc/meson.build) silently no-ops, the build still
-          # succeeds and the device is simply absent -- which is why that patch
-          # exists and what its header describes. Ask the binary directly.
+          # the meson.build patch silently no-ops, the build still succeeds and
+          # the device is simply absent -- which is the failure mode step 6's
+          # comments describe. Ask the binary directly.
           "$BIN" -device help 2>&1 | grep -q 'virtio-nvgpu' \
             || { echo "built QEMU has no virtio-nvgpu device -- the hw/misc"
                  echo "meson.build patch did not take."

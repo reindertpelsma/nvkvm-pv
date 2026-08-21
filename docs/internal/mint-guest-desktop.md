@@ -441,3 +441,100 @@ true, and the zero-MMIO measurement above is evidence nothing tried to use one.
 `tests/validate.sh` was run **both ways** on the same build: 28 PASS / 0 FAIL /
 0 SKIP with `fake-bars` off (and no `resourceN` files), and 28 PASS / 0 FAIL /
 0 SKIP with it on.
+
+## HANDOFF: the NVIDIA DDX, where it stops, and the next experiment
+
+Written for someone picking this up cold, on a different machine. The physical
+box this ran on was handed back, so everything below is what survives.
+
+### Current state
+
+`-device nvkvm-gpu,fake-bars=on` (env `NVKVM_FAKE_BARS=1`, **still default off**)
+gets the DDX much further than before, but not to a working screen. The failure
+moved; it did not go away.
+
+    (**) NVIDIA(G0): Enabling 2D acceleration
+    (II) NVIDIA GLX Module  595.84
+    (II) NVIDIA: The X server supports PRIME Render Offload.
+    (EE) NVIDIA(GPU-0): Failed to initialize the NVIDIA graphics device!
+    (EE) NVIDIA(G0): Failing initialization of X screen
+
+`-verbose 6 -logverbose 6` and `Option "ModeDebug" "true"` are both accepted and
+add **nothing** between the GLX line and the failure. The DDX will not say why.
+
+### The host/guest comparison — this is the important part
+
+Done with `tools/nv_ioctl_trace.c` (an `LD_PRELOAD` shim, same binary shape both
+sides). `NVTRACE_PARAMS` was added to it during this work because the default
+64-byte cap hides the OUT values of larger controls, which is exactly where a
+divergence could hide. Raw traces are **not in the repo** — they were kept on
+the control machine at `.nvkvm-rescue/ddx-traces/` (`guest-rm*.log`,
+`host-rm*.log`, `host.opens`, `host-Xorg.9.log`). Regenerate with:
+
+    cc -shared -fPIC -o nvtrace.so tools/nv_ioctl_trace.c -ldl
+    LD_PRELOAD=./nvtrace.so NVTRACE_LOG=/tmp/rm.log NVTRACE_ALL=1 \
+        NVTRACE_PARAMS=512 X :1 vt1
+
+**Result: the RM conversation is identical.** Matching the two clients (the one
+that allocates `hClass=0x0073`, NV04_DISPLAY_COMMON, on each side) and diffing
+line by line with handles normalised: **39 operations agree exactly** — same
+commands, same `nvstatus=0x0`, same params. The only byte differences are
+user-space pointer values and timestamps. Then:
+
+- **host**: allocates `hClass=0xc56f` (a channel/GPFIFO) and proceeds to
+  `0xc361`, `0x902d` (2D), `0xc7b5` (copy), `0xc997` (3D) — i.e. it sets up its
+  acceleration channels.
+- **guest**: never attempts the channel. It issues `0x20800403`
+  (NV2080_CTRL_CMD_TIMER_GET_TIME) twice and tears everything down.
+
+So the DDX asks nvkvm for exactly what it asks bare metal, gets the same
+answers, and then declines. **The deciding input is not in the RM conversation.**
+
+Specifically ruled out, with measurements:
+
+| ruled out | evidence |
+|---|---|
+| BAR discovery | was a real blocker; `fake-bars` fixes it and the DDX now opens `/dev/nvidiactl` and `/dev/nvidia0`, which it never did before |
+| BAR *access* | **zero** MMIO reads/writes over an entire run — the instrumented handlers never fired. It validates geometry, never pokes it. |
+| nvkvm refusing something | 4 `DENY` lines, identical to a plain boot with no X at all |
+| a failing RM call | every `nvstatus` is 0 on both sides; the one guest-only `0x00000205 nvstatus=0x1f` is a first-client probe that **retries and succeeds with byte-identical params to the host** |
+| display enumeration | both sides call `0x00730101` (GET_NUM_HEADS) twice, both `nvstatus=0x0`, both `params[2]=812f` — *identical* |
+| GPU-screen vs primary | fails the same way as `NVIDIA(0)` primary (with `-vga none`) and as `NVIDIA(G0)` GPU screen (with the VGA present) |
+| a missing modifier/EGL path | unrelated — that is the `modesetting`+glamor story above, a different driver |
+
+### The strongest remaining lead
+
+`/dev/nvidia-modeset`. The **host** DDX opens it; the **guest** DDX never does
+(measured: zero opens). The host also opens `/dev/vga_arbiter` and
+`/proc/driver/nvidia/params`, which the guest run should be checked against —
+the guest-side open-set comparison was **not finished** before the machine was
+handed back, and finishing it is cheap. If the guest is failing a check that
+happens *before* it would open NVKMS, that check is the bug; if it is failing
+because NVKMS is unavailable or answers differently, that is the architectural
+answer.
+
+**Safety rule that must not be dropped:** if the guest DDX ever starts
+enumerating real monitors, stop. `/dev/nvidia-modeset` never being opened is
+currently the thing that makes this safe to experiment with, and the moment it
+*is* opened that guarantee is gone. On a rented box with no physical display
+attached this is much less dangerous, which is a good reason to continue there.
+
+### Next experiment (do this first, it is cheap and may be the whole answer)
+
+`Option "AccelMethod" "none"` on a `modesetting` screen, with NVIDIA as a PRIME
+**GPU screen**. A PRIME output sink does not need glamor for the final blit, so
+this sidesteps the `EGL_NATIVE_PIXMAP_KHR` import NVIDIA's EGL rejects
+(proven above, and it rejects it on bare metal too). That would be accelerated
+rendering on NVIDIA with an unaccelerated final copy — acceptable, and it does
+not require the DDX's own init to be fixed if the offload path can be brought up
+another way. Not yet tried.
+
+Then: finish the host-vs-guest **open-set** diff described above.
+
+### Running the host control safely
+
+Do **not** start an X server on a machine someone is sitting in front of without
+warning them: it takes their console. Use `-novtswitch -sharevts -keeptty`, or
+better run the comparison headless — the failure is during *initialisation*,
+well before scanout, so a real display is probably not needed at all. Kill the
+server afterwards; leaving one holding DRM master blanks the screen.

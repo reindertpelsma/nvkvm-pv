@@ -479,8 +479,7 @@ time to discover:
   **Automatic handover now works** and this note's "no API to switch" is
   resolved: upstream has none, but we build QEMU from source, so the GTK front
   end is patched to move to a console the first time it presents a real (non
-  placeholder) surface — see
-  `patches/0005-gtk-switch-to-guest-display-when-it-goes-live.patch`. It is a one-shot
+  placeholder) surface — see `scripts/build_qemu.sh` step 6d. It is a one-shot
   latch keyed on "still on the page the window opened on, and the target is
   above it", so the VGA going live cannot consume the shot, the user is never
   dragged back after switching manually, and the single-console `-vga none`
@@ -722,13 +721,6 @@ the bare-metal host too, on the ffmpeg build used
   document that also carries a confirmed transcription error, and the
   re-validation pass explicitly marks it "unconfirmed on this driver"
   (`tests/perf/realapp_matrix.md`). Do not use it.
-- **"glmark2 6857 guest vs 21571 host, ~32%"** — superseded 2026-08-21. It is a
-  *single-scene* number, and in the guest a fresh process's first scene runs at
-  ~0.37x while every later scene runs at 0.88-0.93x, so a one-scene invocation
-  measures the cold path and nothing else. The full default suite off-screen,
-  one sha256-identical binary on both sides, is **0.73x** on a default guest and
-  **0.89x** with `clocksource=tsc`
-  (`tests/perf/results/glmark2_2026-08-21/RESULTS.md`).
 - The **2026-06-01 matrix** was taken on driver 580.159.04 with different
   toolkits on each side (host cuBLAS/cuFFT 11.5 vs guest 12.x). The
   2026-08-17 re-validation on 575.51.03 used one statically-linked binary per
@@ -842,16 +834,11 @@ ioctl_on_isolate: cmd=0xc020464f  ret=0  nvstatus=0x57   NV_ESC_RM_UNMAP_MEMORY 
 Vulkan failure, though at a different call site. The driver is reached and
 answers; nvkvm is not refusing anything.
 
-> **Note added 2026-08-21, revised the same day.** These two `0x57`s are still
-> different bugs — different call sites, different objects — but the reason
-> given for separating them was wrong. The first version of this note said the
-> Hopper Vulkan failure "turned out to be a defect in the 570.124.06 driver
-> branch". It is not a driver defect: a driver sweep on an H100 shows the same
-> probe passing on **bare metal** on 570.124.06 while failing through nvkvm, so
-> that one is ours too, and it is still open. Note also that both failures share
-> a shape worth remembering — an object is freed and then referenced — which is
-> a hint, not a proof of common cause. See
-> [correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug).
+> **Note added 2026-08-21.** The shared status code is a coincidence, not a
+> shared cause. The Hopper Vulkan failure turned out to be a defect in the
+> 570.124.06 driver branch — the same nvkvm tree that measured it passes on
+> 580.126.09 — so do not treat these two `0x57`s as one bug. See
+> [correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
 
 Note the ordering: a FREE immediately
 followed by an UNMAP of what looks like the same object.
@@ -928,9 +915,8 @@ about.
 Practical consequence: the A100 passing `vk_compute_dispatch`, EGL and a
 pixel-checked GL draw while failing `cuCtxCreate` is **exactly the wrong way
 round** for that card. The Vulkan pass is still useful as evidence — it is what
-eliminated the "datacenter part" theory for the Hopper failure (which is not a
-driver defect and is still open — see
-[correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug)) — but it is not a
+eliminated the "datacenter part" theory for the Hopper failure (itself since
+resolved as a 570-branch driver defect) — but it is not a
 result to celebrate, and the CUDA failure is the one that counts.
 
 ### X11 clients fall back to llvmpipe on a display-less A100 — NOT AN NVKVM BUG
@@ -1252,34 +1238,3 @@ The throughput gap is in the slot-batched upload loop, not in the per-chunk
 migration path — the chunk size was chosen so per-chunk overhead is negligible
 against the data copied. It has been characterised but not optimised.
 
-
-### Multi-process CUDA IPC (NCCL's SHM transport)
-
-Two RM controls in the `OS_UNIX` export-object family are **absent from the
-allowlist** while their siblings are present:
-
-| control | allowlist |
-|---|---|
-| `0x3d05` `EXPORT_OBJECT_TO_FD` | allowed |
-| `0x3d06` `IMPORT_OBJECT_FROM_FD` | allowed |
-| `0x3d08` | **denied** |
-| `0x3d0b` | **denied** |
-
-Reproduced on a 4x RTX 5060 (580.95.05): every 4-rank NCCL job in the guest
-adds exactly four `DENY ctrl cmd 0x00003d08` and four `0x00003d0b` lines to the
-QEMU log — one per rank — and NCCL then fails in `transport/shm.cc:590` with
-`Cuda failure 101 'invalid device ordinal'` after selecting `SHM/direct/direct`
-channels. The count scales one-to-one with rank count, so the denials are on
-the per-GPU IPC setup path.
-
-The causal link is **strong but not proven**: NCCL could not be made to work on
-the bare-metal host of that box either (it hangs in bootstrap, with and without
-`NCCL_P2P_DISABLE`/`NCCL_SHM_DISABLE`), so there was no passing control against
-which to confirm that allowing these two controls is sufficient. What is
-established is that the guest denies them, that only multi-process IPC reaches
-them, and that single-process multi-GPU work never does — `tests/multi_gpu.c`,
-`tests/peer_gpu.c` and `tests/multi_gpu_app.py` all pass with all four GPUs and
-produce none of these denials.
-
-Anyone picking this up should retest on a box where NCCL runs on bare metal
-first, rather than assuming the allowlist is the whole story.

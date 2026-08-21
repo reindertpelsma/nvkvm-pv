@@ -572,9 +572,7 @@ place where it was most nearly violated. `NV_ESC_RM_IDLE_CHANNELS` carries three
 Read the block below as a statement of intent, not as the shipping control: it
 lives in `src/qemu/nvkvm_dispatch.c`, whose **every** call site is inside the
 `#if 0` at `src/qemu/virtio_nvgpu.c:236-588`. The file still compiles and links
-(it is in the meson file list added by
-`patches/0001-meson-register-virtio-nvgpu-sources.patch`), so it reads as live;
-nothing in it executes. The
+(`scripts/build_qemu.sh:169`), so it reads as live; nothing in it executes. The
 control that does ship is quoted further down, in the stub.
 
 ```c

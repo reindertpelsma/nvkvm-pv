@@ -26,24 +26,3 @@ src/stub/nvkvm_stub_bin.h
 # local secrets — never commit
 *.key
 .env
-
-# python bytecode -- four of these were committed, and they get rewritten on
-# every run, so merely running the sweep or a perf script dirtied the tree.
-# That matters here beyond tidiness: sweep_matrix.py refuses to spend money
-# from a dirty tree (check_tree), and CI fails a build that modifies tracked
-# files.
-__pycache__/
-*.pyc
-*.pyo
-.pytest_cache/
-
-# built test binaries -- tests/unit/test_ctrl_gate was committed as an ELF and
-# the Makefile rebuilds it, so running the suite dirtied the tree.
-tests/unit/test_dispatch
-tests/unit/test_frontend
-tests/unit/test_handle
-tests/unit/test_isolate
-tests/unit/test_tables
-tests/unit/test_open_scm
-tests/unit/test_ctrl_gate
-tests/unit/mock_stub

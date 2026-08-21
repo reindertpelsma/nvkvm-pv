@@ -278,7 +278,7 @@ domain share a property: **they are silent**.
   looks like a working desktop in a screenshot
   (`scripts/stage_guest_libs.sh:153-163`).
 - A missing QEMU build define produces a binary that builds fine and comes up
-  with forwarding off (`scripts/build_qemu.sh:212-225`).
+  with forwarding off (`scripts/build_qemu.sh:77-89`).
 - A wrong cacheability choice is a 100x slowdown on one CPU vendor and invisible
   on the other (`src/guest/nvkvm_mmap.c:44-61`).
 

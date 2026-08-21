@@ -62,10 +62,23 @@ int ioctl(int fd, unsigned long req, ...) {
         /* Dump the params of the few controls whose OUT values decide what the
          * userspace driver does next.  Same bytes on both sides of the
          * boundary or the forwarded session is not equivalent. */
-        if (pparams && psize && psize <= 64) {
+        /* NVTRACE_PARAMS raises the dump limit (default 64).  The limit matters:
+         * a guest/host divergence can be decided by an OUT value in a control
+         * whose params are larger than the default, and then both logs agree on
+         * every command and status while the sessions still behave differently.
+         * Set it high (e.g. 512) when hunting exactly that. */
+        static uint32_t cap;
+        if (!cap) {
+            const char *e = getenv("NVTRACE_PARAMS");
+            cap = e ? (uint32_t)strtoul(e, NULL, 0) : 64;
+            if (cap > 4096) cap = 4096;
+        }
+        if (pparams && psize && psize <= cap) {
             const unsigned char *pb = (const unsigned char *)(uintptr_t)pparams;
             fprintf(lg, " params[%u]=", psize);
             for (uint32_t i = 0; i < psize; i++) fprintf(lg, "%02x", pb[i]);
+        } else if (pparams && psize) {
+            fprintf(lg, " params[%u]=<over NVTRACE_PARAMS cap>", psize);
         }
         fputc('\n', lg);
     } else if (nr == 0x29 && size >= 16) {

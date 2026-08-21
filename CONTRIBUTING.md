@@ -43,23 +43,6 @@ Three things that have bitten people, including us:
 - **A GPU is required for `tests/validate.sh`**, so CI cannot run it. Hardware
   coverage comes from `scripts/sweep_matrix.py` against rented boxes.
 
-## Changing upstream QEMU
-
-Everything nvkvm changes in QEMU itself is a patch file in
-[`patches/`](patches/), applied by `git apply`. If you need another change to an
-upstream file, add a patch there — do not add an in-place edit to
-`scripts/build_qemu.sh`. That is how it used to work, and it meant the delta had
-no diff to review, could not be replicated by hand, and re-applied itself when
-somebody reworded a comment (the already-applied test was a `grep` for a
-sentence out of the patch body).
-
-New files under `src/qemu/` need no patch: they are copied into `hw/misc/`. Only
-`hw/misc/meson.build` has to learn about them, which is
-`patches/0001-meson-register-virtio-nvgpu-sources.patch`.
-
-Regenerate patches with `git format-patch` from a real QEMU tree rather than
-hand-editing them; [`patches/README.md`](patches/README.md) has the recipe.
-
 ## What a good patch looks like
 
 Match the surrounding code, including the comments. This codebase explains

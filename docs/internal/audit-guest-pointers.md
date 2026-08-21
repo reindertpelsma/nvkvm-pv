@@ -96,8 +96,7 @@ at `:230-235` stating the enclosed handlers are "dead code as of Step 3d.1 (gues
 sends these request types)". `handle_ioctl` at `:360` — the function containing line 444 — is
 `static` and has no other reference.
 
-The file is still compiled and linked (it is in the meson file list added by
-`patches/0001-meson-register-virtio-nvgpu-sources.patch`), which is why it looks alive.
+The file is still compiled and linked (`scripts/build_qemu.sh:169`), which is why it looks alive.
 So the reassuring comment at `nvkvm_dispatch.c:383-392` — *"the boundary (not the untrusted guest)
 must ensure no guest pointer is ever forwarded"* — decorates code that never runs, and the
 `IDLE_CHANNELS` overflow hardening beneath it (`:393-403`, the 64-bit math and the 4096 cap) is
