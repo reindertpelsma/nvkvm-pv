@@ -240,11 +240,6 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   vLLM starts and runs
   ([numbers](docs/internal/known-limitations.md#pinned-host-memory)).
 
-Recently fixed: Vulkan compute on Hopper, guest kernels 6.12 and newer being
-unable to use the GPU's DRM nodes, X11 windows not appearing, and GL under
-Wayland. Two of those looked like NVIDIA bugs until the same test was run on
-bare metal ([what broke and how](docs/reference/correctness.md)).
-
 ## Tested applications
 
 An independent third-party benchmark first, because it is the easiest to check:
@@ -427,9 +422,7 @@ in one guest.
 
 The largest open item is that a stock distro's own Xorg session cannot drive the
 display head; everything else is tracked in
-[known limitations](docs/internal/known-limitations.md). Several entries that
-used to sit here have been re-tested and no longer hold — Wayland GL, the NVENC
-hang, Vulkan compute on Hopper, and DRM on guest kernels 6.12+.
+[known limitations](docs/internal/known-limitations.md).
 
 Issues and measurements from other hardware are welcome — particularly boots on
 driver branches this repository has not exercised. Coverage here is a function
