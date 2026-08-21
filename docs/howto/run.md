@@ -269,6 +269,41 @@ Both halves, or neither:
 With graphics off, `/dev/nvidia-modeset` and `/dev/dri/renderD128` never appear
 in the guest, and the corresponding host devices are never opened.
 
+## The guest's own Xorg session (a stock distro desktop)
+
+A stock distro left alone picks one of the two X paths that cannot work on the
+nvkvm head — NVIDIA's DDX (which wants the *host's* display engine) or
+`modesetting` with glamor (whose scanout-pixmap import NVIDIA's EGL rejects,
+on bare metal too).  One file steers it to the third path, which does work:
+
+```bash
+# inside the guest, as root
+cp /mnt/nvkvm/data/xorg/nvkvm-xorg.conf /etc/X11/xorg.conf
+# check BusID matches: lspci -nn | grep NVIDIA   (slot 7 by default)
+```
+
+Then start X the distro's own way (display manager, `startx`, whatever it
+ships).  The X screen composites on the CPU; run GL applications on the GPU the
+way a PRIME laptop does:
+
+```bash
+__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxgears -info
+# GL_RENDERER = NVIDIA GeForce RTX 3070/PCIe/SSE2      ~2460 FPS
+# (without the two variables: llvmpipe, ~490 FPS — check this, not the
+#  renderer string, to be sure you are not on a silent software fallback)
+```
+
+Set the two variables in the session's environment (`/etc/environment`, or the
+`.desktop` files of the applications you care about) to make it the default.
+
+Do **not** try to do this with an `xorg.conf.d` drop-in: the NVIDIA driver
+package's `OutputClass` matches the same device, Xorg tries its driver first,
+that fails the screen and the server exits instead of falling through.  An
+explicit `Device` section in `/etc/X11/xorg.conf` outranks `OutputClass` driver
+selection and is the reason the file above does not require removing anything
+the distro ships.  Background and measurements:
+[`docs/internal/mint-guest-desktop.md`](../internal/mint-guest-desktop.md).
+
 ## Running the guest desktop in a window
 
 By default the VM is headless (`-display none`, serial on stdio) and you reach

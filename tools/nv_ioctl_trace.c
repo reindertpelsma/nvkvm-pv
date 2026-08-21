@@ -9,6 +9,14 @@
  * Covers NV_ESC_RM_ALLOC (0x2b), NV_ESC_RM_CONTROL (0x2a) and NV_ESC_RM_FREE
  * (0x29) -- the object-lifetime calls.  Everything else is passed through
  * untouched and unlogged.
+ *
+ * open()/openat() on the driver's device nodes are logged too, in the SAME
+ * stream.  That ordering is the point: an RM-only log shows two sides agreeing
+ * on every call and still behaving differently, and the deciding difference
+ * turns out to be WHICH NODE was opened and WHEN (e.g. the NVIDIA DDX opens
+ * /dev/nvidia-modeset on bare metal and never does in a guest).  Interleaving
+ * opens with the RM conversation makes that visible without a second strace.
+ * Set NVTRACE_OPENS_ALL=1 to log every open, not just the driver nodes.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -23,6 +31,16 @@
 
 static int (*real_ioctl)(int, unsigned long, ...);
 static FILE *lg;
+
+/* Log this path?  Default: the NVIDIA/DRM device nodes and the driver's procfs
+ * -- the set whose presence or absence changes what the caller does next. */
+static int path_interesting(const char *path) {
+    if (!path) return 0;
+    if (getenv("NVTRACE_OPENS_ALL")) return 1;
+    return strstr(path, "nvidia") != NULL
+        || strncmp(path, "/dev/dri", 8) == 0
+        || strcmp(path, "/dev/vga_arbiter") == 0;
+}
 
 static void open_log(void) {
     const char *p = getenv("NVTRACE_LOG");
@@ -97,6 +115,55 @@ int ioctl(int fd, unsigned long req, ...) {
         fputc('\n', lg);
     }
     return r;
+}
+
+/* open()/openat() -- logged into the same stream as the ioctls so the order of
+ * "which node was opened" against "which RM call was made" is readable. */
+static void log_open(const char *path, int fd) {
+    if (!path_interesting(path)) return;
+    if (!lg) open_log();
+    fprintf(lg, "TRACE OPEN  fd=%d path=%s%s\n", fd, path,
+            fd < 0 ? "  -> FAILED" : "");
+}
+
+int open(const char *path, int flags, ...);
+int open(const char *path, int flags, ...) {
+    static int (*real_open)(const char *, int, ...);
+    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
+    if (!real_open) real_open = dlsym(RTLD_NEXT, "open");
+    int fd = real_open(path, flags, mode);
+    log_open(path, fd);
+    return fd;
+}
+
+int open64(const char *path, int flags, ...);
+int open64(const char *path, int flags, ...) {
+    static int (*real_open64)(const char *, int, ...);
+    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
+    if (!real_open64) real_open64 = dlsym(RTLD_NEXT, "open64");
+    int fd = real_open64(path, flags, mode);
+    log_open(path, fd);
+    return fd;
+}
+
+int openat(int dirfd, const char *path, int flags, ...);
+int openat(int dirfd, const char *path, int flags, ...) {
+    static int (*real_openat)(int, const char *, int, ...);
+    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
+    if (!real_openat) real_openat = dlsym(RTLD_NEXT, "openat");
+    int fd = real_openat(dirfd, path, flags, mode);
+    log_open(path, fd);
+    return fd;
+}
+
+int openat64(int dirfd, const char *path, int flags, ...);
+int openat64(int dirfd, const char *path, int flags, ...) {
+    static int (*real_openat64)(int, const char *, int, ...);
+    va_list ap; va_start(ap, flags); int mode = va_arg(ap, int); va_end(ap);
+    if (!real_openat64) real_openat64 = dlsym(RTLD_NEXT, "openat64");
+    int fd = real_openat64(dirfd, path, flags, mode);
+    log_open(path, fd);
+    return fd;
 }
 
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);

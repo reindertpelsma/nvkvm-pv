@@ -334,15 +334,21 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-- **A stock distro will not boot straight into its own desktop.** An accelerated
-  desktop works — the real Linux Mint Cinnamon desktop runs at full speed on the
-  GPU — but the session has to be started a particular way rather than left to
-  the distro's login screen. On real hardware a distro drives the display with
-  NVIDIA's own X driver; in a guest that driver does not finish starting up yet.
-  It talks to the GPU successfully and then stops partway through its own
-  initialisation, for a reason we have not pinned down. What the X server falls
-  back to instead is a generic path NVIDIA has never supported on any machine —
-  so the gap is in what nvkvm can present to an X server, not in the distro.
+- **A stock distro's own Xorg session needs one config file, and NVIDIA's own X
+  driver cannot be used at all.** Drop
+  [`data/xorg/nvkvm-xorg.conf`](data/xorg/nvkvm-xorg.conf) in as
+  `/etc/X11/xorg.conf` and a stock desktop boots on the nvkvm head, with GL
+  clients accelerated on the GPU through render offload (measured in-guest on an
+  RTX 3070: `glxgears` ~2460 FPS on NVIDIA vs ~490 on llvmpipe). The X server's
+  own 2D compositing is on the CPU — the same bargain a PRIME laptop makes, and
+  the same two environment variables. Without that file a stock install picks
+  one of the two paths that cannot work: NVIDIA's DDX, which reaches the GPU
+  fine and then asks NVKMS about the **host's** physical displays — a question
+  nvkvm will not forward, and could not answer honestly if it did; or
+  `modesetting` with glamor, whose scanout-pixmap import NVIDIA's EGL rejects on
+  bare metal too. Making the NVIDIA DDX work needs a virtual NVKMS that answers
+  with nvkvm's own head; the mechanism and the measured evidence are in
+  [the internal note](docs/internal/mint-guest-desktop.md).
   [How to run a desktop](docs/howto/run.md).
 - **One rare crash is unexplained.** A GL client once took a guest down within a
   minute. It has not reproduced since — through a five-minute soak at 190,013
@@ -547,8 +553,10 @@ workloads at host parity on six GPU architectures (Turing, Ampere, Ada,
 Blackwell, and the GA100 and Hopper datacenter parts), including multiple GPUs
 in one guest.
 
-The largest open item is that a stock distro's own Xorg session cannot drive the
-display head; everything else is tracked in
+The largest open item is that NVIDIA's own X driver cannot run in a guest — it
+wants the host's display engine — so a guest's Xorg session composites on the
+CPU and offloads rendering to the GPU rather than scanning out from it.
+Everything else is tracked in
 [known limitations](docs/internal/known-limitations.md).
 
 Issues and measurements from other hardware are welcome — particularly boots on

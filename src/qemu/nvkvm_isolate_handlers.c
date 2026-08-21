@@ -1957,8 +1957,15 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		 * nvkvm_nvkms_allowlist.h. */
 		uint32_t nvkms_cmd = (param_buf && req->param_size >= 4)
 			? *(const uint32_t *)param_buf : 0xffffffffu;
+		uint32_t nvkms_sz = (param_buf && req->param_size >= 8)
+			? *(const uint32_t *)((const char *)param_buf + 4) : 0;
+		if (getenv("NVKVM_NVKMS_TRACE"))
+			fprintf(stderr, "nvkvm: nvkms cmdType=%u size=%u %s\n",
+				nvkms_cmd, nvkms_sz,
+				nvkvm_nvkms_cmd_allowed(nvkms_cmd) ? "allow" : "DENY");
 		if (!nvkvm_nvkms_cmd_allowed(nvkms_cmd)) {
-			fprintf(stderr, "nvkvm: DENY nvkms cmdType=%u\n", nvkms_cmd);
+			fprintf(stderr, "nvkvm: DENY nvkms cmdType=%u size=%u\n",
+				nvkms_cmd, nvkms_sz);
 			resp->retval     = (uint64_t)(int64_t)(-EACCES);
 			resp->status     = 0;
 			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
