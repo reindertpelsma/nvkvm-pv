@@ -220,10 +220,11 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   desktop works — the real Linux Mint Cinnamon desktop runs at full speed on the
   GPU — but the session has to be started a particular way rather than left to
   the distro's login screen. On real hardware a distro drives the display with
-  NVIDIA's own X driver, which needs direct access to the card that a forwarded
-  GPU does not give it. Without it the X server falls back to a generic path
-  that NVIDIA's driver has never supported, on any machine. So this is a gap in
-  what nvkvm can present to an X server, not something broken about the distro.
+  NVIDIA's own X driver; in a guest that driver does not finish starting up yet.
+  It talks to the GPU successfully and then stops partway through its own
+  initialisation, for a reason we have not pinned down. What the X server falls
+  back to instead is a generic path NVIDIA has never supported on any machine —
+  so the gap is in what nvkvm can present to an X server, not in the distro.
   [How to run a desktop](docs/howto/run.md).
 - **One rare crash is unexplained.** A GL client once took a guest down within a
   minute. It has not reproduced since — through a five-minute soak at 190,013
