@@ -186,61 +186,88 @@ is 28/28, and the same Ada part on 580.95.05 is 28/28 — but **nothing in the
 check is architecture-specific**. It was latent for any guest whose libcuda
 takes the by-base free path.
 
-## Vulkan compute on Hopper
+## Vulkan compute on Hopper — RESOLVED 2026-08-21, and it was never an nvkvm bug
 
-On the H100 every CUDA and bring-up check passes (`sm_90`, PTX JIT, kernel
-launch, matmul, byte-exact 8 MiB round trips) and OpenGL renders through the
-forwarder, but `vk_compute_dispatch` fails: `vkCreateDevice` returns `-4`
-(`VK_ERROR_DEVICE_LOST`) in the guest while the *same binary* returns `0` on the
-host with the same driver. Vulkan enumeration works and both sides see the same
-5 queue families — only device creation differs. Minimal reproducer:
+**Status: fixed by the host NVIDIA driver, not by us.** On an H100 PCIe (GH100)
+with driver **580.126.09**, `tests/validate.sh` is **28/28**, including
+`vk_compute_dispatch` (4096 elements, `data[i]=i*3+7` verified). The failure
+below reproduces only on the **570.124.06** branch this row was first measured
+on. Both halves of the old diagnosis turned out to be wrong; the corrected
+account is kept here because the *way* it was wrong is the instructive part.
+
+### What was originally recorded
+
+`vkCreateDevice` returned `-4` (`VK_ERROR_DEVICE_LOST`) in the guest while the
+same binary returned `0` on the host, and the QEMU trace showed the userspace
+driver allocating an `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`) channel and then
+failing to allocate `HOPPER_COMPUTE_A` (`0xcbc0`) under it with
+`NV_ERR_OBJECT_NOT_FOUND` (`0x57`). That was written up as a *channel/compute
+class mismatch* — an Ampere channel being an illegitimate parent for a Hopper
+compute object. Minimal reproducer:
 [`tests/repro/vk_create_device.c`](tests/repro/vk_create_device.c).
 
-Traced, with two hypotheses eliminated by experiment:
+### Correction 1 — the "class mismatch" is normal, not a fault
 
-* **Not the allowlist.** The QEMU log showed the default-deny gate rejecting
-  `alloc class 0x0000a083` (`NVA083_GRID_DISPLAYLESS`) and `ctrl cmd 0x20803401`
-  (`NV2080_CTRL_CMD_ECC_GET_VOLATILE_COUNTS`, a read-only ECC query that only
-  appears on ECC-capable datacenter parts). Temporarily allowing `0xa083`
-  changed nothing — `vkCreateDevice` still returned `-4` — so it was never the
-  cause, and allowing it would have widened a security boundary for no gain.
-  The entry was reverted.
-* **Not class discovery either.** The failure is a channel/compute mismatch: the
-  userspace driver creates its channel as `AMPERE_CHANNEL_GPFIFO_A` (`0xc56f`)
-  on this Hopper part, then allocating `HOPPER_COMPUTE_A` (`0xcbc0`) under that
-  parent fails with `NV_ERR_OBJECT_NOT_FOUND` (`0x57`). The obvious suspect was
-  a truncated or filtered class list, but instrumenting
-  `NV0080_CTRL_CMD_GPU_GET_CLASSLIST_V2` shows the guest receives it intact —
-  48 classes in a 100-entry array, including both `HOPPER_CHANNEL_GPFIFO_A`
-  (`0xc86f`) and `HOPPER_COMPUTE_A` (`0xcbc0`). The driver has the Hopper
-  channel class available and picks the Ampere one anyway, so the remaining
-  question is why, not what it was told. Run with `NVKVM_DEBUG=1` to see the
-  `CLASSLIST_V2` line.
+**The bare-metal host does exactly the same thing.** Tracing
+`NV_ESC_RM_ALLOC` on the host with an `LD_PRELOAD` shim (decoding
+`NVOS64_PARAMETERS.hClass`/`status`) while running the *same* reproducer on
+driver 580.126.09:
 
-* **Not "datacenter parts" as a class, either — eliminated 2026-08-20 on an
-  A100.** The obvious confound was that the H100 is a display-less,
-  ECC-capable datacenter card and every passing row was a consumer part, which
-  would make this a datacenter problem rather than a Hopper one. It is not: an
-  **A100 80GB PCIe** (GA100, driver 580.126.09) — equally display-less, equally
-  ECC-capable, equally a datacenter SKU — **passes `vk_compute_dispatch`**, with
-  4096 elements verified, plus EGL and a pixel-checked GL draw. So the
-  distinguishing factor is Hopper, not the market segment.
+```
+HOST  RM_ALLOC hParent=0xcef80002 hNew=0xbeee0100 hClass=0xc56f status=0x0   AMPERE_CHANNEL_GPFIFO_A
+HOST  RM_ALLOC hParent=0xbeee0100 hNew=0xbeee90c0 hClass=0xcbc0 status=0x0   HOPPER_COMPUTE_A under it
+```
 
-  This also *supports* the channel/compute diagnosis above rather than merely
-  narrowing it. If the userspace driver reaches for `AMPERE_CHANNEL_GPFIFO_A`
-  regardless of the part, that choice is harmless on an Ampere die — the
-  compute class it then allocates matches — and fatal only where the channel
-  and compute classes come from different generations. The A100 is exactly the
-  case where the same behaviour should be benign, and it is.
+`HOPPER_COMPUTE_A` under an `AMPERE_CHANNEL_GPFIFO_A` parent is what a working
+H100 does — Hopper reuses the Ampere GPFIFO channel class. `HOPPER_CHANNEL_GPFIFO_A`
+(`0xc86f`) is present in the class list but is requested by **neither** the host
+nor the guest. So "the driver picks the Ampere channel on a Hopper part" was
+never the anomaly it was taken for, and the open question it left behind ("why
+does class discovery steer the driver to an Ampere channel?") had no answer
+because it had no premise.
 
-  (That A100 has an unrelated problem of its own: `cuCtxCreate` returns 999
-  before any kernel launch. Different failure, different layer, tracked in
-  [known limitations](../internal/known-limitations.md).)
+The guest on 580.126.09 now produces a byte-for-byte equivalent sequence, with
+**zero** non-zero `status` values across the whole trace:
 
-**This does not affect CUDA.** All 19 CUDA checks pass on the H100 over that
-same Ampere channel, with byte-exact verification, and the class list reaching
-the guest is complete — nvkvm is not withholding Hopper classes from the
-driver.
+```
+GUEST RM_ALLOC hParent=0xcef80002 hNew=0xbeee0100 hClass=0xc56f status=0x0
+GUEST RM_ALLOC hParent=0xbeee0100 hNew=0xbeee90c0 hClass=0xcbc0 status=0x0
+```
+
+This is the project's most-repeated mistake, made again: **a difference was
+attributed to nvkvm without first checking what the host does.** The host check
+is one `LD_PRELOAD` shim and five minutes.
+
+### Correction 2 — no nvkvm change fixed it; the driver branch did
+
+Establishing *what* changed required separating two variables that moved
+together: the host driver (570.124.06 → 580.126.09) and roughly twenty of our
+commits. Measured by A/B on one H100 PCIe box, same hardware, same guest image:
+
+| arm | QEMU | guest module | driver | `vkCreateDevice` |
+|---|---|---|---|---|
+| shipping | `e8e472f` (LIFO=2, DP=1) | `e8e472f` | 580.126.09 | **rc=0 OK** |
+| map-VA fill-in disabled | `e8e472f` + gate | `e8e472f` | 580.126.09 | **rc=0 OK** |
+| **full original stack** | **`a996386`** (LIFO=0, DP=0) | **`a996386`** | 580.126.09 | **rc=0 OK** |
+
+`a996386` is the exact tree whose commit message records *"H100 validate.sh
+re-run with this change: 28 checks, 27 PASS, 1 FAIL"* — i.e. the tree that
+measured the failure. Rebuilt from that tree (QEMU **and** the guest module —
+`nvkvm_guest` size 110592 vs 114688 for current, confirming a genuinely
+different binary) it **passes** on 580.126.09.
+
+Since the only remaining variable is the host driver, **the Hopper
+`vk_compute_dispatch` failure was a defect in the 570.124.06 driver branch.**
+nvkvm required no change, and none of our 2026-08-20 map-VA / `UNMAP_MEMORY`
+work is responsible — arm 2 disables the host half of the `UNMAP_MEMORY`
+address contract outright and Vulkan still comes up.
+
+What is **not** established: the failure was not re-measured on 570.124.06 with
+the current tree, because no 570 box was available. The claim is therefore
+"the original stack passes on 580", not "the current stack fails on 570".
+
+**This never affected CUDA.** All 19 CUDA checks passed on the H100 throughout,
+over that same Ampere channel, with byte-exact verification.
 
 \* Both read 27/28 until the NVKMS allowlist was fixed on 2026-08-17, and the
 595.84 row had no 28/28 measurement.  **That footnote used to blame a box
@@ -271,3 +298,32 @@ Needs only a C compiler, and a software-rasteriser fallback is an explicit
 
 See [`tests/repro/`](../../tests/repro/) — each program is small, self-validating,
 and meant to be run on both sides of the boundary.
+
+## Two bugs that only A100 exposed
+
+Both had been silently wrong on every card before the first datacenter GA100,
+and neither was visible on any consumer die.
+
+**The host half of the `RM_UNMAP_MEMORY` address contract was never
+implemented.** Every unmap reached the driver with virtual address 0. Consumer
+cards tolerated it; GA100 did not.
+
+**`UVM_MAP_DYNAMIC_PARALLELISM_REGION` was unhandled.** `libcuda` calls it during
+context creation on GA100, so `cuCtxCreate` returned 999 (`CUDA_ERROR_UNKNOWN`)
+and every CUDA check below it skipped.
+
+The second one is the more interesting failure, because it had been *silently
+misrouted* rather than rejected. Bare UVM ioctl numbers share a number space
+with the NVIDIA frontend ioctls, and 65 == 0x41 == `NV_ESC_RM_IDLE_CHANNELS` —
+so the call had been forwarded for a long time as a completely different ioctl.
+Adding a type gate to the sanitiser turned that into an honest `ENOTTY`, which
+is what made the missing handler visible at all.
+
+With both fixed the A100 reaches 28/28, and a 3B LLM generates in the guest at
+5.75 GiB VRAM.
+
+Confirmed independently of the A100 afterwards: a three-way A/B on one Turing
+box, one variable at a time, reproduced both failures and both fixes —
+`cuda_ctx_create rc=999` without the UVM handler, `vk_probe`/`gl_probe` dying on
+SIGBUS with an earlier version of the unmap fix that overwrote map-VA table
+entries instead of treating them as a stack, and 28/28 with both correct.

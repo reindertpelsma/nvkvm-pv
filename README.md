@@ -208,24 +208,22 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-**Vulkan compute fails on Hopper.** `vkCreateDevice` returns
-`VK_ERROR_DEVICE_LOST` in the guest on an H100 while the same binary is clean on
-the host; every CUDA check on that part passes. Traced to a channel/compute
-class mismatch, with two hypotheses eliminated —
-[detail](docs/reference/correctness.md#vulkan-compute-on-hopper).
+**Graphics: Wayland works. Native Xorg does not, and that part is not ours.**
+A full desktop runs on the GPU inside the guest and is interactive in a host
+window at 60.0 frames/s with zero dropped frames — a browser rendering real
+pages, eight concurrent EGL clients. X11 clients under `weston --xwayland` work
+too; the earlier "X11 clients get no window" was a signal-restart bug in the
+guest module and is fixed.
 
-**Graphics: Wayland works; X11 clients do not get a window.** A full Wayland
-desktop runs on the GPU inside the guest and is interactive in a host window at
-60.0 frames/s with zero dropped frames — a browser rendering real pages, eight
-concurrent EGL clients. The earlier "frames stall after an initial burst" is
-resolved.
-
-Still open. **X11 clients get no window**: under `weston --xwayland`, Xwayland
-runs but its glamor acceleration cannot allocate textures or EGLImages through
-the forwarded driver (`GL_OUT_OF_MEMORY`, every backtrace through
-`libnvidia-eglcore`), so nothing is ever mapped. This is not app-specific —
-every X11 client uses that path. Wayland clients are unaffected, and so is the
-present path.
+What does not work is a stock distro's own Xorg session driving nvkvm's display
+head, because that path uses `modesetting` + glamor, and glamor imports its
+scanout pixmap with `eglCreateImageKHR(..., EGL_NATIVE_PIXMAP_KHR, gbm_bo)`.
+NVIDIA's EGL returns `EGL_BAD_PARAMETER` for that call **on bare metal too** —
+we measured host and guest side by side ([the repro](tests/repro/gbm_egl_import.c)),
+and dma-buf export itself survives the round trip perfectly. It is the
+long-standing reason `modesetting` + glamor is not the supported combination on
+NVIDIA's proprietary driver anywhere. The supported combination is NVIDIA's own
+X driver, which nvkvm does not stage into the guest yet.
 
 **`kvm run failed Bad address`** — a GL client taking the guest down 10–60 s in
 — has **not reproduced** since: 150 s+ of continuous glmark2, a full 20-scene
@@ -239,6 +237,12 @@ covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL — it does no
 cover everything, and a real correctness bug has passed it before
 ([what it was](docs/reference/correctness.md)). Check your own results against a
 host run.
+
+Recently closed, in case you read an older copy of this file: Vulkan compute on
+Hopper was a defect in the 570 driver branch, not in nvkvm — the same part is
+28/28 on 580
+([the A/B](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug)).
+Guest kernels 6.12 and newer could not open the DRM nodes at all; also fixed.
 
 ## Tested applications
 
@@ -368,7 +372,8 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
-| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`, see below) |
+| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch` — a 570-branch driver bug, see below) |
+| H100 PCIe | **Hopper GH100** | 580.126.09 | 580 | 28/28 |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 | RTX 2080 Ti | Turing TU102 | 575.51.03 | 570 | 28/28 |
 | RTX 3080 | Ampere GA102 | 580.95.05 | 580 | 28/28 |
@@ -378,15 +383,9 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
 | A100 80GB PCIe | **Ampere GA100** (datacenter) | 580.126.09 | 580 | 28/28 \*\*\* |
 
-\*\*\* First datacenter GA100. It needed two fixes to get there, both of
-which had been silently wrong on every card before it: the host half of the
-`RM_UNMAP_MEMORY` address contract was never implemented (every unmap reached
-the driver with VA 0), and `UVM_MAP_DYNAMIC_PARALLELISM_REGION` was unhandled —
-`libcuda` calls it during context creation on GA100, and because bare UVM NRs
-collide with the frontend space (65 == 0x41 == `NV_ESC_RM_IDLE_CHANNELS`) it had
-been forwarded as a completely different ioctl until the sanitizer type gate
-turned that into an honest `ENOTTY`. With both fixed: 28/28, and a 3B LLM
-generating in the guest at 5.75 GiB VRAM.
+\*\*\* First datacenter GA100, and it took two fixes that had been silently
+wrong on every card before it — a 3B LLM now generates in the guest at 5.75 GiB
+VRAM. [What they were](docs/reference/correctness.md#two-bugs-that-only-a100-exposed).
 
 Host/guest parity measured on that A100 with identical scripts, identical torch
 (2.13.0+cu130), same box:
@@ -404,50 +403,15 @@ All eleven workloads land between **93.2% and 100.1%**, two of them at or above
 parity (Particle Physics 100.1%, Face Tracking 100.0%); the weakest is Video
 Filter at 93.2%.
 
-Two caveats on that 98.0%, both of which cut in nvkvm's favour and neither of
-which we can remove:
+The guest was given less machine than the host, and this box is itself a VM
+with the A100 passed through — so 98.0% is nvkvm's cost measured while nested a
+level deeper than usual, which makes it a stronger result rather than a weaker
+one. [Why, and why the 3050 reads higher](docs/reference/parity.md).
 
-- **The "host" side is itself a VM — which makes the number better, not worse.**
-  This box is a Proxmox instance with the A100 passed through, so the topology
-  is L0 bare metal -> L1 the rented VM (the "host" column) -> **L2 the nvkvm
-  guest**. The measurement is therefore nvkvm's forwarding cost *while the guest
-  is already nested a level deeper than usual*, and it is still 98.0% with the
-  worst of eleven workloads at 93.2%.
-
-  That is worth more than a plain parity figure. Nesting is the hostile case for
-  any design that leans on VM exits, because an L2 exit has to traverse
-  L2 -> L1 -> L0. nvkvm's whole premise is that GPU work does **not** exit — a
-  kernel launch is a store to a mapped doorbell page — and this is direct
-  evidence the premise holds where it would be punished hardest. Running nvkvm
-  inside an ordinary cloud VM is not a degraded configuration.
-
-  What it is *not* is a bare-metal number: the RTX 3050 row above is the one to
-  quote for that, and we did not measure L1 against L0, so this does not
-  separate nvkvm's cost from nesting's.
-- **The guest was given less machine.** 8 cores and 15.62 GB against the host's
-  16 cores and 94.38 GB. Geekbench's GPU workloads still do CPU-side work, so
-  the guest carries a handicap unrelated to forwarding.
-
-**Why 98.0% here and 99.9% on the RTX 3050**, since the obvious guess is wrong:
-it is probably not the CPU handicap. The 3050 guest ran under a *larger* relative
-handicap — 4 cores against the host's 8 cores / 16 threads, 5.79 GB against
-15.34 GB — and still reached 99.9%. The likelier explanation is the GPU itself:
-an A100 finishes each workload roughly four times faster, so the same per-call
-forwarding cost occupies a correspondingly larger share of a shorter run. That
-is the same effect as the 0.73x token-generation row, at much smaller scale, and
-it predicts that parity will look slightly worse the faster the card gets.
-
-Both halves are worth reading. Sustained compute is at parity — the 1.01x is
-measurement noise, not a speedup. Single-stream token generation is **27%
-slower**, and that is the honest number for this shape of workload: greedy
-batch-1 decoding is hundreds of tiny kernel launches per token with a
-synchronisation between each, which is exactly the latency-bound control path
-where a forwarding layer costs something. It is the same reason the vLLM figure
-elsewhere in this table reaches 0.99-1.00x: that workload batches, so it is
-bandwidth- and compute-bound rather than launch-bound.
-
-Quote whichever matches your workload, and do not quote the matmul number for an
-interactive chatbot. Both runs produced byte-identical output text.
+Sustained compute is at parity; the 1.01x is noise. Single-stream greedy
+decoding is 27% slower, which is the honest number for that shape — hundreds of
+tiny launches per token with a sync between each. Anything that batches (vLLM,
+llama.cpp) pays close to nothing.
 
 OpenCL and Vulkan were checked on the same card, guest and host, and both
 enumerate the A100 identically (`OpenCL 3.0 CUDA`, driver 580.126.09; Vulkan
@@ -457,18 +421,31 @@ OpenCL through nvkvm once returned *wrong answers* rather than failing, so
 in the guest exactly as on bare metal — `ALLOC_HOST_PTR`, `USE_HOST_PTR`, 20
 map/unmap cycles and an `UNORM_INT8` image, 6.3M values verified, 0 failed.
 
-\*\* nvkvm refused a legitimate `UVM_FREE` — the ioctl names its range by base
-alone and sends length 0, and the ownership check rejected the zero length. The
-range stayed live and every later CUDA call in that context returned
-`INVALID_VALUE`. Fixed; the check now uses the length nvkvm recorded for that
-base and still fails closed on an unrecorded one.
-[Detail](docs/reference/correctness.md).
+\*\* nvkvm rejected a legitimate `UVM_FREE`, which poisoned every later CUDA
+call in that context. Fixed —
+[detail](docs/reference/correctness.md#two-cuda-checks-failed-on-ada--driver-59584--fixed-2026-08-19).
 
 On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
 launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.
-The one failure is `vk_compute_dispatch`, and it does **not** affect CUDA; the
-trace, and the two hypotheses ruled out by experiment, are in
-[Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper).
+`vk_compute_dispatch` failed on driver 570.124.06 and **passes on 580.126.09**
+(28/28); the A/B that pins that on the driver rather than on nvkvm is in
+[Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
+
+Host/guest parity on that H100, same box, same scripts:
+
+| workload | host | guest | ratio |
+|---|---|---|---|
+| **Geekbench 7 GPU (OpenCL)** | **265071** | **261901** | **98.8%** |
+| bf16 matmul 8192x8192 | 487.3 TFLOP/s | 495.5 TFLOP/s | **1.02x** |
+| Qwen2.5-7B generate, batch 1, greedy | 40.0 tok/s | 32.9 tok/s | **0.82x** |
+
+Both Geekbench runs are published:
+[side by side](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612).
+Greedy generations were byte-identical between host and guest.
+
+Same caveats as the A100 row, and they cut the same way: this box is also a VM
+underneath, and the guest got fewer cores. The 0.82x decode row is the control
+path rather than the data path — [what that means](docs/reference/parity.md).
 
 ## FAQ
 
@@ -595,21 +572,23 @@ validating. Verify your own workload against a host run all the same; see
 | [`docs/howto/`](docs/howto/) | Building, running, staging guest libraries, adding a driver version |
 | [`docs/reference/`](docs/reference/) | ABI profiles, allowlists, virtio protocol, device nodes |
 | [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |
+| [Reading the parity numbers](docs/reference/parity.md) | What the host/guest ratios do and do not establish |
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 | [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
 
 ## Status
 
-Experimental. It runs real workloads at host parity on three GPU architectures,
-and it is a research artifact rather than a supported product. Known open items
-are tracked in [known limitations](docs/internal/known-limitations.md); the
-largest are X11 clients under XWayland getting no window, and Vulkan compute on
-Hopper.
+Experimental — a research artifact, not a supported product. It runs real
+workloads at host parity on six GPU architectures (Turing, Ampere, Ada,
+Blackwell, and the GA100 and Hopper datacenter parts), including multiple GPUs
+in one guest.
 
-Two entries that used to sit here have since been re-tested and no longer hold:
-GL clients under Wayland now work (a full desktop at 60 frames/s), and the
-NVENC hang did not reproduce on the driver it was reported against.
+The largest open item is that a stock distro's own Xorg session cannot drive the
+display head; everything else is tracked in
+[known limitations](docs/internal/known-limitations.md). Several entries that
+used to sit here have been re-tested and no longer hold — Wayland GL, the NVENC
+hang, Vulkan compute on Hopper, and DRM on guest kernels 6.12+.
 
 Issues and measurements from other hardware are welcome — particularly boots on
 driver branches this repository has not exercised.

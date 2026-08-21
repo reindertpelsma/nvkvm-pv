@@ -47,3 +47,13 @@ void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size)
 	(void)nv; (void)gpa; (void)size;
 	return NULL;
 }
+
+/*
+ * The isolate teardown path retires any frame a dying isolate still had in
+ * flight (S-4).  The unit build links nvkvm_isolate.c without the EGL present
+ * path, so stub it -- there is no display here to forget anything from.
+ */
+void nvkvm_present_forget_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
+{
+	(void)nv; (void)isolate_id;
+}
