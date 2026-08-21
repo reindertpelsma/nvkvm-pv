@@ -474,13 +474,26 @@ time to discover:
     a compositor taking `card0` silently renders on llvmpipe. This is the more
     dangerous half and is now documented user-facing in `docs/howto/run.md`.
 
-  `tests/validate.sh` is 28/28 with the default VGA present. What remains open
-  is only *automatic* handover: `ui/gtk.c` builds one notebook page per console
-  in index order and never changes the current page, and there is no API for a
-  device to ask the front-end to switch. Real handover needs either a front-end
-  change or the hardware-accurate shape — nvkvm's own device carrying a boot
-  framebuffer so there is one console and nothing to select. Use
-  `-display gtk,show-tabs=on` to make the existing manual switch discoverable.
+  `tests/validate.sh` is 28/28 with the default VGA present.
+
+  **Automatic handover now works** and this note's "no API to switch" is
+  resolved: upstream has none, but we build QEMU from source, so the GTK front
+  end is patched to move to a console the first time it presents a real (non
+  placeholder) surface — see `scripts/build_qemu.sh` step 6d. It is a one-shot
+  latch keyed on "still on the page the window opened on, and the target is
+  above it", so the VGA going live cannot consume the shot, the user is never
+  dragged back after switching manually, and the single-console `-vga none`
+  case is a no-op. All five GTK entry points are hooked, not just the one the
+  default present mode uses — readback goes through `gd_switch()` while
+  `NVKVM_PRESENT_MODE=gl` goes through the egl/gl-area scanout paths and would
+  otherwise silently never switch.
+
+  `-display gtk,show-tabs=on` (or **View → Show Tabs**) still makes the manual
+  switch discoverable, which is worth having while debugging the head.
+
+  The hardware-accurate shape — nvkvm's own device carrying a boot framebuffer,
+  so there is one console and nothing to select — remains the cleaner long-term
+  design, and is now an option rather than a requirement.
 - **A verified-animating client.** An idle compositor correctly stops flipping,
   so the rate reads ~0 with a perfectly healthy pipeline.
 
