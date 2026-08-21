@@ -356,7 +356,9 @@ typedef struct NvkvmPresent {
         uint64_t    mod;
         EGLImageKHR image;
         GLuint      tex;
+        uint64_t    used;    /* p->tick when this entry was last returned */
     } cache[NVKVM_PRESENT_CACHE];
+    uint64_t tick;           /* monotonic, bumped on every cache lookup */
     egl_fb fb;               /* reused; egl_fb_setup_for_tex keeps the FBO */
 
     /* No cached DisplaySurface: the console owns it and may free it at any
@@ -463,6 +465,7 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
             if (p->cache[i].w == w && p->cache[i].h == h &&
                 p->cache[i].stride == stride &&
                 p->cache[i].fourcc == fourcc && p->cache[i].mod == mod) {
+                p->cache[i].used = ++p->tick;
                 return p->cache[i].tex;
             }
             glDeleteTextures(1, &p->cache[i].tex);
@@ -474,11 +477,40 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
     }
 
     if (free_slot < 0) {
-        /* Full: drop slot 0.  A compositor cycles far fewer bos than this. */
-        glDeleteTextures(1, &p->cache[0].tex);
-        eglDestroyImageKHR(qemu_egl_display, p->cache[0].image);
-        p->cache[0].valid = false;
-        free_slot = 0;
+        /*
+         * Full: drop the LEAST RECENTLY USED entry.
+         *
+         * This used to unconditionally drop slot 0, on the reasoning that "a
+         * compositor cycles far fewer bos than this".  That holds for ONE
+         * compositor and not for a desktop: every isolate exporting a scanout
+         * bo competes for the same eight slots, and short-lived surfaces --
+         * tooltips, menus, notifications -- each burn one.  Slot 0 is also the
+         * worst possible victim, because it holds the FIRST buffer imported,
+         * which is the primary scanout bo: the longest-lived and most
+         * frequently used entry in the table.  So once the working set passed
+         * eight, every new surface destroyed the primary framebuffer's import,
+         * the next frame from it missed and re-imported, and that evicted it
+         * again -- steady-state thrash on the one buffer that should never be
+         * evicted, with a visible flicker each time it was rebuilt.
+         *
+         * LRU makes the primary, which is touched every frame, the LAST thing
+         * considered rather than the first.
+         *
+         * Note the churn this avoids is not merely slow: per-frame
+         * eglDestroyImageKHR/glDeleteTextures is what reliably SIGSEGV'd
+         * libnvidia-eglcore (see the comment on the cache above), so an
+         * eviction policy that can thrash is a stability question too.
+         */
+        int lru = 0;
+        for (int i = 1; i < NVKVM_PRESENT_CACHE; i++) {
+            if (p->cache[i].used < p->cache[lru].used) {
+                lru = i;
+            }
+        }
+        glDeleteTextures(1, &p->cache[lru].tex);
+        eglDestroyImageKHR(qemu_egl_display, p->cache[lru].image);
+        p->cache[lru].valid = false;
+        free_slot = lru;
     }
 
     EGLImageKHR image = EGL_NO_IMAGE_KHR;
@@ -490,6 +522,7 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
         .valid = true, .owner = owner, .key = key, .w = w, .h = h,
         .stride = stride,
         .fourcc = fourcc, .mod = mod, .image = image, .tex = tex,
+        .used = ++p->tick,
     };
     return tex;
 }
