@@ -259,6 +259,23 @@ done
 
 export PATH="$HOME/bin:$PATH"     # for the cinnamon --x11 shim, see ~/bin/cinnamon
 export DISPLAY=:2
+
+# Pin the mode.  Xwayland is started with -geometry 1920x1080 above, but
+# -fullscreen makes it adopt the output's PREFERRED mode instead, and the head
+# advertises 5120x2880.  The X screen then comes up at 5K while nvkvm scans out
+# 1920x1080: the desktop is rendered at a size the scanout cannot show, so
+# everything is oversized and the pointer lands in the wrong place.  Measured on
+# the physical test box -- XWAYLAND0 at 5120x2880 against a 1920x1080 scanout.
+#
+# Re-assert it here, after the server is up and before any client connects.
+# Doing it from a terminal with xrandr fixes the running session but does NOT
+# survive a restart, because 5120x2880 is still the preferred mode and comes
+# back every time Xwayland starts.  This is the part that persists.
+for _ in $(seq 1 20); do
+    xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null && break
+    sleep 0.5
+done
+xrandr 2>/dev/null | grep -E "^(Screen |XWAYLAND0 )"   # leave the proof in the log
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=X-Cinnamon
 export XDG_SESSION_DESKTOP=cinnamon
