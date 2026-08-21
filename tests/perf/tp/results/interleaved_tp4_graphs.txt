@@ -1,0 +1,33 @@
+=== round 1 host ===
+host r1 560.586
+host r1 590.234
+host r1 678.147
+host r1 742.629
+=== round 1 guest ===
+guest r1 437.972
+guest r1 416.997
+guest r1 419.016
+guest r1 423.280
+=== round 2 host ===
+host r2 670.351
+host r2 746.086
+host r2 743.208
+host r2 514.178
+=== round 2 guest ===
+guest r2 338.320
+guest r2 340.359
+guest r2 325.868
+guest r2 308.886
+=== round 3 host ===
+host r3 767.596
+host r3 775.091
+host r3 721.887
+host r3 768.168
+=== round 3 guest ===
+guest r3 331.688
+guest r3 497.388
+guest r3 493.715
+guest r3 315.292
+INTERLEAVE_DONE
+
+[exited with code 0]
