@@ -428,6 +428,21 @@ static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
     /* Retire the previously scanned-out buffer only now that the new one is
      * live (its fd was in use until this point). */
     if (p->cur_buf) {
+        /*
+         * Tell the UI backend to drop what dpy_gl_scanout_dmabuf() made it
+         * create.  That call has the backend glGenTextures() into the
+         * QemuDmaBuf; qemu_dmabuf_free() is a bare g_free and does not touch
+         * the texture, so without this the texture and its EGLImage are
+         * abandoned on every flip.  hw/display/virtio-gpu-udmabuf.c releases
+         * here for the same reason; this path did not.
+         *
+         * Measured cost is small rather than alarming -- a compositor recycles
+         * two or three scanout bos, so the abandoned objects alias the same
+         * few buffers and cost driver bookkeeping, not VRAM: ~18,000 flips left
+         * QEMU's own attributed VRAM flat.  It is still an unbounded per-flip
+         * leak of driver-side objects, and it is one call to stop it.
+         */
+        dpy_gl_release_dmabuf(p->con, p->cur_buf);
         qemu_dmabuf_close(p->cur_buf);
         qemu_dmabuf_free(p->cur_buf);
     }
