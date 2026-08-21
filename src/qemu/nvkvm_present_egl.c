@@ -758,6 +758,20 @@ int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
     return 0;
 }
 
+void nvkvm_present_console_set_device(struct VirtIONvgpu *nv,
+                                      struct DeviceState *dev)
+{
+    NvkvmPresent *p = nv->present_ctx;
+
+    if (!p || !p->con || !dev) {
+        return;
+    }
+    /* See the header for why this is needed.  Same call, same reason, as
+     * virtio_gpu_pci_base_realize(). */
+    object_property_set_link(OBJECT(p->con), "device", OBJECT(dev),
+                             &error_abort);
+}
+
 void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
 {
     NvkvmPresent *p = nv->present_ctx;
@@ -861,6 +875,11 @@ int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
     return -ENOTSUP;
 }
 void nvkvm_present_console_fini(struct VirtIONvgpu *nv) { (void)nv; }
+void nvkvm_present_console_set_device(struct VirtIONvgpu *nv,
+                                      struct DeviceState *dev)
+{
+    (void)nv; (void)dev;
+}
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                           uint32_t owner_isolate_id, uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,

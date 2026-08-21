@@ -1,7 +1,13 @@
 # A Linux Mint desktop on the nvkvm head
 
-Status: **working, accelerated, unattended — via weston.**  Cinnamon's own
-session does not work yet, and the reason is a real nvkvm gap (below).
+Status: **an accelerated Mint desktop runs unattended via weston.**  Stock
+Mint's *own* Xorg session does not, and this file records exactly why — with
+the host checked as a control in every case.
+
+The headline goal is stock Mint on its native Xorg session.  weston is not that
+goal; it is a working control that proves the nvkvm head, the DRM node and the
+NVIDIA EGL/GBM stack are all healthy, which is what makes the Xorg findings
+below trustworthy rather than "something in the guest is broken".
 
 ![Mint apps on the nvkvm head](../img/mint-guest-weston-desktop.png)
 
@@ -133,3 +139,146 @@ It is the same Mesa-first probe that produced the earlier
   build in place from `/mnt/nvkvm`.
 - lightdm must stay disabled; enabled, it restart-loops forever on the glamor
   bug and generates continuous disk I/O.
+
+
+## Why stock Mint's Xorg session cannot use modesetting+glamor
+
+Settled, with the host as control — see `tests/repro/gbm_egl_import.c`.
+
+dma-buf export *does* survive the round trip through nvkvm.  Host and guest,
+card node and render node, all four identical: same modifier
+`0x300000000606014`, same stride, `gbm_bo_get_fd()` works, `EGL_LINUX_DMA_BUF_EXT`
+import works, and the imported bo is a complete FBO that renders and reads back.
+There is no forwarding defect.
+
+What fails is one call, and it fails on bare metal too:
+
+    eglCreateImageKHR(dpy, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR, bo, NULL)
+        -> EGL_BAD_PARAMETER (0x300C)    host AND guest, every modifier
+
+Every modifier: block-linear, the render-only variant, and plain `LINEAR`.  So
+there is no modifier nvkvm could advertise that would make it succeed.
+
+That call is verbatim what glamor does — read from xorg-server 21.1.12 source
+in the guest, not recalled:
+`glamor/glamor_egl.c:glamor_egl_create_textured_pixmap_from_gbm_bo()` makes it
+and returns FALSE on failure;
+`hw/xfree86/drivers/modesetting/drmmode_display.c:drmmode_set_pixmap_bo()`
+turns that into `"Failed to create pixmap"`, which becomes the fatal
+`"failed to create screen resources"`.
+
+**Conclusion: modesetting+glamor is a dead end on the proprietary NVIDIA driver,
+in a guest and on real hardware alike.**  It is not the path a stock Mint
+install uses on an NVIDIA card either.
+
+## The NVIDIA DDX — how far it gets, and the exact gap
+
+The path a real NVIDIA box uses is the NVIDIA DDX.  Neither `nvidia_drv.so` nor
+`libglxserver_nvidia.so` was ever staged into the guest; both exist on the host
+under `/usr/lib/x86_64-linux-gnu/nvidia/xorg/`.  Staged by hand, with the host's
+own `/usr/share/X11/xorg.conf.d/10-nvidia.conf`, Xorg gets a long way:
+
+    (**) OutputClass "nvidia" ModulePath extended to ".../nvidia/xorg,..."
+    (II) Applying OutputClass "nvidia" to /dev/dri/card0
+    	loading driver: nvidia
+    (II) Loading .../nvidia/xorg/nvidia_drv.so
+    (II) NVIDIA dlloader X Driver  595.84
+    (II) Loading sub module "glxserver_nvidia"
+    (II) NVIDIA GLX Module  595.84
+    (II) NVIDIA: The X server supports PRIME Render Offload.
+    (EE) NVIDIA(GPU-0): Failed to initialize the NVIDIA graphics device!
+    (EE) NVIDIA(0): Failing initialization of X screen
+
+Note the OutputClass matches: nvkvm's guest DRM driver reports its name as
+`nvidia-drm`, so `MatchDriver "nvidia-drm"` selects the NVIDIA DDX with no
+hand-written `xorg.conf` at all.  The DDX and the GLX server module both load.
+
+**The gap is PCI BARs.**  Under strace the DDX never opens `/dev/nvidia0` or
+`/dev/nvidiactl` — it fails before that, after reading
+`/sys/bus/pci/devices/0000:00:07.0/{vendor,device,class,revision,config,resource,boot_vga}`.
+And that device has no BARs:
+
+| | BAR0 (regs) | BAR1 (FB aperture) | BAR3 | I/O |
+|---|---|---|---|---|
+| host `0000:01:00.0` | `0xfb000000-0xfbffffff` (16 MB) | `0xb0000000-0xbfffffff` (256 MB) | 32 MB | `0xf000-0xf07f` |
+| guest `0000:00:07.0` | — | — | — | — |
+
+Every BAR reads back zero; the only non-zero line is the legacy VGA range.
+That is by design — `nvkvm-gpu` is the identity-only device
+("No BARs/DMA; all GPU I/O still flows through virtio-nvgpu forwarding"), there
+purely to give the render node an NVIDIA-vendor PCI parent.
+
+So the NVIDIA DDX wants a real register aperture to drive a display engine, and
+nvkvm deliberately does not present one.  **This is a genuine nvkvm gap and the
+honest blocker for stock-Mint-on-native-Xorg** — but note it is not a small one:
+even with BARs faked, the DDX drives outputs through nvidia-modeset on the real
+GPU, which is the *host's* display engine and physical connectors, not nvkvm's
+virtual head.  Making this work is a design question (what should a guest DDX
+scan out to?), not a missing-forward.
+
+## `-vga none` is NOT required
+
+The old note in `known-limitations.md` gave two reasons; both are *selection*
+problems, and both are fixed by naming things rather than deleting the boot
+console.  Verified by booting with QEMU's default VGA present:
+
+- **Guest-side.** With a VGA present the guest gets two DRM devices —
+  `card0 -> bochs-drm`, `card1 -> nvidia`.  A compositor that takes `card0`
+  lands on bochs-drm and **silently renders with llvmpipe**: observed exactly
+  that, `EGL vendor: Mesa Project`, `GL renderer: llvmpipe`.  This is the
+  silent-software-fallback failure mode, and it is the real hazard the old note
+  under-described.  Fix: select the DRM node by **driver**, never by index —
+  `run-session.sh` walks `/sys/class/drm/card[0-9]*/device/driver` for `nvidia`
+  and passes `weston --drm-device=`.  With that in place and the VGA still
+  present: `using /dev/dri/card1`, `EGL vendor: NVIDIA`,
+  `GL renderer: NVIDIA GeForce RTX 4070/PCIe/SSE2`.
+- **Host-side.** `screendump` takes a device argument, so the console can be
+  named instead of being the only one — hence `id=nvkvm0` in `run_test_vm.sh`.
+
+Keeping the VGA also fixes the GRUB `gfxterm` stall: GRUB and the early kernel
+now have a device to draw on, and `/dev/fb0` + `fbcon` exist in the guest.
+
+![the emulated VGA boot console](../img/mint-guest-boot-console.png)
+
+That capture is the *emulated VGA* console (QEMU console 0) taken while the
+accelerated desktop was running on the nvkvm head (console 1) at the same time.
+Both are live simultaneously; there is no conflict between the two devices, and
+`tests/validate.sh` still reports 28/28 in this configuration.
+
+What is still missing is only the *automatic* handover: QEMU's front-end opens
+on console 0 and stays there, so a `-display gtk` user must switch tabs (use
+`-display gtk,show-tabs=on` to make that discoverable) once the guest desktop
+comes up.  There is no existing QEMU API for a device to ask the front-end to
+switch consoles — `ui/gtk.c` builds one notebook page per console in index
+order and never changes the current page — so real handover means either a
+front-end change or the hardware-accurate shape (nvkvm's own device exposing a
+boot framebuffer, so there is exactly one console and nothing to select).
+
+### screendump by device id — a QEMU abort we can hit
+
+`screendump <file> nvkvm0` **kills QEMU**:
+
+    Unexpected error in object_property_find_err() at ../qom/object.c:1349:
+    Property 'qemu-fixed-text-console.device' not found
+
+`ui/console.c:qemu_console_lookup_by_device()` walks *every* console and calls
+`object_property_get_link(OBJECT(con), "device", &error_abort)`.  Only graphic
+consoles have a `device` link; `graphic_console_init()` sets it, text consoles
+never have it.  So the walk aborts the moment it steps over a text console
+before reaching the one asked for.
+
+Isolated, minimal repro (no disk, no guest):
+
+    qemu-system-x86_64 -m 256 -device VGA,id=vga0 \
+        -device virtio-nvgpu-pci-non-transitional,id=nvkvm0 \
+        -display none -monitor unix:/tmp/m.sock,server,nowait -S
+    screendump /tmp/a.ppm vga0     # works  -- VGA console is found first
+    screendump /tmp/b.ppm nvkvm0   # ABORTS -- walk reaches a text console
+
+`vga0` survives only because its console is first in the list; the bug is
+order-dependent, not VGA-specific.  It is a QEMU robustness bug (an
+`&error_abort` on a property that legitimately does not exist for text
+consoles), which nvkvm's console reaches because it is registered after one.
+The fix belongs in that lookup — skip consoles that are not graphic consoles —
+and it needs a QEMU rebuild plus a full `validate.sh` re-run, so it is written
+down here rather than half-done.

@@ -19,6 +19,7 @@
 #include "qom/object.h"
 
 #include "virtio_nvgpu.h"
+#include "nvkvm_present_egl.h"
 
 typedef struct VirtIONvgpuPCI VirtIONvgpuPCI;
 
@@ -127,6 +128,13 @@ static void virtio_nvgpu_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 	 * guest has programmed it). */
 	dev->vdev.window_base_get     = nvkvm_pci_window_base;
 	dev->vdev.window_base_opaque  = vpci_dev;
+
+	/* `id=` on the command line names the PCI proxy, but the scanout console
+	 * was registered against the inner virtio device — so `screendump <file>
+	 * <id>` could not find it ("Device X (head 0) is not bound to a
+	 * QemuConsole").  Re-point the link at the proxy, exactly as
+	 * virtio_gpu_pci_base_realize() does for virtio-gpu. */
+	nvkvm_present_console_set_device(&dev->vdev, DEVICE(vpci_dev));
 }
 
 static void virtio_nvgpu_pci_class_init(ObjectClass *klass, void *data)
