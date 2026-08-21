@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Fri, 21 Aug 2026 02:47:44 +0200
+Subject: [PATCH] ui/gtk: switch to the guest's display when it first goes live
+
+The owner photographed his screen and reported no Mint desktop.  The
+desktop was running fine.  The window was on the wrong console.
+
+QEMU's emulated VGA is console 0 and nvkvm's scanout console registers
+second.  ui/gtk.c builds one notebook page per console in index order
+and then never changes the current page, so the guest desktop renders
+perfectly on a tab nobody is looking at -- and from outside, a window
+showing a boot console is indistinguishable from a hung guest.  That
+cost real debugging time before anyone thought to press View -> Show
+Tabs.
+
+This was previously written down as "no API for a device to request a
+page change".  True of upstream QEMU, but we build QEMU from source and
+already patch it, so the constraint was "not exposed", not "not
+possible".
+
+WHEN a console goes live: every console starts on a PLACEHOLDER surface
+("Guest has not initialized the display (yet)"), so for the surface
+paths the first non-placeholder surface is the moment real content
+arrives.  For the GL paths a scanout texture is real content by
+definition.  gd_switch() and its siblings already run at exactly those
+points, so no new plumbing is needed to find the moment.
+
+WHAT it does is a latch, not a policy engine.  Fire only while the
+window is still on the page it opened on (page 0), only for a page
+above it, and at most once:
+
+  * the VGA going live is page 0, so it cannot consume the one shot;
+  * nvkvm going live is a page above 0, so it does;
+  * once fired -- or once the user has moved the tab themselves -- the
+    condition can never hold again, so a manual tab choice is never
+    overridden and the user is never dragged back;
+  * with -vga none there is only page 0, so it is a no-op.
+
+Three required behaviours, no new state to decide them.  That is the
+whole reason for phrasing it as a condition on the notebook rather than
+as a rule about devices: there is nothing to get out of sync.
+
+WHERE: all five GTK entry points, not just gd_switch().  This is the
+part worth not "simplifying" later.  NVKVM_PRESENT_MODE=readback goes
+through gd_switch(), but NVKVM_PRESENT_MODE=gl -- the documented 60fps
+path -- goes through the egl and gl-area scanout paths instead and would
+never reach gd_switch() at all.  A gd_switch()-only fix works in
+whichever mode happens to be under test and silently does nothing in the
+other, which is worse than not fixing it: it turns a visible bug into an
+intermittent one.  (gd_egl_scanout_dmabuf() and
+gd_gl_area_scanout_dmabuf() both funnel into their *_scanout_texture
+counterparts, so hooking the texture entry covers the dma-buf entry.)
+
+The latch lives in include/ui/gtk.h so the surface path and both GL
+paths share one, rather than one per file -- three latches would fire up
+to three times.
+
+It logs one line when it fires.  A window moving on its own is
+surprising if you are not expecting it, and this is the only record that
+it happened.
+
+Only compiled into a build configured --enable-gtk, i.e.
+NVKVM_QEMU_UI=1.  The default headless build applies this patch and
+never compiles a line of it.
+
+Verified on the physical display, measured rather than argued:
+  * fires: "nvkvm: guest display is live -- switched window to console
+    page 1";
+  * fires exactly once -- `grep -c` over the run is 1, after further
+    desktop activity and three more screendumps;
+  * -vga none: zero notices, QEMU alive, desktop still captures at
+    1920x1080.
+Desktop confirmed live on that console (three screendumps four seconds
+apart, three distinct checksums) with Firefox, Nemo and glxgears
+rendering.  Full tests/validate.sh: 28 PASS, 0 FAIL, 0 SKIP.
+
+NOT upstreamable as written, and should not be sent as-is: it is
+nvkvm-specific policy ("the interesting console is the one that is not
+the boot VGA") hardcoded into a generic front end, with an nvkvm-branded
+symbol and an nvkvm-branded log line.  The underlying gap is real and
+general, though -- any device whose console registers after the VGA has
+this problem, and upstream has no way for a console to say "I have
+something worth looking at".  A `dpy_console_request_focus()`-shaped
+mechanism, with the front end owning the policy, would be the
+upstreamable version.  Until someone writes that, this stays downstream.
+---
+ include/ui/gtk.h | 30 ++++++++++++++++++++++++++++++
+ ui/gtk-egl.c     |  6 ++++++
+ ui/gtk-gl-area.c |  6 ++++++
+ ui/gtk.c         |  6 ++++++
+ 4 files changed, 48 insertions(+)
+
+diff --git a/include/ui/gtk.h b/include/ui/gtk.h
+index aa3d637..53398cb 100644
+--- a/include/ui/gtk.h
++++ b/include/ui/gtk.h
+@@ -158,6 +158,36 @@ void gd_update_windowsize(VirtualConsole *vc);
+ void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
+ void gd_hw_gl_flushed(void *vc);
+ 
++/*
++ * nvkvm: one-shot auto-switch to the guest's GPU head.  See scripts/build_qemu.sh
++ * for the full rationale.  Declared here because the surface path (ui/gtk.c) and
++ * both GL paths (ui/gtk-egl.c, ui/gtk-gl-area.c) all need it, and the latch has
++ * to be shared between them rather than per-file.
++ */
++extern bool nvkvm_gd_auto_switched;
++
++static inline void nvkvm_gd_maybe_autoswitch(VirtualConsole *vc)
++{
++    GtkNotebook *nb;
++    gint page;
++
++    if (nvkvm_gd_auto_switched || !vc || !vc->s || !vc->s->notebook ||
++        !vc->tab_item) {
++        return;
++    }
++    nb = GTK_NOTEBOOK(vc->s->notebook);
++    page = gtk_notebook_page_num(nb, vc->tab_item);
++    /* page < 0 means this console was detached into its own window. */
++    if (page > 0 && gtk_notebook_get_current_page(nb) == 0) {
++        nvkvm_gd_auto_switched = true;
++        gtk_notebook_set_current_page(nb, page);
++        /* One line, once: the window moving on its own is surprising if you
++         * are not expecting it, and this is the only record that it happened. */
++        fprintf(stderr, "nvkvm: guest display is live -- switched window to "
++                        "console page %d\n", page);
++    }
++}
++
+ /* ui/gtk-egl.c */
+ void gd_egl_init(VirtualConsole *vc);
+ void gd_egl_draw(VirtualConsole *vc);
+diff --git a/ui/gtk-egl.c b/ui/gtk-egl.c
+index 9831c10..87fc1de 100644
+--- a/ui/gtk-egl.c
++++ b/ui/gtk-egl.c
+@@ -210,6 +210,10 @@ void gd_egl_switch(DisplayChangeListener *dcl,
+         gd_update_windowsize(vc);
+     }
+ 
++    if (!surface_is_placeholder(surface)) {
++        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
++    }
++
+     eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                    EGL_NO_CONTEXT);
+ }
+@@ -261,6 +265,8 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
+     gtk_egl_set_scanout_mode(vc, true);
+     egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                          backing_id, false);
++
++    nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: a scanout texture is real content */
+ }
+ 
+ void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
+diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
+index b628b35..ad88878 100644
+--- a/ui/gtk-gl-area.c
++++ b/ui/gtk-gl-area.c
+@@ -177,6 +177,10 @@ void gd_gl_area_switch(DisplayChangeListener *dcl,
+     if (resized) {
+         gd_update_windowsize(vc);
+     }
++
++    if (!surface_is_placeholder(surface)) {
++        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
++    }
+ }
+ 
+ static int gd_cmp_gl_context_version(int major, int minor, QEMUGLParams *params)
+@@ -275,6 +279,8 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+     gtk_gl_area_set_scanout_mode(vc, true);
+     egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                          backing_id, false);
++
++    nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: a scanout texture is real content */
+ }
+ 
+ void gd_gl_area_scanout_disable(DisplayChangeListener *dcl)
+diff --git a/ui/gtk.c b/ui/gtk.c
+index bf9d3dd..daa3dd6 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -490,6 +490,8 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
+     g_object_unref(cursor);
+ }
+ 
++bool nvkvm_gd_auto_switched;
++
+ static void gd_switch(DisplayChangeListener *dcl,
+                       DisplaySurface *surface)
+ {
+@@ -551,6 +553,10 @@ static void gd_switch(DisplayChangeListener *dcl,
+     } else {
+         gd_update_full_redraw(vc);
+     }
++
++    if (!surface_is_placeholder(surface)) {
++        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
++    }
+ }
+ 
+ static const DisplayChangeListenerOps dcl_ops = {

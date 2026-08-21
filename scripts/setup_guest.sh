@@ -9,7 +9,6 @@
 set -euo pipefail
 
 GUEST_DIR="/opt/nvkvm-guest"
-REPO_ROOT="$(realpath "$(dirname "$0")/..")"
 
 # Source image (Noble Numbat / 24.04).  The filename uses the Ubuntu codename
 # "noble" but the user-facing label is 24.04.

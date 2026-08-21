@@ -178,9 +178,32 @@ cat > /home/$GUEST_USER/run-session.sh <<'RS'
 exec > ~/session.log 2>&1
 echo "=== $(date) session: $(cat ~/session-choice 2>/dev/null) ==="
 export XDG_SESSION_TYPE=wayland
+
+# Pick the nvkvm card by DRIVER, never by index.  The VM boots with an emulated
+# VGA present so GRUB and early kernel messages have somewhere to render, which
+# means the guest has TWO DRM devices and bochs-drm usually enumerates first as
+# card0.  A compositor that just takes card0 lands on bochs-drm and silently
+# renders with llvmpipe: full speed, correct-looking screenshots, no GPU.
+NVCARD=
+for c in /sys/class/drm/card[0-9]*; do
+    [ -e "$c/device/driver" ] || continue
+    if [ "$(basename "$(readlink -f "$c/device/driver")")" = nvidia ]; then
+        NVCARD=$(basename "$c"); break
+    fi
+done
+echo "nvkvm DRM device: ${NVCARD:-NOT FOUND}"
+
 case "$(cat ~/session-choice 2>/dev/null)" in
   cinnamon) exec cinnamon-session-cinnamon --wayland ;;
-  *)        exec weston --backend=drm --xwayland ;;
+  # --idle-time=0 is load-bearing for an unattended head, and its absence does
+  # NOT look like a timeout.  weston's default is 300s of no INPUT -- animating
+  # clients do not count -- after which weston-desktop-shell LOCKS the session,
+  # draws its own "Unlock your desktop" dialog and stops repainting.  The nvkvm
+  # scanout then holds that last frame forever, so screendump returns a
+  # plausible desktop that is byte-identical every time and reads exactly like
+  # a dead present path.  docs/howto/run.md already warned about this.
+  *)        exec weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} \
+                        --xwayland --idle-time=0 ;;
 esac
 RS
 chmod +x /home/$GUEST_USER/run-session.sh

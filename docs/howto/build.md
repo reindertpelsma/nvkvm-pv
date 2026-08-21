@@ -64,7 +64,7 @@ their headers from `src/qemu/`, and the shared ABI/protocol headers from
 upstream; they are a new device that the build is told about. `wc -l
 src/qemu/*.c` is the honest number.
 
-**Four patches to upstream files — 46 lines added, 2 removed**, all of them in
+**Five patches to upstream files — 94 lines added, 2 removed**, all of them in
 [`patches/`](../../patches/), applied with `git apply`:
 
 | patch | file | what it does |
@@ -73,11 +73,14 @@ src/qemu/*.c` is the honest number.
 | `0002-virtio-add-virtio-nvgpu-to-device-name-table.patch` | `hw/virtio/virtio.c` | adds `[50] = "virtio-nvgpu",` to `virtio_device_names[]`. The table stops at `VIRTIO_ID_GPIO` (41) and `virtio_id_to_name()` asserts the ID is in range, so without this QEMU aborts during realize — every boot. |
 | `0003-egl-helpers-import-dmabuf-via-texstorage.patch` | `ui/egl-helpers.c` | binds imported dma-bufs with `glEGLImageTargetTexStorageEXT` instead of `glEGLImageTargetTexture2DOES`. NVIDIA hands out the guest's scanout buffers as external-only EGLImages and returns `GL_INVALID_OPERATION` for the legacy bind (measured, RTX 4070 / 595.84), so `-display gtk,gl=on` silently shows a black window. Falls back to the OES bind when the extension is absent. |
 | `0004-console-do-not-abort-on-deviceless-console.patch` | `ui/console.c` | skips non-graphic consoles in `qemu_console_lookup_by_device()`, which reads `"device"` and `"head"` with `&error_abort` — properties that only graphic consoles have — and so kills QEMU on `screendump` the moment the walk steps over a text console. |
+| `0005-gtk-switch-to-guest-display-when-it-goes-live.patch` | `include/ui/gtk.h`, `ui/gtk.c`, `ui/gtk-egl.c`, `ui/gtk-gl-area.c` | switches the GTK window to the guest's head the first time it presents a non-placeholder surface. QEMU's VGA is console 0 and nvkvm's registers second, and GTK never changes the current notebook page — so the desktop renders on a tab nobody is looking at, which from outside is indistinguishable from a hang. A latch, not a policy engine: only from page 0, only upward, at most once, so a manual tab choice is never overridden. Hooked at all five entry points because readback goes through `gd_switch()` and `NVKVM_PRESENT_MODE=gl` does not. |
 
 `0004` is an **upstream QEMU bug**, not an nvkvm-specific change, and the intent
 is to submit it to qemu-devel. If you see it merged upstream, delete the patch
-rather than forward-porting it. Each patch carries a header explaining its
-reasoning; [`patches/README.md`](../../patches/README.md) is the index.
+rather than forward-porting it. `0003` and `0005` are downstream by intent as
+written — each patch's header states its own position on that, and
+[`patches/README.md`](../../patches/README.md) collects them. Each patch also
+carries the reasoning behind the change, which is the point of the format.
 
 That is the entire delta. Nothing else in the QEMU tree is edited — which you
 can check for yourself, because the tree is a git clone:
@@ -86,8 +89,9 @@ can check for yourself, because the tree is a git clone:
 cd /opt/qemu-src && git status --short
 ```
 
-Four modified files — `hw/misc/meson.build`, `hw/virtio/virtio.c`,
-`ui/egl-helpers.c`, `ui/console.c` — and the untracked `hw/misc/nvkvm_*` /
+Eight modified files — `hw/misc/meson.build`, `hw/virtio/virtio.c`,
+`ui/egl-helpers.c`, `ui/console.c`, `include/ui/gtk.h`, `ui/gtk.c`,
+`ui/gtk-egl.c`, `ui/gtk-gl-area.c` — and the untracked `hw/misc/nvkvm_*` /
 `hw/misc/virtio_nvgpu*` copies. Anything else did not come from this build.
 
 ## Building from scratch, by hand
@@ -126,7 +130,7 @@ git clone --depth=1 --branch v9.2.0 \
 cd "$QEMU_SRC"
 git apply --check "$NVKVM"/patches/*.patch     # silence == it will apply
 git apply         "$NVKVM"/patches/*.patch
-git status --short                             # 4 modified files, no more
+git status --short                             # 8 modified files, no more
 
 # 4. Copy the device sources in.
 cp "$NVKVM"/src/qemu/*.c "$NVKVM"/src/qemu/*.h  "$QEMU_SRC/hw/misc/"
@@ -229,7 +233,7 @@ git clone --depth=1 --branch v9.2.0 \
     https://gitlab.com/qemu-project/qemu.git /opt/qemu-src
 ```
 
-**3. Apply the patch series** (`scripts/build_qemu.sh:250-326`). The four
+**3. Apply the patch series** (`scripts/build_qemu.sh:250-326`). The five
 patches in [`patches/`](../../patches/), in numeric order:
 
 ```bash
@@ -319,11 +323,12 @@ off regardless of what is passed on the command line, and compiles
 Pair it with the matching guest module build (`make NVKVM_GRAPHICS=0`, below).
 The headers say so explicitly: "deploy the two consistently".
 
-Patches `0003` and `0004` only matter to the display path, so a compute-only
-build does not strictly need them. They are still applied, because one QEMU tree
-serves both builds and a conditional patch series is a worse trade than 28
-unused lines. If you are auditing a compute-only deployment, that is two of the
-four patches you can set aside.
+Patches `0003`, `0004` and `0005` only matter to the display path, so a
+compute-only build does not strictly need them — and `0005` is not even
+*compiled* unless QEMU is configured `--enable-gtk` (`NVKVM_QEMU_UI=1`). They
+are still applied, because one QEMU tree serves both builds and a conditional
+patch series is a worse trade than 76 unused lines. If you are auditing a
+compute-only deployment, that is three of the five patches you can set aside.
 
 ## The guest kernel module
 

@@ -1,0 +1,133 @@
+# ci.yml — the fast lane.  Everything here runs on every push and every PR and
+# finishes in about a minute, because a gate people wait for is a gate people
+# route around.
+#
+# WHAT EACH JOB IS FOR.  These are not generic hygiene; each one is a thing
+# that actually broke and that nothing caught:
+#
+#   unit          2026-08-20: test_isolate stopped LINKING, `make` aborted on
+#                 the first error, and test_tables + test_open_scm were never
+#                 built -- 26 passing assertions silently stopped running.
+#                 Nobody noticed until somebody ran the suite by hand (d21d3ff).
+#
+#   qemu-syntax   4edada7: a forward declaration sat ~1000 lines BELOW its only
+#                 caller.  Older compilers warn; GCC 14 makes it a hard error,
+#                 so the tree did not build there at all.  The unit suite does
+#                 not compile that file, and the only other thing that does is
+#                 a 35-minute QEMU build -- so a whole class of build breakage
+#                 had no cheap gate.  Now it has a two-second one.
+#
+#   shellcheck    scripts/ is how everything gets built, shipped and run on
+#                 rented boxes.  A quoting bug there fails at hour three of a
+#                 paid sweep, not at edit time.
+#
+# The GPU is deliberately absent.  GitHub-hosted runners have no NVIDIA device,
+# so tests/validate.sh cannot run here and is not attempted; hardware coverage
+# comes from scripts/sweep_matrix.py against rented boxes.  Kernel-module
+# builds live in kernel-matrix.yml, the QEMU build in qemu-build.yml.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# A newer push supersedes an in-flight run on the same ref.  Nothing here has
+# side effects, so cancelling is free.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    name: unit suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # run_tests.sh, not `make run`.  `make run` exits non-zero by design --
+      # test_isolate fails 5 of its 7 cases at runtime on pre-existing API
+      # drift -- which makes it useless as a pass/fail signal.  run_tests.sh
+      # names those five explicitly: green when exactly those fail, red if a
+      # sixth fails, red if one of the five starts passing, red if a suite
+      # fails to build, and red if a suite silently loses assertions.
+      - name: build and run the unit suite
+        run: bash tests/unit/run_tests.sh
+
+      # Regression 3, the cheap half.  A full working-tree-vs-HEAD guard has to
+      # live where the tree is (scripts/sweep_matrix.py --check-tree), because a
+      # CI runner checks out clean by definition.  What CI CAN catch is the
+      # other half of the same problem: a build artifact that is committed, or
+      # generated into a tracked path, so that merely building the tree makes it
+      # differ from HEAD -- which is exactly what tests/unit/test_ctrl_gate was
+      # doing before it was untracked.
+      - name: building must not modify tracked files
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Building modified the tree:"
+            git status --porcelain
+            echo
+            echo "Something under version control is a build output. Untrack it"
+            echo "and add it to the relevant .gitignore -- otherwise nobody can"
+            echo "tell a real local change from a stale artifact."
+            exit 1
+          fi
+          echo "tree still matches HEAD after a full build"
+
+  qemu-syntax:
+    name: src/qemu compile check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Twice, on purpose.  The bug this exists for was invisible on the
+      # toolchain the author had and fatal on a newer one, so checking a single
+      # compiler reproduces the original blind spot.  gcc-14 is the oldest
+      # compiler that treats an implicit declaration as an error by default.
+      - name: install gcc-14
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-14
+
+      - name: syntax check (default gcc)
+        run: bash tests/qemu_syntax_check.sh
+
+      - name: syntax check (gcc-14)
+        run: CC=gcc-14 bash tests/qemu_syntax_check.sh
+
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to an exact shellcheck, not the runner image's, because a newer
+      # shellcheck ships new checks and would turn this red on a day nobody
+      # touched a script.  A gate that goes red on its own gets ignored.
+      #
+      # BLOCKING at severity>=warning.  That set is clean today (verified: 0
+      # findings across scripts/*.sh), so this starts green and any new finding
+      # is genuinely new.  It is not vacuous either -- it caught a real bug when
+      # it was first run: scripts/run_remote_test.sh referenced $REMOTE_DIR
+      # inside single-quoted remote command blocks, so it expanded on the
+      # REMOTE shell where it is unset, and every path became /scripts/...
+      - name: shellcheck (blocking, severity >= warning)
+        run: |
+          docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 \
+            -S warning scripts/*.sh tests/qemu_syntax_check.sh tests/unit/run_tests.sh
+
+      # NON-BLOCKING for info/style.  There are ~18 of those across scripts/,
+      # mostly SC2086 and SC2012, and they are pre-existing.  Failing on them
+      # would mean starting this gate red, which defeats the point; printing
+      # them means they can be worked off deliberately. tests/validate.sh is
+      # only in this pass -- it has two unused-variable findings and it cannot
+      # be exercised here (it needs a GPU), so it is not gated on a machine
+      # that cannot run it.
+      - name: shellcheck (advisory, all severities)
+        continue-on-error: true
+        run: |
+          docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 \
+            scripts/*.sh tests/*.sh tests/unit/*.sh

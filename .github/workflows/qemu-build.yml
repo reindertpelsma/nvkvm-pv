@@ -1,0 +1,100 @@
+# qemu-build.yml — the slow lane: does scripts/build_qemu.sh still work?
+#
+# WHY IT IS NOT IN ci.yml
+#     This clones QEMU 9.2, patches virtio-nvgpu into it and builds the whole
+#     thing.  ~35 minutes.  Put that on every PR and either people stop waiting
+#     for CI or they stop opening PRs.  So it runs nightly, on pushes to main,
+#     and on demand -- which is often enough to catch breakage within a day and
+#     always attributes it to a small range of commits.
+#
+# WHY IT IS WORTH HAVING AT ALL
+#     build_qemu.sh is the only thing that compiles nvkvm_mmap_host.c,
+#     virtio_nvgpu.c and virtio_nvgpu_pci.c -- tests/qemu_syntax_check.sh skips
+#     those three because they need real QEMU headers.  It is also the only
+#     check that patches/ still applies to a freshly cloned QEMU 9.2 and that
+#     the result compiles.  Those are the fragile parts: the script's own
+#     comments record several rebuild fixes (a missing header copy, a missing
+#     -D that failed SILENTLY at runtime), and a patch that stops applying is
+#     invisible to a compiler until the build runs.
+#
+# NO CACHE, DELIBERATELY
+#     The obvious optimisation is to cache $QEMU_SRC and let the guarded
+#     re-entry make the rebuild incremental.  Rejected: the build directory is
+#     several GB, and worse, a cached tree is already patched -- step 3 would
+#     see `git apply --reverse --check` succeed for every patch, print "already
+#     applied" and write nothing.  The thing this job exists to test is exactly
+#     the thing the cache would skip.  A green run against a stale tree is worse
+#     than no run.  35 minutes of free runner time once a day is the cheaper
+#     trade.
+#
+# NO GPU, so nothing here is executed -- it builds and checks that the binary
+# exists and reports a version.  Running it needs hardware; see
+# scripts/sweep_matrix.py.
+name: qemu-build
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # 04:00 UTC daily. Nothing depends on the hour; it is off-peak for runners.
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: qemu-build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: QEMU 9.2 + virtio-nvgpu
+    runs-on: ubuntu-24.04
+    # The build is ~35 min on a 4-core runner. 90 gives real headroom without
+    # letting a hung ninja burn a full 6-hour job slot.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Installed here rather than via `build_qemu.sh --install-deps` so that a
+      # dependency problem fails in an obviously-labelled step instead of inside
+      # the build script, and so the script itself is exercised on its normal
+      # path (probe deps, find them all present, proceed) -- which is the path
+      # a user follows.
+      - name: install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ninja-build meson libglib2.0-dev libpixman-1-dev \
+            python3 python3-venv python3-tomli git libslirp-dev pkg-config \
+            libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd
+
+      # NVKVM_QEMU_PREFIX/SRC keep everything in the workspace: /opt is not
+      # writable by the runner user, and the script's rootless fallback puts it
+      # under $HOME, which works but is harder to find in a log.
+      - name: build
+        env:
+          NVKVM_QEMU_SRC: ${{ github.workspace }}/.qemu-src
+          NVKVM_QEMU_PREFIX: ${{ github.workspace }}/.qemu-nvkvm
+        run: bash scripts/build_qemu.sh
+
+      # The script's own guard already exits 0 if the binary exists, so an
+      # explicit check here is what distinguishes "built" from "skipped".
+      - name: the binary exists and runs
+        env:
+          NVKVM_QEMU_PREFIX: ${{ github.workspace }}/.qemu-nvkvm
+        run: |
+          BIN="$NVKVM_QEMU_PREFIX/bin/qemu-system-x86_64"
+          test -x "$BIN" || { echo "no binary at $BIN"; exit 1; }
+          "$BIN" --version
+          # virtio-nvgpu is patched in by this script, not shipped by QEMU. If
+          # patch 0001 (hw/misc/meson.build) silently no-ops, the build still
+          # succeeds and the device is simply absent -- which is why that patch
+          # exists and what its header describes. Ask the binary directly.
+          "$BIN" -device help 2>&1 | grep -q 'virtio-nvgpu' \
+            || { echo "built QEMU has no virtio-nvgpu device -- the hw/misc"
+                 echo "meson.build patch did not take."
+                 "$BIN" -device help 2>&1 | grep -i virtio | head -20
+                 exit 1; }
+          echo "virtio-nvgpu present"
