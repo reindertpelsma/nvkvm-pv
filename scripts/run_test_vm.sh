@@ -152,7 +152,12 @@ exec "$QEMU" \
     `# Identity-only NVIDIA PCI device at slot 7 (0000:00:07.0) — gives the` \
     `# DRM render node an NVIDIA-vendor parent so the Vulkan ICD binds it.` \
     `# No BARs/DMA; all GPU I/O still flows through virtio-nvgpu forwarding.` \
-    -device nvkvm-gpu,addr=7 \
+    `# NVKVM_FAKE_BARS=1 additionally advertises the host GPU's BAR GEOMETRY,` \
+    `# for drivers that validate a device by its memory regions (NVIDIA's Xorg` \
+    `# DDX rejects this device today because it has none).  Off by default.` \
+    `# Geometry only: the regions read as zero and drop writes -- no host MMIO` \
+    `# is mapped and no DMA path is created.` \
+    -device nvkvm-gpu,addr=7${NVKVM_FAKE_BARS:+,fake-bars=on} \
     \
     -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped \
     $HOSTLIBS_ARG \

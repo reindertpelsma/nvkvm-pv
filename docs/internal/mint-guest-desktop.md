@@ -375,3 +375,69 @@ same place —
 HW-cursor kill switch to work around it (`strings` over `libmuffin.so.0` shows
 no such `MUFFIN_*` variable, and there is no gsettings key), so closing this
 needs the cursor plane on our side.
+
+
+## The NVIDIA DDX with `fake-bars`: the BAR gap was real, and it was not the only one
+
+`-device nvkvm-gpu,fake-bars=on` (env `NVKVM_FAKE_BARS=1` in `run_test_vm.sh`,
+**off by default**) advertises the host GPU's BAR *geometry*, read per-BAR from
+the host's `/sys/.../resource` so it tracks the actual card:
+
+    nvkvm-gpu: fake-bars: BAR0 size=16 MiB  type=32-bit
+    nvkvm-gpu: fake-bars: BAR1 size=256 MiB type=64-bit prefetchable
+    nvkvm-gpu: fake-bars: BAR3 size=32 MiB  type=64-bit prefetchable
+
+and the guest then reports exactly the host's layout, flags included
+(`0x40200`, `0x14220c`), with `resource0`, `resource1`, `resource1_wc`,
+`resource3`, `resource3_wc` all present where before there were none.
+
+**This resolves the "assumed, not verified" flag: the BAR gap was a real
+blocker, and it is not the only one.**
+
+- **Before:** the DDX failed at validation and never opened a single NVIDIA
+  char device.
+- **After:** it opens `/dev/nvidiactl` (3x) and `/dev/nvidia0` (5x), and every
+  RM ioctl through nvkvm returns 0 — the forwarding works and the DDX gets real
+  answers from RM.
+- It then still fails, at a *later* stage:
+
+      (**) NVIDIA(G0): Enabling 2D acceleration
+      (II) NVIDIA GLX Module  595.84
+      (II) NVIDIA: The X server supports PRIME Render Offload.
+      (EE) NVIDIA(GPU-0): Failed to initialize the NVIDIA graphics device!
+      (EE) NVIDIA(G0): Failing initialization of X screen
+
+  `Option "ModeDebug" "true"` is accepted and adds nothing before the failure,
+  so the DDX declines to say more.
+
+Three measurements that narrow what is left, each a real result in its own
+right:
+
+| measurement | result | what it means |
+|---|---|---|
+| BAR MMIO reads/writes, whole run | **0** | the DDX only *validates* the regions; it never pokes them. The instrumented handlers exist precisely to answer this and they never fired. |
+| `/dev/nvidia-modeset` opens | **0** | it never reached NVKMS, so nothing in this experiment could have driven the host's display. |
+| nvkvm allowlist `DENY` lines | 4, all identical to a plain boot | nvkvm denied the DDX nothing. |
+
+So the remaining blocker is inside the DDX's own device init, after it has
+talked to RM successfully — not a missing forward, not a denied command, and
+not a BAR it wanted to map.
+
+Note it is configured as `NVIDIA(G0)`, a PRIME *GPU screen*, rather than
+`NVIDIA(0)`: with `AllowEmptyInitialConfiguration` and no display outputs of its
+own, Xorg treats it as an offload provider. That is consistent with the
+architectural point — the NVIDIA DDX expects a display engine, and the one RM
+would give it belongs to the host.
+
+### Security
+
+`fake-bars` advertises **geometry in emulated config space**. It does not map
+host MMIO into the guest. The regions are ordinary QEMU `MemoryRegion`s backed
+by handlers that return zero and drop writes; there is no host BAR behind them
+and no DMA path. The standing claim — *the guest never receives the physical
+device, no BAR is mapped to it, no DMA path to host memory* — remains literally
+true, and the zero-MMIO measurement above is evidence nothing tried to use one.
+
+`tests/validate.sh` was run **both ways** on the same build: 28 PASS / 0 FAIL /
+0 SKIP with `fake-bars` off (and no `resourceN` files), and 28 PASS / 0 FAIL /
+0 SKIP with it on.
