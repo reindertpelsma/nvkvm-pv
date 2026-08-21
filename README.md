@@ -251,83 +251,30 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
-**Vulkan compute on Hopper — fixed, and it was ours all along.** On an H100
-PCIe, `vk_compute_dispatch` failed in the guest (`vkCreateDevice` →
-`VK_ERROR_DEVICE_LOST`) on every host driver older than 580 — measured on
-565.57.01, 570.124.06, 570.148.08 and 575.57.08 — while 580.65.06 and 580.126.09
-were fine. **The same drivers all pass on bare metal**, which is what identified
-it as ours: a driver that works on the host and fails through nvkvm is an nvkvm
-bug. Root cause: `HOPPER_USERMODE_A` (`0xc661`) had no entry in the guest
-module's alloc-parameter size table, so nvkvm forwarded a **NULL parameter
-block**, RM built the usermode aperture from defaults (REGMEM instead of
-VIDMEM), and the userspace driver tore down the channel it had just created.
-Fixed; the H100 is now **28/28 on 570.124.06, 575.57.08 and 580.126.09**.
-**This README previously called it "a 570-branch driver bug ... no nvkvm change
-was involved"** — inferred by elimination without a pre-580 box, and wrong on
-both counts.
-[Root cause and trace](docs/reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug).
+- **A stock distro cannot boot into its own Xorg session on the nvkvm head.**
+  That path uses `modesetting` + glamor, and NVIDIA's EGL rejects glamor's
+  scanout-pixmap import **on bare metal too** — measured host and guest side by
+  side. The real Mint Cinnamon desktop does run accelerated, via its X11 session
+  inside a rootful Xwayland
+  ([how](docs/internal/mint-guest-desktop.md) ·
+  [the measurement](tests/repro/gbm_egl_import.c)).
+- **`kvm run failed Bad address`** — a GL client taking the guest down 10–60 s
+  in. Has **not reproduced** since several unrelated fixes landed, across a
+  five-minute soak at 190,013 frames and an interactive desktop session. Treat
+  it as open-and-unreproduced rather than closed
+  ([detail](docs/internal/known-limitations.md)).
+- **`28/28` is not evidence that your workload computes correctly.** The suite
+  covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL. A real
+  correctness bug has passed it before
+  ([what it was](docs/reference/correctness.md)). Check your own results against
+  a host run.
+- **Pinning host memory is slower than native**, and one registration is capped
+  at 2 GiB ([numbers](docs/internal/known-limitations.md#pinned-host-memory)).
 
-**Graphics: the Mint Cinnamon desktop runs accelerated. Stock Xorg-on-KMS does not, and that part is not ours.**
-A full desktop runs on the GPU inside the guest and is interactive in a host
-window at 60.0 frames/s with zero dropped frames — a browser rendering real
-pages, eight concurrent EGL clients. X11 clients under `weston --xwayland` work
-too; the earlier "X11 clients get no window" was a signal-restart bug in the
-guest module and is fixed.
-
-The real Mint Cinnamon desktop — panel, menu, wallpaper — runs accelerated on
-the nvkvm head and comes up unattended after a cold guest reboot, with `glxgears`
-inside the session at 68.9 FPS on the RTX 4070 and no llvmpipe anywhere. It gets
-there via Cinnamon's **X11** session inside a rootful Xwayland hosted by weston,
-rather than via Xorg
-([how, and what is load-bearing](docs/internal/mint-guest-desktop.md)).
-
-What does not work is a stock distro booting into its own Xorg session on
-nvkvm's display head, because that path uses `modesetting` + glamor, and glamor imports its
-scanout pixmap with `eglCreateImageKHR(..., EGL_NATIVE_PIXMAP_KHR, gbm_bo)`.
-NVIDIA's EGL returns `EGL_BAD_PARAMETER` for that call **on bare metal too** —
-we measured host and guest side by side ([the repro](tests/repro/gbm_egl_import.c)),
-and dma-buf export itself survives the round trip perfectly. It is the
-long-standing reason `modesetting` + glamor is not the supported combination on
-NVIDIA's proprietary driver anywhere. To be precise, since earlier wording here
-overstated it: this is not "Mint's X11 is broken" — stock Mint on a real NVIDIA
-card works fine, using NVIDIA's own DDX. It is that the one Xorg path reachable
-from a *virtual* KMS head is the one NVIDIA's EGL does not serve.
-
-The combination that *is* supported on real NVIDIA hardware is NVIDIA's own X
-driver, and we tried it: staged by hand, `nvidia_drv.so` and the GLX server
-module both load and the stock `OutputClass` even matches nvkvm's head, but it
-then fails at `Failed to initialize the NVIDIA graphics device!` because it
-wants PCI BARs that nvkvm deliberately does not expose. Closing that gap would
-not be enough on its own — the NVIDIA X driver drives outputs through
-nvidia-modeset on the *real* GPU's display engine and physical connectors, so
-it is aimed at the host's display hardware rather than at nvkvm's virtual head.
-What a guest X driver should scan out to is an open design question, not a
-missing forward. [Detail](docs/internal/mint-guest-desktop.md).
-
-**A compositor in the guest can land on llvmpipe without saying so.** The VM
-boots with an emulated VGA so GRUB and the early kernel have somewhere to draw,
-which means the guest sees two DRM devices — `card0 -> bochs-drm` and
-`card1 -> nvidia`. A compositor that takes the first one it finds renders
-correctly, animates, and screenshots fine, entirely in software. Select the DRM
-node **by driver name, never by index**, and check `GL renderer` says NVIDIA
-before trusting any graphics number — indices move between configurations.
-[How](docs/howto/run.md#running-the-guest-desktop-in-a-window).
-
-**`kvm run failed Bad address`** — a GL client taking the guest down 10–60 s in
-— has **not reproduced** since: 150 s+ of continuous glmark2, a full 20-scene
-run, a five-minute soak at 190,013 frames, and an interactive desktop session.
-It was originally seen on different hardware and several unrelated fixes have
-landed, so treat it as open-and-unreproduced rather than closed.
-[Detail](docs/internal/known-limitations.md).
-
-**28/28 is not evidence that your workload computes correctly.** The suite
-covers bring-up, the CUDA ladder, Vulkan compute and offscreen GL — it does not
-cover everything, and a real correctness bug has passed it before
-([what it was](docs/reference/correctness.md)). Check your own results against a
-host run.
-
-Recently closed, in case you read an older copy of this file: guest kernels 6.12
-and newer could not open the DRM nodes at all. Fixed.
+Recently closed: Vulkan compute on Hopper, guest kernels 6.12+ being unable to
+open the DRM nodes, X11 clients under Xwayland getting no window, and GL under
+Wayland. Two of those looked like NVIDIA's bugs until the same test was run on
+bare metal — [what broke and how](docs/reference/correctness.md).
 
 ## Tested applications
 
