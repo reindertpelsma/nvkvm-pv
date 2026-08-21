@@ -57,9 +57,17 @@ from *any* repository, which downgrades a provenance check to a signature check.
 produce these, so a different workflow in this same repository — added by
 someone who got write access — would not satisfy it.
 
-`gh attestation verify` needs network access to `api.github.com` the first time;
-`gh attestation trusted-root > root.jsonl` and `--custom-trusted-root root.jsonl`
-lets it run offline afterwards.
+`gh attestation verify` reaches out to `api.github.com` for the attestation and
+to Sigstore for the trust root. To verify on a machine with neither, fetch both
+in advance and hand them over:
+
+```bash
+gh attestation download nvkvm-<version>-linux-x86_64.tar.gz --repo reindertpelsma/nvkvm-pv
+gh attestation trusted-root > trusted_root.jsonl
+# ... on the offline machine:
+gh attestation verify nvkvm-<version>-linux-x86_64.tar.gz --repo reindertpelsma/nvkvm-pv \
+    --bundle sha256:<digest>.jsonl --custom-trusted-root trusted_root.jsonl
+```
 
 ### What is in the tarball, and how to check it against the tag
 
