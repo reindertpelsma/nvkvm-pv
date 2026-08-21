@@ -384,6 +384,20 @@ has no P2P on either side anyway — see the peer matrix above). **Workaround:
 `NCCL_SHM_DISABLE=1`**, which restores full correctness at host-parity
 collective bandwidth, at the cost of the throughput shown in the table above.
 
+**A tempting one-line fix that does NOT work — do not retry it.** The QEMU log
+during these runs carries 60 x `DENY ctrl cmd 0x00003d08`, and `0x3d08` is
+`NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO` — the control libcuda issues
+just before `IMPORT_OBJECT_FROM_FD` to learn which device an exported fd's
+objects are parented by (`deviceInstance` / `gpuInstanceId`). That reads like
+an exact explanation for `CUDA_ERROR_INVALID_DEVICE`, and `0x3d05`/`0x3d06`
+(the export/import pair it sits between) are already allowed. It is not the
+cause: adding `0x00003d08u` to `nvkvm_ctrl_allowlist.h` and rebuilding removes
+the denial completely (`grep -c DENY /tmp/qemu.log` → 0) and NCCL still fails
+at the same `transport/shm.cc:590` with the same CUDA 101. The change was
+reverted rather than kept, since widening the allowlist that guards the host
+is not justified by a fix that does not fix anything. Whatever is wrong lives
+in the cuMem VMM export/import forwarding itself, not in the control allowlist.
+
 ### Second guest-only difference: NVML after fork in vLLM workers
 
 vLLM's default `VLLM_WORKER_MULTIPROC_METHOD=fork` makes each worker call
