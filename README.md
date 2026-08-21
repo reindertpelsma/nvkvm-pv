@@ -13,7 +13,7 @@ nothing printed was cut. ([asciinema cast](docs/img/boot.cast) ·
 `nvkvm` gives a virtual machine real, driver-level access to an NVIDIA GPU
 without handing the card over to it. The host keeps the GPU. The guest gets
 `/dev/nvidia0` and friends, backed by a small kernel module that forwards the
-NVIDIA Resource Manager ioctl surface over virtio to the host driver.
+NVIDIA driver's own ioctl interface over virtio to the host driver.
 
 Unmodified NVIDIA userspace runs inside the guest. Not a CUDA shim, not an API
 remoting layer, not a container: the guest's own `libcuda` talks to what it
@@ -39,8 +39,8 @@ From a user's perspective, this is what it buys you:
   independently usable, verified on up to six cards in one guest
 
 It is fast because the guest is not in a hot path. Control calls are forwarded;
-the work itself is not. A kernel launch reaches the GPU as a store to a mapped
-doorbell page, so there is no per-operation cost to pay:
+the work itself is not — launching a kernel is a write to memory the guest
+already has mapped, and nvkvm is not in that path at all:
 
 > **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of bare metal**, on four
 > machines, published to Geekbench's own servers where neither we nor you can
@@ -65,16 +65,12 @@ hangs outright on one driver.
 
 - **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
   security boundary you should rely on — read [`SECURITY.md`](SECURITY.md)
-  before you decide where to run this. It also runs in **containers**, where
-  Linux namespaces are usually blocked — the isolate falls back to UID separation,
-  which is weaker; see [the isolate model](docs/internal/isolate-model.md). We
-  audit it ourselves and publish what we find, fixed or not: the
+  before you decide where to run this. We audit it ourselves and publish what we
+  find, fixed or not: the
   [pointer audit](docs/internal/audit-guest-pointers.md) (14 unenforced paths,
   5 since fixed) and the
   [boundary audit](docs/internal/audit-boundaries-2026-08-20.md) (19 findings
-  across all three trust boundaries, 15 fixed, 4 named as open). The most
-  exposed surface in the second was liveness, not memory safety: an
-  unprivileged guest could hang the whole VMM without corrupting anything.
+  across all three trust boundaries, 15 fixed, 4 named as open).
   **Do not put untrusted tenants behind it.**
 - **Not a virtual monitor.** There is no scanout path. A GPU-accelerated desktop
   runs inside the guest and frames leave by *capture*, not by a virtual display.
@@ -186,8 +182,8 @@ staging step.
 
 ### Prebuilt tarball, on a bare host
 
-The full sandbox rung, without building QEMU yourself. From the
-[releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
+The bare-host install — stronger isolation than a container, and no QEMU build.
+From the [releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
 
 ```bash
 # runtime dependencies -- the tarball ships QEMU, not what QEMU links against
@@ -199,17 +195,16 @@ sudo cp -a qemu-nvkvm /opt/qemu-nvkvm
 sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
 ```
 
-Built on Ubuntu 24.04, so it needs **glibc 2.38 or newer** — on an older host
-(Ubuntu 22.04 is glibc 2.35) use the container, which brings its own userspace.
-
 ```bash
 bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image
 ```
 
 x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
-source for that). It carries a glibc floor, since it is a real binary built on
-Ubuntu 24.04; the exact number and the runtime package list are in `RELEASE.md`
-inside the tarball.
+source for that). It is a real binary built on Ubuntu 24.04, so it needs
+**glibc 2.38 or newer**: on an older host (Ubuntu 22.04 is glibc 2.35) use the
+container, which brings its own userspace. Exact floor and runtime package list
+are in `RELEASE.md` inside the tarball
+([detail](docs/howto/build.md#installing-the-tarball)).
 
 **The guest kernel module is not in there and cannot be** — it is compiled
 against *your* guest's kernel. That is why `src/guest/` ships with the tarball:
@@ -230,9 +225,8 @@ mechanism: everything it changes in upstream QEMU is five patch files in
 device sources into `hw/misc/`.
 [`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
 same build by hand, command by command, if you would rather not run a script
-over your QEMU tree. `--force` is what you want after editing anything under
-`src/qemu/`; see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the three traps in
-this build.
+over your QEMU tree; [`CONTRIBUTING.md`](CONTRIBUTING.md) has the three traps in
+this build, including which changes need a `--force` rebuild.
 
 ### Staging the guest driver libraries
 
@@ -249,13 +243,11 @@ bash scripts/make_host_bundle.sh    # collects host-libs-$V/ from the installed 
 
 Inside the guest, `scripts/stage_guest_libs.sh` puts them in place — see
 [First result](#first-result) below. Guest setup is three things installed, not
-two: that script also writes `/etc/X11/xorg.conf` from
-[`data/xorg/nvkvm-xorg.conf`](data/xorg/nvkvm-xorg.conf), which is what makes a
-stock distro's own Xorg session come up on the nvkvm head. It rewrites the
-`BusID` to the address nvkvm's device actually has in your guest, it will not
-overwrite an `/etc/X11/xorg.conf` you wrote yourself, and `NVKVM_STAGE_XORG=0`
-tells it to leave X alone entirely
-([detail](docs/howto/run.md#the-guests-own-xorg-session-a-stock-distro-desktop)).
+two: the same script also writes an `/etc/X11/xorg.conf`, which is what makes a
+stock distro's own Xorg session come up on the nvkvm head. It will not overwrite
+one you wrote yourself, and `NVKVM_STAGE_XORG=0` tells it to leave X alone
+([why the file is needed, and the two cases where you have to think about
+it](docs/howto/run.md#the-guests-own-xorg-session-a-stock-distro-desktop)).
 
 ### Verifying what you downloaded
 
@@ -273,14 +265,13 @@ gh attestation verify nvkvm-<version>-linux-x86_64.tar.gz \
     --repo reindertpelsma/nvkvm-pv
 ```
 
-Add `--signer-workflow reindertpelsma/nvkvm-pv/.github/workflows/release.yml`
-to pin *which* workflow, not just which repository, was allowed to produce it.
-That is the stronger check and it is the one to use if you are scripting this.
-
 `--repo` is the point of the exercise: without it, `verify` will accept an
 attestation from any repository, which makes it a signature check rather than a
 provenance check. The `.sha256` file beside each download only proves the bytes
-arrived intact.
+arrived intact. Add `--signer-workflow` to pin *which* workflow was allowed to
+produce it, and see [verify before you run
+either](docs/howto/build.md#verify-before-you-run-either) for the offline
+variant.
 
 ## First result
 
@@ -323,46 +314,38 @@ is usable in a script. Every `28/28` below is this command on that hardware.
 ## How it fits together
 
 ```
-  GUEST                                        HOST
-  ─────────────────────────────────────        ──────────────────────────────
+  GUEST                                  HOST
+  ──────────────────────────────         ──────────────────────────────
   CUDA / PyTorch / Vulkan / OpenGL
     │  ioctl(/dev/nvidia*)
     ▼
-  nvkvm-guest.ko                               QEMU: virtio-nvgpu device
-    │  sanitise: zero guest VAs,                 │  validate against allowlist
-    │  stage params in the aux slot              │  translate handles + fds
-    │  virtio                                    ▼
-    └──────────────────────────────────────►  per-process isolate  ──► NVIDIA driver ──► GPU
-                                                (own RM client, own address space)
+  nvkvm-guest.ko ─── virtio ────►  QEMU: virtio-nvgpu device
+                                     │
+                                     ▼
+                                   one sandboxed process per guest
+                                   process ──► NVIDIA driver ──► GPU
 ```
 
-Three properties fall out of that shape:
+Two things follow from that shape, and they are the two claims on this page that
+sound too good to be true.
 
-**The guest never gets the device.** No BAR is mapped to it, no MMIO window is
-handed over, and there is no DMA path from the guest to host memory. Compare
-PCIe passthrough, where the GPU retains DMA access to host RAM and the isolation
-boundary is weaker than the VM boundary suggests.
-
-**Guest pointers never reach the host driver.** The host boundary overwrites
-pointer-carrying fields rather than trusting the guest to have done it — and we
-audited how completely, open items included, in
-[the pointer audit](docs/internal/audit-guest-pointers.md).
+**The guest never gets the device**, and that is something PCIe passthrough
+cannot offer: with passthrough the GPU keeps DMA access to host RAM, so the
+isolation boundary is weaker than the VM boundary suggests.
 
 **In steady state there is no forwarded call at all.** Control operations cross
-the boundary; work does not. A kernel launch reaches the GPU as a write-combining
-store to a mapped BAR doorbell page — there is no doorbell interception anywhere
-in this codebase. Control-RTT is 1–2% of per-token LLM decode time for a
-stack that uses CUDA graphs, and about 20% for one that launches kernels
-individually — which is why most numbers below are near 1.00 and a few are not.
+the boundary; the work does not. That is why most of the numbers below are
+1.00x.
 
-Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
+The request path end to end, the five hard problems it runs into, and what the
+boundary does with a guest pointer: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
 - **NVIDIA's own X driver — the DDX — cannot be used inside the guest.** It
-  reaches the GPU fine, then asks NVKMS about the **host's** physical displays:
-  a question nvkvm will not forward, and could not answer honestly if it did.
-  This costs you something only if you specifically need that driver — chiefly
+  reaches the GPU fine, then asks about the **host's** physical displays — a
+  question nvkvm will not forward, and could not answer honestly if it did. This
+  costs you something only if you specifically need that driver — chiefly
   `nvidia-settings`, and the professional-application features that depend on
   it. Ordinary desktops are unaffected: a stock distro's own Xorg session comes
   up on the nvkvm head, and GL, Vulkan and CUDA are accelerated on all of them
@@ -377,11 +360,9 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   bring-up, CUDA, Vulkan compute and offscreen GL. It does not cover everything,
   and a real correctness bug has passed it before. Check your own results
   against a host run ([what that bug was](docs/reference/correctness.md)).
-- **Multi-GPU tensor-parallel serving is correct, and about 0.86x of host** on
-  the one measurement taken since the NCCL shared-memory fix (2026-08-21). The
-  earlier 0.12–0.37x figures were measured with that transport disabled and are
-  superseded. Output parity on the fast path is **not yet confirmed** — see the
-  section. Single-GPU serving is at parity
+- **Multi-GPU tensor-parallel serving is correct, and about 0.86x of host** —
+  but that is **one** measurement, not a matrix, and output parity on this path
+  is **not yet confirmed**. Single-GPU serving is at parity
   ([numbers](#multi-gpu-serving)).
 - **Frameworks that pin large host buffers pay a penalty.** Registering pinned
   memory is slower than native and a single registration is capped at 2 GiB —
@@ -438,18 +419,17 @@ per-frame counters over 60 consecutive one-second samples, every one of which
 was exactly 60 frames. The pipeline is limited by display refresh, not by
 forwarding overhead.
 
-Graphics is the one area below parity, though far less than an earlier note
-here claimed. Re-measured on an RTX 3060 with one `glmark2` binary,
-sha256-identical on both sides: the full suite off-screen runs at **0.73x of
-host**, and **0.89x** with `clocksource=tsc` in the guest. The GPU itself is at
+Graphics is the one area below parity. Measured on an RTX 3060 with one
+`glmark2` binary, sha256-identical on both sides: the full suite off-screen
+runs at **0.73x of host**, and **0.89x** with `clocksource=tsc` in the guest. The GPU itself is at
 parity — GL fill rate is 1.000x and draw-call submission is slightly *faster*
 in the guest.
 
 The remaining cost is not the present path. It is a cold first scene — the
 guest's first scene in a process runs ~0.37x and every one after it 0.88-0.93x,
-so a single-scene run measures the cold path and nothing else — plus clock
-reads leaving the vDSO under `kvm-clock`, which a benchmark that times every
-frame pays for directly. [Full decomposition and what was ruled
+so a single-scene run measures the cold path and nothing else — plus much
+slower clock reads in the guest under `kvm-clock`, which a benchmark that times
+every frame pays for directly. [Full decomposition and what was ruled
 out](tests/perf/results/glmark2_2026-08-21/RESULTS.md).
 
 ### Containers
@@ -603,17 +583,11 @@ workloads at host parity on six GPU architectures (Turing, Ampere, Ada,
 Blackwell, and the GA100 and Hopper datacenter parts), including multiple GPUs
 in one guest.
 
-The largest open item is that NVIDIA's own X driver cannot run in a guest — it
-wants the host's display engine — so a guest's Xorg session composites on the
-CPU and offloads rendering to the GPU rather than scanning out from it.
-Everything else is tracked in
-[known limitations](docs/internal/known-limitations.md).
-
-Issues and measurements from other hardware are welcome — particularly boots on
-driver branches this repository has not exercised. Coverage here is a function
-of what someone happened to rent, so your card is probably one we do not have:
-see [contributing](CONTRIBUTING.md), and note that a **failure** report is worth
-more to us than a success.
+The largest open item is [NVIDIA's own X driver](#known-issues); everything
+else is tracked in [known
+limitations](docs/internal/known-limitations.md). Issues and measurements from
+hardware and driver branches this repository has not exercised are welcome —
+see [contributing](CONTRIBUTING.md).
 
 ## Credits
 
