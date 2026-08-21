@@ -2938,10 +2938,23 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	 * — it says nothing about who owns it — so without this an isolate could
 	 * map any other host-process isolate's live /dev/nvidia* fd into the
 	 * window, at a GPA of its choosing, in the privileged QEMU process.
-	 * Isolates are separate uid-separated host processes, so that is the
-	 * host-process boundary this layer is responsible for, not intra-VM
-	 * policy; PRESENT and XISO_IMPORT already check the same two things
-	 * (handle→session, session→isolate) and this handler simply did not.
+	 * Isolates are separate host processes, so that is the host-process
+	 * boundary this layer is responsible for, not intra-VM policy; PRESENT
+	 * and XISO_IMPORT already check the same two things (handle→session,
+	 * session→isolate) and this handler simply did not.
+	 *
+	 * NOT uid-separated, whatever this comment used to say.  On the rung
+	 * nvkvm_iso_auto_select() prefers, mode is NS|SECCOMP with no
+	 * NVKVM_ISO_LAYER_UID, so use_uid is false, nvkvm_iso_drop_privilege()
+	 * never runs, and nvkvm_map_child_userns() writes a bare
+	 * "0 <geteuid()> 1" uid_map -- every isolate's in-namespace root maps to
+	 * the SAME host uid, QEMU's own.  What separates them is the user/pid/
+	 * mount/net/ipc/uts namespaces plus seccomp, which is a real boundary
+	 * (sibling user namespaces cannot ptrace each other and CLONE_NEWPID
+	 * hides the pids) but is not a uid boundary.  Distinct host uids appear
+	 * only on the UID rung, which auto-select falls back to when
+	 * CLONE_NEWUSER fails.  Do not reason about this layer as though a
+	 * DAC check were backing it up.
 	 */
 	if (h->session_id != req->session_id ||
 	    !session_has_isolate(nv, req->session_id, req->isolate_id)) {
@@ -3256,8 +3269,11 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 
 	/*
 	 * S-2 (cross-isolate): the token is an index into one VM-global table,
-	 * and isolates are separate, uid-separated HOST processes — the same
-	 * boundary PRESENT/XISO_IMPORT validate against.  Without this check any
+	 * and isolates are separate HOST processes — the same boundary
+	 * PRESENT/XISO_IMPORT validate against.  (Separate, but NOT uid-
+	 * separated on the default rung; see the note in
+	 * nvkvm_req_mmap_on_isolate above for what actually separates them.)
+	 * Without this check any
 	 * isolate could walk the token space and tear down a NEIGHBOUR's live GPU
 	 * mapping: the teardown below runs entirely on the victim's recorded
 	 * entry (its isolate, its GVA, its GPA extent), so a stranger's token
@@ -3267,6 +3283,23 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 	 * iso_mmap_free() now refuses a token this isolate does not own, and
 	 * reports it as ENOENT — the same answer as an unknown token, so probing
 	 * cannot distinguish "not yours" from "not there".
+	 *
+	 * KNOWN GAP, do not read this as a closed boundary.  "This isolate" is
+	 * req->isolate_id, which the GUEST supplies, and this request carries no
+	 * other identity — struct nvkvm_req_munmap_on_isolate is
+	 * { isolate_id, mmap_token } and nothing else.  So the test is
+	 * "the token you named must belong to the isolate you named", not "…to
+	 * you": a caller that names a neighbour's isolate_id together with that
+	 * neighbour's token passes it.  Three of the five isolate_id-taking
+	 * handlers additionally check session_has_isolate() against a session_id
+	 * they take from QEMU's own handle table; there is no handle here to
+	 * anchor to, and anchoring to the mapping entry's own handle_id would be
+	 * circular (the entry's isolate_id is already required to match).
+	 * Closing this needs a caller session_id ON THE WIRE — a protocol
+	 * change, deliberately not bodged in here.  Note it would bound a
+	 * malicious guest USERSPACE process only: the guest kernel module fills
+	 * that field and is itself untrusted, so treat it as defence in depth,
+	 * the same weight the neighbouring session_has_isolate() checks carry.
 	 */
 	if (req->isolate_id == 0) {
 		resp->status = EINVAL;

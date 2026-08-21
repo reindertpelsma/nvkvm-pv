@@ -107,6 +107,44 @@ Read [`CLAUDE.md`](CLAUDE.md) first. It is the orientation and trap list —
 component map, which document to read before touching what, and the build,
 measurement and domain traps that have each cost this project real time.
 
+## The dev VM harness is not a sandbox
+
+`scripts/run_test_vm.sh` and `scripts/run_remote_test.sh` are a **development
+harness only**. Point them at a guest you trust completely, and nothing else.
+
+`run_test_vm.sh` exports the whole repository to the guest over 9p
+**read-write**:
+
+```
+-virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped
+```
+
+The guest mounts that at `/mnt/nvkvm` and *builds its kernel module on it*,
+which is why the export is writable and why making it read-only is not a
+one-line change — the build would have to move to a guest-local copy or an
+overlay first.
+
+The consequence is a direct guest-root → host-root path, and it is short:
+
+1. guest root edits any file under `/mnt/nvkvm` — say `scripts/run_test_vm.sh`;
+2. `scripts/run_remote_test.sh restart` runs
+   `bash $REMOTE_DIR/scripts/run_test_vm.sh` **on the host, as root**;
+3. done.
+
+`security_model=mapped` does not help here. It maps guest ownership and mode
+bits into host xattrs; it does not make the export read-only, and the host-side
+files stay owned by the (root) user running QEMU.
+
+This is a property of the harness, not of nvkvm's boundary — the VMM's own
+guest→host boundary is the thing the rest of this project is about, and it does
+not depend on 9p. But do not benchmark, fuzz, or demo against an untrusted guest
+image with this harness, and do not leave it running on a shared machine.
+
+If you need a harness that survives an untrusted guest: drop the writable repo
+export, ship the built artefacts in instead (a read-only export, a virtio-blk
+image, or `scp` into the guest), and stop having any host-side script execute a
+path the guest can write.
+
 ## Security
 
 Do not file security issues in public. See [`SECURITY.md`](SECURITY.md).

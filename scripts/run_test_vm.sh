@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 # run_test_vm.sh — launch a KVM guest VM with virtio-nvgpu device
 #
+# ############################################################################
+# DEVELOPMENT HARNESS ONLY -- NOT A SANDBOX. DO NOT POINT IT AT AN UNTRUSTED
+# GUEST.
+#
+# The -virtfs line below exports the ENTIRE REPOSITORY to the guest over 9p
+# READ-WRITE (mount_tag=nvkvm_src, guest /mnt/nvkvm). The guest builds its
+# kernel module on that share, which is why it is writable -- making it
+# read-only is not a one-liner, the build has to move off it first.
+#
+# That gives guest root a three-step path to host root:
+#   1. guest root edits /mnt/nvkvm/scripts/run_test_vm.sh (or anything else
+#      under the tree);
+#   2. scripts/run_remote_test.sh restart runs
+#      `bash $REMOTE_DIR/scripts/run_test_vm.sh` ON THE HOST, AS ROOT;
+#   3. that is the whole exploit.
+#
+# security_model=mapped does not mitigate this: it maps guest ownership/mode
+# into host xattrs, it does not make the export read-only.
+#
+# This is a property of the harness, not of nvkvm's guest->host boundary. But
+# do not fuzz, benchmark or demo an untrusted guest image with it, and do not
+# leave it running on a shared machine. See CONTRIBUTING.md, "The dev VM
+# harness is not a sandbox".
+# ############################################################################
+#
 # This starts a QEMU VM with:
 #   - The virtio-nvgpu device patched into QEMU (built by scripts/build_qemu.sh)
 #   - nvkvm-guest.ko available to build/load in the guest via 9p virtfs
@@ -173,6 +198,9 @@ exec "$QEMU" \
     `# No BARs/DMA; all GPU I/O still flows through virtio-nvgpu forwarding.` \
     -device nvkvm-gpu,addr=7 \
     \
+    `# READ-WRITE export of the whole repo. Guest root can rewrite any script` \
+    `# here, including ones the HOST later runs as root (run_remote_test.sh` \
+    `# restart). Dev harness only -- see the banner at the top of this file.` \
     -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped \
     $HOSTLIBS_ARG \
     $SHARE_ARG \
