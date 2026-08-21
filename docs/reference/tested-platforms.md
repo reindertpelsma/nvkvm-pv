@@ -128,3 +128,59 @@ Same caveats as the A100 row, and they cut the same way: this box is also a VM
 underneath, and the guest got fewer cores. The 0.82x decode row is the control
 path rather than the data path — [what that means](parity.md).
 
+## The display path
+
+The table above is about compute — every row reached a CUDA kernel launch. The
+display path is a different code path and needs its own matrix, because *how the
+guest's frame reaches a human* varies more than the GPU does, and each route
+exercises different code:
+
+- **native** — the host desktop is rendered by the *same* NVIDIA GPU, so QEMU
+  imports the guest's dma-buf straight into its window. Zero copies.
+  `NVKVM_PRESENT_MODE=gl`, and the log says `window mode=GL-zerocopy`.
+- **readback** — the host's window cannot import an NVIDIA dma-buf (a hybrid
+  laptop where the display is on the iGPU, an Xvfb or software X server, a
+  non-NVIDIA compositor). QEMU reads the pixels back to a CPU surface and
+  re-uploads them. Correct everywhere, and the default for exactly that reason.
+- **headless** — no host display or display server at all. The guest still gets
+  a virtual KMS head; frames leave by whatever runs *inside* the guest, e.g. a
+  remote-desktop or streaming server. This is the cloud-workstation case and the
+  one no other open stack covers.
+
+| GPU | driver | host session | present path | what was exercised |
+|---|---|---|---|---|
+| RTX 4070 (Ada AD104) | 595.84 | GNOME/Wayland, real monitor | **readback**, then **native** | Mint desktop; Minecraft at max settings, 60 fps, chunk generation smooth, 35% GPU util; `nvtop` (NVML); GL zero-copy A/B against readback |
+| RTX 3050 (Ampere GA107) | 595.84 | GNOME/Wayland, real monitor | **native** | Mint desktop; pointer lock; keyboard grab (Super to guest); configurable head verified at 1600x900; OpenGL 4.6 reported by the guest |
+
+Both physical rows are on driver **595.84** and were verified by watching the
+screen, not by reading a log. Two GPU generations (Ada and Ampere) and two CPU
+vendors (Ryzen 9 7900 and Core i5-4460).
+
+**Not yet in this table, and it should be:** a headless run on rented hardware
+(no X on the host, frames leaving via a browser-based screencast), and a
+container with Xvfb, which is a readback row by construction. Both were done by
+the author and neither is recorded here with its driver version, so they are
+named rather than tabulated until someone writes down what they ran.
+
+### What the display path is fragile to
+
+Not CPU architecture — DRM, dma-buf and EGL are arch-neutral, and the x86-64
+constraint lives in the isolate and the GPA-window logic instead.
+
+It is fragile to **driver branch**. `enum NvKmsIoctlCommand` is unvalued, so
+position is the wire value, and NVIDIA renumbers it *mid-branch*: 570.195.03 and
+570.207 disagree. A gate written against one branch silently admits a different
+command on another — which is exactly what happened, and why the allowlist is
+now keyed on major *and* minor across 28 vendor tags. Assume a new driver branch
+needs the enum re-read, not that it will just work.
+
+### Pointer lock needs SDL, and that is a host-side constraint
+
+On a Wayland host, QEMU's **GTK** backend cannot take a pointer lock at all: it
+emulates one with `gdk_seat_grab()` plus `gdk_device_warp()`, and an X11 client
+under Xwayland can do neither, because the compositor owns the pointer. Measured
+— the cursor left the "grabbed" window and `evtest` in the guest saw zero
+relative events. The **SDL** backend asks properly
+(`SDL_SetRelativeMouseMode()`, which on Wayland is `zwp_pointer_constraints_v1`
+plus `zwp_relative_pointer_v1`), and that is the configuration both rows above
+used for grab mode.
