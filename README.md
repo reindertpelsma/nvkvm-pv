@@ -220,7 +220,7 @@ bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and pr
 ```
 
 Most of the wall clock is QEMU. The script is a convenience, not the
-mechanism: everything it changes in upstream QEMU is nine patch files in
+mechanism: everything it changes in upstream QEMU is ten patch files in
 [`patches/`](patches/) — 631 lines, applied with `git apply` — plus a copy of the
 device sources into `hw/misc/`.
 [`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
