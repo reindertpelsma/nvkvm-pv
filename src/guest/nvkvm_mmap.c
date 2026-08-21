@@ -169,6 +169,11 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 	if (!nvkvm_gpa_in_mmap_window((unsigned long)gpa_base, vma_len)) {
 		pr_warn("nvkvm: MMAP_ON_ISOLATE returned GPA %llx outside window\n",
 			gpa_base);
+		/* The isolate mapping and its mmap_token already exist; without
+		 * this the token is stranded in QEMU's VM-global table with
+		 * nothing tracking it and no reaper that could find it. */
+		nvkvm_virtio_munmap_on_isolate(ctx->session->isolate_id,
+					       mmap_token);
 		return -EIO;
 	}
 
@@ -229,8 +234,24 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 		nvkvm_force_range_wb(vma->vm_mm, vma->vm_start, vma->vm_end);
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);
-	if (!region)
-		return 0; /* mapping live; leak the region tracking */
+	if (!region) {
+		/*
+		 * The region IS the only handle on this mapping: mmap_token is
+		 * released from nvkvm_mmap_release_fd()/the region teardown and
+		 * from nowhere else, and without vm_private_data even
+		 * nvkvm_vma_close() cannot find it.  "Leak the region tracking"
+		 * therefore meant leaking an entry in QEMU's VM-global mmap
+		 * table permanently, per call, with no reap path -- so a guest
+		 * that can make this small kzalloc fail can exhaust the table
+		 * for every process in the VM.  Undo the isolate-side mapping
+		 * and fail the mmap instead; the kernel tears the VMA (and the
+		 * PTEs remap_pfn_range installed) down for us on error, exactly
+		 * as it does for the remap_pfn_range failure just above.
+		 */
+		nvkvm_virtio_munmap_on_isolate(ctx->session->isolate_id,
+					       mmap_token);
+		return -ENOMEM;
+	}
 
 	region->mmap_token = mmap_token;
 	region->handle_id  = ctx->handle_id;
@@ -839,7 +860,7 @@ int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	if (ret) {
 		pr_warn("nvkvm: cpu_page_migrate mmap_on_isolate gva=0x%lx isolate=%u ret=%d\n",
 			page_gva, ctx->session->isolate_id, ret);
-		goto err_handle;
+		goto err_iso_handle;
 	}
 
 	/* Stash the GPA on the tracking node so a later range-swap can install
@@ -850,8 +871,18 @@ int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	/* Track the migration for writeback and cleanup at fd close. */
 	cp = kzalloc(sizeof(*cp), GFP_KERNEL);
 	if (!cp) {
-		/* Mapping is live; accept the tracking leak. */
-		return 0;
+		/*
+		 * "Accept the tracking leak" was not a leak of a kzalloc — cp is
+		 * the ONLY record of this mapping, so without it nothing ever
+		 * sends MUNMAP_ON_ISOLATE or CLOSE_HANDLE for it, and both the
+		 * mmap token and the handle sit in QEMU's VM-global tables until
+		 * the session dies (the handle permanently: see err_iso_handle).
+		 * The page stays pinned too.  Unwind and fail the resolve.
+		 */
+		ret = -ENOMEM;
+		nvkvm_virtio_munmap_on_isolate(ctx->session->isolate_id,
+					       mmap_token);
+		goto err_iso_handle;
 	}
 	cp->page        = page;
 	cp->mm          = current->mm;
@@ -874,6 +905,20 @@ int nvkvm_cpu_page_migrate(struct nvkvm_fd_ctx *ctx,
 	mutex_unlock(&ctx->cpu_pages_lock);
 	return 0;
 
+err_iso_handle:
+	/*
+	 * Reached only once copy_handle_to_isolate() has SUCCEEDED, which is
+	 * what takes the isolate reference (nvkvm_handle_ref_isolate, on ret==0
+	 * only — so the copy-failure branch above must not come here).  That
+	 * reference makes nvkvm_handle_close() return -EBUSY, and the guest
+	 * does not check the return value, so CLOSE_HANDLE on its own left the
+	 * handle-table entry in_use for the life of the session: the only code
+	 * that clears a held isolate_refcount is the full-session teardown in
+	 * nvkvm_handle_close_session().  No reaper touches nv->handles.  Drop
+	 * the reference first, exactly as nvkvm_cpu_page_release() and the
+	 * chunk_fail_mapped unwind below both do.
+	 */
+	nvkvm_virtio_close_handle_on_isolate(handle_id, ctx->session->isolate_id);
 err_handle:
 	nvkvm_virtio_close_handle(handle_id);
 err_slot:

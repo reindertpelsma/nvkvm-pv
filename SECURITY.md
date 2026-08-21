@@ -90,7 +90,13 @@ framebuffer), none of which are the configuration this project targets.
 We audit our own boundary and publish the results, fixed or not:
 
 - [Boundary audit, 2026-08-20](docs/internal/audit-boundaries-2026-08-20.md) —
-  19 findings across all three in-scope boundaries. 15 fixed, 4 open.
+  19 findings across all three in-scope boundaries. 16 fixed, 1 partial (A-8,
+  by decision), 1 open (A-9), and the low-severity set A-16 four-sixths done.
+  What is left open is left open on purpose and says why: A-8 and A-9 both need
+  a threading change rather than a fix, one A-16 item is a resource-policy
+  decision (no `RLIMIT_MEMLOCK` on pinning) and one was not re-traced. The
+  follow-up round is §8 of that document; it is build-verified only and has not
+  been run against a GPU.
 - [Guest pointer audit](docs/internal/audit-guest-pointers.md) — 14 unenforced
   paths against one invariant, 5 since fixed.
 
@@ -106,7 +112,7 @@ process's own GPU context, which is exactly the containment the isolate model
 exists to provide. The most serious practical exposure is **liveness**: an
 unprivileged guest process could hang the entire VMM without corrupting
 anything. Those two are fixed; the remaining open items are listed by name in
-the audit rather than quietly dropped.
+the audit rather than quietly dropped, each with the reason it is still there.
 
 ## Weaker configurations you should know about
 

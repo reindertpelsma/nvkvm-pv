@@ -326,16 +326,33 @@ static unsigned int nvkvm_ring_idle_us;
 module_param_named(ring_idle_us, nvkvm_ring_idle_us, uint, 0644);
 MODULE_PARM_DESC(ring_idle_us, "stub consumer-loop idle window in spin iters (0=default; capped in stub)");
 
+/*
+ * "Is there queued work?" for the pump.
+ *
+ * s->req_ring is NULL-stored by nvkvm_session_put() under sessions_lock —
+ * which this kthread does not hold, and which is released BEFORE
+ * nvkvm_session_stop_pump() runs, so the pump is deliberately still alive
+ * across that store.  The predicate therefore has to load the pointer exactly
+ * once and use that value; the previous form loaded s->req_ring twice per
+ * evaluation (test, then argument), leaving the compiler free to re-load a
+ * pointer that had become NULL in between and hand it to nvkvm_ring_has_work()
+ * to dereference.  READ_ONCE + a local closes the window.
+ */
+static bool nvkvm_pump_has_work(struct nvkvm_session *s)
+{
+	struct nvkvm_ring *r = READ_ONCE(s->req_ring);
+
+	return r && nvkvm_ring_has_work(r);
+}
+
 static int nvkvm_pump_fn(void *data)
 {
 	struct nvkvm_session *s = data;
 
 	while (!kthread_should_stop()) {
 		wait_event_interruptible(s->pump_wq,
-			kthread_should_stop() ||
-			(s->req_ring && nvkvm_ring_has_work(s->req_ring)));
-		while (!kthread_should_stop() &&
-		       s->req_ring && nvkvm_ring_has_work(s->req_ring)) {
+			kthread_should_stop() || nvkvm_pump_has_work(s));
+		while (!kthread_should_stop() && nvkvm_pump_has_work(s)) {
 			u64 head = 0;
 			int ret = nvkvm_virtio_enter_loop((unsigned int)s->id,
 							  nvkvm_ring_idle_us,
@@ -1284,6 +1301,13 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	bool have_uvm_mm_init     = false;
 	__u32 orig_uvm_rm_ctrl_fd = 0;
 	bool have_uvm_rm_ctrl     = false;
+	/*
+	 * Byte offset of the rm_ctrl_fd the sanitizer swapped for a handle_id.
+	 * 16 for uvm_register_gpu_vaspace_params / uvm_register_channel_params
+	 * (both open with a 16-byte uvm_uuid); UVM_MAP_EXTERNAL_ALLOCATION's is
+	 * version-variant and comes from the ABI profile — see the capture site.
+	 */
+	unsigned uvm_rm_ctrl_off  = 16;
 	/* EXPORT_OBJECT_TO_FD (ctrl 0x3d05): frontend fd embedded in the INNER
 	 * control params (aux) at offset 16 — translate guest-fd→handle_id, save
 	 * the caller's fd to restore on the response (fd is IN/OUT, value kept). */
@@ -1333,9 +1357,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		   (cmd == UVM_REGISTER_GPU_VASPACE ||
 		    cmd == UVM_REGISTER_CHANNEL ||
 		    cmd == UVM_MAP_EXTERNAL_ALLOCATION)) {
-		if (param_size >= 20) {
+		/*
+		 * #81: UVM_MAP_EXTERNAL_ALLOCATION's rm_ctrl_fd is NOT at 16.
+		 * nvkvm_sanitize_ioctl_params() writes the handle_id at
+		 * nvkvm_prof()->uvm_map_ext_fd_off (1184 in the pre-V550
+		 * 1-entry layout, 9248 in the V550 256-entry one); capturing
+		 * and restoring offset 16 for it therefore restored a field
+		 * nobody touched and left the sanitizer's handle_id standing at
+		 * the real one, handing an internal VM-global id back to
+		 * userspace.  Index by the same profile offset the sanitizer
+		 * uses so capture and restore cannot disagree.
+		 */
+		if (cmd == UVM_MAP_EXTERNAL_ALLOCATION)
+			uvm_rm_ctrl_off = nvkvm_prof()->uvm_map_ext_fd_off;
+		if (param_size >= (size_t)uvm_rm_ctrl_off + sizeof(__u32)) {
 			orig_uvm_rm_ctrl_fd =
-				*(__u32 *)((char *)params_buf + 16);
+				*(__u32 *)((char *)params_buf + uvm_rm_ctrl_off);
 			have_uvm_rm_ctrl = true;
 		}
 	} else if (_IOC_NR(cmd) == NV_ESC_REGISTER_FD && params_buf &&
@@ -2265,8 +2302,10 @@ forwarded:;
 			   param_size == sizeof(struct uvm_mm_initialize_params)) {
 			((struct uvm_mm_initialize_params *)params_buf)->uvm_fd =
 				orig_uvm_mm_init_fd;
-		} else if (have_uvm_rm_ctrl && param_size >= 20) {
-			*(__u32 *)((char *)params_buf + 16) = orig_uvm_rm_ctrl_fd;
+		} else if (have_uvm_rm_ctrl &&
+			   param_size >= (size_t)uvm_rm_ctrl_off + sizeof(__u32)) {
+			*(__u32 *)((char *)params_buf + uvm_rm_ctrl_off) =
+				orig_uvm_rm_ctrl_fd;
 		} else if (have_fe_ctl_fd && _IOC_NR(cmd) == NV_ESC_REGISTER_FD &&
 			   param_size >= sizeof(struct nv_ioctl_register_fd)) {
 			((struct nv_ioctl_register_fd *)params_buf)->ctl_fd =
