@@ -45,6 +45,9 @@ doorbell page, so there is no per-operation cost to pay:
 > Seventeen other workloads — PyTorch, ResNet-50, BERT, Vulkan compute — land
 > between 0.95x and 1.00x. [See the numbers](#tested-applications).
 
+That is **one** GPU. Tensor-parallel serving across several is correct but not
+yet fast — see [multi-GPU serving](#multi-gpu-serving-correct-not-yet-fast).
+
 ## Where it's useful
 
 - **A workstation you don't want to give up** — GPU work inside a VM while the
@@ -385,6 +388,10 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   bring-up, CUDA, Vulkan compute and offscreen GL. It does not cover everything,
   and a real correctness bug has passed it before. Check your own results
   against a host run ([what that bug was](docs/reference/correctness.md)).
+- **Multi-GPU tensor-parallel serving is correct but slow** — 0.12–0.37x of
+  host, because NCCL's shared-memory transport fails in the guest and its
+  fastest path is unavailable. Single-GPU serving is at parity
+  ([numbers](#multi-gpu-serving-correct-not-yet-fast)).
 - **Frameworks that pin large host buffers pay a penalty.** Registering pinned
   memory is slower than native and a single registration is capped at 2 GiB —
   noticeable in data loaders and serving stacks that pin aggressively. Stock
@@ -481,6 +488,26 @@ sha256 over every `.py`/`.so`.
 At temperature 0 the guest produced **token-id identical** output to the host on
 all three tasks (long-chain reasoning, C11 lock-free ring codegen, 8k-token
 summarisation).
+
+### Multi-GPU serving: correct, not yet fast
+
+vLLM with `--tensor-parallel-size 6` on six RTX A4000s runs a 38 GB model that
+does not fit on any one 16 GB card, and the guest's output is **byte-identical
+to the host's** under matched settings. So it works and it is correct. It is
+also slow:
+
+| identical flags on both sides | host | guest | ratio |
+|---|---|---|---|
+| eager | 47.9 | 10.0 tok/s | 0.21x |
+| CUDA graphs | 36.0 | 13.3 tok/s | 0.37x |
+| host's best configuration | 115.7 | not reachable | 0.12x |
+
+The collectives are not the problem — matched, the guest matches or beats the
+host on both bandwidth and latency, and an NCCL world=6 check passes on both
+sides. The cause is a **guest-only bug**: NCCL's shared-memory transport fails
+in `cuMemImportFromShareableHandle`, so `NCCL_SHM_DISABLE=1` is required and the
+host's fastest path is unavailable in the guest. Single-GPU serving is
+unaffected.
 
 ### Fine-tuning
 
