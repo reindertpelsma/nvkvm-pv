@@ -747,10 +747,33 @@ static void reader_signal_sync(struct nvkvm_isolate *iso, int err,
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
-/* Variant for OPEN_DEVICE: also carries the SCM_RIGHTS fd. */
+/*
+ * Variant for OPEN_DEVICE: also carries the SCM_RIGHTS fd.
+ *
+ * R2-M1 follow-up: the reader's defensive close loop above closes any fd
+ * attached to a response type that has no business carrying one -- but it
+ * EXEMPTS the two types that do, and both of those hand the fd to a
+ * single-slot field.  Overwriting that field without closing what was there
+ * drops the previous fd on the floor inside QEMU, which is the same
+ * fd-exhaustion DoS the close loop exists to prevent, reached by the two
+ * doors it deliberately leaves open.  A stub does it by answering when
+ * nobody asked: every unsolicited ISOLATE_RESP_OPEN_DEVICE (or
+ * _PRESENT_EXPORT) with an fd attached leaks the last one, in a loop, until
+ * the VMM is out of descriptors.  It also covers the honest race -- a
+ * response that arrives after its waiter timed out leaves an fd in the slot
+ * that nothing ever consumes.
+ *
+ * Close before overwrite, which is what nvkvm_present_egl.c:810 already does
+ * for the same shape of single-slot fd handoff ("drop the frame the display
+ * hasn't taken yet").  Guarded on >= 0 so the sentinel is never closed, and
+ * done under the same lock as the store so a waiter cannot be reading the
+ * field while we retire it.
+ */
 static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
 {
 	pthread_mutex_lock(&iso->sync_lock);
+	if (iso->sync_open_fd >= 0 && iso->sync_open_fd != fd)
+		close(iso->sync_open_fd);
 	iso->sync_error    = err;
 	iso->sync_open_fd  = fd;
 	iso->sync_done     = true;
@@ -758,10 +781,13 @@ static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
-/* PRESENT_EXPORT (#106): dedicated slot, carries the dma-buf SCM_RIGHTS fd. */
+/* PRESENT_EXPORT (#106): dedicated slot, carries the dma-buf SCM_RIGHTS fd.
+ * Same close-before-overwrite as reader_signal_sync_open above; see there. */
 static void reader_signal_present(struct nvkvm_isolate *iso, int err, int fd)
 {
 	pthread_mutex_lock(&iso->present_sync_lock);
+	if (iso->present_fd >= 0 && iso->present_fd != fd)
+		close(iso->present_fd);
 	iso->present_err  = err;
 	iso->present_fd   = fd;
 	iso->present_done = true;
@@ -1308,7 +1334,20 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			 * Every sync op resets it under sync_lock before its own wait;
 			 * resetting it here under iso->lock is a cross-lock data race that
 			 * can re-park a stale ENTER_LOOP waiter from a just-killed slot. */
+			/*
+			 * Retire, don't just forget: a response that raced its
+			 * waiter's timeout can leave a live fd in either slot,
+			 * and the old occupant's reader is long joined, so this
+			 * is the last chance to close it.  Without this the
+			 * close-before-overwrite above still leaks one fd per
+			 * slot across a kill/create cycle.
+			 */
+			if (iso->sync_open_fd >= 0)
+				close(iso->sync_open_fd);
 			iso->sync_open_fd = -1;
+			if (iso->present_fd >= 0)
+				close(iso->present_fd);
+			iso->present_fd   = -1;
 			iso->reader_started = false;
 			iso->run_uid      = 0;
 			iso->run_gid      = 0;
