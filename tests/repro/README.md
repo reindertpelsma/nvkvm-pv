@@ -68,4 +68,4 @@ on bare metal either. nvkvm reproduces bare metal faithfully here.
 Consistent with that, glamor under **Xwayland** works fine in the guest (it
 imports via dmabuf, not native-pixmap): `glxinfo` through Xwayland reports the
 RTX 4070 and Mint's GTK apps render accelerated. See
-`docs/internal/mint-guest-desktop.md`.
+[`docs/internal/mint-guest-desktop.md`](../../docs/internal/mint-guest-desktop.md).

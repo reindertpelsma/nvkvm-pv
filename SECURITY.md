@@ -77,9 +77,9 @@ the audit rather than quietly dropped.
   back to UID separation — a weaker inner boundary than the namespaced sandbox.
   Do not read that as "containers are the less safe option", because of what the
   isolate does *not* cover: it sandboxes the **stub**, not the VMM. QEMU runs on
-  the host unconfined, and **eleven of the nineteen findings in the boundary
-  audit target the VMM**. On a bare host, that is a landing zone on the host
-  itself. Inside a container, the same paths land in the container, behind a
+  the host unconfined, and **ten of the nineteen findings in the boundary audit
+  name the VMM as their target**, with an eleventh (A-15) naming the host
+  directly. On a bare host, that is a landing zone on the host itself. Inside a container, the same paths land in the container, behind a
   boundary that is not our code and is scrutinised far more heavily than ours.
   So the container trades a weaker boundary we wrote for a stronger one we did
   not, and it covers the component our own sandbox leaves exposed. A minimal
@@ -88,6 +88,30 @@ the audit rather than quietly dropped.
 - **Enforcement is per-ioctl and hand-written**, not categorical. It is audited
   but not complete, and a new ioctl added without its validation is the most
   likely way a hole appears.
+
+## The rule we hold ourselves to on the allowlists
+
+Nine default-deny gates stand between a guest ioctl and the host driver — six
+static tables and three code checks, listed in the order an ioctl meets them in
+[Allowlists](docs/reference/allowlists.md). They are the part of this design
+doing the most security work, so:
+
+**Do not widen the control or NVKMS allowlist to make something work.** Widening
+is the fastest-looking fix and almost never the right one. Two worked examples:
+the NVIDIA DDX stops on a denied `NVKMS_IOCTL_DECLARE_EVENT_INTEREST`, and
+allowing it only walks the DDX one rung further down a ladder that ends at the
+*host's* physical monitors — the honest answer is a virtual NVKMS, not a wider
+gate. Separately, an allowlist entry (`0x3d08`) was measured against the NCCL
+shared-memory failure and **did not fix it**; the real bug was a missing fd
+translation, and the widening was reverted rather than kept "in case".
+
+What a legitimate addition looks like is set out in
+[Add a driver version → Expect the allowlist to need an entry](docs/howto/add-a-driver-version.md#6-expect-the-allowlist-to-need-an-entry):
+check what the command is in OGKM at the driver version in question, check its
+params struct for embedded pointers, and check whether an equivalent is already
+allowed under another class id. **An allowlist entry with no handler is worse
+than leaving it out** — `0x70` (`NV_ESC_EXPORT_TO_DMABUF_FD`) was removed from
+the frontend list for exactly that reason.
 
 ## Reporting a vulnerability
 
@@ -105,8 +129,10 @@ otherwise, and publish the finding whether or not there is a fix yet — the aud
 documents above are what that commitment looks like in practice.
 
 If a finding is in NVIDIA's driver rather than in nvkvm, we will say so and
-point you at NVIDIA; several things that looked like nvkvm bugs turned out to
-reproduce identically on bare metal.
+point you at NVIDIA; six things that looked like nvkvm bugs turned out to
+reproduce identically on bare metal. We check that before answering, and it cuts
+both ways — bare metal *passing* is what identified two real bugs of ours. See
+[contributing → check the host](CONTRIBUTING.md#before-you-file-a-bug-check-the-host).
 
 ## Scope of this file
 

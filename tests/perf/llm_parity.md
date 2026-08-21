@@ -11,7 +11,7 @@ on a 7B, not a serving stack, and were not re-run on this driver.
 
 Two things had to be fixed before vLLM would start in the guest at all, and one
 of them is a real forwarder limitation. Both are documented below — see
-[Blockers](#blockers-found-standing-this-up). Read that section before quoting
+[Blockers](#5-blockers-found-standing-this-up). Read that section before quoting
 the throughput table: the guest numbers were taken with vLLM's pinned host
 buffers disabled *on both sides*, because the guest cannot allocate them.
 
@@ -236,7 +236,7 @@ paid once at startup instead of per token.
 
 > **RESOLVED (2026-08-17, branch `fix-pin-cap`).** The cap is gone and stock,
 > unmodified vLLM now starts in the guest with pinned buffers enabled. Jump to
-> [5a-fix](#5a-fix--cap-removed) for the before/after measurements. The
+> [5a-fix](#5a-fix-cap-removed--stock-vllm-starts-with-pinned-buffers-enabled) for the before/after measurements. The
 > `CUDA_ERROR_INVALID_VALUE` loose end flagged at the bottom of this section is
 > also root-caused there — it was a *second*, separate limit, not noise.
 >

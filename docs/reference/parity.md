@@ -1,7 +1,10 @@
 # Reading the parity numbers
 
 The README quotes host/guest ratios for several cards. This page explains what
-those measurements do and do not establish, and why they differ between GPUs.
+those measurements do and do not establish, why they differ between GPUs, and
+which of them are bare metal on both sides. If you are here to check one number,
+the four Geekbench rows below are the only ones you can verify without trusting
+us.
 
 ## Where the numbers come from
 
@@ -85,3 +88,38 @@ measurement noise, not a speedup.
 
 So the number that matters depends on what you run. A serving stack sees ~1.00x.
 An interactive single-stream chat loop in eager mode sees the control path.
+
+## Multi-GPU tensor-parallel serving
+
+This is the one shape where the honest number is neither ~1.00x nor a control-path
+story, and it is also the row that has been quoted wrongly the most.
+
+| measurement | host | guest | ratio |
+|---|---|---|---|
+| vLLM TP=6, 6x RTX A4000, SHM transport on both sides | 163.57 | 140.15 tok/s | **~0.86x** |
+| world=6 all-reduce, 64 MiB sustained, guest aggregate payload | — | 1.52 GB/s | — |
+
+**The older 0.12–0.37x figures are superseded and should not be quoted.** They
+were measured with `NCCL_SHM_DISABLE=1`, which was a *workaround*, not a
+setting: NCCL's shared-memory transport failed in the guest inside
+`cuMemImportFromShareableHandle`, so every world≥2 job needed it and the host's
+fastest path was simply unavailable. That bug was fixed on 2026-08-21 — the CUDA
+VMM shareable-handle fd is now brokered across isolates — and NCCL world=6
+passes in the guest with **default settings**. The workaround hurt the guest far
+worse than the host (host 115.7 → 47.9 tok/s without SHM; guest → 10.0), which
+is why removing it moves the end-to-end ratio so much further than it moves
+collective bandwidth (0.83 → 1.52 GB/s, roughly double).
+
+Two caveats, both load-bearing:
+
+- That is **one** datapoint, not a re-measured matrix. TP=1/2/4 scaling on the
+  fixed stack has not been measured.
+- In that run the **generated-text hashes differed between host and guest**,
+  where the earlier `NCCL_SHM_DISABLE=1` comparison had been byte-identical.
+  That is plausibly reduction-order nondeterminism in tensor-parallel
+  collectives, which is common and not specific to nvkvm — but it has not been
+  shown either way, so **output parity on this path is not claimed**.
+
+Single-GPU serving is unaffected by any of this. Mechanism and the fd-brokering
+fix: [cross-isolate sharing](../internal/cross-isolate-sharing.md); the raw runs
+are in [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md).

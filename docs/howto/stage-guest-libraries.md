@@ -99,8 +99,8 @@ Two destination directories, and both must match
 | `/usr/lib/x86_64-linux-gnu` | NVML for `nvidia-smi`, the GL/EGL/Vulkan stack, the GBM backend |
 | `/usr/local/nvidia-guest/lib` | `libcuda`, `libnvidia-allocator`, `libnvidia-ptxjitcompiler`, `libnvidia-nvvm` — ahead of the system dir on the loader path via `/etc/ld.so.conf.d/nvidia-guest.conf` |
 
-It also writes four configuration files that are as load-bearing as the
-libraries:
+It writes four vendor/loader configuration files that are as load-bearing as the
+libraries (a fifth, `/etc/X11/xorg.conf`, is covered below):
 
 | file | why |
 |---|---|
@@ -115,6 +115,24 @@ and one symlink that is easy to miss: `$SYS/gbm/nvidia-drm_gbm.so` →
 NVIDIA backend *is* `libnvidia-allocator`. Without it, `gbm_create_device()` on
 card0 returns a Mesa "dri" device and the NVIDIA EGL platform never gets a
 chance.
+
+It also installs the guest's **X configuration**, which is deliberate scope
+rather than an afterthought: `/etc/X11/xorg.conf`, copied from
+[`data/xorg/nvkvm-xorg.conf`](../../data/xorg/nvkvm-xorg.conf) with the `BusID`
+rewritten to the address nvkvm's device actually has in *your* guest
+(`scripts/stage_guest_libs.sh:405-440`). A stock distro left alone picks one of
+the two X paths that cannot work on the nvkvm head; this file names the third,
+which does.
+
+| | |
+|---|---|
+| it will not overwrite an `xorg.conf` you wrote | it recognises its own file by the `nvkvm-xorg.conf` marker on line 1, and otherwise prints what to merge |
+| it must be `/etc/X11/xorg.conf`, not an `xorg.conf.d` drop-in | with a drop-in the NVIDIA package's `OutputClass` still matches, Xorg tries the DDX first, and the server exits rather than falling through |
+| to skip it entirely | `NVKVM_STAGE_XORG=0 sudo -E bash .../stage_guest_libs.sh` |
+
+Why that file is the working path, and what is genuinely unavailable without
+NVIDIA's own X driver:
+[the guest's own Xorg session](run.md#the-guests-own-xorg-session-a-stock-distro-desktop).
 
 Finally it blacklists `nouveau` (`:328-333`) — the emulated `nvkvm-gpu` PCI
 device has no BARs, so nouveau auto-binding to it can only fail and make noise.
@@ -244,7 +262,7 @@ says `llvmpipe`.
 **So: always pair a capture with the client's renderer string.** Staging the
 external platform is necessary for GPU-accelerated Wayland clients; it has not
 by itself been shown sufficient. See
-[Known limitations](../internal/known-limitations.md#gl-clients-under-wayland-render-on-the-gpu-but-present-nothing--open).
+[Known limitations](../internal/known-limitations.md#gl-clients-under-wayland-presented-nothing--two-root-causes-fixed-2026-08-19).
 
 ## What each library is for
 
@@ -262,6 +280,9 @@ by itself been shown sufficient. See
 | `libnvidia-cfg` | system | device configuration queries |
 | `libnvidia-egl-wayland`, `libnvidia-egl-gbm` | system, own version | Wayland/GBM clients fall back to software, silently |
 
-Staging `libnvidia-encode` and `libnvcuvid` makes the encoder *loadable*. It
-does not make it work — see
-[Known limitations](../internal/known-limitations.md#nvenc-does-not-work-in-the-guest-on-5755103--open).
+Staging `libnvidia-encode` and `libnvcuvid` makes the encoder *loadable*. That
+is not the same as making it work: an `h264_nvenc` hang was recorded on driver
+575.51.03 and then **did not reproduce** on a re-test on the same driver, which
+is neither a fix nor a retraction. Read
+[Known limitations](../internal/known-limitations.md#nvenc--the-5755103-hang-did-not-reproduce-2026-08-20)
+before relying on hardware encode in a guest.

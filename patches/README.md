@@ -7,7 +7,7 @@ edited.
 
 They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
-A reader deciding whether to trust this can read four diffs; a maintainer
+A reader deciding whether to trust this can read five diffs; a maintainer
 bumping the QEMU version resolves conflicts with ordinary tools instead of
 rewriting editing logic; and "is it already applied?" is answered by
 `git apply --reverse --check` rather than by grepping the tree for a comment

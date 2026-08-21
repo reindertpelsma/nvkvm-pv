@@ -862,11 +862,15 @@ ioctl_on_isolate: cmd=0xc020464f  ret=0  nvstatus=0x57   NV_ESC_RM_UNMAP_MEMORY 
 Vulkan failure, though at a different call site. The driver is reached and
 answers; nvkvm is not refusing anything.
 
-> **Note added 2026-08-21.** The shared status code is a coincidence, not a
-> shared cause. The Hopper Vulkan failure turned out to be a defect in the
-> 570.124.06 driver branch — the same nvkvm tree that measured it passes on
-> 580.126.09 — so do not treat these two `0x57`s as one bug. See
-> [correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
+> **Note added 2026-08-21, corrected.** The shared status code is a
+> coincidence, not a shared cause — that conclusion still holds, but the reason
+> first given for it does not. ~~The Hopper Vulkan failure turned out to be a
+> defect in the 570.124.06 driver branch.~~ It was **ours**: `HOPPER_USERMODE_A`
+> (`0xc661`) had no alloc-param size entry, so nvkvm forwarded a NULL parameter
+> block and RM built the usermode aperture from defaults. The 570-branch-driver
+> account was reached by elimination on a box that could not exhibit the bug.
+> Do not treat these two `0x57`s as one bug. See
+> [correctness.md](../reference/correctness.md#vulkan-compute-on-hopper--root-caused-it-was-ours-and-it-was-never-a-driver-bug).
 
 Note the ordering: a FREE immediately
 followed by an UNMAP of what looks like the same object.

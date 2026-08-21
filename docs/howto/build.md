@@ -12,9 +12,10 @@ Steps 1 and 2 are one script. Step 3 is done by cloud-init on first guest boot.
 
 The QEMU delta is a **patch series** in [`patches/`](../../patches/) plus a file
 copy, so `scripts/build_qemu.sh` is a convenience and not the only path —
-[Building from scratch, by hand](#building-from-scratch-by-hand) is the same
-sequence as commands you can type. [What this does to
-QEMU](#what-this-does-to-qemu) is the whole surface in one table.
+[Building without the script](#building-without-the-script) is the same
+sequence as commands you can type, and
+[`patches/README.md`](../../patches/README.md) is the whole upstream surface in
+one table: five patches, 94 added lines and 2 removed, against `v9.2.0`.
 
 ## You may not need to build this
 
@@ -377,35 +378,78 @@ sudo insmod nvkvm-guest.ko
 
 ## Tests
 
+### The four gates that need no GPU
+
+These are what CI runs on every push
+([`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)), and the same
+four commands run locally. Run all four before claiming a change is done — a
+targeted fix here once silently regressed 27 unrelated probes.
+
+| gate | command | what it catches |
+|---|---|---|
+| unit suite | `bash tests/unit/run_tests.sh` | a suite that fails, **and** a suite that silently stops running |
+| QEMU compile check | `bash tests/qemu_syntax_check.sh` and `CC=gcc-14 bash tests/qemu_syntax_check.sh` | build breakage in `src/qemu/` without a 20-minute QEMU build |
+| ABI parity | `cd tests/abi_parity && go test -count=1 ./...` | a profile row or selector boundary that disagrees with the C structs |
+| shellcheck | `docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 -S warning scripts/*.sh tests/qemu_syntax_check.sh tests/unit/run_tests.sh` | a quoting bug that would fail at hour three of a paid sweep |
+
+The GPU is deliberately absent: GitHub-hosted runners have no NVIDIA device, so
+`tests/validate.sh` cannot run there. Hardware coverage comes from
+`scripts/sweep_matrix.py` against rented boxes.
+
 **Unit tests** — host, no GPU, no VM. They compile the real QEMU-side sources
 against stub headers in `tests/unit/stubs/`:
 
 ```bash
-cd tests/unit && make && make run
+bash tests/unit/run_tests.sh        # or: make -C tests/unit check
 ```
 
-`tests/unit/Makefile:33` names seven binaries — `test_dispatch test_frontend
-test_handle mock_stub test_isolate test_tables test_open_scm` — but **four of
-them do not currently build**, and because `test_dispatch` is first, a plain
-`make` fails there and produces nothing (verified 2026-08-18, gcc 15.2):
+**Use `run_tests.sh`, not `make run`.** `tests/unit/Makefile:70-77` runs the
+suites raw and exits non-zero *by design*: `test_isolate` fails 5 of its 7 cases
+at runtime — pre-existing API drift between the test and the isolate table,
+documented at `tests/unit/Makefile:65-69` — which makes `make run` useless as a
+pass/fail signal. `run_tests.sh` names those five explicitly and is green when
+exactly those fail.
 
-| target | state |
+It is also stricter than `make` in the way that matters. `make` aborts on the
+first error, so on 2026-08-20 a `test_isolate` link failure meant `test_tables`
+and `test_open_scm` were never built and **26 passing assertions silently
+stopped running**, with nothing saying so. `run_tests.sh` builds with `make -k`,
+then requires every expected binary to exist and every suite to report its
+pinned assertion count (`tests/unit/run_tests.sh:1-33`).
+
+Eight binaries, all of which build (`tests/unit/Makefile:39`):
+
+| suite | pinned expectation |
 |---|---|
-| `test_dispatch` | **compile error** — declares `nvkvm_ioctl_expected_param_size` with one parameter at `:98` against the two-parameter declaration it already included from `virtio_nvgpu.h:369`; *conflicting types* |
-| `test_frontend`, `test_handle` | **link error** — `nvkvm_debug_enabled`, defined only in `src/qemu/virtio_nvgpu.c:1095`, is in no unit-test source list |
-| `test_isolate` | **compile error** — needs `-D_GNU_SOURCE` for `CLONE_NEWUSER` (the Makefile passes it only to `test_tables`/`test_open_scm`); with it added, **link error** on `nvkvm_debug_enabled`, `nvkvm_gpa_to_vmm_va`, `nvkvm_sparse_gpa_alloc`, `nvkvm_sparse_gpa_free`, `nvkvm_virtio_push_evt` |
-| `mock_stub`, `test_tables`, `test_open_scm` | build and run |
+| `test_dispatch` | 39/39 |
+| `test_tables` | 17/17 |
+| `test_handle` | 9/9 |
+| `test_frontend` | 8/8 |
+| `test_open_scm` | prints `ALL OPEN_SCM TESTS PASSED` |
+| `test_ctrl_gate` | prints `test_ctrl_gate: PASS` |
+| `test_isolate` | 7 cases run, exactly 5 known-failing |
+| `mock_stub` | not a suite — the fake isolate `test_isolate` spawns |
 
-Do not read "unit tests" as covering the dispatch, frontend, handle or isolate
-code today. `test_dispatch` additionally targets `src/qemu/nvkvm_dispatch.c`,
-which is dead code (see
+If you add cases, bump the count in `run_tests.sh`; that one-line diff is the
+point of pinning them. If one of the five known-failing isolate cases starts
+passing, the suite also goes red — that means the drift got fixed and the file
+needs updating, not that the test is wrong.
+
+`test_dispatch` targets `src/qemu/nvkvm_dispatch.c`, which is dead code (see
 [the pointer audit](../internal/audit-guest-pointers.md), section 2).
 
 **ABI parity** — host, needs Go with cgo:
 
 ```bash
-cd tests/abi_parity && go test -v ./...
+cd tests/abi_parity && go test -count=1 ./...
 ```
+
+**`-count=1` is mandatory.** Go's build cache does track the cgo-included
+header, but the *test-result* cache is keyed on the test binary, so a plain
+`go test` after editing `src/common/nvkvm_abi.h` can replay a stale pass — which
+would make the gate worthless in exactly the situation it exists for. Observed:
+breaking the 610 bucket and re-running `go test` reported `ok`; `-count=1`
+failed correctly.
 
 It asserts compiled-in struct sizes against hardcoded expectations sourced from
 gVisor `pkg/abi/nvgpu` and OGKM `nvos.h`. Nine tests across two files. Six in
