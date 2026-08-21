@@ -308,3 +308,76 @@ verification of A-12/15/17/18 and the vendor driver for P-2 and P-5.
 `src/guest/nvkvm_mmap.c` (guest process → guest kernel got only a shallow pass),
 `nvkvm_present_egl.c` beyond the fd-close idiom, and the UVM descriptor table.
 **Nothing was executed** — static analysis throughout.
+
+---
+
+## Addendum, 2026-08-21 (evening) — found by RUNNING the tests, not reading them
+
+The audit above was static throughout ("Nothing was executed"). Running
+`tests/unit/test_isolate` under strace turned up two things static reading had
+missed, and one of them is a live production bug. Both were sitting behind a
+comment that asserted the failing tests were "API drift ... the test and the
+isolate table disagree about what isolate id gets handed back", which is not
+true and is what kept anyone from looking.
+
+### P-13 — the isolate child could fexecve its own command socket  (FIXED)
+
+`open()` and `memfd_create()` return the lowest free descriptor. When QEMU runs
+with **stdin closed** that is fd 0, and the child's next statement is
+`dup2(sv[1], STDIN_FILENO)` — which destroys the image descriptor before it is
+parked at fd 3. The child then `dup2(binfd /* now the socket */, 3)` and
+`fexecve`s fd 3, i.e. it attempts to execute the AF_UNIX command socket.
+
+Measured:
+
+```
+openat(".../mock_stub", O_RDONLY|O_CLOEXEC) = 0
+dup2(4, 0)                                 = 0
+dup2(0, 3)                                 = 3
+execveat(3, "", [...], AT_EMPTY_PATH)      = -1 EACCES
+```
+
+Present in **both** spawn paths (embedded-memfd and on-disk `NVKVM_STUB_PATH`).
+
+It fails **closed** — exec fails, the child `_exit(127)`s, no stub ever runs —
+so this is availability, not escape. But it takes out every isolate on any host
+whose QEMU was started with fd 0 closed, which is an ordinary thing for a
+supervisor to do, and it is silent: the parent only sees the socket close.
+
+Fixed by relocating the descriptor clear of stdio before stdin is rewired. The
+guard is a no-op whenever `open()` returns >= 3, which is every ordinary run.
+
+### P-14 — ring-setup failure does not degrade the way the comment claims  (OPEN)
+
+`nvkvm_isolate_create()` says of the command-buffer ring:
+
+> Pure optimisation: failure is logged and ignored — the isolate keeps serving
+> every ioctl over the existing IOCTL/MMAP path.
+
+That holds for the early returns (`-EINVAL`, `-errno` from `memfd_create` /
+`ftruncate`). It does **not** hold for the case where the stub simply never
+answers: `nvkvm_isolate_ring_setup()` reaches `sync_sendmsg_recv()`, the wait
+times out, and the timeout path declares the whole isolate dead ("sync
+fd-passing command never answered"). The isolate is gone before the "falling
+back to the socket path" line is even logged, and every later ioctl returns
+`-ENOENT`.
+
+Latent in production, because the real stub always answers. It matters because
+the graceful-degradation property is stated in a comment and relied on, and a
+stub that is merely slow or wedged at ring setup loses its isolate outright
+rather than falling back. Not fixed here: whether the right answer is "don't
+declare dead on a ring-setup timeout" or "ring setup should not use the shared
+sync path" is a design call, not a pre-release patch.
+
+### Method note
+
+Both findings came from `strace -f` on an existing test that had been red for
+long enough to become scenery. Two of the three faults stacked underneath it
+were test-only (a dynamically linked mock that cannot exec after `pivot_root`,
+and a mock that predates `ISOLATE_CMD_SETUP_RING` and answered it with silence);
+the third was real. A permanently-red test with a confident-sounding
+explanation is worse than a red test with no explanation.
+
+Four isolate cases remain failing and are **not** explained: the isolate reports
+itself not-alive by the time the ioctl is issued, and its stub sees EOF
+immediately after exec rather than any command. That is still open.
