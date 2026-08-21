@@ -39,20 +39,82 @@
  *     to that pair so much as its replacement;
  *   - denying it returns -EACCES/NV_ERR_NOT_SUPPORTED and the ICD responds by
  *     unregistering the surface and declaring every format unrenderable.
- * It is NOT named here because it cannot be: the DKMS tree ships only
- * nvidia-modeset/nvkms-ioctl.h (the wrapper), and the NvKmsIoctlCommand enum
- * that would name 60 is not in any shipped header.  Treat it exactly like
- * 61/62 — required in practice, unaudited in principle — and name it against
- * nvkms-api.h if that enum ever becomes available.
+ * 2026-08-21 — the cmdTypes ARE nameable, and now are.  The DKMS tree ships
+ * only nvidia-modeset/nvkms-ioctl.h (the wrapper), which is why the numbers sat
+ * unnamed here — but NVIDIA/open-gpu-kernel-modules carries the
+ * NvKmsIoctlCommand enum at src/nvidia-modeset/interface/nvkms-api.h, tagged per
+ * driver release, and it is a plain unvalued enum so position IS the wire value.
+ * Read off the 575.51.03 tag:
+ *
+ *     60 = NVKMS_IOCTL_SET_FLIPLOCK_GROUP
+ *     61 = NVKMS_IOCTL_ENABLE_VBLANK_SEM_CONTROL
+ *     62 = NVKMS_IOCTL_DISABLE_VBLANK_SEM_CONTROL
+ *
+ * So 61/62 are not "query-class" as guessed above; they bracket a vblank
+ * semaphore control around a registered surface, which is consistent with where
+ * they land in the observed 0/17/60/18 (and 17/61/18/62) sequences.  Re-read the
+ * enum at the matching tag before trusting these on a new branch: it grows by
+ * APPENDING, so old values are stable, but a number seen on 610 may simply not
+ * exist on 575.
+ *
+ * WHAT IS DELIBERATELY *NOT* HERE, and why (2026-08-21)
+ * ----------------------------------------------------
+ * cmdType 33 = NVKMS_IOCTL_DECLARE_EVENT_INTEREST is the first NVKMS command
+ * the NVIDIA Xorg DDX issues, and denying it is exactly what stops the DDX:
+ * it opens /dev/nvidia-modeset, gets -EACCES on this one call, closes the fd
+ * and prints "Failed to select a display subsystem".  Adding 33 is therefore
+ * tempting and is still WRONG, because it does not make the DDX work — it
+ * moves the failure one rung down a ladder that ends somewhere we cannot go.
+ * Measured on an RTX 3070 / 575.51.03 by widening the list one cmdType at a
+ * time:
+ *
+ *     33 DECLARE_EVENT_INTEREST            -> then wants
+ *      0 ALLOC_DEVICE (already allowed; succeeds) -> then wants
+ *      2 QUERY_DISP                        -> then wants
+ *      3 QUERY_CONNECTOR_STATIC_DATA x6      (one per HOST connector)
+ *      5 QUERY_DPY_STATIC_DATA             -> ...
+ *
+ * i.e. the DDX is walking the *host's* physical display topology, because the
+ * host's NVKMS is the only display subsystem behind this device.  That is the
+ * architectural boundary, not an allowlist entry short of working.  A guest DDX
+ * can only be satisfied by a virtual NVKMS that answers with nvkvm's own head,
+ * never by forwarding further.  See docs/internal/mint-guest-desktop.md for the
+ * full ladder and the log excerpts.
  */
 #ifndef NVKVM_NVKMS_ALLOWLIST_H
 #define NVKVM_NVKMS_ALLOWLIST_H
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
+
+/* Investigation escape hatch, OFF unless the env var is set, and never a
+ * default: NVKVM_NVKMS_EXTRA_ALLOW="33,34" widens the list for one QEMU run.
+ * It exists because the list above is a live capture that expires with every
+ * driver branch (see the 2026-08-17 note), and bisecting which cmdType a new
+ * client needs otherwise means a QEMU rebuild per guess.  Anything learned
+ * this way belongs in the switch below, named, not left to the env var. */
+static inline bool nvkvm_nvkms_extra_allow(uint32_t cmd_type)
+{
+	const char *s = getenv("NVKVM_NVKMS_EXTRA_ALLOW");
+	if (!s)
+		return false;
+	while (*s) {
+		char *end;
+		unsigned long v = strtoul(s, &end, 0);
+		if (end == s)
+			break;
+		if ((uint32_t)v == cmd_type)
+			return true;
+		s = (*end == ',') ? end + 1 : end;
+	}
+	return false;
+}
 
 static inline bool nvkvm_nvkms_cmd_allowed(uint32_t cmd_type)
 {
+	if (nvkvm_nvkms_extra_allow(cmd_type))
+		return true;
 	switch (cmd_type) {
 	case 0:   /* NVKMS_IOCTL_ALLOC_DEVICE      */
 	case 1:   /* NVKMS_IOCTL_FREE_DEVICE       */

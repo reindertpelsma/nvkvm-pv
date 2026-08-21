@@ -4,8 +4,13 @@ Status: **the real Mint Cinnamon desktop runs, accelerated, unattended.**
 Cinnamon's own X11 session — panel, menu, wallpaper, the lot — inside a rootful
 Xwayland hosted by weston on the nvkvm KMS head.  See "The Mint desktop" below.
 
-What does *not* work is Mint booting into that desktop entirely on its own via
-Xorg, and this file records exactly why, with the host checked as a control in
+A stock distro **does** now boot into its own Xorg session on the nvkvm head —
+`modesetting` with `Option "AccelMethod" "none"`, GL clients accelerated on
+NVIDIA through render offload (`data/xorg/nvkvm-xorg.conf`).  What still does
+not work is the **NVIDIA DDX**, and as of 2026-08-21 we know exactly why and
+exactly why it is not a one-line fix: see
+["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command)
+below.  This file records the whole trail, with the host checked as a control in
 every case.
 
 ### A correction, because the earlier phrasing here was wrong
@@ -112,7 +117,13 @@ Also observed, not yet chased: `cinnamon --wayland --nested` inside weston
 starts fully (applets load, no GL errors in its log) but its window renders
 solid black.
 
-## The native-Xorg glamor failure (unchanged, still open)
+## The native-Xorg glamor failure (unchanged, still open — but routed around)
+
+> `Option "AccelMethod" "none"` sidesteps this entirely and gives a working X
+> session with NVIDIA-accelerated clients; see
+> ["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command).
+> The glamor call itself is still unusable, and still unusable on bare metal.
+
 
     (EE) modeset(0): Failed to create pixmap
     (EE) Fatal server error:
@@ -186,6 +197,11 @@ in a guest and on real hardware alike.**  It is not the path a stock Mint
 install uses on an NVIDIA card either.
 
 ## The NVIDIA DDX — how far it gets, and the exact gap
+
+> **Superseded.**  "The gap is PCI BARs" below was true of the *first* wall and
+> `fake-bars` removed it.  The real blocker is one denied NVKMS command; see
+> ["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command).
+
 
 The path a real NVIDIA box uses is the NVIDIA DDX.  Neither `nvidia_drv.so` nor
 `libglxserver_nvidia.so` was ever staged into the guest; both exist on the host
@@ -442,7 +458,165 @@ true, and the zero-MMIO measurement above is evidence nothing tried to use one.
 0 SKIP with `fake-bars` off (and no `resourceN` files), and 28 PASS / 0 FAIL /
 0 SKIP with it on.
 
-## HANDOFF: the NVIDIA DDX, where it stops, and the next experiment
+## RESOLVED (2026-08-21): the DDX stops on ONE denied NVKMS command
+
+Measured on a rented headless RTX 3070 box, host driver 575.51.03, guest Ubuntu
+24.04 cloud image, `NVKVM_FAKE_BARS=1`, with the bare-metal host of the same box
+as the control.  The handoff below this section is kept for the trail it
+records; the parts of it that are now **wrong** are called out inline.
+
+### The mechanism, in three syscalls
+
+With `fake-bars`, the guest DDX and the bare-metal DDX are byte-identical
+through the entire RM conversation — every `TRACE ALLOC` / `TRACE CTRL`, same
+handles, same `nvstatus`, same params, right down to the last
+`NV2081_CTRL` call.  Then both open NVKMS, and there the two diverge:
+
+    guest:
+      openat("/dev/nvidia-modeset", O_RDWR|O_CLOEXEC)          = 21
+      ioctl(21, _IOC(_IOC_READ|_IOC_WRITE, 0x6d, 0, 0x10), ..) = -1 EACCES
+      close(21)
+      (EE) NVIDIA(GPU-0): Failed to select a display subsystem.
+      (EE) NVIDIA(0): Failing initialization of X screen
+
+    host (same box, same driver, same config):
+      openat("/dev/nvidia-modeset", O_RDWR|O_CLOEXEC)          = 21
+      ioctl(21, ...)                                           = 0
+      ... proceeds to allocate the channel and its 2D/copy/3D objects,
+          enumerates DFP-0..DFP-5, and the X screen comes up.
+
+The `EACCES` is ours, and QEMU names it:
+
+    nvkvm: DENY nvkms cmdType=33 size=8
+
+`_IOWR('m', 0, 16)` is `NVKMS_IOCTL_CMD`, the single NVKMS wrapper.  Its inner
+`cmdType=33` is **`NVKMS_IOCTL_DECLARE_EVENT_INTEREST`**, and it is not in
+`src/qemu/nvkvm_nvkms_allowlist.h`, which is default-deny.  That one denial is
+the whole of the DDX failure.
+
+### Two corrections to the handoff below
+
+- **"the guest DDX never opens `/dev/nvidia-modeset`" is wrong.**  It opens it,
+  every time, at exactly the same point in the sequence as the host does (right
+  after the `hClass=0x2081` subdevice-diag alloc).  The earlier measurement said
+  zero opens because the trace shim did not log `open()` at all and the
+  open-set was taken with a separate `strace` that was never lined up against
+  the RM log.  `tools/nv_ioctl_trace.c` now logs `open`/`openat` on the driver
+  nodes into the *same* stream as the ioctls, which is what made the ordering
+  readable and the divergence obvious in one pass.
+- **"nvkvm denied it nothing — 4 DENY lines, identical to a plain boot" is
+  wrong**, or rather it was measured on a run that never reached this point.
+  There is exactly one DENY that matters and it is `nvkms cmdType=33`.
+
+The reason the older run stopped earlier is configuration, not driver version:
+with QEMU's default VGA present the emulated Bochs device is the *primary* VGA,
+Xorg makes the NVIDIA device a GPU screen and the failure shape changes.  Pin
+the device explicitly (`BusID "PCI:0:7:0"`, `Driver "nvidia"`, and a `Files`
+section with `ModulePath` pointing at the NVIDIA xorg dir — without that last
+one Xorg silently falls back to `modesetting` and you debug the wrong driver).
+
+### Why allowing cmdType 33 is NOT the fix
+
+Widening the allowlist one cmdType at a time (`NVKVM_NVKMS_EXTRA_ALLOW`, added
+for exactly this) walks the DDX down a ladder:
+
+| allow | DDX then asks for | outcome |
+|---|---|---|
+| — | 33 `DECLARE_EVENT_INTEREST` | DENY → "Failed to select a display subsystem" |
+| 33 | 0 `ALLOC_DEVICE` (already allowed) → 2 `QUERY_DISP` | DENY → same message |
+| 33,2 | 3 `QUERY_CONNECTOR_STATIC_DATA` **x6**, then 5 `QUERY_DPY_STATIC_DATA` | DENY → same message |
+
+Six is the number of connectors on the **host's** RTX 3070 (DFP-0..DFP-5 in the
+host control's Xorg log).  So the DDX is not short one permission; it is walking
+the host's physical display topology, and the next rungs are `QUERY_DPY_*`,
+`VALIDATE_MODE`, `SET_MODE`, `GRAB_OWNERSHIP`.  The escalation was stopped at
+connector enumeration, deliberately, on a box with no display attached.
+
+**That is the architectural answer.**  NVKMS is the only display subsystem the
+NVIDIA DDX knows, and the NVKMS behind this device is the host's — it owns the
+host's heads, not nvkvm's virtual one.  Forwarding further does not give the
+guest a display, it gives the guest *the host's* display.  The DDX can only be
+satisfied by a **virtual NVKMS** that answers `QUERY_DISP` /
+`QUERY_CONNECTOR_STATIC_DATA` with nvkvm's own 1920x1080 head and terminates
+`SET_MODE`/`FLIP` at our KMS pipe.  That is a real piece of work (the NVKMS API
+surface, guest-side, versioned per driver branch) and it is the only shape that
+can work.  `fake-bars` remains correct and remains off by default; it is a
+prerequisite for that future work, not a step toward it on its own.
+
+Note also, and it is not new: **`cmdType 0 = ALLOC_DEVICE` is already allowed
+today** (Vulkan/EGL need it), so a guest can already allocate an NVKMS device on
+the host's display engine.  That was true before this investigation and is
+listed here because the audit note above did not name it.
+
+### And the thing that actually works: `AccelMethod "none"`
+
+The cheap experiment turned out to be the answer to the *user-facing* problem,
+even though it does nothing for the DDX.  A stock `modesetting` screen with
+glamor **disabled** comes up on the nvkvm head, and GL clients on it are
+GPU-accelerated through NVIDIA's own GLX vendor library:
+
+    Section "Device"
+        Identifier  "nvkvm-device"
+        Driver      "modesetting"
+        BusID       "PCI:0:7:0"
+        Option      "AccelMethod" "none"
+    EndSection
+
+(the full file is `data/xorg/nvkvm-xorg.conf`; install it as
+`/etc/X11/xorg.conf` in the guest).  Measured in-guest, RTX 3070:
+
+| checked | result |
+|---|---|
+| `xrandr` | `Virtual-1 connected primary 1920x1080+0+0`, full mode list |
+| `glxinfo -B` default | `llvmpipe`, `Accelerated: no` |
+| `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxinfo -B` | `NVIDIA GeForce RTX 3070/PCIe/SSE2`, `4.6.0 NVIDIA 575.51.03` |
+| `glxgears` on NVIDIA | **~2460 FPS** |
+| `glxgears` on llvmpipe (control) | ~490 FPS |
+| full XFCE4 session (`startxfce4`) | xfwm4 + xfce4-panel + xfdesktop + Thunar running, 30 windows mapped |
+| `glxgears` **inside** that session | `NVIDIA GeForce RTX 3070/PCIe/SSE2`, ~1900 FPS |
+| frames flowing | root-window checksums differ across 3 s, repeatedly |
+
+The 5x gap against llvmpipe is what rules out a silent software fallback; the
+renderer string on its own would not.
+
+Three things about this that matter:
+
+- **It does not need the distro's `10-nvidia.conf` removed.**  An explicit
+  `Device` section outranks `OutputClass` driver selection, so Xorg applies only
+  the vendor snippet's *options* and this file's `Driver` wins.  A drop-in
+  `xorg.conf.d` snippet does **not** work — both OutputClasses apply, Xorg tries
+  the NVIDIA DDX first, it fails the screen, and the server exits rather than
+  falling through to the second.  It has to be `/etc/X11/xorg.conf`.
+- **The X server's own 2D is on the CPU.**  Window moves and Render blits are
+  software.  This is the same bargain a PRIME laptop makes, and the same two
+  environment variables drive it.
+- **`glamor disabled` in the log is the line to check.**  Without
+  `AccelMethod "none"` the same server reaches
+  `glamor X acceleration enabled on NVIDIA GeForce RTX 3070/PCIe/SSE2` and then
+  dies on `(EE) modeset(0): Failed to create pixmap` /
+  `failed to create screen resources` — reconfirmed on 575.51.03, so the glamor
+  finding above is not specific to 595.
+
+### Reproducing any of this
+
+    # host control (safe on a headless box; -novtswitch -sharevts -keeptty)
+    cc -shared -fPIC -o nvtrace.so tools/nv_ioctl_trace.c -ldl
+    LD_PRELOAD=./nvtrace.so NVTRACE_LOG=/root/host-rm.log NVTRACE_ALL=1 \
+        NVTRACE_PARAMS=512 \
+        Xorg :9 -novtswitch -sharevts -keeptty -verbose 6 -logverbose 6 \
+            -logfile /root/host-xorg.log -noreset
+
+    # guest, same command, plus the NVKMS wrapper trace on the QEMU side:
+    NVKVM_NVKMS_TRACE=1 ...  scripts/run_test_vm.sh     # logs every wrapper
+    NVKVM_NVKMS_EXTRA_ALLOW=33,2 ...                    # widen for a bisect only
+
+`NVTRACE_OPENS_ALL=1` widens the shim from the driver nodes to every `open`.
+`NVKVM_NVKMS_EXTRA_ALLOW` is an investigation hatch and must never become a
+default; see the header of `src/qemu/nvkvm_nvkms_allowlist.h`.
+
+---
+
+## HANDOFF (superseded 2026-08-21 by the section above; kept for the trail)
 
 Written for someone picking this up cold, on a different machine. The physical
 box this ran on was handed back, so everything below is what survives.
