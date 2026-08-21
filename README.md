@@ -89,11 +89,25 @@ Not yet for untrusted multi-tenant hosting — see below.
 
 | | |
 |---|---|
-| Host | Linux with KVM, an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
+| Host | Linux with **working KVM** (see below), an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
 | Guest | Linux, kernel 5.15 – 7.0 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
 | Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script |
+
+**Check you can actually use KVM before anything else.** CPU flags do not prove
+it — a container inherits the host's, so `grep vmx /proc/cpuinfo` looks healthy
+inside one that has no `/dev/kvm` at all:
+
+```bash
+ls -l /dev/kvm          # must exist, and you must be able to open it
+systemd-detect-virt     # `kvm`/`none` fine; `docker`/`lxc` means no KVM for you
+```
+
+Without `/dev/kvm`, QEMU silently falls back to software emulation (TCG). It
+will appear to work and be unusably slow, which is the most expensive way to
+find out. Cloud instances, CI runners and containers are the usual places this
+bites; nested VMs need nested virtualisation enabled on the host.
 
 ## Install
 
