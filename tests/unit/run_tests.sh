@@ -16,16 +16,16 @@
 #      every expected binary exists.  A suite that vanishes is a failure, not
 #      a smaller test run.
 #
-#   2. test_isolate fails 4 of its 7 cases at RUNTIME.  That is a real
-#      outstanding defect -- see the long note above ISOLATE_KNOWN_FAIL for what
-#      was diagnosed and what is still open -- not something to "fix" by
-#      deleting the test.  But it makes `make run` exit non-zero BY DESIGN, and
-#      a suite that is red by default is a suite nobody reads.
+#   2. test_isolate used to fail 4 of its 9 cases at RUNTIME.  That was a real
+#      production defect -- see the long note above ISOLATE_KNOWN_FAIL for the
+#      four-deep stack of causes and how each was found -- not something to
+#      "fix" by deleting the test.  All four are fixed as of 2026-08-21;
+#      ISOLATE_KNOWN_FAIL is now EMPTY and must stay that way.  A case that
+#      starts failing again is a regression, and this file is what says so.
 #
 # So the known-failing cases are named here, individually.  The suite is green
-# when exactly those five fail.  It goes red if a sixth one fails, if one of
-# the five starts passing (the drift got fixed -- update this file), if any
-# other suite regresses, or if anything fails to build.
+# when exactly the named set (currently: none) fails.  It goes red if any case
+# fails, if any other suite regresses, or if anything fails to build.
 #
 # The assertion counts are pinned for the same reason as (1): a suite that
 # quietly loses half its cases still exits 0.  If you add tests, bump the
@@ -53,14 +53,15 @@ declare -A MARKER_SUITES=(
     [test_ctrl_gate]="test_ctrl_gate: PASS"
 )
 
-# test_isolate is handled on its own, below.  These four cases are EXPECTED to
-# fail.  The explanation that used to sit here -- "the test and the isolate
-# table disagree about what isolate id gets handed back" -- was wrong, and was
-# hiding a real bug behind a shrug.  What was actually happening, established by
-# strace rather than by reading, was three independent faults stacked on top of
-# each other:
+# test_isolate is handled on its own, below.  NO case is expected to fail any
+# more, which is why ISOLATE_KNOWN_FAIL is empty -- but the list stays, because
+# what it used to hold is the point.  The explanation that sat here for months
+# -- "the test and the isolate table disagree about what isolate id gets handed
+# back" -- was wrong, and a confident wrong explanation is what stopped anyone
+# looking.  What was actually there, established by strace rather than by
+# reading, was FOUR independent faults stacked on top of each other:
 #
-#   1. A PRODUCTION bug, now fixed (see the isolate fd-0 commit).  open() hands
+#   1. A PRODUCTION bug, fixed (see the isolate fd-0 commit).  open() hands
 #      back the lowest free descriptor; with stdin closed that is fd 0, and the
 #      child's next statement, dup2(sv[1], STDIN_FILENO), destroyed the image fd
 #      before it could be parked at fd 3.  The child then fexecve()d the command
@@ -77,15 +78,22 @@ declare -A MARKER_SUITES=(
 #      like an id mismatch.  Fixed by answering RESP_ERROR/ENOSYS, which
 #      satisfies the wait without killing the isolate.
 #
-# Fixing those took the suite from 2/7 to 3/7 and made the remaining failures
-# deterministic (-ENOENT every time, instead of alternating -ECONNRESET/-ENOTSOCK
-# /-ENOENT run to run).  The four below still fail: the isolate reports itself
-# not-alive by the time the ioctl is issued, and its stub receives EOF
-# immediately after exec rather than any command.  That is a REAL remaining
-# defect, not an id disagreement, and nobody has run it to ground yet.  Do not
-# replace this note with a guess.
+#   4. A SECOND production bug, and the one that kept the last four cases red:
+#      nvkvm_isolate_table_init() memset the table to zero and then hand-set
+#      only sock_fd and present_fd to -1.  sync_open_fd was left at 0, and
+#      alloc_isolate_slot() retires a stale descriptor with the usual
+#      `if (fd >= 0) close(fd)` -- so claiming a slot for the FIRST time closed
+#      fd 0.  In this file's own create path that is immediately fatal:
+#      socketpair() runs BEFORE the slot is claimed, so once fd 0 is free the
+#      next isolate's command socket IS fd 0 and claiming the slot closes it.
+#      Measured: sendmsg -> ENOTSOCK on ring setup, then -ENOENT for every
+#      later call.  Fixed by initialising every descriptor field to -1.
+#
+# So the "isolate reports itself not-alive, and its stub sees EOF right after
+# exec" symptom had a mundane cause: QEMU had closed its own end of the socket,
+# by hand, one instruction before it needed it.
 ISOLATE_TOTAL=9
-ISOLATE_KNOWN_FAIL="concurrent_ioctl out_of_order_ioctl sequential_ioctl sync_mmap_munmap"
+ISOLATE_KNOWN_FAIL=""
 
 # Cases that legitimately differ BY ENVIRONMENT, and so cannot be pinned either
 # way.  poll_unpoll passes on a normal host but fails on the GitHub runner: CI
@@ -198,16 +206,21 @@ printf '  compared    : %s\n' "${iso_cmp:-<none>}"
 
 if [ "$iso_cmp" != "$ISOLATE_KNOWN_FAIL" ]; then
     fail "test_isolate's failing set changed."
-    echo "      A case that is failing but not listed is a REGRESSION -- fix it."
-    echo "      A listed case that now passes means the isolate-id drift got"
-    echo "      fixed: drop it from ISOLATE_KNOWN_FAIL in this file so the next"
-    echo "      regression cannot hide behind it."
+    echo "      ISOLATE_KNOWN_FAIL is empty on purpose: every deterministic"
+    echo "      case passes.  A case failing here is a REGRESSION -- fix it."
+    echo "      Do NOT re-add it to the list, and do NOT move it to"
+    echo "      ISOLATE_ENV_DEPENDENT unless you can say what in the"
+    echo "      environment changes the answer."
 fi
 
 echo
 if [ "$rc" -eq 0 ]; then
     echo "UNIT SUITE OK — all 8 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
-    echo "ran with exactly the ${ISOLATE_KNOWN_FAIL// /, } drift failures."
+    if [ -n "$ISOLATE_KNOWN_FAIL" ]; then
+        echo "ran with exactly the ${ISOLATE_KNOWN_FAIL// /, } known failures."
+    else
+        echo "ran with no known failures."
+    fi
 else
     echo "UNIT SUITE FAILED"
 fi

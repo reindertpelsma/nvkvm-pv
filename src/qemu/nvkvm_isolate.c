@@ -1392,7 +1392,30 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t,
 	t->next_id = 1;
 	for (int i = 0; i < NVKVM_ISOLATE_MAX; i++) {
 		struct nvkvm_isolate *iso = &t->isolates[i];
-		iso->sock_fd = -1;
+		/*
+		 * EVERY descriptor field starts at -1, not at the 0 the memset
+		 * above leaves behind.  0 is a perfectly good fd number, and the
+		 * teardown paths in this file are all written as "if (fd >= 0)
+		 * close(fd)" -- so a descriptor field that is still zero because
+		 * nobody ever filled it reads as "I own fd 0" and gets closed.
+		 * alloc_isolate_slot() does exactly that for sync_open_fd on the
+		 * FIRST claim of every slot: it closed QEMU's fd 0 out from under
+		 * whoever actually owned it.  In this file's own create path that
+		 * is immediately fatal, because socketpair() runs before the slot
+		 * is claimed -- once fd 0 is free, the very next isolate's
+		 * command socket IS fd 0, and claiming the slot closes it, so the
+		 * isolate is born with a dead socket (measured: sendmsg ->
+		 * ENOTSOCK, then every later call -ENOENT once the reader's
+		 * recvmsg on the same number fails).  In a real QEMU fd 0 belongs
+		 * to whatever the process was started with -- a monitor chardev,
+		 * a logfile, a migration stream -- and closing it hands that
+		 * number to the next open(), which is a silent cross-wiring, not
+		 * a crash.  Keep this list exhaustive when adding a field.
+		 */
+		iso->sock_fd      = -1;
+		iso->sync_open_fd = -1;
+		iso->ring_memfd   = -1;
+		iso->ring_kvm_slot = -1;
 		pthread_mutex_init(&iso->lock,       NULL);
 		pthread_mutex_init(&iso->write_lock, NULL);
 		pthread_mutex_init(&iso->sync_cmd_lock, NULL);

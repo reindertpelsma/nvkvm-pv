@@ -31,6 +31,9 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 | P-10 | medium–high | liveness ×3 | isolate → VMM | see below |
 | P-11 | medium | struct size disagreement | guest → host | silent wrong answer |
 | P-12 | medium | state reuse | guest process → VM-wide DoS | see below |
+| P-13 | medium | descriptor handling | — (availability) | **fixed** — see addendum |
+| P-14 | medium | design vs documentation | isolate → VMM | **open** — see addendum |
+| P-15 | medium–high | descriptor handling | VMM → VMM's own fds | **fixed** — see addendum |
 
 ---
 
@@ -314,8 +317,8 @@ verification of A-12/15/17/18 and the vendor driver for P-2 and P-5.
 ## Addendum, 2026-08-21 (evening) — found by RUNNING the tests, not reading them
 
 The audit above was static throughout ("Nothing was executed"). Running
-`tests/unit/test_isolate` under strace turned up two things static reading had
-missed, and one of them is a live production bug. Both were sitting behind a
+`tests/unit/test_isolate` under strace turned up three things static reading had
+missed, and **two of them are live production bugs**. All were sitting behind a
 comment that asserted the failing tests were "API drift ... the test and the
 isolate table disagree about what isolate id gets handed back", which is not
 true and is what kept anyone from looking.
@@ -369,15 +372,81 @@ rather than falling back. Not fixed here: whether the right answer is "don't
 declare dead on a ring-setup timeout" or "ring setup should not use the shared
 sync path" is a design call, not a pre-release patch.
 
+### P-15 — creating an isolate close()d file descriptor 0  (FIXED)
+
+This is what the remaining four red cases were, and it is the more serious of
+the two runtime findings.
+
+`nvkvm_isolate_table_init()` `memset`s the whole table to zero and then repairs
+the sentinels by hand:
+
+```c
+memset(t, 0, sizeof(*t));
+...
+iso->sock_fd = -1;
+...
+iso->present_fd = -1;
+```
+
+`sync_open_fd` was not in that list, so it stayed **0**. Every teardown path in
+the file is written as `if (fd >= 0) close(fd)`, and `alloc_isolate_slot()`
+retires the previous occupant's leftovers exactly that way:
+
+```c
+if (iso->sync_open_fd >= 0)
+        close(iso->sync_open_fd);
+```
+
+So the **first** claim of every slot closed fd 0 — a descriptor the isolate
+layer had never owned. `ring_memfd` and `ring_kvm_slot` had the same hole; they
+were unreachable only because `alloc_isolate_slot()` happens to overwrite them
+before anything tests them.
+
+In this file's own create path the consequence is immediate, because
+`socketpair()` runs *before* the slot is claimed. Once fd 0 is free, the next
+isolate's command socket **is** fd 0, and claiming the slot closes it. Measured,
+one isolate after another:
+
+```
+socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC, 0, [0, 3]) = 0
+close(0)                                                    = 0   <-- ours
+memfd_create("nvkvm-ring", MFD_CLOEXEC)                     = 0   <-- reused
+sendmsg(0, {... SETUP_RING ...})  = -1 ENOTSOCK (Socket operation on non-socket)
+recvmsg(0, ...)                   = -1 ENOTSOCK   (the reader thread)
+```
+
+The reader then declares the isolate dead, so every later call returns
+`-ENOENT`, and the stub — whose end of the pair is intact — sits in `recvmsg`
+and sees EOF the moment QEMU exits. That is precisely the "not-alive by the time
+the ioctl is issued / stub sees EOF right after exec" symptom the previous
+addendum could not explain.
+
+Severity in production is the part worth stating plainly. QEMU does not usually
+run with fd 0 free, so the *self*-clobber above is the stdin-closed case again
+(same precondition as P-13). But the close itself is unconditional: on **every**
+host, the first isolate created closes whatever fd 0 is. In a QEMU process fd 0
+is stdin — routinely a monitor chardev, a logfile, or a migration stream wired
+up by libvirt or a supervisor. Closing it does not crash anything; it frees the
+number, and the next `open()` in the process silently inherits it. That is a
+descriptor cross-wiring in a VMM that brokers guest-owned fds for a living, and
+it fails **open**, not closed.
+
+Fixed by initialising every descriptor field to -1 in
+`nvkvm_isolate_table_init()`, with a comment saying why the list has to stay
+exhaustive.
+
 ### Method note
 
-Both findings came from `strace -f` on an existing test that had been red for
-long enough to become scenery. Two of the three faults stacked underneath it
+All three findings came from `strace -f` on an existing test that had been red
+for long enough to become scenery. Two of the four faults stacked underneath it
 were test-only (a dynamically linked mock that cannot exec after `pivot_root`,
 and a mock that predates `ISOLATE_CMD_SETUP_RING` and answered it with silence);
-the third was real. A permanently-red test with a confident-sounding
-explanation is worse than a red test with no explanation.
+the other two were production bugs, P-13 and P-15. A permanently-red test with a
+confident-sounding explanation is worse than a red test with no explanation —
+and the confident explanation here was wrong in a way that took months off the
+clock.
 
-Four isolate cases remain failing and are **not** explained: the isolate reports
-itself not-alive by the time the ioctl is issued, and its stub sees EOF
-immediately after exec rather than any command. That is still open.
+`tests/unit/test_isolate` now passes 9/9, and `ISOLATE_KNOWN_FAIL` in
+`tests/unit/run_tests.sh` is empty. It is the only test in the tree that drives
+a real spawned isolate over the real socket protocol, so it is the only thing
+standing between this code and an untested live path.

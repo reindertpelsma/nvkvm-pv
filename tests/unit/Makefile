@@ -73,13 +73,15 @@ test_ctrl_gate: $(CTRL_GATE_SRCS)
 test_nvkms_allowlist: test_nvkms_allowlist.c ../../src/qemu/nvkvm_nvkms_allowlist.h
 	$(CC) $(CFLAGS) -o $@ test_nvkms_allowlist.c
 
-# NOTE: test_isolate currently fails 4 of its 7 cases at RUNTIME.  It is not a
-# build problem -- all seven binaries compile and the other six suites pass.
-# It is also NOT the "isolate id disagreement" this note used to claim; that
-# guess was masking a real production bug (the child fexecve'd its own command
-# socket when fd 0 was free).  run_tests.sh carries the full diagnosis and the
-# list of what is still genuinely broken.  Until that is run to ground `make
-# run` exits non-zero -- use `make check` / run_tests.sh for a pass/fail signal.
+# NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
+# the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
+# runtime until 2026-08-21, and the note that used to sit here blamed "isolate
+# id disagreement" -- which was wrong, and was masking TWO real production bugs
+# (the child fexecve'd its own command socket when fd 0 was free, and
+# nvkvm_isolate_table_init left sync_open_fd at 0 so claiming a slot close()d
+# fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
+# `make check` / run_tests.sh is still the pass/fail signal, because it also
+# pins the case counts and catches a suite that silently stops building.
 run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist
 	./test_dispatch
 	./test_frontend
@@ -90,12 +92,13 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_ctrl_gate
 	./test_nvkms_allowlist
 
-# `check` is what CI runs, and what you should run too.  `run` above is the
-# raw thing: it exits non-zero because of the test_isolate drift documented
-# there, which makes it useless as a pass/fail signal.  run_tests.sh names the
-# five known-failing cases explicitly, so the suite is GREEN when exactly those
-# fail and RED for anything else -- including a suite that fails to build,
-# which plain `make` hides by aborting on the first error.
+# `check` is what CI runs, and what you should run too.  `run` above is the raw
+# thing: it does not pin the assertion counts, so a suite that quietly loses
+# half its cases still exits 0.  run_tests.sh pins the counts AND names the
+# known-failing isolate cases explicitly (that list is empty now), so the suite
+# is GREEN only when exactly the expected set fails -- and RED for anything
+# else, including a suite that fails to build, which plain `make` hides by
+# aborting on the first error.
 check:
 	@bash run_tests.sh
 
