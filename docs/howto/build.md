@@ -15,7 +15,7 @@ copy, so `scripts/build_qemu.sh` is a convenience and not the only path —
 [Building without the script](#building-without-the-script) is the same
 sequence as commands you can type, and
 [`patches/README.md`](../../patches/README.md) is the whole upstream surface in
-one table: seven patches, 236 added lines and 15 removed, against `v9.2.0`.
+one table: nine patches, 631 added lines and 15 removed, against `v9.2.0`.
 
 ## You may not need to build this
 

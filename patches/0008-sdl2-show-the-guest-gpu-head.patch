@@ -3,11 +3,14 @@ From: Reindert Pelsma <reindert.pelsma@gmail.com>
 Date: Thu, 21 Aug 2026 12:00:00 +0200
 Subject: [PATCH] ui/sdl2: show the guest's GPU head
 
-*** THIS PATCH HAS NOT BEEN SEEN TO WORK.  It builds --enable-sdl with no
-*** new warnings and that is all: this machine has no GPU and no display,
-*** so no window was opened, no frame was presented and nothing was
-*** looked at.  "How to actually verify" is at the bottom.  It is on
-*** gpu-untested for that reason.
+*** RUN ON REAL HARDWARE, ONCE.  What was measured and what was not is
+*** under "WHAT THE HARDWARE SAID" below; read that before trusting any
+*** of this.  The short version: the dma-buf reaches SDL's window and the
+*** guest is usable, but the last link -- the pixels themselves -- was
+*** confirmed by a person looking at the screen and by nothing
+*** reproducible.  It stays on gpu-untested for that reason, and because
+*** the same session reported the result as "works, but slow" (see "IF IT
+*** IS SLOW").
 
 `-display sdl,gl=on` never showed the guest.  With the default consoles the
 window showed the black boot VGA; with `-vga none` it showed
@@ -121,9 +124,101 @@ HOW TO ACTUALLY VERIFY, on a machine with an NVIDIA GPU and a display:
   * GTK must be unchanged: VM_DISPLAY="gtk,gl=on" still shows the desktop and
     still logs 0005's "switched window to console page 1" exactly once.
 
-NOT UPSTREAMABLE AS WRITTEN.  Items 1-3 above are plain upstream gaps and the
-fixes for them belong in qemu-devel roughly as they stand -- ui/sdl2.c is the
-only remaining front end with a GL context and no dma-buf scanout.  The raise
+WHAT THE HARDWARE SAID.  One session on an RTX 4070, driver 595.84, host
+session GNOME on WAYLAND, Mint 22.3 guest, `-display sdl,gl=on`.
+
+MEASURED:
+  * builds: NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force ran end to end, the
+    patch log reads "applied: 0008-sdl2-show-the-guest-gpu-head.patch", and
+    ui_sdl2.c.o, ui_sdl2-gl.c.o, ui_sdl2-2d.c.o and ui_sdl2-input.c.o all
+    compiled with no warning or error mentioning sdl2;
+  * NVKVM_PRESENT_MODE=gl -- the dma-buf path this patch is really about --
+    logs "nvkvm present: window mode=GL-zerocopy (console_has_gl=1)" and then
+    "nvkvm: guest display is live -- raised SDL window for console 1".  That
+    second line is emitted at the END of sdl2_gl_scanout_texture(), and in GL
+    mode that function is reachable ONLY from the new sdl2_gl_scanout_dmabuf()
+    and only after egl_dmabuf_import_texture() returned a non-zero texture.  So
+    the guest's dma-buf really was imported on the window's own EGL display and
+    installed as the scanout.  Before this patch dpy_gl_scanout_dmabuf() had no
+    callback to call at all and the frame was discarded inside ui/console.c;
+  * it fires exactly once: `grep -c` over the whole run is 1;
+  * zero lines matching "error" in the run -- in particular no
+    "eglCreateImageKHR failed", which is what a failed import prints;
+  * SDL was a genuine Wayland client: the QEMU process held a
+    /memfd:wayland-cursor fd, which only libwayland-cursor creates.  GTK on
+    this same host held zero wayland references, which is the whole reason
+    this backend is worth having;
+  * NVKVM_PRESENT_MODE=readback -- the surface path, the one that could
+    already have worked and therefore the regression check for this patch --
+    also logs the raise line exactly once with no errors, and
+    NVKVM_PRESENT_DUMP wrote a 1920x1080 frame that IS the live Cinnamon
+    desktop (fetched and looked at).  So the console SDL is bound to carries a
+    real desktop, and this patch did not break the path that already worked;
+  * SDL_VIDEODRIVER=x11 SDL_VIDEO_X11_FORCE_EGL=1 reaches the same two log
+    lines, so none of this is Wayland-specific.
+
+NOT MEASURED, and the gap is exactly where you would want it not to be:
+  * nothing reproducible ever read the pixels out of the SDL window.  A
+    TEMPORARY debug hook (not part of this patch, and not in this diff) was
+    added to sdl2_gl_scanout_flush() to glReadPixels the back buffer straight
+    after egl_fb_blit().  It logged "window readback 1920x1080" repeatedly and
+    wrote a 6,220,817-byte PPM -- exactly 1920x1080x3 plus header -- and the
+    machine was returned before that file could be fetched.  So the blit ran,
+    onto a correctly sized target, and its output was never seen;
+  * the person at that console reported the guest usable and pointer lock
+    working.  That is the only evidence the window shows the desktop.  It is a
+    report, not a measurement, and it is written down here as one.
+
+IF IT IS SLOW, and that session said it was, look in this order.  None of
+these is a line of code in this patch; the patch only decides whether frames
+arrive at all.
+
+  1. WHICH PRESENT MODE ARE YOU IN.  nvkvm_present_decide_mode() defaults to
+     READBACK unless NVKVM_PRESENT_MODE=gl is in the environment -- it will not
+     guess GL from the render node, deliberately.  Readback does, per frame,
+     glReadPixels of 1920x1080x4 out of the GPU into a CPU DisplaySurface and
+     then surface_gl_update_texture() to push the same 8 MB back in, plus an
+     eglMakeCurrent onto a different EGL display and back.  Two 8 MB copies and
+     a full pipeline stall every frame is a textbook "works but sluggish".
+     CHECK: grep "window mode" in the QEMU log.  If it says readback, relaunch
+     with NVKVM_PRESENT_MODE=gl and compare.  This is the first thing to try
+     and costs nothing.
+  2. PER-FRAME DMA-BUF IMPORT.  nvkvm_present_gl() builds a FRESH QemuDmaBuf
+     every frame, so egl_dmabuf_import_texture() never hits its
+     `texture != 0` early-out: every frame is eglCreateImageKHR +
+     glGenTextures + glEGLImageTargetTexStorageEXT + eglDestroyImageKHR, and
+     sdl2_gl_release_dmabuf() then glDeleteTextures the previous one.  nvkvm's
+     own readback path has a comment saying this exact churn "reliably killed
+     the NVIDIA driver: SIGSEGV inside libnvidia-eglcore ... within ~2 s", and
+     it carries an 8-entry import cache to avoid it.  The zero-copy path has
+     no such cache because it delegates the import to the UI.  ui/gtk.c has
+     the identical shape, so this is not SDL's fault -- but SDL runs with
+     SDL_GL_SetSwapInterval(0), i.e. unthrottled, so it will hit the churn
+     harder.  CHECK: NVKVM_DISP_STATS=1 prints frames/s and present_mean ms.
+     FIX SHAPE: hand the UI a STABLE QemuDmaBuf per guest scanout bo, so the
+     import early-out fires.  nvkvm already has the keying for it
+     (nvkvm_present_cached_tex, keyed on owner + gem handle + geometry).  That
+     fix belongs in hw/misc/nvkvm_present_egl.c and helps GTK too.
+  3. INPUT LATENCY, if "slow" means the mouse feels heavy rather than the
+     picture stuttering.  sdl2_poll_events() runs ONLY from the DCL refresh
+     callback, and ui/sdl2.c flips that callback's update_interval between
+     SDL2_REFRESH_INTERVAL_BUSY (10 ms) and GUI_REFRESH_INTERVAL_DEFAULT
+     (30 ms) on an idle counter.  So relative motion is drained at 33-100 Hz
+     in bursts, whatever rate the compositor delivers it at.  CHECK: evtest in
+     the guest while moving the mouse steadily -- deltas arriving in clumps
+     every 10 or 30 ms is this; smooth ~1 ms spacing is not.
+  4. NOT this patch's per-frame cost.  What 0008 adds to each frame is a
+     pointer test (the ensure-window check), two assignments (the
+     qemu_egl_display borrow) and one already-false branch
+     (nvkvm_sdl2_maybe_raise after it has fired).  The one wasteful line is
+     the SDL_GL_MakeCurrent in sdl2_gl_release_dmabuf(), which is redundant
+     because the context is already current -- worth deleting for tidiness,
+     not a cause of visible slowness.
+
+NOT UPSTREAMABLE AS WRITTEN.  The three gaps listed under WHAT IT ACTUALLY IS
+are plain upstream gaps and the fixes for them belong in qemu-devel roughly as
+they stand -- ui/sdl2.c is the only remaining front end with a GL context and
+no dma-buf scanout.  The raise
 is nvkvm policy ("the interesting console is the one that is not the boot VGA")
 hardcoded into a generic front end, with an nvkvm-branded symbol and log line,
 and would have to become the same dpy_console_request_focus()-shaped mechanism

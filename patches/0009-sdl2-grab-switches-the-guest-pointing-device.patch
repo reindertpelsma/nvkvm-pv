@@ -4,10 +4,11 @@ Date: Thu, 21 Aug 2026 12:05:00 +0200
 Subject: [PATCH] ui/sdl2: make the pointer grab switch the guest's pointing
  device
 
-*** THIS PATCH HAS NOT BEEN SEEN TO WORK.  No grab was taken on this
-*** machine -- it has no display -- no guest saw a delta, and `info mice`
-*** was never run against a QEMU carrying it.  It builds --enable-sdl with
-*** no new warnings and that is all.  It is on gpu-untested for that reason.
+*** RUN ON REAL HARDWARE, ONCE, AND REPORTED WORKING BY THE PERSON AT THE
+*** SCREEN -- but the instrumentation that would have proved it was armed
+*** and never read, because the machine was returned first.  "WHAT THE
+*** HARDWARE SAID" below separates the two.  It stays on gpu-untested
+*** until someone runs the evtest under "How to actually verify".
 
 Separate from patches/0008 on purpose.  0008 makes the guest visible under SDL;
 this makes the grab useful.  Either is worth having without the other, and
@@ -66,6 +67,37 @@ window, not the guest's.  A flag set across our two qemu_mouse_set() calls makes
 the notifier track the mode and skip the side effects; the guest's own mode
 changes still reach it unchanged.  (ui/gtk.c's 0007 gets the same effect from
 ordering against ptr_owner.  SDL has no equivalent state, hence the flag.)
+
+WHAT THE HARDWARE SAID.  Same single session as 0008: RTX 4070, driver 595.84,
+host session GNOME on WAYLAND, Mint 22.3 guest, `-display sdl,gl=on`, with
+virtio-mouse present alongside the tablet.
+
+MEASURED:
+  * builds clean --enable-sdl, no warning or error mentioning sdl2;
+  * `info mice` on the monitor, before any grab:
+        Mouse #2: QEMU PS/2 Mouse
+        Mouse #7: vmmouse (absolute)
+        Mouse #5: QEMU Virtio Mouse
+      * Mouse #4: QEMU Virtio Tablet (absolute)
+    which is exactly the precondition this patch exists for: an ABSOLUTE device
+    current, so sdl_hide_cursor()'s !qemu_input_is_absolute() test is false and
+    SDL_SetRelativeMouseMode() would never be reached.  It also confirms the
+    device the switch must find (#5) is present and not current;
+  * the guest's relative node is /dev/input/event6 ("QEMU Virtio Mouse") and
+    the tablet is event5.  evtest was started on BOTH -- the tablet as well,
+    so that the switch shows up as one going quiet while the other speaks.
+
+NOT MEASURED BY THIS AUTHOR: the evtest output, and `info mice` after a grab.
+The machine was returned before a human took the grab, so the REL_X/REL_Y count
+that patches/0007 asks for still has not been read by anyone.
+
+WHAT THE USER REPORTED: pointer lock works.  That is the outcome 0008 and this
+patch were for.  It is a person's report rather than a measurement -- but it is
+not a weak one, because pointer lock cannot work at all while an absolute
+device is current: SDL never asks the compositor for the lock in that state.  A
+working lock therefore implies the switch happened.  The same session reported
+it as "slow"; the input-latency suspect is item 3 of "IF IT IS SLOW" in
+patches/0008, and it is SDL's poll cadence, not this patch.
 
 Edge cases, none of them measured either:
 

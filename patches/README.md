@@ -22,8 +22,8 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | `0005-gtk-switch-to-guest-display-when-it-goes-live.patch` | `include/ui/gtk.h`, `ui/gtk.c`, `ui/gtk-egl.c`, `ui/gtk-gl-area.c` | switches the GTK window to the guest's head the first time it presents real content, once, and only from the page the window opened on |
 | `0006-gtk-no-implicit-grab-on-click.patch` | `ui/gtk.c` | drops upstream's grab-on-first-left-click, so entering grab mode is Ctrl+Alt+G or the View menu and nothing else |
 | `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | on grab, makes a relative mouse the guest's current device; on ungrab, restores the absolute one. **Not known to work** — see its header |
-| `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. **Not known to work** — see its header |
-| `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. **Not known to work** — see its header |
+| `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
+| `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. Pointer lock was **reported working** on that box; the evtest that would prove it was never read — see its header |
 
 Each patch's commit message says *why* it is there. Read those before changing
 one — several of them record a measurement (a driver version, an error code)
@@ -31,7 +31,7 @@ that is the whole justification for the change.
 
 ## Which of these should stop existing
 
-Six of the nine carry `ui/` changes, and `ui/` is the surface we would most
+Seven of the nine carry `ui/` changes, and `ui/` is the surface we would most
 like to shed — it is generic front-end code, shared with every other QEMU user,
 and the part a reviewer has least reason to trust us with.
 
@@ -62,7 +62,10 @@ so it cannot go as-is; the upstreamable version is a display option
 `0007` and `0009` are the same idea in two front ends, which is itself the
 argument for the upstreamable version: a shared helper in `ui/input.c` that
 expresses "a grab wants a relative device" once, instead of once per backend.
-Neither has been observed working; both headers say so at the top.
+`0007` was tried by hand and did not work — on GTK it cannot, because that
+backend never asks the compositor for a lock. `0009` is the same change where
+the lock is real, and pointer lock was reported working with it in place.
+Neither has an evtest trace behind it; both headers say so at the top.
 
 `0008` is two things wearing one number, and only one of them is ours. Its
 first three parts — SDL had no `dpy_gl_scanout_dmabuf`, nothing on the scanout
@@ -75,6 +78,18 @@ before it could go anywhere.
 
 `0001` and `0002` are downstream by nature: they register a device that is not
 upstream and claim a virtio ID that is not assigned. They will never leave.
+
+## "It works, but it is slow"
+
+The one hardware session with `0008` + `0009` reported the SDL window usable
+and pointer lock working, and also reported it as slow. That is not diagnosed.
+The ranked suspects, the check for each, and the reason none of them is a line
+of code in `0008`, are written out under **IF IT IS SLOW** in
+[`0008-sdl2-show-the-guest-gpu-head.patch`](0008-sdl2-show-the-guest-gpu-head.patch).
+The short version: `nvkvm_present_decide_mode()` defaults to **readback**
+unless `NVKVM_PRESENT_MODE=gl` is in the environment, and readback copies 8 MB
+out of the GPU and 8 MB back into it every frame. Check `grep "window mode"` in
+the QEMU log before looking anywhere else.
 
 ## What is *not* here
 
