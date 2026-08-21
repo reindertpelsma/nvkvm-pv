@@ -180,7 +180,7 @@ cat > /home/$GUEST_USER/run-session.sh <<'RS'
 #   weston                  - bare weston + Xwayland; the control path
 #   cinnamon                - Cinnamon's own Wayland session (crashes, see docs)
 exec > ~/session.log 2>&1
-echo "=== $(date) session: $(cat ~/session-choice 2>/dev/null) ==="
+echo "=== \$(date) session: \$(cat ~/session-choice 2>/dev/null) ==="
 export XDG_SESSION_TYPE=wayland
 
 # Pick the nvkvm card by DRIVER, never by index.  The VM boots with an emulated
@@ -190,12 +190,12 @@ export XDG_SESSION_TYPE=wayland
 # renders with llvmpipe: full speed, correct-looking screenshots, no GPU.
 NVCARD=
 for c in /sys/class/drm/card[0-9]*; do
-    [ -e "$c/device/driver" ] || continue
-    if [ "$(basename "$(readlink -f "$c/device/driver")")" = nvidia ]; then
-        NVCARD=$(basename "$c"); break
+    [ -e "\$c/device/driver" ] || continue
+    if [ "\$(basename "\$(readlink -f "\$c/device/driver")")" = nvidia ]; then
+        NVCARD=\$(basename "\$c"); break
     fi
 done
-echo "nvkvm DRM device: ${NVCARD:-NOT FOUND}"
+echo "nvkvm DRM device: \${NVCARD:-NOT FOUND}"
 
 # --idle-time=0 is load-bearing for an unattended head, and its absence does NOT
 # look like a timeout.  weston's default is 300s of no INPUT -- animating clients
@@ -204,17 +204,17 @@ echo "nvkvm DRM device: ${NVCARD:-NOT FOUND}"
 # holds that last frame forever: screendump returns a plausible desktop that is
 # byte-identical every time and reads exactly like a dead present path.
 start_weston() {
-    weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} --idle-time=0 "$@" &
-    WESTON_PID=$!
-    for _ in $(seq 1 60); do
-        [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/wayland-1" ] && return 0
+    weston --backend=drm \${NVCARD:+--drm-device=\$NVCARD} --idle-time=0 "\$@" &
+    WESTON_PID=\$!
+    for _ in \$(seq 1 60); do
+        [ -S "\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}/wayland-1" ] && return 0
         sleep 0.5
     done
     echo "weston socket never appeared"; return 1
 }
 
-case "$(cat ~/session-choice 2>/dev/null)" in
-  weston)   exec weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} \
+case "\$(cat ~/session-choice 2>/dev/null)" in
+  weston)   exec weston --backend=drm \${NVCARD:+--drm-device=\$NVCARD} \
                         --xwayland --idle-time=0 ;;
   cinnamon) exec cinnamon-session-cinnamon --wayland ;;
   *)
@@ -233,7 +233,7 @@ case "$(cat ~/session-choice 2>/dev/null)" in
     # EGL_NATIVE_PIXMAP_KHR import that Xorg's modesetting+glamor requires.
     start_weston || exit 1
     ~/start-cinnamon-x11.sh &
-    wait $WESTON_PID
+    wait \$WESTON_PID
     ;;
 esac
 RS
