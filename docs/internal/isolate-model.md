@@ -90,7 +90,7 @@ It is embedded in the QEMU binary as a byte array produced by `xxd -i`
 disk (`src/qemu/nvkvm_isolate.c:803-864`). `/usr/lib/nvkvm/nvkvm_stub` is a
 fallback path used only when the embed is absent, and the build script warns at
 length that an accidental fallback is silent
-(`scripts/build_qemu.sh:77-89`).
+(`scripts/build_qemu.sh:212-225`).
 
 **Threading**: one reader thread on the socket, 16 workers
 (`NVKVM_STUB_WORKERS`, `src/stub/nvkvm_stub.c:433`). Non-IOCTL commands run

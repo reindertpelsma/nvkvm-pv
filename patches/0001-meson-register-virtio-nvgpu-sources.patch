@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Fri, 21 Aug 2026 02:31:59 +0200
+Subject: [PATCH] hw/misc: register the virtio-nvgpu sources with meson
+
+nvkvm's device lives in hw/misc/ as eleven .c files copied in from this
+repo's src/qemu/ (see docs/howto/build.md).  Meson has no globbing, so
+the file list has to be written out; this adds it, plus the
+include_directories() entry for hw/misc/nvkvm_inc/, which is where the
+build copies src/abi/*.h and src/common/*.h so the device sources can
+reach the shared ABI headers without reaching outside the QEMU tree.
+
+CONFIG_VIRTIO gates the block because the device is a virtio device: on
+a target built without virtio there is nothing for it to attach to, and
+the sources would not link.
+
+Two things a reader will notice and should not "fix" without thinking:
+
+  * The block lands between the "# HPPA devices" comment and the
+    CONFIG_LASI line it belongs to.  That is an artefact of how the
+    pre-patch-series build script inserted it (before the last non-empty
+    line of the file), preserved here so the patched tree is
+    byte-identical to what that script produced and the migration to a
+    patch series is provably a no-op.  Moving it to the end of the file
+    is a safe follow-up -- do it as its own commit so the diff says so.
+
+  * nvkvm_dispatch.c is in the list but is dead code at runtime (see
+    docs/internal/audit-guest-pointers.md).  It still has to compile and
+    link; dropping it from the build is a separate decision from
+    dropping it from the tree.
+---
+ hw/misc/meson.build | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+index d02d96e..ef97efc 100644
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -151,4 +151,20 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
+ system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
+ 
+ # HPPA devices
++
++nvkvm_inc = include_directories('nvkvm_inc')
++
++system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
++  'virtio_nvgpu.c',
++  'virtio_nvgpu_pci.c',
++  'nvkvm_dispatch.c',
++  'nvkvm_frontend.c',
++  'nvkvm_objects.c',
++  'nvkvm_mmap_host.c',
++  'nvkvm_handle.c',
++  'nvkvm_isolate.c',
++  'nvkvm_isolate_handlers.c',
++  'nvkvm_tables.c',
++  'nvkvm_present_egl.c',
++))
+ system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))

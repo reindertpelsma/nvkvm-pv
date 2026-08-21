@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Fri, 21 Aug 2026 02:32:13 +0200
+Subject: [PATCH] hw/virtio: add virtio-nvgpu to virtio_device_names[]
+
+virtio_id_to_name() asserts
+
+    assert(device_id < G_N_ELEMENTS(virtio_device_names));
+
+and virtio_device_names[] in QEMU 9.2 stops at VIRTIO_ID_GPIO (41).
+nvkvm's device is virtio device ID 50 (VIRTIO_ID_NVGPU in
+src/qemu/virtio_nvgpu.h, which must stay in step with the same constant
+in src/guest/nvkvm.h), so without this entry the array is too short and
+QEMU aborts the first time anything asks the device for its name --
+which happens during virtio realize, i.e. every boot.
+
+The entry is written as a bare [50] rather than [VIRTIO_ID_NVGPU]
+because that constant is nvkvm's, not upstream's: it is not in
+include/standard-headers/linux/virtio_ids.h and the device is not
+registered with the virtio spec.  Spelling the number out keeps this
+patch to one file and makes it obvious that it is a downstream
+squatting on an unassigned ID.  If the ID is ever assigned upstream,
+this patch is what has to change.
+
+The designated initialiser also sizes the array to 51, so IDs 42-49
+become NULL entries.  That is not a new hazard: virtio_id_to_name()
+asserts name != NULL immediately after the bounds check, so an
+unassigned ID aborts either way -- it just now aborts on the second
+assert instead of the first.  Nothing in QEMU 9.2 constructs those IDs.
+---
+ hw/virtio/virtio.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/hw/virtio/virtio.c b/hw/virtio/virtio.c
+index f12c4aa..85b36ca 100644
+--- a/hw/virtio/virtio.c
++++ b/hw/virtio/virtio.c
+@@ -194,7 +194,8 @@ const char *virtio_device_names[] = {
+     [VIRTIO_ID_PARAM_SERV] = "virtio-param-serv",
+     [VIRTIO_ID_AUDIO_POLICY] = "virtio-audio-pol",
+     [VIRTIO_ID_BT] = "virtio-bluetooth",
+-    [VIRTIO_ID_GPIO] = "virtio-gpio"
++    [VIRTIO_ID_GPIO] = "virtio-gpio",
++    [50] = "virtio-nvgpu",
+ };
+ 
+ static const char *virtio_id_to_name(uint16_t device_id)

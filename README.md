@@ -103,6 +103,13 @@ bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 9.2 wit
 bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and prepares a disk
 ```
 
+The script is a convenience, not the mechanism. Everything it changes in
+upstream QEMU is four patch files in [`patches/`](patches/) — 46 lines, applied
+with `git apply` — plus a copy of the device sources into `hw/misc/`.
+[`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
+same build by hand, command by command, if you would rather not run a script
+over your QEMU tree.
+
 The guest also needs NVIDIA userspace libraries version-matched to your **host**
 driver. Assemble the bundle and stage it:
 

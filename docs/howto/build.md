@@ -10,6 +10,12 @@ Three artefacts, built in this order:
 
 Steps 1 and 2 are one script. Step 3 is done by cloud-init on first guest boot.
 
+The QEMU delta is a **patch series** in [`patches/`](../../patches/) plus a file
+copy, so `scripts/build_qemu.sh` is a convenience and not the only path —
+[Building from scratch, by hand](#building-from-scratch-by-hand) is the same
+sequence as commands you can type. [What this does to
+QEMU](#what-this-does-to-qemu) is the whole surface in one table.
+
 ## Host prerequisites
 
 - Linux with KVM and an NVIDIA GPU with the driver installed. QEMU's device
@@ -47,15 +53,129 @@ libepoxy-dev libgbm-dev libegl-dev libdrm-dev
 xxd
 ```
 
-### Building without the script
+## What this does to QEMU
 
-The script is a convenience, not the mechanism — everything below it is an
-ordinary QEMU build, and the numbered steps in the rest of this document are
-what it runs, in order. If you would rather not run it: install the
-dependencies above, then follow those steps by hand. The only nvkvm-specific
-parts are step 1b (build `src/stub`, which generates the embed header) and
-steps 3–5 (copy `src/qemu` + `src/abi` + `src/common` into `hw/misc/` and fix
-the include paths); the rest is `configure` and `ninja`.
+The whole surface, so you can decide whether to trust it before you run
+anything:
+
+**New files — ~12,900 lines copied into `hw/misc/`.** Eleven `.c` files plus
+their headers from `src/qemu/`, and the shared ABI/protocol headers from
+`src/abi/` and `src/common/` into `hw/misc/nvkvm_inc/`. These touch nothing
+upstream; they are a new device that the build is told about. `wc -l
+src/qemu/*.c` is the honest number.
+
+**Four patches to upstream files — 46 lines added, 2 removed**, all of them in
+[`patches/`](../../patches/), applied with `git apply`:
+
+| patch | file | what it does |
+|---|---|---|
+| `0001-meson-register-virtio-nvgpu-sources.patch` | `hw/misc/meson.build` | registers the eleven `.c` files and the `nvkvm_inc/` include directory, gated on `CONFIG_VIRTIO`. Meson has no globbing, so the list is written out. |
+| `0002-virtio-add-virtio-nvgpu-to-device-name-table.patch` | `hw/virtio/virtio.c` | adds `[50] = "virtio-nvgpu",` to `virtio_device_names[]`. The table stops at `VIRTIO_ID_GPIO` (41) and `virtio_id_to_name()` asserts the ID is in range, so without this QEMU aborts during realize — every boot. |
+| `0003-egl-helpers-import-dmabuf-via-texstorage.patch` | `ui/egl-helpers.c` | binds imported dma-bufs with `glEGLImageTargetTexStorageEXT` instead of `glEGLImageTargetTexture2DOES`. NVIDIA hands out the guest's scanout buffers as external-only EGLImages and returns `GL_INVALID_OPERATION` for the legacy bind (measured, RTX 4070 / 595.84), so `-display gtk,gl=on` silently shows a black window. Falls back to the OES bind when the extension is absent. |
+| `0004-console-do-not-abort-on-deviceless-console.patch` | `ui/console.c` | skips non-graphic consoles in `qemu_console_lookup_by_device()`, which reads `"device"` and `"head"` with `&error_abort` — properties that only graphic consoles have — and so kills QEMU on `screendump` the moment the walk steps over a text console. |
+
+`0004` is an **upstream QEMU bug**, not an nvkvm-specific change, and the intent
+is to submit it to qemu-devel. If you see it merged upstream, delete the patch
+rather than forward-porting it. Each patch carries a header explaining its
+reasoning; [`patches/README.md`](../../patches/README.md) is the index.
+
+That is the entire delta. Nothing else in the QEMU tree is edited — which you
+can check for yourself, because the tree is a git clone:
+
+```bash
+cd /opt/qemu-src && git status --short
+```
+
+Four modified files — `hw/misc/meson.build`, `hw/virtio/virtio.c`,
+`ui/egl-helpers.c`, `ui/console.c` — and the untracked `hw/misc/nvkvm_*` /
+`hw/misc/virtio_nvgpu*` copies. Anything else did not come from this build.
+
+## Building from scratch, by hand
+
+The script is a convenience, not the mechanism. Every step below is a command
+you can type and check the result of, and `scripts/build_qemu.sh` runs exactly
+this sequence — which is why the QEMU delta is a patch series and not a set of
+`sed` expressions: a `git apply` is replicable by hand, a `sed` replacement is
+not.
+
+Install the dependencies listed above first. Nothing here needs root except
+that, and the `/usr/lib/nvkvm` copy in step 1, which is optional.
+
+```bash
+# 0. Where things go.  Pick anything you can write.
+export NVKVM=$PWD                       # this repo
+export QEMU_SRC=/opt/qemu-src
+export QEMU_PREFIX=/opt/qemu-nvkvm
+
+# 1. Build the isolate stub.  This generates nvkvm_stub_bin.h, which QEMU
+#    embeds.  Skipping it does not fail the build -- it fails at RUNTIME,
+#    silently, with forwarding off.  See the warning below.
+make -C "$NVKVM/src/stub"
+ls -l "$NVKVM/src/stub/nvkvm_stub" "$NVKVM/src/stub/nvkvm_stub_bin.h"
+sudo install -d /usr/lib/nvkvm                                   # optional
+sudo install -m 0755 "$NVKVM/src/stub/nvkvm_stub" /usr/lib/nvkvm/ # optional
+
+# 2. Fetch QEMU at the pinned tag.  9.2.0 and nothing else: the patches carry
+#    upstream context lines and will refuse to apply to a different tree.
+git clone --depth=1 --branch v9.2.0 \
+    https://gitlab.com/qemu-project/qemu.git "$QEMU_SRC"
+
+# 3. Apply the patch series.  --check first: git apply is all-or-nothing per
+#    invocation, so a dry run over the whole set is what stops a mismatch from
+#    leaving you with a half-patched tree.
+cd "$QEMU_SRC"
+git apply --check "$NVKVM"/patches/*.patch     # silence == it will apply
+git apply         "$NVKVM"/patches/*.patch
+git status --short                             # 4 modified files, no more
+
+# 4. Copy the device sources in.
+cp "$NVKVM"/src/qemu/*.c "$NVKVM"/src/qemu/*.h  "$QEMU_SRC/hw/misc/"
+cp "$NVKVM"/src/stub/nvkvm_stub_bin.h           "$QEMU_SRC/hw/misc/"
+
+# 5. Copy the shared ABI/protocol headers into hw/misc/nvkvm_inc/.
+#    ALL of them -- a hand-picked subset fails the build.
+mkdir -p "$QEMU_SRC/hw/misc/nvkvm_inc"
+cp "$NVKVM"/src/abi/*.h "$NVKVM"/src/common/*.h "$QEMU_SRC/hw/misc/nvkvm_inc/"
+cp "$NVKVM"/src/qemu/nvkvm_linux_types.h \
+   "$QEMU_SRC/hw/misc/nvkvm_inc/linux_types_compat.h"
+
+# 6. Rewrite the include paths.  The copied sources say
+#    "../../src/common/foo.h", which was right in src/qemu/ and is wrong in
+#    hw/misc/.  These two seds only ever touch files nvkvm owns.
+sed -i -E 's#"\.\./\.\./src/(common|abi)/([A-Za-z0-9_]+\.h)"#"nvkvm_inc/\2"#g' \
+    "$QEMU_SRC"/hw/misc/*.c "$QEMU_SRC"/hw/misc/*.h
+sed -i 's|#include <linux/types.h>|#include "linux_types_compat.h"|g' \
+    "$QEMU_SRC"/hw/misc/nvkvm_inc/*.h
+
+# 7. Configure.  See the notes on each flag under "7. Configure" below.
+cd "$QEMU_SRC"
+./configure \
+    --target-list=x86_64-softmmu \
+    --enable-kvm \
+    --disable-werror --disable-sdl --disable-gtk --disable-vnc \
+    --enable-opengl \
+    --disable-virglrenderer \
+    --extra-cflags=-DNVKVM_STUB_EMBEDDED \
+    --prefix="$QEMU_PREFIX"
+
+# 8-9. Build and install.  QEMU 9.2 configures out of tree.
+ninja -C "$QEMU_SRC/build" -j"$(nproc)"
+ninja -C "$QEMU_SRC/build" install
+
+# Check.
+"$QEMU_PREFIX/bin/qemu-system-x86_64" -device help | grep nvgpu
+```
+
+That last line is the one that tells you it worked: `virtio-nvgpu-pci` in the
+device list means the sources compiled, meson picked them up, and the device
+registered itself.
+
+Add `--enable-gtk --enable-sdl` in place of `--disable-*` if you want a real
+window (and install the GTK/SDL dev packages); the script does this for you
+under `NVKVM_QEMU_UI=1`.
+
+To un-apply the QEMU changes, `git apply --reverse "$NVKVM"/patches/*.patch`
+and delete `hw/misc/nvkvm_*` / `hw/misc/virtio_nvgpu*`.
 
 ## Build the stub and QEMU
 
@@ -66,14 +186,14 @@ bash scripts/build_qemu.sh --install-deps  # + install missing deps (needs root)
 
 Guarded, not idempotent-in-the-useful-sense: it exits 0 immediately if the
 QEMU binary already exists under the chosen prefix
-(`scripts/build_qemu.sh:37-41`). **A plain re-run after editing anything under
+(`scripts/build_qemu.sh:75-79`). **A plain re-run after editing anything under
 `src/qemu/` or `src/common/` is therefore a silent no-op** — you keep testing the
 old binary against new guest code, which surfaces as a confusing mismatch rather
 than as a build error (a new `NVKVM_HFILE_*` id, for instance, comes back
 "Invalid argument" from the stale binary's whitelist).
 
 Pass `--force` to rebuild over the existing install
-(`scripts/build_qemu.sh:25-44`). The QEMU source tree and the ninja build dir
+(`scripts/build_qemu.sh:48-82`). The QEMU source tree and the ninja build dir
 are reused, so a forced rebuild is incremental — minutes, not the full ~20:
 
 ```bash
@@ -82,7 +202,7 @@ sudo bash scripts/build_qemu.sh --force
 
 What it does, in the order it does it:
 
-**1b. Build and install the isolate stub** (`scripts/build_qemu.sh:90-94`).
+**1b. Build and install the isolate stub** (`scripts/build_qemu.sh:226-238`).
 `make -C src/stub` produces `nvkvm_stub` and `nvkvm_stub_bin.h`. The build flags
 matter (`src/stub/Makefile:11-18`): `-nostdlib -static -fPIE -ffreestanding
 -fno-stack-protector -fno-builtin`, linked `-nostdlib -static -pie
@@ -93,7 +213,7 @@ when that directory is not writable, which is harmless because the stub is
 embedded in the QEMU binary anyway (`NVKVM_STUB_PATH` overrides it).
 
 This step is load-bearing and its absence is silent — the script's own comment
-(`scripts/build_qemu.sh:77-89`):
+(`scripts/build_qemu.sh:212-225`):
 
 > with neither the define nor the generated header the QEMU build SUCCEEDS with
 > `stub_elf = NULL`, `stub_elf_len = 0`, and silently falls back to
@@ -102,15 +222,39 @@ This step is load-bearing and its absence is silent — the script's own comment
 > `nvkvm-gpu[GA106] M5.1: open ctl/gpu FAILED r1=-2 r2=-2 — forwarding OFF`
 > i.e. the device comes up with forwarding OFF and NOTHING says why.
 
-**2. Fetch QEMU** (`scripts/build_qemu.sh:99-100`):
+**2. Fetch QEMU** (`scripts/build_qemu.sh:241-248`):
 
 ```bash
 git clone --depth=1 --branch v9.2.0 \
     https://gitlab.com/qemu-project/qemu.git /opt/qemu-src
 ```
 
-**3-4. Inject the nvkvm sources by copy** (`scripts/build_qemu.sh:107-125`). Not
-a symlink, not a submodule:
+**3. Apply the patch series** (`scripts/build_qemu.sh:250-326`). The four
+patches in [`patches/`](../../patches/), in numeric order:
+
+```bash
+cd /opt/qemu-src
+git apply --check /path/to/nvkvm/patches/*.patch
+git apply         /path/to/nvkvm/patches/*.patch
+```
+
+The `--check` pass over the whole pending set comes first on purpose: `git
+apply` is all-or-nothing per invocation, so checking the set as a unit is what
+guarantees a mismatch fails with the tree untouched rather than half-mutated.
+A patch that neither applies nor un-applies is a hard error naming the file,
+because in practice it means the tree is not v9.2.0 or somebody hand-edited it.
+
+**Already-applied is decided by `git apply --reverse --check`** — "does this
+patch un-apply cleanly?" — not by grepping the tree. That matters: the previous
+version of this script tested for the `ui/console.c` change by grepping for a
+sentence out of the patch's own comment, so rewording that comment would have
+made the patch apply twice. Re-running the script over an already-patched tree
+prints `already applied:` for each patch and writes nothing.
+
+**4-5. Inject the nvkvm sources by copy** (`scripts/build_qemu.sh:328-352`).
+Not a symlink, not a submodule, and deliberately not a patch — these files touch
+nothing upstream, so a patch would be 12,900 lines of pure addition and no
+easier to review than the files themselves:
 
 ```bash
 cp src/qemu/*.c src/qemu/*.h              /opt/qemu-src/hw/misc/
@@ -121,7 +265,7 @@ cp src/stub/nvkvm_stub_bin.h               /opt/qemu-src/hw/misc/
 ```
 
 All of `src/abi` and `src/common` is copied, not a hand-picked subset — an
-incomplete copy fails the build (`scripts/build_qemu.sh:113-115`). The stub blob
+incomplete copy fails the build (`scripts/build_qemu.sh:341-343`). The stub blob
 lands in `hw/misc/` rather than `nvkvm_inc/` because `nvkvm_isolate.c` includes
 it by bare name.
 
@@ -129,22 +273,15 @@ it by bare name.
 existing `/opt/qemu-src` tree until the copy is repeated. See
 [Rebuilding after a source change](#rebuilding-after-a-source-change).
 
-**5. Rewrite includes** (`scripts/build_qemu.sh:136-143`). Two `sed` passes:
+**6. Rewrite includes** (`scripts/build_qemu.sh:354-376`). Two `sed` passes:
 `"../../src/{common,abi}/X.h"` → `"nvkvm_inc/X.h"`, and
 `<linux/types.h>` → `"linux_types_compat.h"` (QEMU's `osdep.h` conflicts with
-the kernel UAPI types).
+the kernel UAPI types). These two survived the move to a patch series because
+they only ever rewrite files nvkvm owns and that the previous step just copied
+in — they are part of "install our sources", not part of "modify QEMU", and
+re-running them is a no-op because the copy is fresh.
 
-**6. Patch `hw/misc/meson.build`** (`scripts/build_qemu.sh:151-197`) —
-idempotent, guarded by `grep -q virtio_nvgpu.c`. Adds
-`nvkvm_inc = include_directories('nvkvm_inc')` and a `system_ss.add(when:
-['CONFIG_VIRTIO'], ...)` block listing the eleven `.c` files.
-
-**6b. Patch `hw/virtio/virtio.c`** (`scripts/build_qemu.sh:203-234`). Inserts
-`[50] = "virtio-nvgpu",` into `virtio_device_names[]` right after the
-`[VIRTIO_ID_GPIO]` entry — QEMU's table ends around ID 41 and
-`virtio_id_to_name()` asserts `device_id < G_N_ELEMENTS(virtio_device_names)`.
-
-**7. Configure** (`scripts/build_qemu.sh:239-256`):
+**7. Configure** (`scripts/build_qemu.sh:378-415`):
 
 ```bash
 ./configure \
@@ -165,7 +302,7 @@ through virtio-gpu GL.
 `-DNVKVM_STUB_EMBEDDED` is the define whose absence produces the silent
 forwarding-off failure described above.
 
-**8-9. Build and install** (`scripts/build_qemu.sh:261-268`). QEMU 9.2
+**8-9. Build and install** (`scripts/build_qemu.sh:417-430`). QEMU 9.2
 configures out of tree, so ninja runs against `/opt/qemu-src/build`.
 
 Output: `/opt/qemu-nvkvm/bin/qemu-system-x86_64`.
@@ -181,6 +318,12 @@ off regardless of what is passed on the command line, and compiles
 
 Pair it with the matching guest module build (`make NVKVM_GRAPHICS=0`, below).
 The headers say so explicitly: "deploy the two consistently".
+
+Patches `0003` and `0004` only matter to the display path, so a compute-only
+build does not strictly need them. They are still applied, because one QEMU tree
+serves both builds and a conditional patch series is a worse trade than 28
+unused lines. If you are auditing a compute-only deployment, that is two of the
+four patches you can set aside.
 
 ## The guest kernel module
 
@@ -251,9 +394,9 @@ cp src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
 `scripts/run_remote_test.sh rebuild` (`:44-80`)** — that script is in any case
 hardcoded to a private dev box and is not a reproducible entry point. Copying
 `src/qemu/*.c` back over `hw/misc/` restores the `../../src/common/...` and
-`../../src/abi/...` includes that step 5 rewrote, so the next `ninja` stops at
+`../../src/abi/...` includes that step 6 rewrote, so the next `ninja` stops at
 `fatal error: ../../src/common/nvkvm_proto.h: No such file or directory`. Either
-replicate steps 4 and 5 by hand after every copy, or — simpler and what you
+replicate steps 5 and 6 by hand after every copy, or — simpler and what you
 should actually do — re-run the script:
 
 ```bash

@@ -511,7 +511,7 @@ rebuild loop rather than in nvkvm itself:
 
 4. **`run_remote_test.sh rebuild` cannot actually rebuild QEMU.** It copies
    `src/qemu/*.c`/`*.h` into `/opt/qemu-src/hw/misc/` and runs `ninja`, but
-   skips steps 4–5 of `build_qemu.sh` — staging `src/abi` + `src/common`
+   skips steps 5–6 of `build_qemu.sh` — staging `src/abi` + `src/common`
    headers into `hw/misc/nvkvm_inc/` and rewriting the `../../src/{common,abi}/`
    includes to point at them. The build stops at
    `fatal error: ../../src/common/nvkvm_proto.h: No such file or directory`.

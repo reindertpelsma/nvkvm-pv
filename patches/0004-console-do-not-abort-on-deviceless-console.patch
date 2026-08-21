@@ -1,0 +1,62 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Fri, 21 Aug 2026 02:32:44 +0200
+Subject: [PATCH] ui/console: skip non-graphic consoles in
+ qemu_console_lookup_by_device()
+
+*** This is an upstream QEMU bug, not an nvkvm-specific change.  The
+*** intent is to submit it to qemu-devel.  If you find it merged
+*** upstream (or in a QEMU newer than the pinned 9.2.0), DELETE this
+*** patch rather than forward-porting it -- there is nothing nvkvm
+*** -specific left in it once upstream has the fix.
+
+`screendump <file> nvkvm0` killed QEMU outright:
+
+    Unexpected error in object_property_find_err() at ../qom/object.c:1349:
+    Property 'qemu-fixed-text-console.device' not found
+
+qemu_console_lookup_by_device() walks every console and reads the
+"device" link and the "head" property with &error_abort.  But "device"
+and "head" are class properties of qemu-graphic-console only -- text
+consoles never have them -- so the walk aborts the moment it steps over
+a text console on the way to the console it was actually asked for.
+
+The sibling loop in qemu_graphic_console_lookup_unused() already guards
+with QEMU_IS_GRAPHIC_CONSOLE(); this one simply forgot.
+
+It is order-dependent, not device-specific, which is why it has gone
+unnoticed upstream: a VGA whose console happens to be first in the list
+is found before the walk reaches any text console and so survives.
+nvkvm's console is registered later and sits behind one, so we hit it
+every time.  Any device in that position hits it -- nothing here
+depends on nvkvm.
+
+A non-graphic console can never be the answer to "which console belongs
+to this device", so skipping it is both the minimal fix and the
+upstream-shaped one.
+---
+ ui/console.c | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ui/console.c b/ui/console.c
+index 5165f17..6dcc1cd 100644
+--- a/ui/console.c
++++ b/ui/console.c
+@@ -1264,6 +1264,17 @@ QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head)
+     uint32_t h;
+ 
+     QTAILQ_FOREACH(con, &consoles, next) {
++        /* nvkvm: "device" and "head" are class properties of
++         * qemu-graphic-console ONLY.  Text consoles do not have them, and both
++         * reads below pass &error_abort -- so walking past a text console on
++         * the way to the requested one aborts QEMU ("Property
++         * 'qemu-fixed-text-console.device' not found").  A device whose
++         * console happens to come first is found before the walk gets there,
++         * which is why this is order-dependent rather than device-specific.
++         * A non-graphic console can never be the match, so skip it. */
++        if (!QEMU_IS_GRAPHIC_CONSOLE(con)) {
++            continue;
++        }
+         obj = object_property_get_link(OBJECT(con),
+                                        "device", &error_abort);
+         if (DEVICE(obj) != dev) {

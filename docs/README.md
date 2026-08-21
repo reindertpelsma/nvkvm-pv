@@ -16,6 +16,7 @@ value is), or rationale (why it is that way).
 | [Run a guest](howto/run.md) | image preparation, the QEMU command line, first bring-up, what to check |
 | [Stage the guest NVIDIA userspace](howto/stage-guest-libraries.md) | `make_host_bundle.sh` on the host, `stage_guest_libs.sh` in the guest, and why the failures here are silent |
 | [Add a driver version](howto/add-a-driver-version.md) | measuring a new ABI profile row and what else may need to change |
+| [The QEMU patch series](../patches/README.md) | the four patches applied to upstream QEMU 9.2, and why each one exists |
 
 ## Reference
 
