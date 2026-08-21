@@ -290,6 +290,29 @@ VM_DISPLAY="gtk,gl=on" VM_SERIAL=none NVKVM_PRESENT_MODE=gl \
     scripts/run_test_vm.sh
 ```
 
+The window **switches to the guest's GPU head by itself** the moment that head
+first presents. It opens on QEMU's emulated VGA (console 0) so GRUB and the
+early kernel are visible, then moves to nvkvm's console once the guest
+compositor comes up, logging one line when it does:
+
+```
+nvkvm: guest display is live -- switched window to console page 1
+```
+
+It switches exactly once. If you then pick a different tab yourself it will not
+drag you back, and with `-vga none` there is only one console so nothing
+happens at all.
+
+Add `show-tabs=on` to see the tab bar and switch by hand — worth doing if you
+are debugging the head, because without it a window sitting on the boot console
+looks exactly like a hung guest:
+
+```bash
+VM_DISPLAY="gtk,gl=on,show-tabs=on" ... scripts/run_test_vm.sh
+```
+
+(The same toggle lives in the window's **View → Show Tabs** menu.)
+
 `VM_DISPLAY` != `none` also adds `virtio-keyboard-pci` and `virtio-tablet-pci`,
 without which the window would show the desktop and swallow every key and
 click. The tablet reports absolute coordinates, so the host and guest pointers

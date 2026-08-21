@@ -483,6 +483,195 @@ print("  ui/console.c patched.")
 CONPATCH
 fi
 
+# ── 6d. Patch the GTK UI: show the guest's GPU head when it goes live ───────
+#
+# QEMU's default VGA is console 0 and nvkvm's scanout console registers second,
+# so the GTK window opens on the BOOT console and stays there forever: ui/gtk.c
+# builds one notebook page per console in index order and nothing ever changes
+# the current page.  The guest desktop renders perfectly on console 1 while the
+# user watches a login prompt on console 0 -- from outside, indistinguishable
+# from a hang.
+#
+# A console goes live the first time it gets real content.  Every console starts
+# on a PLACEHOLDER surface ("Guest has not initialized the display (yet)"), so
+# for the surface paths the first non-placeholder surface is that moment; for
+# the GL paths, a scanout texture is real content by definition.
+#
+# The rule is deliberately narrow -- fire only while the window is still on the
+# page it opened on (page 0), only for a page above it, and at most once:
+#   * the VGA going live is page 0, so it cannot consume the one shot;
+#   * nvkvm going live is a page above 0, so it does;
+#   * once fired -- or once the user has moved the tab themselves -- the
+#     condition can never hold again, so the user is never dragged back;
+#   * with -vga none there is only page 0, so it is a no-op.
+# A latch, not a policy engine, and it needs no new state to decide.
+#
+# All five entry points are hooked, not just the one the default present mode
+# happens to use: readback goes through gd_switch(), while NVKVM_PRESENT_MODE=gl
+# goes through the egl/gl-area scanout paths and would otherwise silently never
+# switch.  (*_scanout_dmabuf both funnel into *_scanout_texture, so hooking the
+# texture entry covers the dma-buf one too.)
+echo "[6d/9] Patching GTK UI for guest-head auto-switch..."
+if grep -q "nvkvm_gd_maybe_autoswitch" "$QEMU_SRC/include/ui/gtk.h"; then
+    echo "  GTK UI already patched -- skipping."
+else
+    python3 - "$QEMU_SRC" <<'GTKPATCH'
+import sys, os
+root = sys.argv[1]
+
+def patch(relpath, edits):
+    path = os.path.join(root, relpath)
+    src = open(path).read()
+    for old, new in edits:
+        if src.count(old) != 1:
+            sys.exit("%s: anchor not found exactly once (%d): %.60r"
+                     % (relpath, src.count(old), old))
+        src = src.replace(old, new, 1)
+    open(path, 'w').write(src)
+    print("  %s patched." % relpath)
+
+# 1. the shared latch + helper, after struct GtkDisplayState is complete
+patch('include/ui/gtk.h', [(
+"""/* ui/gtk-egl.c */""",
+"""/*
+ * nvkvm: one-shot auto-switch to the guest's GPU head.  See scripts/build_qemu.sh
+ * for the full rationale.  Declared here because the surface path (ui/gtk.c) and
+ * both GL paths (ui/gtk-egl.c, ui/gtk-gl-area.c) all need it, and the latch has
+ * to be shared between them rather than per-file.
+ */
+extern bool nvkvm_gd_auto_switched;
+
+static inline void nvkvm_gd_maybe_autoswitch(VirtualConsole *vc)
+{
+    GtkNotebook *nb;
+    gint page;
+
+    if (nvkvm_gd_auto_switched || !vc || !vc->s || !vc->s->notebook ||
+        !vc->tab_item) {
+        return;
+    }
+    nb = GTK_NOTEBOOK(vc->s->notebook);
+    page = gtk_notebook_page_num(nb, vc->tab_item);
+    /* page < 0 means this console was detached into its own window. */
+    if (page > 0 && gtk_notebook_get_current_page(nb) == 0) {
+        nvkvm_gd_auto_switched = true;
+        gtk_notebook_set_current_page(nb, page);
+        /* One line, once: the window moving on its own is surprising if you
+         * are not expecting it, and this is the only record that it happened. */
+        fprintf(stderr, "nvkvm: guest display is live -- switched window to "
+                        "console page %d\\n", page);
+    }
+}
+
+/* ui/gtk-egl.c */""")])
+
+# 2. define the latch, and hook the non-GL surface path
+patch('ui/gtk.c', [
+("""static void gd_switch(DisplayChangeListener *dcl,
+                      DisplaySurface *surface)
+{""",
+ """bool nvkvm_gd_auto_switched;
+
+static void gd_switch(DisplayChangeListener *dcl,
+                      DisplaySurface *surface)
+{"""),
+("""    if (resized) {
+        gd_update_windowsize(vc);
+    } else {
+        gd_update_full_redraw(vc);
+    }
+}""",
+ """    if (resized) {
+        gd_update_windowsize(vc);
+    } else {
+        gd_update_full_redraw(vc);
+    }
+
+    if (!surface_is_placeholder(surface)) {
+        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
+    }
+}"""),
+])
+
+# 3. GL / EGL paths
+patch('ui/gtk-egl.c', [
+("""    if (resized) {
+        gd_update_windowsize(vc);
+    }
+
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+}""",
+ """    if (resized) {
+        gd_update_windowsize(vc);
+    }
+
+    if (!surface_is_placeholder(surface)) {
+        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
+    }
+
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+}"""),
+("""    gtk_egl_set_scanout_mode(vc, true);
+    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                         backing_id, false);
+}""",
+ """    gtk_egl_set_scanout_mode(vc, true);
+    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                         backing_id, false);
+
+    nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: a scanout texture is real content */
+}"""),
+])
+
+# 4. GL-area path
+patch('ui/gtk-gl-area.c', [
+("""        surface_gl_create_texture(vc->gfx.gls, surface);
+    }
+    vc->gfx.ds = surface;
+
+    if (resized) {
+        gd_update_windowsize(vc);
+    }
+}""",
+ """        surface_gl_create_texture(vc->gfx.gls, surface);
+    }
+    vc->gfx.ds = surface;
+
+    if (resized) {
+        gd_update_windowsize(vc);
+    }
+
+    if (!surface_is_placeholder(surface)) {
+        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
+    }
+}"""),
+("""    gtk_gl_area_set_scanout_mode(vc, true);
+    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                         backing_id, false);
+}""",
+ """    gtk_gl_area_set_scanout_mode(vc, true);
+    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
+                         backing_id, false);
+
+    nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: a scanout texture is real content */
+}"""),
+])
+GTKPATCH
+    python3 - "$QEMU_SRC/ui/gtk-gl-area.c" <<'GLAREA'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+old = """    gd_gl_area_scanout_texture(dcl, texture, y0_top,
+                               backing_width, backing_height,
+                               x, y, width, height, NULL);"""
+if src.count(old) != 1:
+    sys.exit("gtk-gl-area.c: scanout_dmabuf -> scanout_texture call not found")
+print("  ui/gtk-gl-area.c: dmabuf path funnels through scanout_texture (already hooked).")
+GLAREA
+fi
+
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────
 #
 # Window backends are OFF by default: the normal deployment is headless (a
