@@ -75,13 +75,15 @@ the audit rather than quietly dropped.
 
 - **In containers**, Linux namespaces are usually blocked, so the isolate falls
   back to UID separation — a weaker inner boundary than the namespaced sandbox.
-  Note what sits behind it, though: in a container the last boundary before the
-  host is the container runtime's, which is not our code and is scrutinised far
-  more heavily than ours. On a bare host the isolate sandbox **is** the last
-  boundary, and it is code we wrote and audited ourselves. So this is a trade
-  between a weaker boundary we control and a stronger one we do not, rather than
-  a straight downgrade — and a minimal image with nothing useful readable by
-  other UIDs strengthens the container side further. See
+  Do not read that as "containers are the less safe option", because of what the
+  isolate does *not* cover: it sandboxes the **stub**, not the VMM. QEMU runs on
+  the host unconfined, and **eleven of the nineteen findings in the boundary
+  audit target the VMM**. On a bare host, that is a landing zone on the host
+  itself. Inside a container, the same paths land in the container, behind a
+  boundary that is not our code and is scrutinised far more heavily than ours.
+  So the container trades a weaker boundary we wrote for a stronger one we did
+  not, and it covers the component our own sandbox leaves exposed. A minimal
+  image with nothing useful readable by other UIDs strengthens it further. See
   [the isolate model](docs/internal/isolate-model.md).
 - **Enforcement is per-ioctl and hand-written**, not categorical. It is audited
   but not complete, and a new ioctl added without its validation is the most

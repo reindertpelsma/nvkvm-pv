@@ -171,16 +171,16 @@ staging step.
   [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
   Both are already in [`docker-compose.yml`](docker-compose.yml). No
   `--privileged`, no added capabilities.
-- **Isolation is a different trade here, not simply a downgrade.** Containers
-  usually block unprivileged user namespaces, so nvkvm's per-VM isolate cannot
-  build its namespaced sandbox and falls back to UID separation — a weaker inner
-  boundary. But it is not the last one: behind it sits the container boundary,
-  which is not our code and is far more scrutinised than ours. On a bare host,
-  the isolate sandbox **is** the last boundary before the host, and it is code we
-  wrote and audited ourselves. Which arrangement you prefer depends on what you
-  trust; a minimal image, with nothing useful readable by other UIDs, makes the
-  container case stronger still. Either way nvkvm is not ready for untrusted
-  tenants — see [`SECURITY.md`](SECURITY.md).
+- **Isolation is a different trade here, and arguably a better one.** Containers
+  usually block unprivileged user namespaces, so the per-VM isolate falls back to
+  UID separation — a weaker inner boundary. What sits behind it matters more.
+  nvkvm's isolate sandboxes the **stub**; it does not sandbox the VMM, and QEMU
+  runs on the host unconfined. **Eleven of the nineteen findings in our own
+  boundary audit target the VMM**, so on a bare host that is where they land. In
+  a container they land in the container, behind a boundary that is not our code
+  and is scrutinised far more than ours. A minimal image with nothing useful
+  readable by other UIDs strengthens it further. Neither arrangement makes nvkvm
+  ready for untrusted tenants — see [`SECURITY.md`](SECURITY.md).
 - **The driver userspace is mounted read-only, not copied in.** The container
   hands the guest the host's NVIDIA libraries over a read-only 9p share and the
   guest links against them, so `apt upgrade` inside the guest cannot replace a
