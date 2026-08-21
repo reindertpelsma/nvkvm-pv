@@ -992,3 +992,106 @@ of which are true *of the GPU* and say nothing about the host.
 **So probe before committing.** Boot, run `ls /dev/kvm`, and destroy if it is
 missing — that costs a few cents and is the only reliable signal. A `VM` badge
 means *ask*, not *no*.
+
+
+### 4x RTX 4090: tensor-parallel scaling on the SHM-fixed stack, and what TP costs
+
+Rented box, 4x RTX 4090 (PCIe-only, no NVLink), driver 575.51.03, host
+Ubuntu 22.04 / guest Ubuntu 24.04, 32 vCPU + 96 GB guest, host runs pinned to
+`taskset -c 0-31` so the CPU count is not silently part of the answer. vLLM
+0.10.2 + torch 2.8.0+cu128, Qwen2.5-7B-Instruct bf16, batch 8, 128 in / 128 out.
+**Host and guest mount the same read-only ext4 image** holding the interpreter,
+the venv and the weights, so the stack is byte-identical by construction and the
+model does not come over 9p. Tree: `main` + the merged NCCL SHM fix. Raw output
+in `tests/perf/tp/results/`.
+
+**Scaling shape, medians, NCCL at its defaults (SHM transport ON, both sides):**
+
+| TP | mode | host tok/s | guest tok/s | guest/host |
+|---|---|---|---|---|
+| 1 | eager | 449.4 | 437.5 | **0.97x** |
+| 1 | CUDA graphs | 466.4 | 459.7 | **0.99x** |
+| 2 | eager | 389.7 | 355.0 | **0.91x** |
+| 2 | CUDA graphs | 489.5 | 519.3 | **1.06x** |
+| 4 | eager | 411.8 | 367.3 | **0.89x** |
+| 4 | CUDA graphs | 716.9 | 369.8 | **0.52x** |
+
+The eager column is the flat one: 0.97 / 0.91 / 0.89 from TP=1 to TP=4, a mild
+and orderly decline. **All of the damage is in one cell** — TP=4 with CUDA
+graphs — and it is not a smooth trend, because TP=2 with graphs is *faster* in
+the guest than on the host.
+
+**That cell is bimodal, and the host's is not.** 40 guest samples across 13
+separate engine instantiations, interleaved host/guest A/B so GPU-clock drift
+cancels: guest median 369.8, range 308.9-659.6; host median 716.9, range
+494.2-775.1 over 37 samples. The guest sits in a ~330-420 mode most of the time
+and in a ~640-795 mode sometimes, at identical settings, decided somewhere
+before the first token and stable for the life of the process. Its best
+observed run, 795.3 tok/s, **beats the host's best (775.1)**. So this is not a
+throughput ceiling; it is a mode the guest keeps falling into.
+
+**What it is not.**
+
+* *Not forwarder serialisation under N-way load.* `rtt_contend` (rdtscp-timed,
+  1/2/4 concurrent isolates): guest launch+sync p50 7.6 / 6.3-7.0 / 7.0-8.0 us
+  against host 5.2 / 5.2-5.5 / 5.2-5.6. **Flat in both.** Four isolates cost a
+  guest round trip nothing over one. The control tax is 1.35x at p50 and does
+  not compound with world size.
+* *Not a different collective algorithm.* `NCCL_DEBUG=INFO` on both sides:
+  identical `SHM/direct/direct` on every channel, and vLLM disables its custom
+  all-reduce on **both** sides for the same reason (`not supported on more than
+  two PCIe-only GPUs`). Same transport, same code path.
+* *Not the NCCL channel count*, although the two sides pick differently (host 4
+  coll channels, guest 2). Forcing the guest to 4 or 8 makes it **worse**
+  (306-343 tok/s); pinning it to 2 does not remove the bimodality (three
+  processes: 795 / 362 / 396).
+* *Not CUDA graphs failing to capture.* The guest captures all 67 piecewise
+  graphs, 0.99 GiB, same as the host.
+
+What the guest does carry is a **long per-call tail**: launch+sync p99 is 38-54 us
+against the host's 6.6-8.6 us, and an empty `cuCtxSynchronize` — which should
+never leave the guest — has a p999 of 56-89 us against 0.4-0.8 us. `cuMemAlloc`+
+`cuMemFree` is 4526 us against 197 us (23x) and, unlike the host's, does not
+degrade further with concurrency. Whether the tail is what puts the guest in
+the slow mode is **not established**.
+
+#### The old "3-5x at matched settings" was the workaround, not the boundary
+
+Re-measured on this box with `NCCL_SHM_DISABLE=1` forced on **both** sides —
+the configuration the 6x A4000 numbers were taken in — the guest does not lose
+at all:
+
+| TP | mode | host tok/s | guest tok/s | guest/host |
+|---|---|---|---|---|
+| 2 | eager | 212.4 | 281.5 | **1.33x** |
+| 4 | eager | 63.9 | 129.0 | **2.02x** |
+
+Crippling NCCL costs the *host* far more than the guest here (host TP=4 eager
+411.8 -> 63.9; guest 367.3 -> 129.0). The 0.21x figure was a property of that
+one topology under that one workaround, not a property of forwarding.
+
+#### Temperature-0 tensor-parallel decode is not reproducible — on bare metal
+
+Asked because a host-vs-guest text hash mismatch appeared once the SHM path was
+in use. Greedy, `ignore_eos`, fixed prompts, `seed=0`, hashes over token ids:
+
+| side | TP | eager | CUDA graphs |
+|---|---|---|---|
+| host | 1 | 6/6 identical | **20/20 identical** |
+| host | 4 | **disagrees with itself** (2 distinct outputs) | **disagrees with itself** |
+| guest | 1 | 6/6 identical, and equal to the host's hash | 19/20 identical and equal to the host's; 1 flip |
+| guest | 4 | 6/6 identical | disagrees with itself |
+
+**The host does not reproduce itself at TP=4**, in either mode, across separate
+processes and across repetitions inside one. TP=1 is rock solid on the same
+binary, so the harness is sound and the model is deterministic when there is no
+collective. A host/guest text difference at TP>1 is therefore ordinary
+reduction-order nondeterminism and **not** evidence of a guest defect.
+
+One residue is guest-only and stays open: at **TP=1 with CUDA graphs** — where
+there is no collective at all — the host was identical 20/20 and the guest
+flipped once in 20 (and 3 times in an earlier, noisier 6-run sample). The
+differing output is a plausible near-tie token flip on 2 of 4 prompts, not
+garbage, and TP=1 eager is 6/6 stable on both sides. Cause unknown; a batch
+composition that varies with timing is the obvious suspect and has not been
+checked.
