@@ -298,3 +298,32 @@ Needs only a C compiler, and a software-rasteriser fallback is an explicit
 
 See [`tests/repro/`](../../tests/repro/) — each program is small, self-validating,
 and meant to be run on both sides of the boundary.
+
+## Two bugs that only A100 exposed
+
+Both had been silently wrong on every card before the first datacenter GA100,
+and neither was visible on any consumer die.
+
+**The host half of the `RM_UNMAP_MEMORY` address contract was never
+implemented.** Every unmap reached the driver with virtual address 0. Consumer
+cards tolerated it; GA100 did not.
+
+**`UVM_MAP_DYNAMIC_PARALLELISM_REGION` was unhandled.** `libcuda` calls it during
+context creation on GA100, so `cuCtxCreate` returned 999 (`CUDA_ERROR_UNKNOWN`)
+and every CUDA check below it skipped.
+
+The second one is the more interesting failure, because it had been *silently
+misrouted* rather than rejected. Bare UVM ioctl numbers share a number space
+with the NVIDIA frontend ioctls, and 65 == 0x41 == `NV_ESC_RM_IDLE_CHANNELS` —
+so the call had been forwarded for a long time as a completely different ioctl.
+Adding a type gate to the sanitiser turned that into an honest `ENOTTY`, which
+is what made the missing handler visible at all.
+
+With both fixed the A100 reaches 28/28, and a 3B LLM generates in the guest at
+5.75 GiB VRAM.
+
+Confirmed independently of the A100 afterwards: a three-way A/B on one Turing
+box, one variable at a time, reproduced both failures and both fixes —
+`cuda_ctx_create rc=999` without the UVM handler, `vk_probe`/`gl_probe` dying on
+SIGBUS with an earlier version of the unmap fix that overwrote map-VA table
+entries instead of treating them as a stack, and 28/28 with both correct.
