@@ -1241,6 +1241,7 @@ void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
 		pthread_mutex_init(&iso->present_sync_lock, NULL);
 		pthread_cond_init(&iso->present_cond,       nvkvm_iso_condattr_p);
 		pthread_mutex_init(&iso->xiso_lock,         NULL);
+		pthread_mutex_init(&iso->xrm_lock,          NULL);
 		pthread_mutex_init(&iso->xiso_sync_lock,    NULL);
 		pthread_cond_init(&iso->xiso_cond,          nvkvm_iso_condattr_p);
 		pthread_mutex_init(&iso->loop_lock,         NULL);
@@ -1265,6 +1266,7 @@ void nvkvm_isolate_table_fini(struct nvkvm_isolate_table *t)
 		pthread_mutex_destroy(&iso->present_sync_lock);
 		pthread_cond_destroy(&iso->present_cond);
 		pthread_mutex_destroy(&iso->xiso_lock);
+		pthread_mutex_destroy(&iso->xrm_lock);
 		pthread_mutex_destroy(&iso->xiso_sync_lock);
 		pthread_cond_destroy(&iso->xiso_cond);
 		pthread_mutex_destroy(&iso->loop_lock);
@@ -2118,6 +2120,57 @@ static int sync_send_recv_mmap(struct nvkvm_isolate *iso,
 }
 
 /* ── Handle distribution ────────────────────────────────────────────────── */
+
+/*
+ * Cross-isolate RM export/import bookkeeping.  See nvkvm_isolate.h and
+ * nvkvm_xrm_materialise() in nvkvm_isolate_handlers.c for what this is for.
+ */
+bool nvkvm_isolate_note_foreign_handle(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint32_t handle_id)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return true;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	bool present = true;
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id) {
+		present = false;
+		for (unsigned i = 0; i < iso->xrm_n; i++) {
+			if (iso->xrm_handles[i] == handle_id) {
+				present = true;
+				break;
+			}
+		}
+		if (!present) {
+			if (iso->xrm_n < NVKVM_XRM_MAX)
+				iso->xrm_handles[iso->xrm_n++] = handle_id;
+			else
+				present = true;   /* full: decline, do not evict */
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+	return present;
+}
+
+void nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
+					 uint32_t isolate_id, uint32_t handle_id)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id) {
+		for (unsigned i = 0; i < iso->xrm_n; i++) {
+			if (iso->xrm_handles[i] == handle_id) {
+				iso->xrm_handles[i] = iso->xrm_handles[--iso->xrm_n];
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+}
 
 int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 			      struct nvkvm_handle_table *ht,

@@ -36,6 +36,15 @@
 #define NVKVM_ISOLATE_MAX  4096
 
 /*
+ * Per-isolate cap on relayed foreign handles (cross-isolate RM export/import).
+ * NCCL opens one shareable handle per peer per channel, so a rank on a 6-GPU
+ * node needs tens, not hundreds; 256 leaves headroom without making every
+ * isolate struct large.  Overflow is handled by declining further relays for
+ * that isolate, not by evicting a live one.
+ */
+#define NVKVM_XRM_MAX      256
+
+/*
  * Forward declaration — fully defined in nvkvm_isolate.c.
  * Callers of nvkvm_isolate_ioctl never touch this directly; it lives on
  * the caller's stack and is registered/deregistered internally.
@@ -158,6 +167,19 @@ struct nvkvm_isolate {
 	bool        xiso_done;
 	int         xiso_err;
 	uint32_t    xiso_gem;       /* importer-local GEM handle on success */
+
+	/*
+	 * Cross-isolate RM export/import (CUDA VMM shareable handles / the NCCL
+	 * SHM transport): the set of FOREIGN handle_ids QEMU has already relayed
+	 * into this isolate with RECEIVE_FD.  The stub's handle_store()
+	 * overwrites without closing, so pushing a second dup of the same handle
+	 * would leak the first inside the stub; this is what makes the relay
+	 * once-per-(isolate, handle) instead of once-per-import.  Guarded by its
+	 * own lock because the broker runs on QEMU's pooled IOCTL workers.
+	 */
+	pthread_mutex_t xrm_lock;
+	uint32_t    xrm_handles[NVKVM_XRM_MAX];
+	unsigned    xrm_n;
 
 	/*
 	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
@@ -326,6 +348,20 @@ int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
 int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 			      struct nvkvm_handle_table *ht,
 			      uint32_t isolate_id, uint32_t handle_id);
+
+/*
+ * Cross-isolate RM export/import bookkeeping (see xrm_handles above).
+ * note(): atomic test-and-set — returns true if this isolate was ALREADY
+ * recorded as holding handle_id (caller does nothing), false if it has just
+ * been recorded (caller must do the relay, and call forget() if it fails).
+ * A full table returns true, which degrades to "do not relay again" rather
+ * than to a leak.
+ */
+bool nvkvm_isolate_note_foreign_handle(struct nvkvm_isolate_table *t,
+				       uint32_t isolate_id, uint32_t handle_id);
+void nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
+					 uint32_t isolate_id,
+					 uint32_t handle_id);
 
 /*
  * Ask the isolate to open /dev/nvidia* (or eventfd) on QEMU's behalf so the

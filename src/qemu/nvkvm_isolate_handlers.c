@@ -1571,6 +1571,124 @@ void nvkvm_mapva_forget_isolate(uint32_t iso)
 	pthread_mutex_unlock(&g_mapva_lock);
 }
 
+/* ── Cross-isolate RM export/import (CUDA VMM shareable handles) ────────────
+ *
+ * cuMemExportToShareableHandle(CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) parks
+ * an RM object on a freshly-opened /dev/nvidiactl fd via RM control 0x3d05 (fd
+ * at inner offset 16).  The exporter passes that fd to a peer PROCESS over a
+ * Unix socket with SCM_RIGHTS, and the peer calls 0x3d08
+ * (GET_EXPORT_OBJECT_INFO) and then 0x3d06 (IMPORT_OBJECT_FROM_FD) on it, both
+ * with the fd at inner offset 0.  That exchange is exactly NCCL's SHM transport
+ * connection setup (v2.27.3 transport/shm.cc:590).
+ *
+ * Two guest processes are two isolates, and that is what makes this hard — the
+ * same problem #110 solved for dma-bufs: an RM object minted in stub A is
+ * meaningless in stub B.  The guest kernel rewrites the embedded fd to a
+ * VM-global handle_id (so no guest fd number and no guest VA crosses the
+ * boundary), but the fd behind that handle was opened by the EXPORTER's stub,
+ * so the importer stub's handle_lookup() missed and the control reached the
+ * driver carrying a bogus fd.  libcuda reported that as CUDA error 101,
+ * CUDA_ERROR_INVALID_DEVICE.
+ *
+ * The answer is the one docs/internal/cross-isolate-sharing.md already
+ * documents: QEMU is the broker.  QEMU holds a copy of every handle's fd
+ * (struct nvkvm_handle.fd), so nothing new has to be invented and no new
+ * isolate command is needed — ISOLATE_CMD_RECEIVE_FD relays a dup into the
+ * importer stub, and the stub's existing handle_lookup() then resolves it on
+ * the path that was already there for 0x3d05/0x3d06.
+ *
+ * Confinement is structural, exactly as for xiso: nv->handles hangs off the
+ * per-guest VirtIONvgpu, so there is no namespace in which one guest could
+ * name another guest's handle.  Within the VM, entitlement stays the guest
+ * kernel's call and is enforced by fd possession — the importer can only name
+ * this handle because it was handed a real fd for it through a real kernel
+ * fd-passing mechanism, which cannot be forged the way a guessable cookie
+ * could.  QEMU additionally re-derives the owning isolate from the handle
+ * itself rather than trusting anything the guest said about it.
+ */
+static void nvkvm_xrm_materialise(VirtIONvgpu *nv, uint32_t iso_id,
+				  uint32_t handle_id)
+{
+	struct nvkvm_handle *h;
+	uint32_t owner_iso;
+
+	if (iso_id == 0 || handle_id == 0)
+		return;
+
+	h = nvkvm_handle_get(&nv->handles, handle_id);
+	if (!h || h->type != NVKVM_HANDLE_TYPE_NVIDIA || h->fd < 0)
+		return;
+
+	/*
+	 * Re-derive the owner from QEMU's own bookkeeping.  Same isolate means
+	 * the existing intra-stub path already works and there is nothing to
+	 * broker — the overwhelmingly common case, and the one this must not
+	 * perturb.
+	 */
+	owner_iso = session_first_isolate(nv, h->session_id);
+	if (owner_iso == 0 || owner_iso == iso_id)
+		return;
+
+	/*
+	 * Both isolates must belong to this VM.  session_first_isolate() only
+	 * ever walks THIS nv's sessions, and the caller's iso_id was validated
+	 * upstream, so this is confinement in depth rather than the only check.
+	 */
+	if (!session_has_isolate(nv, h->session_id, owner_iso))
+		return;
+
+	if (nvkvm_isolate_note_foreign_handle(&nv->isolates, iso_id, handle_id))
+		return;   /* already relayed here (or table full) */
+
+	if (nvkvm_isolate_send_handle(&nv->isolates, &nv->handles,
+				      iso_id, handle_id) == 0) {
+		NVKVM_DBG("nvkvm xrm: owner(iso=%u) -> importer(iso=%u) "
+			  "handle=%u relayed\n", owner_iso, iso_id, handle_id);
+	} else {
+		/*
+		 * Best-effort: leave the control to be forwarded and fail the
+		 * way it did before rather than converting a relay miss into a
+		 * new hard error, and drop the note so a retry can try again.
+		 */
+		nvkvm_isolate_forget_foreign_handle(&nv->isolates, iso_id,
+						    handle_id);
+	}
+}
+
+/*
+ * If this RM_CONTROL is one of the export/import family, make the handle it
+ * names resolvable in the calling isolate.  Offsets are MEASURED against the
+ * host's own ioctl stream (tools/nv_ioctl_trace.c): 0x3d05 carries the fd at
+ * inner offset 16, 0x3d06 and 0x3d08 at inner offset 0.
+ */
+static void nvkvm_xrm_prepare(VirtIONvgpu *nv,
+			      struct nvkvm_req_ioctl_on_isolate *req,
+			      void *param_buf, void *aux_buf)
+{
+	uint32_t icmd = 0;
+	int      hoff = -1;
+	int32_t  hid  = 0;
+
+	if (_IOC_TYPE(req->cmd) != 'F' ||
+	    _IOC_NR(req->cmd) != NV_ESC_RM_CONTROL || !aux_buf)
+		return;
+	if (!param_buf || req->param_size < 12)
+		return;
+	memcpy(&icmd, (char *)param_buf + 8, 4);
+
+	if (icmd == 0x00003d05u && req->aux_size >= 20)
+		hoff = 16;
+	else if ((icmd == 0x00003d06u || icmd == 0x00003d08u) &&
+		 req->aux_size >= 4)
+		hoff = 0;
+	if (hoff < 0)
+		return;
+
+	memcpy(&hid, (char *)aux_buf + hoff, 4);
+	if (hid > 0)
+		nvkvm_xrm_materialise(nv, req->isolate_id, (uint32_t)hid);
+}
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
@@ -2363,6 +2481,12 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		/* No entry: leave the guest's zero.  Failing closed here keeps a
 		 * forged triple from unmapping something we never mapped. */
 	}
+
+	/*
+	 * Cross-isolate RM export/import: if this control names a handle whose
+	 * fd lives in another isolate's stub, relay it in before forwarding.
+	 */
+	nvkvm_xrm_prepare(nv, req, param_buf, aux_buf);
 
 	int ret = nvkvm_isolate_ioctl(&nv->isolates,
 				      req->isolate_id,

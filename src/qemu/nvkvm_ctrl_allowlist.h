@@ -187,6 +187,30 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	 * already owns into the caller's client (intra-stub, accounted to the
 	 * stub).  No reg-ops/HWPM/display. */
 	0x00003d06u,
+	/*
+	 * NV0000_CTRL_CMD_OS_UNIX_GET_EXPORT_OBJECT_INFO — the query half of the
+	 * same export/import family, sitting between 0x3d05 and 0x3d06.  It
+	 * takes the nv-export fd at inner offset 0 (translated guest→handle_id
+	 * →stub-local fd exactly like 0x3d06) and returns the deviceInstance /
+	 * maxObjects the exported objects are parented by.
+	 *
+	 * JUSTIFICATION (measured, not assumed): with tools/nv_ioctl_trace.c on
+	 * the BARE-METAL host, cuMemImportFromShareableHandle issues 0x3d08
+	 * BEFORE 0x3d06 on every import — host trace is 0x3d05 (exporter) then
+	 * 0x3d08, 0x3d06 (importer).  In the guest this control was the first
+	 * thing denied, six times per import, and libcuda then failed the import
+	 * with CUDA_ERROR_INVALID_DEVICE without ever issuing 0x3d06.  It is a
+	 * read-only query about an fd the caller already possesses; it names no
+	 * object the caller does not already hold and carries no reg-ops/HWPM/
+	 * display surface.
+	 *
+	 * NOTE for anyone re-treading this: allowing 0x3d08 *alone* does NOT fix
+	 * the NCCL SHM bug (that was tried and recorded in tests/BOOT_MATRIX.md).
+	 * It is necessary but not sufficient — the fd it names still has to be
+	 * relayed into the importing isolate, which is the other half of the fix
+	 * (nvkvm_xrm_materialise in nvkvm_isolate_handlers.c).
+	 */
+	0x00003d08u,
 	0x00730101u,
 	0x00801102u, /* NV0080 device controls */
 	0x00801104u,

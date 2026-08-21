@@ -1112,14 +1112,24 @@ static void worker_thread(void *arg)
 					export_fd_off = 16;
 				}
 			}
-			if (inner_cmd == 0x00003d06U &&
+			if ((inner_cmd == 0x00003d06U ||
+			     inner_cmd == 0x00003d08U) &&
 			    job.aux_size >= 4) {
 				/* NV0000_CTRL_CMD_OS_UNIX_IMPORT_OBJECT_FROM_FD
-				 * (#110): the source nv-export fd is at aux offset
-				 * 0 and carries a handle_id; map it to our local fd
-				 * so the kernel imports the object into the caller's
-				 * RM client.  Reuse export_fd_off/saved (restore
-				 * writes the handle_id back at that offset). */
+				 * (#110) and _GET_EXPORT_OBJECT_INFO (0x3d08):
+				 * the source nv-export fd is at aux offset 0 and
+				 * carries a handle_id; map it to our local fd so
+				 * the kernel imports the object into the caller's
+				 * RM client (0x3d06) or reports which device the
+				 * exported objects are parented by (0x3d08).
+				 * Reuse export_fd_off/saved (restore writes the
+				 * handle_id back at that offset).
+				 *
+				 * 0x3d08 belongs here for the same reason 0x3d06
+				 * does: without the translation the driver sees a
+				 * handle_id where it expects an fd and answers
+				 * NV_ERR_INVALID_PARAMETER (0x3b), which libcuda
+				 * turns into CUDA_ERROR_INVALID_DEVICE. */
 				int32_t hid;
 				__builtin_memcpy(&hid, job.aux_buf, sizeof(hid));
 				export_fd_saved = hid;
@@ -2396,7 +2406,9 @@ static int ring_ctrl_must_punt(uint32_t cmd, const void *param,
 		return 1;
 	if (inner == 0x00000101U)                /* GET_BUILD_VERSION (str ptrs)*/
 		return 1;
-	if (inner == 0x00003d05U)                /* EXPORT_OBJECT_TO_FD (fd)    */
+	if (inner == 0x00003d05U ||               /* EXPORT_OBJECT_TO_FD (fd)    */
+	    inner == 0x00003d06U ||               /* IMPORT_OBJECT_FROM_FD (fd)  */
+	    inner == 0x00003d08U)                 /* GET_EXPORT_OBJECT_INFO (fd) */
 		return 1;
 	if (inner == 0x0080170dU)                /* FIFO_GET_CHANNELLIST (ptr)  */
 		return 1;
