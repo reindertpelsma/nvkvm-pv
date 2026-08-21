@@ -382,6 +382,27 @@ a physical ASUS TUF F17 laptop, not another VM
 ([side by side](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)).
 Both runs are public; neither is ours to edit.
 
+A second third-party-hosted result names the cost instead of averaging it away.
+**clpeak**, published to OpenBenchmarking, puts seven of its eight subtests at
+**99.4-100.2%** of bare metal -- several fractionally above 1.00x -- and the
+eighth is the whole story: **kernel launch latency is 2.13x the host's**, 3.84 us
+against 8.18 us, or **+4.3 us per launch**
+([result](https://openbenchmarking.org/result/2608219-NE-NVKVMPVRT27)). That is
+the design working exactly as designed, with its price stated: sustained GPU work
+never exits the guest, but every launch does. It is also why throughput
+workloads sit at parity while something that issues many tiny launches -- an
+interactive desktop, say -- feels slower.
+
+**Blender Open Data** (Cycles, RTX 4070, bare metal on both sides) splits that
+cost a third way: the **GPU render is 99.95% of bare metal**, with one scene
+fractionally above 1.00x, while *total* render time is 93.10%. The entire gap is
+Cycles' scene-sync phase -- a roughly constant +2.0 to +4.1 s per scene of CPU
+work on 4 vCPUs against 24 threads, plus host-to-device upload -- not a
+per-kernel forwarding tax. Unlike the two above, **this one is ours and is not
+third-party verifiable**: launcher 3.x requires a Blender ID login and offers no
+anonymous submission path
+([detail](docs/reference/blender-opendata.md)).
+
 The rest is guest vs host, one statically-linked binary run on both sides, RTX
 3060, host driver 575.51.03, strictly serial on one GPU.
 
