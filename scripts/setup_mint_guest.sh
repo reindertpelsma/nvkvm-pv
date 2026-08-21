@@ -275,6 +275,24 @@ for _ in $(seq 1 20); do
     xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null && break
     sleep 0.5
 done
+
+# ...and again, in the background, for a while.  Setting it once here is not
+# enough: cinnamon-settings-daemon's xrandr plugin applies its OWN saved display
+# configuration when the session comes up, a few seconds after this point, and
+# it picks the preferred mode -- 5120x2880 -- straight back.  Measured: the
+# session log shows this script setting 1920x1080 successfully, and xrandr
+# reporting 5120x2880 minutes later.  Re-asserting past the point where csd
+# settles means we apply last.  Cheap, idempotent, and it stops on its own.
+(
+    for _ in $(seq 1 30); do
+        sleep 2
+        cur=$(xrandr 2>/dev/null | awk '/^Screen 0:/ {print $8 $9 $10}')
+        case "$cur" in
+            *1920x1080*) : ;;
+            *) xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null ;;
+        esac
+    done
+) &
 xrandr 2>/dev/null | grep -E "^(Screen |XWAYLAND0 )"   # leave the proof in the log
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=X-Cinnamon
