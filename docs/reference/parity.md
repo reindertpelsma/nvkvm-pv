@@ -53,6 +53,22 @@ the host's 16 and 94.38 GB; on the H100, 16 cores and 62.79 GB against 20 and
 125.88 GB. Geekbench's GPU workloads still do CPU-side work, so the guest
 carries a handicap unrelated to forwarding.
 
+## Published on OpenBenchmarking: where the cost actually is
+
+clpeak on the same RTX 4070, both sides, one result file on Phoronix's server:
+[**openbenchmarking.org/result/2608219-NE-NVKVMPVRT27**](https://openbenchmarking.org/result/2608219-NE-NVKVMPVRT27)
+
+Seven of its eight subtests land between 99.4% and 100.2% — single- and
+double-precision compute, integer compute, global memory bandwidth, and both
+buffer-transfer directions are all at parity. The eighth is **kernel launch
+latency: 3.84 us on the host, 8.18 us in the guest, 2.13x.**
+
+That is the clearest statement of the trade this design makes. Sustained GPU
+work does not exit and costs nothing; each *launch* costs about +4.3 us. Every
+other row on this page follows from that one number — which is why batched
+serving reaches 1.00x and single-stream eager decode does not. Details and
+method in [clpeak on OpenBenchmarking](openbenchmarking-clpeak.md).
+
 ## A second opinion: Blender Cycles
 
 Geekbench is one vendor's harness. Blender Open Data on the same RTX 4070,
