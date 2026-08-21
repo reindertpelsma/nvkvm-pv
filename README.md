@@ -57,8 +57,8 @@ numbers](#tested-applications).
 
 That is one GPU, with CUDA graphs, on throughput. Three shapes cost more, all
 measured: single-stream greedy decode without graphs (0.73–0.82x), tensor-parallel
-serving across several GPUs ([about
-0.86x](#multi-gpu-serving)), and NVENC video encode, which
+serving across several GPUs ([0.89–1.06x, with one
+configuration at 0.52x](#multi-gpu-serving)), and NVENC video encode, which
 hung once and has not reproduced since.
 
 ## What it is not
@@ -361,9 +361,10 @@ boundary does with a guest pointer: [`ARCHITECTURE.md`](ARCHITECTURE.md).
   bring-up, CUDA, Vulkan compute and offscreen GL. It does not cover everything,
   and a real correctness bug has passed it before. Check your own results
   against a host run ([what that bug was](docs/reference/correctness.md)).
-- **Multi-GPU tensor-parallel serving is correct, and about 0.86x of host** —
-  but that is **one** measurement, not a matrix, and output parity on this path
-  is **not yet confirmed**. Single-GPU serving is at parity
+- **Multi-GPU tensor-parallel serving is correct, and 0.89–1.06x of host** at
+  TP=1/2/4 — except TP=4 with CUDA graphs, which is bimodal and lands at 0.52x
+  for reasons not yet established. Output differences at TP>1 are reduction
+  order, not a guest defect: the host disagrees with itself there too
   ([numbers](#multi-gpu-serving)).
 - **Frameworks that pin large host buffers pay a penalty.** Registering pinned
   memory is slower than native and a single registration is capped at 2 GiB —
@@ -476,16 +477,35 @@ summarisation).
 
 ### Multi-GPU serving
 
-vLLM with `--tensor-parallel-size 6` on six RTX A4000s runs a 38 GB model that
-fits on none of them, at **about 0.86x of host** (guest 140.15 vs host 163.57
-tok/s). NCCL runs with default settings.
+vLLM tensor-parallel on 4x RTX 4090, Qwen2.5-7B. Host and guest mount **one
+read-only image** holding the interpreter, venv and weights, so both sides run
+byte-identical bytes by construction. Medians, NCCL at defaults on both sides:
 
-Two caveats. That is **one** measurement, not a matrix — TP=1/2/4 scaling is
-still being measured. And in that run the generated-text hashes differed between
-host and guest, which may be ordinary reduction-order nondeterminism in
-tensor-parallel collectives; **we are not claiming output parity on this path
-until we have shown which it is.** Single-GPU serving is unaffected.
-[How the number got there](docs/reference/parity.md).
+| TP | eager | CUDA graphs |
+|----|-------|-------------|
+| 1  | 0.97x | 0.99x |
+| 2  | 0.91x | 1.06x |
+| 4  | 0.89x | 0.52x |
+
+Eager scaling is flat and orderly. **One cell is not: TP=4 with CUDA graphs** —
+and it is not a trend, because TP=2 with graphs is *faster* in the guest. That
+cell is bimodal where the host's is not: across 40 samples the guest's best run
+(795 tok/s) **beats the host's best** (775), but it keeps falling into a slow
+mode, so the median lands at 0.52x. It is a mode, not a ceiling. Cause not
+established — the guest carries a long launch+sync tail (p99 38–54 us against
+6.6–8.6) and whether that tail *causes* the slow mode is assumed, not shown.
+
+Separately, on six RTX A4000s a 38 GB model that fits on none of them serves at
+**0.86x**.
+
+**Output parity on this path is resolved, and it clears the guest.** The *host*
+disagrees with itself at TP=4, in both modes, while being 20/20 identical at
+TP=1 on the same binary. A host/guest text difference at TP>1 is reduction order
+inside the collective, not a guest defect. One residue stays open and we are not
+smoothing it over: at TP=1 with CUDA graphs — no collective at all — the host is
+20/20 and the guest 19/20. The odd output is a plausible near-tie flip, not
+garbage; cause unknown.
+[How the numbers got there](docs/reference/parity.md).
 
 ### Fine-tuning
 
