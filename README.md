@@ -244,6 +244,22 @@ Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Known issues
 
+**Vulkan compute on Hopper — fixed, and it was ours all along.** On an H100
+PCIe, `vk_compute_dispatch` failed in the guest (`vkCreateDevice` →
+`VK_ERROR_DEVICE_LOST`) on every host driver older than 580 — measured on
+565.57.01, 570.124.06, 570.148.08 and 575.57.08 — while 580.65.06 and 580.126.09
+were fine. **The same drivers all pass on bare metal**, which is what identified
+it as ours: a driver that works on the host and fails through nvkvm is an nvkvm
+bug. Root cause: `HOPPER_USERMODE_A` (`0xc661`) had no entry in the guest
+module's alloc-parameter size table, so nvkvm forwarded a **NULL parameter
+block**, RM built the usermode aperture from defaults (REGMEM instead of
+VIDMEM), and the userspace driver tore down the channel it had just created.
+Fixed; the H100 is now **28/28 on 570.124.06, 575.57.08 and 580.126.09**.
+**This README previously called it "a 570-branch driver bug ... no nvkvm change
+was involved"** — inferred by elimination without a pre-580 box, and wrong on
+both counts.
+[Root cause and trace](docs/reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug).
+
 **Graphics: Wayland works. Native Xorg does not, and that part is not ours.**
 A full desktop runs on the GPU inside the guest and is interactive in a host
 window at 60.0 frames/s with zero dropped frames — a browser rendering real
@@ -293,11 +309,8 @@ cover everything, and a real correctness bug has passed it before
 ([what it was](docs/reference/correctness.md)). Check your own results against a
 host run.
 
-Recently closed, in case you read an older copy of this file: Vulkan compute on
-Hopper was a defect in the 570 driver branch, not in nvkvm — the same part is
-28/28 on 580
-([the A/B](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug)).
-Guest kernels 6.12 and newer could not open the DRM nodes at all; also fixed.
+Recently closed, in case you read an older copy of this file: guest kernels 6.12
+and newer could not open the DRM nodes at all. Fixed.
 
 ## Tested applications
 
@@ -427,7 +440,12 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
-| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch` — a 570-branch driver bug, see below) |
+| H100 PCIe | **Hopper GH100** | 550.54.14 | 550 | 28/28 |
+| H100 PCIe | **Hopper GH100** | 565.57.01 | 550 | 27/28 before the `0xc661` fix; not re-run after |
+| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 28/28 (27/28 before the `0xc661` fix) |
+| H100 PCIe | **Hopper GH100** | 570.148.08 | 570 | 27/28 before the `0xc661` fix; not re-run after |
+| H100 PCIe | **Hopper GH100** | 575.57.08 | 570 | 28/28 (27/28 before the `0xc661` fix) |
+| H100 PCIe | **Hopper GH100** | 580.65.06 | 580 | 28/28 |
 | H100 PCIe | **Hopper GH100** | 580.126.09 | 580 | 28/28 |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
 | RTX 2080 Ti | Turing TU102 | 575.51.03 | 570 | 28/28 |
@@ -482,9 +500,12 @@ call in that context. Fixed —
 
 On the H100 every CUDA and bring-up check passes — `sm_90`, PTX JIT, kernel
 launch, matmul, byte-exact transfers — and OpenGL renders through the forwarder.
-`vk_compute_dispatch` failed on driver 570.124.06 and **passes on 580.126.09**
-(28/28); the A/B that pins that on the driver rather than on nvkvm is in
-[Correctness and known issues](docs/reference/correctness.md#vulkan-compute-on-hopper--resolved-2026-08-21-and-it-was-never-an-nvkvm-bug).
+`vk_compute_dispatch` used to fail on every host driver **older than 580**
+(565.57.01, 570.124.06, 570.148.08, 575.57.08) while passing on 580.65.06 and
+580.126.09, and passed on the bare-metal host on all of them — which is how it
+was identified as nvkvm's bug rather than the driver's, and then fixed
+(`HOPPER_USERMODE_A` was allocated with a NULL parameter block). Now 28/28 —
+[the driver sweep, the trace and the fix](docs/reference/correctness.md#vulkan-compute-on-hopper--fixed-2026-08-21-it-was-ours-and-it-was-never-a-driver-bug).
 
 Host/guest parity on that H100, same box, same scripts:
 

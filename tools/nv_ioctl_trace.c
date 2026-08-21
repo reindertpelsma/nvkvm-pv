@@ -1,0 +1,99 @@
+/* nv_ioctl_trace.c -- LD_PRELOAD shim that logs the NVIDIA frontend ioctls a
+ * process issues on the BARE-METAL HOST, in the same shape nvkvm's NVKVM_DEBUG
+ * trace prints them in the guest.  The two logs can then be diffed directly to
+ * find where a forwarded session first diverges from a native one.
+ *
+ *   cc -shared -fPIC -o nv_ioctl_trace.so tools/nv_ioctl_trace.c -ldl
+ *   NVTRACE_LOG=/tmp/host.log LD_PRELOAD=./nv_ioctl_trace.so ./some_gpu_program
+ *
+ * Covers NV_ESC_RM_ALLOC (0x2b), NV_ESC_RM_CONTROL (0x2a) and NV_ESC_RM_FREE
+ * (0x29) -- the object-lifetime calls.  Everything else is passed through
+ * untouched and unlogged.
+ */
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdarg.h>
+#include <dlfcn.h>
+#include <sys/ioctl.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+static int (*real_ioctl)(int, unsigned long, ...);
+static FILE *lg;
+
+static void open_log(void) {
+    const char *p = getenv("NVTRACE_LOG");
+    lg = p ? fopen(p, "w") : NULL;
+    if (!lg) lg = stderr;
+    setvbuf(lg, NULL, _IOLBF, 0);
+}
+
+int ioctl(int fd, unsigned long req, ...) {
+    va_list ap; va_start(ap, req); void *arg = va_arg(ap, void *); va_end(ap);
+    if (!real_ioctl) real_ioctl = dlsym(RTLD_NEXT, "ioctl");
+    if (!lg) open_log();
+
+    int r = real_ioctl(fd, req, arg);
+
+    unsigned type = (req >> 8) & 0xff;
+    unsigned nr   = req & 0xff;
+    unsigned size = (req >> 16) & 0x3fff;
+    if (type != 'F' || !arg) return r;
+
+    const uint32_t *w = arg;
+    if (nr == 0x2b && size >= 16) {
+        /* NVOS21 {hRoot,hParent,hNew,hClass,pParms,status}  (32B)
+         * NVOS64 {hRoot,hParent,hNew,hClass,pParms,pRights,paramsSize,flags,status} (48B) */
+        uint32_t aps = 0, status;
+        if (size >= 48) { aps = w[8]; status = w[10]; } else { status = w[6]; }
+        fprintf(lg, "TRACE ALLOC hRoot=0x%x hParent=0x%x hNew=0x%x "
+                    "hClass=0x%04x aps=%u nvstatus=0x%x\n",
+                w[0], w[1], w[2], w[3], aps, status);
+    } else if (nr == 0x2a && size >= 24) {
+        /* NVOS54 {hClient,hObject,cmd,flags,params(u64)@16,paramsSize@24,status@28} */
+        uint64_t pparams; uint32_t psize;
+        memcpy(&pparams, (const char *)arg + 16, 8);
+        memcpy(&psize,   (const char *)arg + 24, 4);
+        fprintf(lg, "TRACE CTRL  hClient=0x%x hObject=0x%x cmd=0x%08x nvstatus=0x%x",
+                w[0], w[1], w[2], w[7]);
+        /* Dump the params of the few controls whose OUT values decide what the
+         * userspace driver does next.  Same bytes on both sides of the
+         * boundary or the forwarded session is not equivalent. */
+        if (pparams && psize && psize <= 64) {
+            const unsigned char *pb = (const unsigned char *)(uintptr_t)pparams;
+            fprintf(lg, " params[%u]=", psize);
+            for (uint32_t i = 0; i < psize; i++) fprintf(lg, "%02x", pb[i]);
+        }
+        fputc('\n', lg);
+    } else if (nr == 0x29 && size >= 16) {
+        /* NVOS00 {hRoot,hObjectParent,hObjectOld,status} */
+        fprintf(lg, "TRACE FREE  hRoot=0x%x hParent=0x%x hObject=0x%x nvstatus=0x%x\n",
+                w[0], w[1], w[2], w[3]);
+    } else if (getenv("NVTRACE_ALL")) {
+        /* Every other frontend ioctl, with the head of its parameter block.
+         * The RM object calls alone were not enough to explain a divergence:
+         * the guest and host agreed on all of them and still behaved
+         * differently, which means the deciding value came through one of
+         * these. */
+        uint32_t n = size < 48 ? size : 48;
+        fprintf(lg, "TRACE IOCTL nr=0x%02x size=%u ret=%d p=", nr, size, r);
+        for (uint32_t i = 0; i < n; i++) fprintf(lg, "%02x", ((const unsigned char *)arg)[i]);
+        fputc('\n', lg);
+    }
+    return r;
+}
+
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off);
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, off_t off) {
+    static void *(*real_mmap)(void *, size_t, int, int, int, off_t);
+    if (!real_mmap) real_mmap = dlsym(RTLD_NEXT, "mmap");
+    void *p = real_mmap(addr, len, prot, flags, fd, off);
+    if (lg && fd >= 0 && getenv("NVTRACE_ALL"))
+        fprintf(lg, "TRACE MMAP  fd=%d len=%zu prot=0x%x flags=0x%x off=0x%llx -> %s\n",
+                fd, len, prot, flags, (unsigned long long)off,
+                p == (void *)-1 ? "FAILED" : "ok");
+    return p;
+}
