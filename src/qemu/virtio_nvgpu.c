@@ -1232,7 +1232,7 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 
 	/* Initialize isolate/handle managers */
 	nvkvm_handle_table_init(&nv->handles);
-	nvkvm_isolate_table_init(&nv->isolates);
+	nvkvm_isolate_table_init(&nv->isolates, &nv->handles);
 	/* #81: stamp every forwarded IOCTL with the host driver's ABI id so the
 	 * stub uses matching version-variant offsets. */
 	nv->isolates.abi_profile = nv->abi ? nv->abi->id : NVKVM_ABI_570;

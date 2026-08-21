@@ -56,6 +56,7 @@ void nvkvm_handle_table_init(struct nvkvm_handle_table *t)
 	memset(t, 0, sizeof(*t));
 	pthread_mutex_init(&t->lock, NULL);
 	t->next_id = 1;
+	t->next_generation = 1;
 	for (int i = 0; i < NVKVM_HANDLE_MAX; i++)
 		t->handles[i].fd = -1;
 }
@@ -89,6 +90,9 @@ static struct nvkvm_handle *alloc_slot(struct nvkvm_handle_table *t,
 		if (!h->in_use) {
 			memset(h, 0, sizeof(*h));
 			h->id     = id;
+			h->generation = t->next_generation++;
+			if (t->next_generation == 0)
+				t->next_generation = 1;
 			h->fd     = -1;
 			h->in_use = true;
 			*id_out   = id;
@@ -265,7 +269,7 @@ struct nvkvm_handle *nvkvm_handle_get(struct nvkvm_handle_table *t,
  * Returns -1 if the handle is gone/closed.  *dev_id_out (optional) gets dev_id.
  */
 int nvkvm_handle_acquire_fd(struct nvkvm_handle_table *t, uint32_t handle_id,
-			    int *dev_id_out)
+			    int *dev_id_out, uint64_t *generation_out)
 {
 	int dfd = -1;
 	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
@@ -276,18 +280,45 @@ int nvkvm_handle_acquire_fd(struct nvkvm_handle_table *t, uint32_t handle_id,
 		dfd = fcntl(h->fd, F_DUPFD_CLOEXEC, 0);
 		if (dev_id_out)
 			*dev_id_out = h->dev_id;
+		if (generation_out)
+			*generation_out = h->generation;
 	}
 	pthread_mutex_unlock(&t->lock);
 	return dfd;
 }
 
-int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
+int nvkvm_handle_acquire_fd_ref_isolate(struct nvkvm_handle_table *t,
+					 uint32_t handle_id, int *dev_id_out,
+					 uint64_t *generation_out)
+{
+	int dfd = -1;
+	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
+		return -1;
+	pthread_mutex_lock(&t->lock);
+	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
+	if (h->in_use && h->id == handle_id && h->fd >= 0) {
+		dfd = fcntl(h->fd, F_DUPFD_CLOEXEC, 0);
+		if (dfd >= 0) {
+			h->isolate_refcount++;
+			if (dev_id_out)
+				*dev_id_out = h->dev_id;
+			if (generation_out)
+				*generation_out = h->generation;
+		}
+	}
+	pthread_mutex_unlock(&t->lock);
+	return dfd;
+}
+
+int nvkvm_handle_ref_isolate_generation(struct nvkvm_handle_table *t,
+					 uint32_t handle_id, uint64_t generation)
 {
 	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
 		return -EBADF;
 	pthread_mutex_lock(&t->lock);
 	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
-	if (!h->in_use || h->id != handle_id) {
+	if (!h->in_use || h->id != handle_id ||
+	    (generation != 0 && h->generation != generation)) {
 		pthread_mutex_unlock(&t->lock);
 		return -EBADF;
 	}
@@ -296,13 +327,20 @@ int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
 	return 0;
 }
 
-int nvkvm_handle_unref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
+int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
+{
+	return nvkvm_handle_ref_isolate_generation(t, handle_id, 0);
+}
+
+int nvkvm_handle_unref_isolate_generation(struct nvkvm_handle_table *t,
+					   uint32_t handle_id, uint64_t generation)
 {
 	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX)
 		return -EBADF;
 	pthread_mutex_lock(&t->lock);
 	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
-	if (!h->in_use || h->id != handle_id) {
+	if (!h->in_use || h->id != handle_id ||
+	    (generation != 0 && h->generation != generation)) {
 		pthread_mutex_unlock(&t->lock);
 		return -EBADF;
 	}
@@ -310,6 +348,11 @@ int nvkvm_handle_unref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
 		h->isolate_refcount--;
 	pthread_mutex_unlock(&t->lock);
 	return 0;
+}
+
+int nvkvm_handle_unref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id)
+{
+	return nvkvm_handle_unref_isolate_generation(t, handle_id, 0);
 }
 
 int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id)

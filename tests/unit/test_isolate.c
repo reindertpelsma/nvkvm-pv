@@ -77,7 +77,7 @@ static struct nvkvm_isolate_table g_it;
 static void fixture_init(void)
 {
 	nvkvm_handle_table_init(&g_ht);
-	nvkvm_isolate_table_init(&g_it);
+	nvkvm_isolate_table_init(&g_it, &g_ht);
 }
 
 static void fixture_fini(void)
@@ -354,6 +354,61 @@ TEST(poll_unpoll)
 	fixture_fini();
 }
 
+/* ── Test 8: cross-isolate relay bookkeeping across teardown ─────────────── */
+
+TEST(foreign_relay_cleanup_on_kill)
+{
+	fixture_init();
+
+	/*
+	 * Install a process-free live slot by hand.  This exercises the
+	 * bookkeeping in nvkvm_isolate_kill() without spawning mock_stub or
+	 * waiting on a child, which is what the four known-failing cases above
+	 * are stuck on.
+	 */
+	const uint32_t iso_id = 7;
+	struct nvkvm_isolate *iso = &g_it.isolates[iso_id];
+	iso->id = iso_id;
+	iso->in_use = true;
+	iso->alive = true;
+	iso->pid = 0;
+	iso->sock_fd = -1;
+	iso->xrm_accepting = true;
+
+	uint32_t hid = 0;
+	EXPECT_EQ(nvkvm_handle_open_memory(&g_ht, 77, 4096, &hid), 0);
+	struct nvkvm_handle *h = nvkvm_handle_get(&g_ht, hid);
+	EXPECT_GE((uintptr_t)h, 1);
+	uint64_t generation = h->generation;
+
+	/*
+	 * A reserved-but-undelivered relay is not the same as a delivered one:
+	 * no handle reference exists for it yet, so forget() reports generation
+	 * 0 and teardown must not try to drop one.
+	 */
+	uint64_t pending_generation = 99;
+	EXPECT_EQ(nvkvm_isolate_note_foreign_handle(&g_it, iso_id, hid), false);
+	EXPECT_EQ(nvkvm_isolate_forget_foreign_handle(&g_it, iso_id, hid,
+						      &pending_generation), true);
+	EXPECT_EQ(pending_generation, 0);
+
+	/* Now the delivered case: reserve, pin, publish the generation. */
+	EXPECT_EQ(nvkvm_isolate_note_foreign_handle(&g_it, iso_id, hid), false);
+	EXPECT_EQ(nvkvm_handle_ref_isolate_generation(&g_ht, hid, generation), 0);
+	EXPECT_EQ(nvkvm_isolate_finalize_foreign_handle(&g_it, iso_id, hid,
+							generation), true);
+	EXPECT_EQ(h->isolate_refcount, 1);
+
+	/* Killing the importer must return the reference, or the owner's fd
+	 * stays pinned open for the life of the VM. */
+	EXPECT_EQ(nvkvm_isolate_kill(&g_it, iso_id), 0);
+	EXPECT_EQ(h->isolate_refcount, 0);
+	EXPECT_EQ(iso->xrm_n, 0);
+	EXPECT_EQ(nvkvm_handle_close(&g_ht, hid), 0);
+
+	fixture_fini();
+}
+
 /* ── main ─────────────────────────────────────────────────────────────────── */
 
 int main(void)
@@ -385,6 +440,7 @@ int main(void)
 	RUN(kill_during_inflight);
 	RUN(sync_mmap_munmap);
 	RUN(poll_unpoll);
+	RUN(foreign_relay_cleanup_on_kill);
 
 	fprintf(stderr, "\n%d/%d tests passed\n", tests_passed, tests_run);
 	return tests_failed ? 1 : 0;

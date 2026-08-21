@@ -45,6 +45,19 @@
 #define NVKVM_XRM_MAX      256
 
 /*
+ * One recorded cross-isolate relay.  generation == 0 means "reserved, delivery
+ * still in flight": the worker doing the blocking relay owns the eventual
+ * rollback, and teardown must NOT drop a handle reference for it because none
+ * has been taken yet.  A nonzero generation is the handle-table generation the
+ * relayed fd was pinned against, so a slot that has since been closed and
+ * reissued under the same handle id cannot be unreffed by mistake.
+ */
+struct nvkvm_xrm_handle {
+	uint32_t handle_id;
+	uint64_t generation;
+};
+
+/*
  * Forward declaration — fully defined in nvkvm_isolate.c.
  * Callers of nvkvm_isolate_ioctl never touch this directly; it lives on
  * the caller's stack and is registered/deregistered internally.
@@ -178,8 +191,14 @@ struct nvkvm_isolate {
 	 * own lock because the broker runs on QEMU's pooled IOCTL workers.
 	 */
 	pthread_mutex_t xrm_lock;
-	uint32_t    xrm_handles[NVKVM_XRM_MAX];
+	struct nvkvm_xrm_handle xrm_handles[NVKVM_XRM_MAX];
 	unsigned    xrm_n;
+	/*
+	 * Cleared by nvkvm_isolate_kill() before it drains the list, so a
+	 * pooled IOCTL worker cannot reserve a new relay against a slot that is
+	 * already being torn down and have its reference outlive the drain.
+	 */
+	bool        xrm_accepting;
 
 	/*
 	 * Command-buffer SPSC ring pair (docs/design/command_buffer.md, Phase 2).
@@ -220,9 +239,17 @@ struct nvkvm_isolate_table {
 	 * guest can map it.  QEMU only maps the ring — it never inspects contents.
 	 */
 	void                *nv;
+	/*
+	 * The VM's handle table.  nvkvm_isolate_kill() needs it to drop the
+	 * isolate references held by relayed foreign handles; it is the same
+	 * table every caller already passes explicitly, kept here so teardown
+	 * does not have to be handed it by whoever happened to notice the death.
+	 */
+	struct nvkvm_handle_table *handles;
 };
 
-void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t);
+void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t,
+			      struct nvkvm_handle_table *handles);
 
 /*
  * Validate the resolved isolation configuration against what this host can
@@ -348,6 +375,15 @@ int nvkvm_isolate_interrupt(struct nvkvm_isolate_table *t,
 int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 			      struct nvkvm_handle_table *ht,
 			      uint32_t isolate_id, uint32_t handle_id);
+/*
+ * As above, but also reports the handle-table generation the reference was
+ * taken against, so the caller can later release exactly that reference and
+ * not one belonging to a recycled slot with the same handle id.
+ */
+int nvkvm_isolate_send_handle_generation(struct nvkvm_isolate_table *t,
+					 struct nvkvm_handle_table *ht,
+					 uint32_t isolate_id, uint32_t handle_id,
+					 uint64_t *generation_out);
 
 /*
  * Cross-isolate RM export/import bookkeeping (see xrm_handles above).
@@ -359,9 +395,24 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
  */
 bool nvkvm_isolate_note_foreign_handle(struct nvkvm_isolate_table *t,
 				       uint32_t isolate_id, uint32_t handle_id);
-void nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
+/*
+ * finalize(): publish the generation of a relay that has now been delivered.
+ * Returns false if the reservation is gone (the isolate died mid-relay), in
+ * which case the caller still owns the reference and must drop it itself.
+ */
+bool nvkvm_isolate_finalize_foreign_handle(struct nvkvm_isolate_table *t,
+					   uint32_t isolate_id,
+					   uint32_t handle_id,
+					   uint64_t generation);
+/*
+ * forget(): remove the record.  Returns true if one was present, and writes
+ * its generation (0 for a reservation that never completed delivery) to
+ * *generation_out when non-NULL.
+ */
+bool nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
 					 uint32_t isolate_id,
-					 uint32_t handle_id);
+					 uint32_t handle_id,
+					 uint64_t *generation_out);
 
 /*
  * Ask the isolate to open /dev/nvidia* (or eventfd) on QEMU's behalf so the

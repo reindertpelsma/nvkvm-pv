@@ -1640,8 +1640,23 @@ static void nvkvm_xrm_materialise(VirtIONvgpu *nv, uint32_t iso_id,
 	if (nvkvm_isolate_note_foreign_handle(&nv->isolates, iso_id, handle_id))
 		return;   /* already relayed here (or table full) */
 
-	if (nvkvm_isolate_send_handle(&nv->isolates, &nv->handles,
-				      iso_id, handle_id) == 0) {
+	uint64_t generation = 0;
+	if (nvkvm_isolate_send_handle_generation(&nv->isolates, &nv->handles,
+						 iso_id, handle_id,
+						 &generation) == 0) {
+		/*
+		 * note() above reserved the entry before the blocking relay, so
+		 * the record exists but does not yet name a generation.  Publish
+		 * it only now that delivery succeeded.  If teardown won the race
+		 * the reservation is gone, the delivered fd died with the
+		 * isolate, and the reference the send took is ours to retire --
+		 * nobody else will.
+		 */
+		if (!nvkvm_isolate_finalize_foreign_handle(&nv->isolates, iso_id,
+							   handle_id, generation))
+			nvkvm_handle_unref_isolate_generation(&nv->handles,
+							      handle_id,
+							      generation);
 		NVKVM_DBG("nvkvm xrm: owner(iso=%u) -> importer(iso=%u) "
 			  "handle=%u relayed\n", owner_iso, iso_id, handle_id);
 	} else {
@@ -1649,9 +1664,11 @@ static void nvkvm_xrm_materialise(VirtIONvgpu *nv, uint32_t iso_id,
 		 * Best-effort: leave the control to be forwarded and fail the
 		 * way it did before rather than converting a relay miss into a
 		 * new hard error, and drop the note so a retry can try again.
+		 * send_handle_generation() has already rolled back its own
+		 * reference, so there is nothing to unref here.
 		 */
 		nvkvm_isolate_forget_foreign_handle(&nv->isolates, iso_id,
-						    handle_id);
+						    handle_id, NULL);
 	}
 }
 
@@ -1906,7 +1923,8 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			 * pool worker.  The dup keeps the struct file alive for
 			 * the whole call; we close it immediately after. */
 			int tfd = nvkvm_handle_acquire_fd(&nv->handles,
-							  req->handle_id, NULL);
+							  req->handle_id, NULL,
+							  NULL);
 			if (tfd < 0) {
 				resp->retval     = (uint64_t)(int64_t)(-EBADF);
 				resp->status     = 0;

@@ -21,6 +21,7 @@
 
 struct nvkvm_handle {
 	uint32_t    id;
+	uint64_t    generation;   /* distinguishes a slot after handle-id reuse */
 	int         type;         /* NVKVM_HANDLE_TYPE_* */
 	int         fd;           /* underlying fd in QEMU (-1 if closed) */
 	uint32_t    session_id;   /* owning session */
@@ -46,6 +47,7 @@ struct nvkvm_handle_table {
 	pthread_mutex_t  lock;
 	struct nvkvm_handle handles[NVKVM_HANDLE_MAX];
 	uint32_t         next_id;   /* monotonic counter, wraps with gap-fill */
+	uint64_t         next_generation;
 };
 
 void nvkvm_handle_table_init(struct nvkvm_handle_table *t);
@@ -84,13 +86,24 @@ struct nvkvm_handle *nvkvm_handle_get(struct nvkvm_handle_table *t,
 /* C-2: dup the handle's fd atomically under the table lock so a concurrent
  * close cannot recycle it mid-ioctl. Caller MUST close() the returned fd. */
 int nvkvm_handle_acquire_fd(struct nvkvm_handle_table *t, uint32_t handle_id,
-			    int *dev_id_out);
+			    int *dev_id_out, uint64_t *generation_out);
+
+/* As above, but atomically pins the handle for one isolate relay. */
+int nvkvm_handle_acquire_fd_ref_isolate(struct nvkvm_handle_table *t,
+					 uint32_t handle_id, int *dev_id_out,
+					 uint64_t *generation_out);
 
 /* Bump isolate refcount (called when sending fd to an isolate). */
 int nvkvm_handle_ref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id);
 
 /* Decrement isolate refcount (called when isolate closes fd). */
 int nvkvm_handle_unref_isolate(struct nvkvm_handle_table *t, uint32_t handle_id);
+
+/* Generation-qualified variants used by delayed cross-isolate teardown. */
+int nvkvm_handle_ref_isolate_generation(struct nvkvm_handle_table *t,
+					 uint32_t handle_id, uint64_t generation);
+int nvkvm_handle_unref_isolate_generation(struct nvkvm_handle_table *t,
+					   uint32_t handle_id, uint64_t generation);
 
 /* Close the underlying fd. Fails (returns -EBUSY) if isolate_refcount > 0. */
 int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id);

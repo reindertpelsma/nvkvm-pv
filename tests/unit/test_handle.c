@@ -222,6 +222,58 @@ TEST(test_ref_unref_multiple_isolates)
 	nvkvm_handle_table_fini(&t);
 }
 
+/*
+ * Generation qualification: a release must name the incarnation of the slot it
+ * took a reference against, so a handle id that has been closed and reissued
+ * cannot have its new occupant's count decremented by a stale releaser.
+ */
+TEST(test_generation_qualified_unref_rejects_stale_slot)
+{
+	struct nvkvm_handle_table t;
+	nvkvm_handle_table_init(&t);
+
+	uint32_t id;
+	ASSERT_EQ(open_test_memory_handle(&t, 1, &id), 0);
+	struct nvkvm_handle *h = nvkvm_handle_get(&t, id);
+	ASSERT_NOTNULL(h);
+	uint64_t generation = h->generation;
+	ASSERT_NE(generation, 0);
+
+	ASSERT_EQ(nvkvm_handle_ref_isolate_generation(&t, id, generation), 0);
+	/* Wrong generation: refused, and the reference is still held. */
+	ASSERT_EQ(nvkvm_handle_unref_isolate_generation(&t, id, generation + 1),
+		  -EBADF);
+	ASSERT_EQ(nvkvm_handle_close(&t, id), -EBUSY);
+	ASSERT_EQ(nvkvm_handle_unref_isolate_generation(&t, id, generation), 0);
+	ASSERT_EQ(nvkvm_handle_close(&t, id), 0);
+
+	nvkvm_handle_table_fini(&t);
+}
+
+/*
+ * The relay path needs the dup and the pin to happen together under the table
+ * lock; if they can be separated, a close between them recycles the fd number.
+ */
+TEST(test_acquire_fd_ref_is_atomic_pin)
+{
+	struct nvkvm_handle_table t;
+	nvkvm_handle_table_init(&t);
+
+	uint32_t id;
+	ASSERT_EQ(open_test_memory_handle(&t, 1, &id), 0);
+	uint64_t generation = 0;
+	int fd = nvkvm_handle_acquire_fd_ref_isolate(&t, id, NULL, &generation);
+	ASSERT_NE(fd, -1);
+	ASSERT_NE(generation, 0);
+	/* The pin is already in place when the fd comes back. */
+	ASSERT_EQ(nvkvm_handle_close(&t, id), -EBUSY);
+	close(fd);
+	ASSERT_EQ(nvkvm_handle_unref_isolate_generation(&t, id, generation), 0);
+	ASSERT_EQ(nvkvm_handle_close(&t, id), 0);
+
+	nvkvm_handle_table_fini(&t);
+}
+
 /* ── Tests: session close ──────────────────────────────────────────────────── */
 
 TEST(test_close_session_frees_all_handles)

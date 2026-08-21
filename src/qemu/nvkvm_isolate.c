@@ -1376,9 +1376,11 @@ const char *nvkvm_isolate_cfg_describe(const struct nvkvm_isolate_table *t,
 	return buf;
 }
 
-void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t)
+void nvkvm_isolate_table_init(struct nvkvm_isolate_table *t,
+			      struct nvkvm_handle_table *handles)
 {
 	memset(t, 0, sizeof(*t));
+	t->handles = handles;
 	pthread_mutex_init(&t->lock, NULL);
 	/* F1-1: every condvar below is waited on with a deadline now, so pin
 	 * them to CLOCK_MONOTONIC before creating any of them — a wall-clock
@@ -1511,6 +1513,7 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			pthread_mutex_lock(&iso->xrm_lock);
 			iso->xrm_n = 0;
 			memset(iso->xrm_handles, 0, sizeof(iso->xrm_handles));
+			iso->xrm_accepting = true;
 			pthread_mutex_unlock(&iso->xrm_lock);
 			*id_out = id;
 			return iso;
@@ -2082,6 +2085,19 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 	pthread_mutex_unlock(&iso->lock);
 
 	/*
+	 * Stop pooled IOCTL workers reserving new foreign relays against a slot
+	 * that is on its way out.  A reservation taken after the drain below
+	 * would leave an isolate reference on a handle with no isolate left to
+	 * release it, which pins the handle's fd open for the life of the VM.
+	 * Existing reservations are drained further down, after the stub process
+	 * has been reaped -- at that point no SCM_RIGHTS receiver can still be
+	 * holding one.
+	 */
+	pthread_mutex_lock(&iso->xrm_lock);
+	iso->xrm_accepting = false;
+	pthread_mutex_unlock(&iso->xrm_lock);
+
+	/*
 	 * Audit C-1 (unchanged intent): the fd is claimed — snapshotted AND
 	 * nulled — under write_lock, so an IOCTL_ON_ISOLATE running on a
 	 * thread-pool worker either finishes its send first or sees -1 and
@@ -2185,6 +2201,31 @@ int nvkvm_isolate_kill(struct nvkvm_isolate_table *t, uint32_t isolate_id)
 		if (!reaped) {
 			kill(pid, SIGKILL);
 			waitpid(pid, &status, 0);
+		}
+	}
+
+	/*
+	 * Drain the cross-isolate relay list while the slot is still marked
+	 * in_use, so alloc_isolate_slot() cannot hand it to a new occupant
+	 * between the snapshot and the clear.  Every delivered relay took one
+	 * isolate reference on the owner's handle; the isolate that held them is
+	 * now dead, so they are ours to drop.  Entries with generation 0 are
+	 * reservations whose delivery never completed -- no reference was taken
+	 * for them, and the worker doing that relay owns the rollback.
+	 */
+	struct nvkvm_xrm_handle xrm[NVKVM_XRM_MAX];
+	unsigned xrm_n;
+	pthread_mutex_lock(&iso->xrm_lock);
+	xrm_n = iso->xrm_n;
+	memcpy(xrm, iso->xrm_handles, xrm_n * sizeof(xrm[0]));
+	iso->xrm_n = 0;
+	pthread_mutex_unlock(&iso->xrm_lock);
+	if (t->handles) {
+		for (unsigned i = 0; i < xrm_n; i++) {
+			if (xrm[i].generation != 0)
+				nvkvm_handle_unref_isolate_generation(
+					t->handles, xrm[i].handle_id,
+					xrm[i].generation);
 		}
 	}
 
@@ -2398,14 +2439,21 @@ bool nvkvm_isolate_note_foreign_handle(struct nvkvm_isolate_table *t,
 	if (iso->in_use && iso->id == isolate_id) {
 		present = false;
 		for (unsigned i = 0; i < iso->xrm_n; i++) {
-			if (iso->xrm_handles[i] == handle_id) {
+			if (iso->xrm_handles[i].handle_id == handle_id) {
 				present = true;
 				break;
 			}
 		}
-		if (!present) {
+		if (!iso->xrm_accepting) {
+			/* Teardown has started.  Decline rather than record a
+			 * relay whose reference nothing will be left to drop. */
+			present = true;
+		} else if (!present) {
 			if (iso->xrm_n < NVKVM_XRM_MAX)
-				iso->xrm_handles[iso->xrm_n++] = handle_id;
+				iso->xrm_handles[iso->xrm_n++] =
+					(struct nvkvm_xrm_handle){
+						.handle_id = handle_id,
+					};
 			else
 				present = true;   /* full: decline, do not evict */
 		}
@@ -2414,42 +2462,100 @@ bool nvkvm_isolate_note_foreign_handle(struct nvkvm_isolate_table *t,
 	return present;
 }
 
-void nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
-					 uint32_t isolate_id, uint32_t handle_id)
+bool nvkvm_isolate_finalize_foreign_handle(struct nvkvm_isolate_table *t,
+					   uint32_t isolate_id,
+					   uint32_t handle_id,
+					   uint64_t generation)
 {
-	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
-		return;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX || generation == 0)
+		return false;
 	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	bool found = false;
 
 	pthread_mutex_lock(&iso->xrm_lock);
-	if (iso->in_use && iso->id == isolate_id) {
+	if (iso->in_use && iso->id == isolate_id && iso->xrm_accepting) {
 		for (unsigned i = 0; i < iso->xrm_n; i++) {
-			if (iso->xrm_handles[i] == handle_id) {
-				iso->xrm_handles[i] = iso->xrm_handles[--iso->xrm_n];
+			if (iso->xrm_handles[i].handle_id == handle_id &&
+			    iso->xrm_handles[i].generation == 0) {
+				iso->xrm_handles[i].generation = generation;
+				found = true;
 				break;
 			}
 		}
 	}
 	pthread_mutex_unlock(&iso->xrm_lock);
+	return found;
 }
 
-int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
-			      struct nvkvm_handle_table *ht,
-			      uint32_t isolate_id, uint32_t handle_id)
+bool nvkvm_isolate_forget_foreign_handle(struct nvkvm_isolate_table *t,
+					 uint32_t isolate_id, uint32_t handle_id,
+					 uint64_t *generation_out)
 {
+	if (generation_out)
+		*generation_out = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return false;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+	uint64_t generation = 0;
+	bool found = false;
+
+	pthread_mutex_lock(&iso->xrm_lock);
+	if (iso->in_use && iso->id == isolate_id) {
+		for (unsigned i = 0; i < iso->xrm_n; i++) {
+			if (iso->xrm_handles[i].handle_id == handle_id) {
+				generation = iso->xrm_handles[i].generation;
+				found = true;
+				iso->xrm_handles[i] =
+					iso->xrm_handles[--iso->xrm_n];
+				break;
+			}
+		}
+	}
+	pthread_mutex_unlock(&iso->xrm_lock);
+	if (generation_out)
+		*generation_out = generation;
+	return found;
+}
+
+int nvkvm_isolate_send_handle_generation(struct nvkvm_isolate_table *t,
+					 struct nvkvm_handle_table *ht,
+					 uint32_t isolate_id, uint32_t handle_id,
+					 uint64_t *generation_out)
+{
+	if (generation_out)
+		*generation_out = 0;
 	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
 		return -ENOENT;
 	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
 
 	pthread_mutex_lock(&iso->lock);
 	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
-	struct nvkvm_handle *h = valid ? nvkvm_handle_get(ht, handle_id) : NULL;
-	int fd        = (h && h->fd >= 0) ? h->fd : -1;
-	int h_dev_id  = h ? h->dev_id : 0;
 	pthread_mutex_unlock(&iso->lock);
 
 	if (!valid)
 		return -ENOENT;
+
+	/*
+	 * Never carry the handle table's raw fd INTEGER across the blocking
+	 * send/ack round-trip below.  The old code read h->fd, dropped every
+	 * lock, and only then did the sendmsg; a concurrent session teardown
+	 * running on another thread can close that descriptor in that window,
+	 * and the kernel is free to hand the same number straight back to an
+	 * unrelated open() in QEMU.  The relay would then pass THAT file to the
+	 * isolate over SCM_RIGHTS.  The refcount was also only taken after the
+	 * send succeeded, so nothing stopped the close in the first place.
+	 *
+	 * Acquire a duplicate and the isolate reference together, under the
+	 * handle-table lock, while identity still holds: the dup keeps this open
+	 * file description alive until sendmsg has taken its own SCM_RIGHTS
+	 * reference, and the refcount makes nvkvm_handle_close() return -EBUSY
+	 * for the duration.  The generation is reported so the eventual release
+	 * can name this incarnation of the slot and not a later one.
+	 */
+	int h_dev_id = 0;
+	uint64_t generation = 0;
+	int fd = nvkvm_handle_acquire_fd_ref_isolate(ht, handle_id, &h_dev_id,
+						     &generation);
 	if (fd < 0)
 		return -EBADF;
 
@@ -2474,9 +2580,26 @@ int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
 	memcpy(CMSG_DATA(cm), &fd, sizeof(int));
 
 	int ret = sync_sendmsg_recv(iso, &msg);
-	if (ret == 0)
-		nvkvm_handle_ref_isolate(ht, handle_id);
+	/* Our own copy has done its job either way: on success the kernel holds
+	 * an SCM_RIGHTS reference for the stub, on failure nothing does. */
+	close(fd);
+	if (ret == 0) {
+		if (generation_out)
+			*generation_out = generation;
+	} else {
+		/* Roll the reservation back, or a failed delivery pins the
+		 * owner's fd open until the VM exits. */
+		nvkvm_handle_unref_isolate_generation(ht, handle_id, generation);
+	}
 	return ret;
+}
+
+int nvkvm_isolate_send_handle(struct nvkvm_isolate_table *t,
+			      struct nvkvm_handle_table *ht,
+			      uint32_t isolate_id, uint32_t handle_id)
+{
+	return nvkvm_isolate_send_handle_generation(t, ht, isolate_id, handle_id,
+						    NULL);
 }
 
 /* ── Command-buffer ring setup ──────────────────────────────────────────── */
@@ -3016,8 +3139,27 @@ int nvkvm_isolate_close_handle(struct nvkvm_isolate_table *t,
 		.handle_id = handle_id,
 	};
 	int ret = sync_send_recv(iso, &cmd, sizeof(cmd));
-	if (ret == 0)
-		nvkvm_handle_unref_isolate(ht, handle_id);
+	if (ret == 0) {
+		/*
+		 * If this handle got here as a cross-isolate relay, drop the
+		 * record along with the reference -- and release exactly the
+		 * generation the relay pinned.  Leaving the record behind meant
+		 * the slot still owed a reference at teardown, and a bare
+		 * unref would happily decrement whatever occupies the handle id
+		 * now if it has been closed and reissued since.
+		 */
+		uint64_t generation = 0;
+		bool foreign = nvkvm_isolate_forget_foreign_handle(
+			t, isolate_id, handle_id, &generation);
+		if (!foreign)
+			nvkvm_handle_unref_isolate(ht, handle_id);
+		else if (generation != 0)
+			nvkvm_handle_unref_isolate_generation(ht, handle_id,
+							      generation);
+		/* foreign with generation 0: delivery never completed, so no
+		 * reference was ever taken and the relay worker owns the
+		 * rollback.  Dropping one here would underflow the count. */
+	}
 	return ret;
 }
 
