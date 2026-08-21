@@ -434,13 +434,19 @@ control commands the allowlist was generated without:
 |---|---|
 | 545.23.08 | `0x00730102`, `0x00730138` |
 | 550.54.14 | `0x00730102` |
-| 580.95.05 | none observed |
+| 580.95.05 | ~~none observed~~ → `0x00730102` |
 | 595.84 | ~~none observed~~ → `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
 | 610.43.02 | `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
 
 The 595.84 row was re-measured 2026-08-17; "none observed" was taken before
 anything created an offscreen GL context, which is the only thing that reaches
 NVKMS. 595 and 610 in fact deny the same four things.
+
+The 580.95.05 row was re-measured 2026-08-21 on a 4x RTX 5060 (Blackwell,
+sm_120, open kernel module): `0x00730102` is denied 8 times during bring-up.
+That row is the same story as 595 — the original "none observed" simply
+predates a run that touched the display path. Non-fatal as everywhere else:
+that host scores 28/28, and the denials all land before any GPU work starts.
 
 The three RM control commands are non-fatal — 610.43.02 scores 28/28 with all
 three still denied. **The NVKMS `cmdType=60` denial was not**: it is what broke
