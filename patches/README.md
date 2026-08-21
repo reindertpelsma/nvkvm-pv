@@ -1,13 +1,13 @@
 # QEMU patches
 
-Everything nvkvm changes in **upstream QEMU** is in this directory: seven patch
-files, 236 added lines and 15 removed, against the `v9.2.0` tag
+Everything nvkvm changes in **upstream QEMU** is in this directory: nine patch
+files, 631 added lines and 15 removed, against the `v9.2.0` tag
 (`ae35f033b874c627d81d51070187fbf55f0bf1a7`). Nothing else in the QEMU tree is
 edited.
 
 They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
-A reader deciding whether to trust this can read seven diffs; a maintainer
+A reader deciding whether to trust this can read nine diffs; a maintainer
 bumping the QEMU version resolves conflicts with ordinary tools instead of
 rewriting editing logic; and "is it already applied?" is answered by
 `git apply --reverse --check` rather than by grepping the tree for a comment
@@ -20,8 +20,10 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | `0003-egl-helpers-import-dmabuf-via-texstorage.patch` | `ui/egl-helpers.c` | imports dma-bufs with `glEGLImageTargetTexStorageEXT`; NVIDIA rejects the legacy OES bind for external-only images |
 | `0004-console-do-not-abort-on-deviceless-console.patch` | `ui/console.c` | skips non-graphic consoles in `qemu_console_lookup_by_device()`, which otherwise aborts QEMU on `screendump` |
 | `0005-gtk-switch-to-guest-display-when-it-goes-live.patch` | `include/ui/gtk.h`, `ui/gtk.c`, `ui/gtk-egl.c`, `ui/gtk-gl-area.c` | switches the GTK window to the guest's head the first time it presents real content, once, and only from the page the window opened on |
-| `0006-gtk-no-implicit-grab-on-click.patch` | `ui/gtk.c` | stops a left click taking the pointer and keyboard when the current device is relative; a click is forwarded to the guest, and grab is entered only from the menu or Ctrl+Alt+G |
-| `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | makes the grab activate a **relative** mouse and the ungrab put the **absolute** one back. **Not known to work** — see below |
+| `0006-gtk-no-implicit-grab-on-click.patch` | `ui/gtk.c` | drops upstream's grab-on-first-left-click, so entering grab mode is Ctrl+Alt+G or the View menu and nothing else |
+| `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | on grab, makes a relative mouse the guest's current device; on ungrab, restores the absolute one. **Not known to work** — see its header |
+| `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. **Not known to work** — see its header |
+| `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. **Not known to work** — see its header |
 
 Each patch's commit message says *why* it is there. Read those before changing
 one — several of them record a measurement (a driver version, an error code)
@@ -29,7 +31,7 @@ that is the whole justification for the change.
 
 ## Which of these should stop existing
 
-Five of the seven carry `ui/` changes, and `ui/` is the surface we would most
+Six of the nine carry `ui/` changes, and `ui/` is the surface we would most
 like to shed — it is generic front-end code, shared with every other QEMU user,
 and the part a reviewer has least reason to trust us with.
 
@@ -53,29 +55,23 @@ something worth looking at". A `dpy_console_request_focus()`-shaped mechanism,
 with the front end owning the policy, would be the upstreamable version. Until
 someone writes that, this stays downstream.
 
-`0006` is a deletion, and not upstreamable as-is for the opposite reason to the
-others: upstream *wants* click-to-grab for a guest whose only pointer is a
-relative mouse, where nothing tracks the host cursor and the grab is the only
-way to point at anything. Removing it outright regresses those guests. The
-upstreamable version is a display option (`-display gtk,grab-on-click=off`)
-defaulting to today's behaviour. nvkvm does not need the option, only the
-behaviour.
+`0006` is a behaviour change upstream deliberately wants for mouse-only guests,
+so it cannot go as-is; the upstreamable version is a display option
+(`-display gtk,grab-on-click=off`) defaulting to today's behaviour.
 
-**`0007` is not known to work, and is the one patch here to hold rather than
-merge.** The gap it fills is general — upstream's grab is a host-side window
-concept with no opinion about which guest input device should be current, and
-every front end that grabs has this problem; `ui/sdl2.c` has its own grab and is
-untouched, so the two backends now differ — but the fix is stated as policy
-hardcoded into one front end, with nvkvm-branded symbols. A shared helper in
-`ui/input.c`, called by the front ends, would be the upstreamable version.
+`0007` and `0009` are the same idea in two front ends, which is itself the
+argument for the upstreamable version: a shared helper in `ui/input.c` that
+expresses "a grab wants a relative device" once, instead of once per backend.
+Neither has been observed working; both headers say so at the top.
 
-More importantly: **the mechanism it automates was tried by hand on real
-hardware and did not work.** Doing the same switch from the monitor
-(`mouse_set <relative index>`, then grab) left mouse look dead in the guest. The
-host-side chain reads as correct afterwards and the remaining suspects are
-guest-side, but that is reading, not measurement. The patch header carries the
-full analysis and, more usefully, the single `evtest` command in the guest that
-splits the problem in half. Run that before doing anything else with this patch.
+`0008` is two things wearing one number, and only one of them is ours. Its
+first three parts — SDL had no `dpy_gl_scanout_dmabuf`, nothing on the scanout
+path created a window, and nothing ever set `qemu_egl_display` for an SDL
+window — are plain upstream gaps, and `ui/sdl2.c` is the last front end with a
+GL context and no dma-buf scanout. Those belong on qemu-devel roughly as they
+stand. The window-raise is nvkvm policy in a generic front end, exactly like
+`0005`, and would need the same `dpy_console_request_focus()`-shaped mechanism
+before it could go anywhere.
 
 `0001` and `0002` are downstream by nature: they register a device that is not
 upstream and claim a virtio ID that is not assigned. They will never leave.
@@ -98,9 +94,10 @@ git apply         /path/to/nvkvm/patches/*.patch
 `scripts/build_qemu.sh` does exactly this, plus the same `--reverse --check`
 already-applied test for each patch so a re-run is a no-op.
 
-`0005`, `0006` and `0007` only touch files that are compiled when QEMU is
-configured `--enable-gtk` (`NVKVM_QEMU_UI=1`). The default headless build
-applies them and never compiles a line of any of them.
+`0005`–`0007` only touch files that are compiled when QEMU is configured
+`--enable-gtk`, and `0008`–`0009` only files compiled when it is configured
+`--enable-sdl` (both come from `NVKVM_QEMU_UI=1`). The default headless build
+applies all five and never compiles a line of them.
 
 ## Regenerating them after a QEMU version bump
 

@@ -1,0 +1,492 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Thu, 21 Aug 2026 12:00:00 +0200
+Subject: [PATCH] ui/sdl2: show the guest's GPU head
+
+*** THIS PATCH HAS NOT BEEN SEEN TO WORK.  It builds --enable-sdl with no
+*** new warnings and that is all: this machine has no GPU and no display,
+*** so no window was opened, no frame was presented and nothing was
+*** looked at.  "How to actually verify" is at the bottom.  It is on
+*** gpu-untested for that reason.
+
+`-display sdl,gl=on` never showed the guest.  With the default consoles the
+window showed the black boot VGA; with `-vga none` it showed
+"Guest has not initialized the display (yet)".  GTK shows the same guest fine
+(patches/0005), so this is an SDL-side gap, and it matters because SDL is the
+only backend that can take a real pointer lock on a Wayland host --
+ui/sdl2.c:sdl_hide_cursor() calls SDL_SetRelativeMouseMode(), which SDL2
+implements with zwp_pointer_constraints_v1 + zwp_relative_pointer_manager_v1,
+while ui/gtk.c's gd_grab_pointer() does gdk_seat_grab() plus a warp and asks
+the compositor for no lock at all.
+
+WHAT IT IS NOT.  The obvious theory is that nvkvm's console is registered too
+late: sdl2_display_init() counts consoles once, allocates one sdl2_console per
+console found, and never grows that array, so a console that appears afterwards
+would have no listener and no window.  That is not what happens here.
+nvkvm registers its console from virtio_nvgpu_device_realize(), i.e. from
+qemu_create_cli_devices(), and system/vl.c runs that BEFORE qemu_init_displays()
+-- and before phase PHASE_MACHINE_READY, so qemu_console_register()'s
+"graphical consoles before text consoles" path applies and the head is console 1
+(console 0 with `-vga none`).  SDL does create a listener for it.  patches/0005
+depends on the same ordering from the other side: GTK's notebook has a page for
+that console, which it could not if the console arrived later.  Ruled out by
+reading the code, not by testing -- but the code is unambiguous.
+
+WHAT IT ACTUALLY IS.  Three things, all on the GL scanout path:
+
+  1. ui/sdl2.c's dcl_gl_ops has dpy_gl_scanout_texture but NO
+     dpy_gl_scanout_dmabuf.  dpy_gl_scanout_dmabuf() in ui/console.c is
+     `if (dcl->ops->dpy_gl_scanout_dmabuf)` -- a listener without the callback
+     is SKIPPED, no warning, no error.  nvkvm presents by dma-buf
+     (nvkvm_present_gl() -> dpy_gl_scanout_dmabuf + dpy_gl_update), so every
+     frame was dropped inside QEMU before it reached SDL.  The dpy_gl_update
+     that follows lands in sdl2_gl_scanout_flush(), which returns immediately
+     because !scon->scanout_mode -- scanout mode is set by the texture path,
+     which was never reached.  ui/gtk.c has gd_egl_scanout_dmabuf and
+     gd_gl_area_scanout_dmabuf; SDL had neither.  This is the whole reason the
+     window kept showing whatever surface was last installed.
+
+  2. Nothing on the scanout path creates a window.  Windows are created in
+     sdl2_gl_switch()/sdl2_2d_switch(), i.e. only when a SURFACE arrives, and
+     for a console above index 0 those functions actively destroy the window
+     while the surface is the placeholder.  A console whose content is a GL
+     scanout and nothing else therefore has real_window == NULL for ever, and
+     sdl2_gl_scanout_texture() then calls SDL_GL_MakeCurrent(NULL, NULL) and
+     sdl2_gl_scanout_flush() would call SDL_GetWindowSize(NULL, &ww, &wh) and
+     blit with an uninitialised size.  patches/0005 learned the same lesson for
+     GTK: the GL entry points are a separate path from the surface one and have
+     to be hooked separately, or a fix works in whichever present mode happens
+     to be under test and silently does nothing in the other.
+
+  3. egl_dmabuf_import_texture() imports into the global `qemu_egl_display`,
+     and nothing in ui/sdl2*.c ever set it -- SDL creates its own GL context
+     and QEMU's qemu_egl_init_dpy_*() path is never taken, so the global was
+     either EGL_NO_DISPLAY or, worse, whatever nvkvm's readback path left there
+     when it called egl_init() on the render node.  Upstream already solves
+     this for GTK's GtkGLArea in gl_area_realize(): make the context current,
+     then read the display back out of it with eglGetCurrentDisplay().  Same
+     three lines here, in sdl2_gl_bind_window_egl(), called from
+     sdl2_window_create() where SDL_GL_CreateContext() has just left the new
+     context current.
+
+WHAT IT DOES.  Adds sdl2_gl_scanout_dmabuf() -- gd_egl_scanout_dmabuf() with
+the GTK parts removed: import, then hand the texture to the texture path that
+already worked -- plus sdl2_gl_release_dmabuf() (without it every flip abandons
+a texture and its EGLImage, the leak gd_gl_release_dmabuf() exists to stop) and
+sdl2_gl_has_dmabuf(), so a window whose backend is GLX rather than EGL reports
+no dma-buf support instead of claiming it and drawing nothing.  Window creation
+moves into a helper the scanout path calls as well; it also initialises the
+console's shader, because surface_gl_create_texture() asserts on a NULL one and
+leaving scanout mode goes straight there.
+
+AND ONE POLICY BIT, the analogue of patches/0005.  SDL gives every console its
+own window rather than a notebook page, so there is no tab to switch; the
+equivalent is to raise the guest's window the first time it has real content.
+This is not tidiness.  Ctrl+Alt+G grabs WHICHEVER window has focus, so with the
+boot VGA in front the grab -- and every keystroke and mouse delta after it --
+goes to console 0 and the guest never sees any of it.  The latch is 0005's,
+term for term: only a console above the boot console, only once, only if the
+user has not hidden it, and it logs the one line that explains a window moving
+on its own.  With `-vga none` the guest IS console 0 and it is a no-op.
+
+WHY NOT JUST RECOMMEND `-vga none`.  It would make several things line up --
+one window, and ui/sdl2.c's several hardcoded references to sdl2_console[0]
+(sdl_mouse_mode_change(), the fullscreen startup grab) would then mean the
+guest.  It is still the wrong answer: scripts/run_test_vm.sh documents why the
+VGA is there, which is that GRUB and the early kernel have nothing to draw on
+without it and boot stalls in gfxterm video init with no console to say so.
+Deleting the boot display to work around a display bug trades a visible problem
+for an invisible one.  The multi-console case is handled instead.
+
+Only compiled into a build configured --enable-sdl, i.e. NVKVM_QEMU_UI=1.  The
+default headless build applies this patch and never compiles a line of it.  The
+GTK path is untouched: no file this patch edits is compiled into a GTK-only
+build.
+
+HOW TO ACTUALLY VERIFY, on a machine with an NVIDIA GPU and a display:
+
+    NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force
+    VM_DISPLAY="sdl,gl=on" VM_SERIAL=none scripts/run_test_vm.sh
+
+  * expect one line on stderr, once: "nvkvm: guest display is live -- raised
+    SDL window for console 1", and a second QEMU window in front showing the
+    guest desktop.  `grep -c` over the whole run must be 1.
+  * with NVKVM_PRESENT_MODE=gl (the zero-copy path this patch is really about)
+    the same must hold, and "nvkvm present: window mode=GL-zerocopy" must
+    appear.  With NVKVM_PRESENT_MODE=readback it must also hold -- that path
+    went through the surface entry points and is the one thing here that could
+    already have worked, so it is the regression check.
+  * `-vga none`: no raise line at all, one window, the desktop still appears in
+    it.
+  * GTK must be unchanged: VM_DISPLAY="gtk,gl=on" still shows the desktop and
+    still logs 0005's "switched window to console page 1" exactly once.
+
+NOT UPSTREAMABLE AS WRITTEN.  Items 1-3 above are plain upstream gaps and the
+fixes for them belong in qemu-devel roughly as they stand -- ui/sdl2.c is the
+only remaining front end with a GL context and no dma-buf scanout.  The raise
+is nvkvm policy ("the interesting console is the one that is not the boot VGA")
+hardcoded into a generic front end, with an nvkvm-branded symbol and log line,
+and would have to become the same dpy_console_request_focus()-shaped mechanism
+patches/0005 wants before either could go upstream.
+---
+ include/ui/sdl2.h |  51 +++++++++++++++
+ ui/sdl2-2d.c      |   3 +
+ ui/sdl2-gl.c      | 192 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ ui/sdl2.c         |  15 +++++
+ 4 files changed, 261 insertions(+)
+
+diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
+index dbe6e3d..cce22b1 100644
+--- a/include/ui/sdl2.h
++++ b/include/ui/sdl2.h
+@@ -51,9 +51,50 @@ struct sdl2_console {
+     egl_fb win_fb;
+     bool y0_top;
+     bool scanout_mode;
++    /*
++     * nvkvm: the EGL display THIS window renders on, read out of its own GL
++     * context (sdl2_gl_bind_window_egl()).  Kept per console rather than in
++     * the global qemu_egl_display, which other code owns -- see the comment on
++     * sdl2_gl_bind_window_egl().  EGL_NO_DISPLAY when SDL chose a non-EGL
++     * backend, e.g. GLX on X11.
++     */
++    EGLDisplay edpy;
++    /* Can that display import a dma-buf?  Reported to ui/console.c through
++     * .dpy_has_dmabuf, so a console that requires dma-buf is not handed a
++     * window that cannot show it. */
++    bool has_dmabuf;
+ #endif
+ };
+ 
++/*
++ * nvkvm: one-shot raise of the guest's head.  GTK has tabs and patches/0005
++ * switches to the right one; SDL gives every console its own window, so the
++ * equivalent is to bring the guest's window to the front the first time it has
++ * something to show.  It matters for more than tidiness: Ctrl+Alt+G grabs
++ * WHICHEVER window has focus, so with the boot VGA in front the grab -- and
++ * every key and delta after it -- lands on console 0 instead of the guest.
++ *
++ * Latch, not a policy engine, exactly as in 0005: fire only for a console above
++ * the boot console, only when it has a window, only when the user has not
++ * hidden it, and at most once.  With -vga none the guest IS console 0 and this
++ * is a no-op, which is correct -- there is only one window.
++ */
++extern bool nvkvm_sdl2_raised;
++
++static inline void nvkvm_sdl2_maybe_raise(struct sdl2_console *scon)
++{
++    if (nvkvm_sdl2_raised || !scon || scon->idx == 0 ||
++        !scon->real_window || scon->hidden) {
++        return;
++    }
++    nvkvm_sdl2_raised = true;
++    SDL_RaiseWindow(scon->real_window);
++    /* One line, once: a window jumping to the front is surprising if you are
++     * not expecting it, and this is the only record that it happened. */
++    fprintf(stderr, "nvkvm: guest display is live -- raised SDL window for "
++                    "console %d\n", scon->idx);
++}
++
+ void sdl2_window_create(struct sdl2_console *scon);
+ void sdl2_window_destroy(struct sdl2_console *scon);
+ void sdl2_window_resize(struct sdl2_console *scon);
+@@ -97,4 +138,14 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+ 
++#ifdef CONFIG_OPENGL
++/* nvkvm: dma-buf scanout for SDL -- see patches/0008 for why it was missing. */
++void sdl2_gl_bind_window_egl(struct sdl2_console *scon);
++void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf);
++void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf);
++bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl);
++#endif
++
+ #endif /* SDL2_H */
+diff --git a/ui/sdl2-2d.c b/ui/sdl2-2d.c
+index 7305238..ff97a59 100644
+--- a/ui/sdl2-2d.c
++++ b/ui/sdl2-2d.c
+@@ -122,6 +122,9 @@ void sdl2_2d_switch(DisplayChangeListener *dcl,
+                                       surface_width(new_surface),
+                                       surface_height(new_surface));
+     sdl2_2d_redraw(scon);
++
++    nvkvm_sdl2_maybe_raise(scon);   /* nvkvm: past the placeholder check above,
++                                     * so this is real content */
+ }
+ 
+ void sdl2_2d_refresh(DisplayChangeListener *dcl)
+diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
+index e01d9ab..87697d8 100644
+--- a/ui/sdl2-gl.c
++++ b/ui/sdl2-gl.c
+@@ -46,6 +46,86 @@ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
+     }
+ }
+ 
++/*
++ * nvkvm: learn which EGL display this window renders on.
++ *
++ * egl_dmabuf_import_texture() imports into the global `qemu_egl_display`, and
++ * nothing in ui/sdl2*.c ever set it -- SDL creates its own GL context and
++ * QEMU's qemu_egl_init_dpy_*() path is never taken, so the import had no
++ * display to work on.  Upstream solves the same problem for GTK's GtkGLArea in
++ * gl_area_realize(): make the context current, then read the display back out
++ * of it.  SDL_GL_CreateContext() has just left the new context current on this
++ * thread, so eglGetCurrentDisplay() names it here too.
++ *
++ * WHERE THIS DIVERGES FROM gl_area_realize(), and it is not a style choice:
++ * that function assigns straight to the global.  We must not.  The global is
++ * ALREADY OWNED by something else in an nvkvm run -- hw/misc/nvkvm_present_egl.c
++ * calls egl_init() on the NVIDIA render node and then does
++ * eglMakeCurrent(qemu_egl_display, ..., qemu_egl_rn_ctx) on every readback
++ * frame.  Overwriting the global from here makes that pairing invalid on the
++ * NEXT frame (a context does not belong to another display), eglMakeCurrent
++ * fails, and the readback path -- which is nvkvm's DEFAULT present mode, and
++ * the one that already worked under SDL -- stops presenting silently.  So the
++ * window's display is kept on the console and the global is borrowed only for
++ * the duration of an import, in sdl2_gl_scanout_dmabuf().
++ *
++ * If SDL chose a non-EGL backend (GLX on X11) eglGetCurrentDisplay() returns
++ * EGL_NO_DISPLAY and this window truthfully reports no dma-buf support, rather
++ * than claiming it and then drawing nothing.
++ */
++void sdl2_gl_bind_window_egl(struct sdl2_console *scon)
++{
++    scon->edpy = EGL_NO_DISPLAY;
++    scon->has_dmabuf = false;
++#ifdef CONFIG_GBM
++    if (!scon->winctx) {
++        return;
++    }
++    scon->edpy = eglGetCurrentDisplay();
++    if (scon->edpy == EGL_NO_DISPLAY) {
++        return;
++    }
++    /* qemu_egl_has_dmabuf() asks the global; ask ours. */
++    scon->has_dmabuf = epoxy_has_egl_extension(scon->edpy,
++                                               "EGL_EXT_image_dma_buf_import");
++#endif
++}
++
++/*
++ * nvkvm: make sure this console has a window before scanning out to it.
++ *
++ * Windows are created in sdl2_gl_switch()/sdl2_2d_switch(), i.e. only on the
++ * SURFACE path, and for a console above index 0 that path actively DESTROYS
++ * the window while the surface is the placeholder.  A console whose content
++ * arrives as a GL scanout and nothing else therefore never gets a window at
++ * all, and every draw below silently no-ops on a NULL SDL_Window.  Same lesson
++ * as patches/0005 for GTK: the GL entry points are a separate path and have to
++ * be hooked separately, or the fix works in whichever present mode happens to
++ * be under test and does nothing in the other.
++ *
++ * Returns false when there is still nothing to size a window by, which is not
++ * an error -- the next scanout tries again.
++ */
++static bool sdl2_gl_ensure_window(struct sdl2_console *scon)
++{
++    if (scon->real_window) {
++        return true;
++    }
++    sdl2_window_create(scon);
++    if (!scon->real_window) {
++        return false;
++    }
++    if (!scon->gls) {
++        /*
++         * surface_gl_create_texture() asserts on a NULL shader, and leaving
++         * scanout mode goes straight there.  The surface path pairs the shader
++         * with the window; so does this one.
++         */
++        scon->gls = qemu_gl_init_shader();
++    }
++    return true;
++}
++
+ static void sdl2_gl_render_surface(struct sdl2_console *scon)
+ {
+     int ww, wh;
+@@ -106,6 +186,9 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
+     }
+ 
+     surface_gl_create_texture(scon->gls, scon->surface);
++
++    nvkvm_sdl2_maybe_raise(scon);   /* nvkvm: past the placeholder check above,
++                                     * so this is real content */
+ }
+ 
+ void sdl2_gl_refresh(DisplayChangeListener *dcl)
+@@ -211,6 +294,11 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+ 
+     assert(scon->opengl);
++
++    if (!sdl2_gl_ensure_window(scon)) {   /* nvkvm: a scanout is real content */
++        return;
++    }
++
+     scon->x = x;
+     scon->y = y;
+     scon->w = w;
+@@ -222,6 +310,105 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+     sdl2_set_scanout_mode(scon, true);
+     egl_fb_setup_for_tex(&scon->guest_fb, backing_width, backing_height,
+                          backing_id, false);
++
++    nvkvm_sdl2_maybe_raise(scon);
++}
++
++/*
++ * nvkvm: import a dma-buf scanout and present it.
++ *
++ * SDL's DisplayChangeListenerOps carried dpy_gl_scanout_texture but NOT
++ * dpy_gl_scanout_dmabuf, and dpy_gl_scanout_dmabuf() in ui/console.c skips
++ * every listener that lacks the callback -- silently.  A device that presents
++ * by dma-buf (virtio-gpu with udmabuf, and nvkvm's GL zero-copy path) therefore
++ * had its frames dropped on the floor under -display sdl, and the window went
++ * on showing whatever surface was last installed: the boot VGA, or the
++ * "Guest has not initialized the display (yet)" placeholder.
++ *
++ * This is gd_egl_scanout_dmabuf() with the GTK parts removed: import, then
++ * hand the resulting texture to the texture path that already worked.
++ */
++void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf)
++{
++#ifdef CONFIG_GBM
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++    uint32_t x, y, width, height, backing_width, backing_height, texture;
++    EGLDisplay saved_dpy;
++    bool y0_top;
++
++    assert(scon->opengl);
++
++    if (!sdl2_gl_ensure_window(scon) || scon->edpy == EGL_NO_DISPLAY) {
++        return;
++    }
++    /* The import binds a texture into whatever context is current. */
++    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++
++    /*
++     * Borrow the global for the length of the import and put it back.  See
++     * sdl2_gl_bind_window_egl() for why it is borrowed rather than owned: the
++     * device's readback path pairs this global with its own context and breaks
++     * if we leave ours there.  Not thread-safe, and does not need to be --
++     * every dpy_* callback runs on the main loop under the BQL.
++     */
++    saved_dpy = qemu_egl_display;
++    qemu_egl_display = scon->edpy;
++    egl_dmabuf_import_texture(dmabuf);
++    qemu_egl_display = saved_dpy;
++
++    texture = qemu_dmabuf_get_texture(dmabuf);
++    if (!texture) {
++        return;
++    }
++
++    x = qemu_dmabuf_get_x(dmabuf);
++    y = qemu_dmabuf_get_y(dmabuf);
++    width = qemu_dmabuf_get_width(dmabuf);
++    height = qemu_dmabuf_get_height(dmabuf);
++    backing_width = qemu_dmabuf_get_backing_width(dmabuf);
++    backing_height = qemu_dmabuf_get_backing_height(dmabuf);
++    y0_top = qemu_dmabuf_get_y0_top(dmabuf);
++
++    sdl2_gl_scanout_texture(dcl, texture, y0_top, backing_width, backing_height,
++                            x, y, width, height, NULL);
++#endif
++}
++
++/*
++ * nvkvm: drop what the import above created.  Without this the texture and its
++ * EGLImage are abandoned on every flip -- the same leak, and the same fix, as
++ * gd_gl_release_dmabuf().  The caller (hw/misc/nvkvm_present_egl.c,
++ * hw/display/virtio-gpu-udmabuf.c) releases the previous buffer once the new
++ * one is live.
++ */
++void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
++                            QemuDmaBuf *dmabuf)
++{
++#ifdef CONFIG_GBM
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    if (scon->real_window) {
++        /* glDeleteTextures needs the context the texture was created in. */
++        SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
++    }
++    egl_dmabuf_release_texture(dmabuf);
++    if (scon->guest_fb.dmabuf == dmabuf) {
++        scon->guest_fb.dmabuf = NULL;
++    }
++#endif
++}
++
++/*
++ * nvkvm: report dma-buf support honestly.  Without this, console.c infers it
++ * from the mere presence of dpy_gl_scanout_dmabuf, so a GLX window (no EGL
++ * display, no import) would claim support and then draw nothing.
++ */
++bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl)
++{
++    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
++
++    return scon->has_dmabuf;
+ }
+ 
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+@@ -237,6 +424,11 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+     if (!scon->guest_fb.framebuffer) {
+         return;
+     }
++    if (!scon->real_window) {
++        /* nvkvm: SDL_GetWindowSize() on a NULL window leaves ww/wh
++         * uninitialised and the blit below would use them. */
++        return;
++    }
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+ 
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index bd4f5a9..6b207e5 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -116,6 +116,11 @@ void sdl2_window_create(struct sdl2_console *scon)
+ 
+         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+         SDL_GL_SetSwapInterval(0);
++#ifdef CONFIG_OPENGL
++        /* nvkvm: the context is current right now -- read the EGL display out
++         * of it, which is what makes dma-buf import possible at all here. */
++        sdl2_gl_bind_window_egl(scon);
++#endif
+     } else {
+         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+@@ -797,6 +802,11 @@ static void sdl_cleanup(void)
+     SDL_QuitSubSystem(SDL_INIT_VIDEO);
+ }
+ 
++/* nvkvm: one-shot latch for nvkvm_sdl2_maybe_raise(); see include/ui/sdl2.h.
++ * Shared by the 2D path and the GL paths so it fires once in total rather than
++ * once per path. */
++bool nvkvm_sdl2_raised;
++
+ static const DisplayChangeListenerOps dcl_2d_ops = {
+     .dpy_name             = "sdl2-2d",
+     .dpy_gfx_update       = sdl2_2d_update,
+@@ -819,6 +829,11 @@ static const DisplayChangeListenerOps dcl_gl_ops = {
+ 
+     .dpy_gl_scanout_disable  = sdl2_gl_scanout_disable,
+     .dpy_gl_scanout_texture  = sdl2_gl_scanout_texture,
++    /* nvkvm: without these three, dpy_gl_scanout_dmabuf() in ui/console.c
++     * skips this listener and a dma-buf present never reaches the window. */
++    .dpy_gl_scanout_dmabuf   = sdl2_gl_scanout_dmabuf,
++    .dpy_gl_release_dmabuf   = sdl2_gl_release_dmabuf,
++    .dpy_has_dmabuf          = sdl2_gl_has_dmabuf,
+     .dpy_gl_update           = sdl2_gl_scanout_flush,
+ };
+ 

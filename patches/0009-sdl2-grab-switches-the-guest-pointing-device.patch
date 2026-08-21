@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Thu, 21 Aug 2026 12:05:00 +0200
+Subject: [PATCH] ui/sdl2: make the pointer grab switch the guest's pointing
+ device
+
+*** THIS PATCH HAS NOT BEEN SEEN TO WORK.  No grab was taken on this
+*** machine -- it has no display -- no guest saw a delta, and `info mice`
+*** was never run against a QEMU carrying it.  It builds --enable-sdl with
+*** no new warnings and that is all.  It is on gpu-untested for that reason.
+
+Separate from patches/0008 on purpose.  0008 makes the guest visible under SDL;
+this makes the grab useful.  Either is worth having without the other, and
+neither should be held up by the other's verification.
+
+Ctrl+Alt+G confines the host cursor and changes nothing else, so the guest keeps
+receiving whatever kind of coordinates it was receiving before.  With nvkvm's
+default virtio-tablet current that is ABSOLUTE coordinates, and a tablet says
+"the pointer is at (x, y)", never "it moved by (dx, dy)", so a guest reading
+deltas for pointer lock gets nothing.
+
+Concretely, ui/sdl2.c:sdl_hide_cursor() asks for the real lock --
+SDL_SetRelativeMouseMode(SDL_TRUE), which SDL2's Wayland backend implements
+with zwp_pointer_constraints_v1 + zwp_relative_pointer_manager_v1, the same
+mechanism a native game uses -- but only `if (!qemu_input_is_absolute())`.  With
+a tablet current that is false, so SDL never enters relative mode and the one
+backend that CAN take a real lock does not take it.
+
+So: on grab, activate a relative device; on ungrab, put the absolute one back.
+Both directions go through the public interface -- qmp_query_mice() to read the
+list, qemu_mouse_set() to activate -- which is exactly what the monitor's
+`info mice` and `mouse_set` do, so nothing new is exported from ui/input.c and
+the monitor sees the same state.
+
+WHY THIS IS NOT PATCHES/0007 AGAIN.  0007 is the same change for ui/gtk.c and
+its header records a negative result: the switch done by hand from the monitor
+(`mouse_set <relative index>`, then grab) produced no motion in the guest.  That
+result does not carry over, and the reason is measured rather than assumed.  On
+that Wayland host QEMU held ZERO fds to wayland-0 -- it was an X11 client under
+Xwayland -- gd_grab_pointer() does gdk_seat_grab() plus gdk_device_warp()
+re-centring, which asks the compositor for no lock at all, the cursor left the
+"grabbed" window freely, and evtest in the guest saw zero REL_X/REL_Y.  There
+were no deltas on that host for ANY guest device to receive; which device was
+current could not have been the deciding factor.  Under SDL the lock is real, so
+the device is the remaining question and this is the answer to it.
+
+That is an argument from two measurements, not a measurement of this patch.
+The test that settles it is in "How to actually verify" below.
+
+ORDER MATTERS, in both directions, and is the only subtle thing here:
+
+  * on grab the switch runs BEFORE the cursor decision, because
+    sdl_hide_cursor() is what calls SDL_SetRelativeMouseMode() and it tests the
+    current device.  Switch after it and the lock is never requested;
+  * on ungrab the restore runs AFTER sdl_show_cursor(), which leaves relative
+    mode only while the current device is still relative.  Restore the tablet
+    first and that test is false, relative mode is never left, and the pointer
+    stays locked with no way out.
+
+RE-ENTRANCY.  qemu_mouse_set() calls qemu_input_handler_activate(), which fires
+the mouse-mode notifier synchronously -- and ui/sdl2.c's notifier runs the grab
+side effects: going relative makes it sdl_grab_end(), going absolute makes it
+absolute_mouse_grab().  Called from inside our own switch, each would undo the
+transition in progress, and both act on sdl2_console[0] -- the boot VGA's
+window, not the guest's.  A flag set across our two qemu_mouse_set() calls makes
+the notifier track the mode and skip the side effects; the guest's own mode
+changes still reach it unchanged.  (ui/gtk.c's 0007 gets the same effect from
+ordering against ptr_owner.  SDL has no equivalent state, hence the flag.)
+
+Edge cases, none of them measured either:
+
+  * NO RELATIVE DEVICE, the default tablet-only config: the lookup returns 0 and
+    grab never calls qemu_mouse_set().  Not an error path -- byte for byte the
+    old behaviour, in both directions;
+  * ALREADY RELATIVE when the grab is taken: nothing to switch, nothing saved;
+  * NO ABSOLUTE DEVICE: ungrab finds no candidate and leaves the guest alone,
+    which is right for a relative-only guest;
+  * RESTORE WHAT WAS CURRENT, not merely "an absolute device".  Grab saves the
+    current index and ungrab re-activates that exact one, saved only when it was
+    absolute.  With nothing saved, or the saved device unplugged since, ungrab
+    falls back to any absolute device;
+  * GUEST WENT ABSOLUTE MID-GRAB: ungrab sees an absolute device already current
+    and leaves the guest's choice alone;
+  * TWO DEVICES OF A KIND: take the one closest to the head of the handler list,
+    i.e. the most recently activated.  qmp_query_mice() prepends, so that is the
+    LAST match in its list, which is why the loop overwrites instead of stopping.
+
+KNOWN GAP, left in the open rather than papered over: sdl_grab_start()'s
+guest_cursor branch does not call sdl_hide_cursor() at all, so a guest that has
+defined a hardware cursor gets the device switch without the pointer lock.
+nvkvm's console never defines one -- nvkvm_present_hwops has no cursor ops -- so
+it does not arise here, and fixing it means reworking upstream's cursor handling.
+
+THE GRAB IS STILL A USER GESTURE.  Nothing here initiates one; it only changes
+what a grab the user already took does.  Note also that upstream's implicit grab
+in handle_mousebutton() (left button up while the current device is relative)
+becomes unreachable in nvkvm's configuration once this patch is in: ungrab always
+restores an absolute device, so the guest cannot arrange the precondition.  It
+stays live only for a relative-only guest, which is the case upstream means it
+for.  That is why there is no ui/sdl2.c twin of patches/0006.
+
+Only compiled into a build configured --enable-sdl, i.e. NVKVM_QEMU_UI=1.  GTK
+is untouched.
+
+HOW TO ACTUALLY VERIFY, on a machine with an NVIDIA GPU and a Wayland display:
+
+    NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force
+    VM_RELATIVE_MOUSE=1 VM_DISPLAY="sdl,gl=on" VM_SERIAL=none \
+        scripts/run_test_vm.sh
+
+  VM_RELATIVE_MOUSE=1 is required: without a virtio-mouse there is no relative
+  device to switch to and this patch is a deliberate no-op.
+
+  * host side: `ls -l /proc/$(pgrep -f qemu-system-x86_64)/fd | grep -c wayland`
+    must be non-zero (SDL is a real Wayland client; GTK scored 0 here);
+  * monitor `info mice` before the grab: the tablet is starred.  Take the grab
+    with Ctrl+Alt+G; `info mice` now stars the virtio-mouse.  Release it; the
+    tablet is starred again.  That alone is what this patch does;
+  * in the guest, while grabbed:
+        sudo evtest /dev/input/by-path/pci-0000:00:09.0-event-mouse
+    and move the mouse.  REL_X/REL_Y events mean the whole QEMU-side chain
+    works.  Silence means the break is at or below virtio-input and this patch
+    is looking in the right place but is not enough -- exactly the split
+    patches/0007 asks for, now on a host where the lock is real;
+  * the cursor must not escape the window while grabbed, and must come back
+    under host control after Ctrl+Alt+G.  A pointer that stays locked after
+    release means the ungrab ordering above is wrong, and is the most likely
+    way this patch fails;
+  * with the default tablet-only config (no VM_RELATIVE_MOUSE) nothing may
+    change: grab and release must behave exactly as before.
+
+NOT UPSTREAMABLE AS WRITTEN.  The gap is general -- upstream's grab is a
+host-side window concept with no opinion about which guest device should be
+current, and this is now the second front end carrying its own copy of the
+answer.  The upstreamable version is the shared helper in ui/input.c that
+patches/0007 already asks for, with the mode choice expressed once instead of
+per backend.  Two copies is the argument for writing it.
+---
+ ui/sdl2.c | 166 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 166 insertions(+)
+
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 6b207e5..687535c 100644
+--- a/ui/sdl2.c
++++ b/ui/sdl2.c
+@@ -29,6 +29,7 @@
+ #include "ui/console.h"
+ #include "ui/input.h"
+ #include "ui/sdl2.h"
++#include "qapi/qapi-commands-ui.h"
+ #include "sysemu/runstate.h"
+ #include "sysemu/runstate-action.h"
+ #include "sysemu/sysemu.h"
+@@ -242,6 +243,140 @@ static void sdl_show_cursor(struct sdl2_console *scon)
+     SDL_ShowCursor(SDL_ENABLE);
+ }
+ 
++/*
++ * nvkvm: make the grab decide which pointing device the guest sees.
++ *
++ * SDL_SetRelativeMouseMode() is the only real pointer lock QEMU has -- on a
++ * Wayland host SDL2 implements it with zwp_pointer_constraints_v1 +
++ * zwp_relative_pointer_manager_v1, the same mechanism a native game uses -- and
++ * sdl_hide_cursor() below asks for it only when !qemu_input_is_absolute().
++ * With nvkvm's default virtio-tablet current that is FALSE, so the grab
++ * confines the cursor and nothing else, and a guest waiting on deltas gets
++ * none.  So: on grab, activate a relative device; on ungrab, put the absolute
++ * one back.
++ *
++ * This is the ui/sdl2.c twin of patches/0007.  That patch's header records a
++ * negative result -- the same switch done by hand did not produce guest motion
++ * under GTK.  It does not transfer: GTK never takes a Wayland lock at all
++ * (gd_grab_pointer() does gdk_seat_grab() plus a warp, the pre-Wayland way of
++ * emulating one), so on that host there were no deltas to deliver whatever
++ * device was current.  Under SDL the lock is real and the device switch is
++ * exactly the missing half.  That is an argument, not a measurement: see the
++ * commit message for what has and has not been observed.
++ *
++ * Both directions go through the public interface -- qmp_query_mice() to read
++ * the list, qemu_mouse_set() to activate -- which is what the monitor's
++ * `info mice` and `mouse_set` do, so nothing new is exported and the monitor
++ * sees the same state.
++ */
++
++/* Index of the absolute device to restore on ungrab; 0 = nothing saved. */
++static int nvkvm_sdl_saved_mouse;
++
++/*
++ * Set while WE are activating a device, so sdl_mouse_mode_change() can tell
++ * our own switch from the guest's.  Without it the notifier fires re-entrantly
++ * from inside qemu_input_handler_activate() and runs the grab side effects:
++ * going relative would sdl_grab_end() the grab we are in the middle of taking,
++ * and going absolute would absolute_mouse_grab() a new one as we release.
++ * Worse, both act on sdl2_console[0] -- the boot VGA's window, not the guest's.
++ */
++static bool nvkvm_sdl_switching;
++
++/*
++ * One walk over the mouse list.  Returns the index of the device to make
++ * current for `absolute`, or 0 when the guest has none; *cur / *cur_abs
++ * describe whichever device is current right now (*cur is 0 when the guest has
++ * no mouse at all).
++ *
++ * qmp_query_mice() marks the HEAD of QEMU's handler list current and builds its
++ * answer by PREPENDING, so the list it hands back runs tail-to-head: the match
++ * closest to the head -- the most recently activated one -- is the LAST match
++ * in the list, not the first.  That is why the loop overwrites `found` instead
++ * of stopping.
++ */
++static int nvkvm_sdl_pick_mouse(bool absolute, int *cur, bool *cur_abs)
++{
++    MouseInfoList *mice, *entry;
++    int found = 0;
++
++    *cur = 0;
++    *cur_abs = false;
++
++    mice = qmp_query_mice(NULL);
++    for (entry = mice; entry != NULL; entry = entry->next) {
++        MouseInfo *m = entry->value;
++
++        if (m->current) {
++            *cur = (int)m->index;
++            *cur_abs = m->absolute;
++        }
++        if (m->absolute == absolute) {
++            found = (int)m->index;
++        }
++    }
++    qapi_free_MouseInfoList(mice);
++
++    return found;
++}
++
++static void nvkvm_sdl_grab_set_relative(void)
++{
++    bool cur_abs = false;
++    int cur = 0;
++    int rel;
++
++    nvkvm_sdl_saved_mouse = 0;
++
++    rel = nvkvm_sdl_pick_mouse(false, &cur, &cur_abs);
++    if (rel == 0 || rel == cur) {
++        /*
++         * No relative device at all -- the default tablet-only config -- or the
++         * guest already has one current.  Change nothing, so the grab behaves
++         * exactly as it did before this patch.
++         */
++        return;
++    }
++
++    nvkvm_sdl_switching = true;
++    if (qemu_mouse_set(rel, NULL)) {
++        /* Only an absolute device is worth restoring by index. */
++        nvkvm_sdl_saved_mouse = cur_abs ? cur : 0;
++    }
++    nvkvm_sdl_switching = false;
++}
++
++static void nvkvm_sdl_ungrab_set_absolute(void)
++{
++    bool cur_abs = false;
++    int cur = 0;
++    int want = nvkvm_sdl_saved_mouse;
++    int abs_idx;
++
++    nvkvm_sdl_saved_mouse = 0;
++
++    abs_idx = nvkvm_sdl_pick_mouse(true, &cur, &cur_abs);
++    if (cur_abs) {
++        /* The guest went absolute on its own while we held the grab; leave its
++         * choice alone. */
++        return;
++    }
++
++    nvkvm_sdl_switching = true;
++    if (want == 0 || !qemu_mouse_set(want, NULL)) {
++        /*
++         * Nothing was saved (the grab found the guest already relative), or the
++         * saved device has been unplugged since.  Fall back to any absolute
++         * device; with none -- a relative-only guest -- leave the guest alone,
++         * as before.
++         */
++        if (abs_idx != 0 && abs_idx != want) {
++            qemu_mouse_set(abs_idx, NULL);
++        }
++    }
++    nvkvm_sdl_switching = false;
++}
++
+ static void sdl_grab_start(struct sdl2_console *scon)
+ {
+     QemuConsole *con = scon ? scon->dcl.con : NULL;
+@@ -257,6 +392,20 @@ static void sdl_grab_start(struct sdl2_console *scon)
+     if (!(SDL_GetWindowFlags(scon->real_window) & SDL_WINDOW_INPUT_FOCUS)) {
+         return;
+     }
++    /*
++     * nvkvm: BEFORE the cursor decision below, because sdl_hide_cursor() asks
++     * for relative mode only when the current device is relative -- so the
++     * switch has to have happened by the time it runs.
++     *
++     * Known gap, deliberately not papered over: the guest_cursor branch below
++     * does not call sdl_hide_cursor() at all, so a guest that has defined a
++     * hardware cursor gets the device switch without the pointer lock.
++     * nvkvm's console never defines one (nvkvm_present_hwops has no cursor
++     * ops), so this does not arise here; fixing it properly means reworking
++     * upstream's cursor handling, which is a different patch.
++     */
++    nvkvm_sdl_grab_set_relative();
++
+     if (guest_cursor) {
+         SDL_SetCursor(guest_sprite);
+         if (!qemu_input_is_absolute(scon->dcl.con) && !absolute_enabled) {
+@@ -277,6 +426,13 @@ static void sdl_grab_end(struct sdl2_console *scon)
+     gui_grab = 0;
+     win32_kbd_set_grab(false);
+     sdl_show_cursor(scon);
++    /*
++     * nvkvm: AFTER sdl_show_cursor(), which leaves relative mode only while the
++     * current device is still relative.  Restoring the tablet first would make
++     * its !qemu_input_is_absolute() test false and the pointer would stay
++     * locked with no way out.
++     */
++    nvkvm_sdl_ungrab_set_absolute();
+     sdl_update_caption(scon);
+ }
+ 
+@@ -294,6 +450,16 @@ static void absolute_mouse_grab(struct sdl2_console *scon)
+ 
+ static void sdl_mouse_mode_change(Notifier *notify, void *data)
+ {
++    if (nvkvm_sdl_switching) {
++        /*
++         * nvkvm: this activation is OURS, from inside sdl_grab_start() or
++         * sdl_grab_end().  Track the mode, but do not run the grab side
++         * effects -- they would undo the grab transition in progress, and they
++         * would do it to console 0's window rather than the guest's.
++         */
++        absolute_enabled = qemu_input_is_absolute(sdl2_console[0].dcl.con);
++        return;
++    }
+     if (qemu_input_is_absolute(sdl2_console[0].dcl.con)) {
+         if (!absolute_enabled) {
+             absolute_enabled = 1;
