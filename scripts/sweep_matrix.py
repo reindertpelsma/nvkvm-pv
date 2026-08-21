@@ -300,6 +300,49 @@ def kernel_cc(S):
     return path if "HAVE" in out else ""
 
 
+def _fetch_installer(S, candidates, tried):
+    """Download the first candidate that arrives INTACT.  Returns (ok, version).
+
+    Appends one human-readable line per URL to `tried`, carrying the observed
+    HTTP status and curl exit, so a failure says what actually happened
+    instead of being guessed at afterwards.
+    """
+    for cand in candidates:
+        for url in driver_urls(cand):
+            out, _ = sh(rsh(S,
+                f"curl -sS -L --max-time 1500 -w '\\nHTTP=%{{http_code}}' "
+                f"-o /root/drv.run {url} 2>&1; echo \" CURLRC=$?\"; "
+                f"df -P /root | tail -1"), timeout=1800)
+            m = re.search(r"HTTP=(\d+)", out)
+            code = m.group(1) if m else ""
+            m2 = re.search(r"CURLRC=(\d+)", out)
+            crc = m2.group(1) if m2 else "?"
+
+            # NB: curl's own exit code, not the ssh command's.  The ssh rc is
+            # the exit of the trailing `df`, which is always 0 -- checking it
+            # (as this once did) accepted every failed transfer as a success.
+            if code == "200" and crc == "0":
+                # VERIFY THE ARCHIVE rather than trusting HTTP 200.  The
+                # 610.43.02 installer once arrived with HTTP=200 and curl_rc=0
+                # and was still corrupt: it printed "Verifying archive
+                # integrity... Error in check sums 3400907251 3425542902" and
+                # the row was filed driver-install-failed -- which reads as
+                # "610 will not install", a driver conclusion, for what was a
+                # bad download of a perfectly good installer.  The .run is a
+                # makeself archive and can check itself; ask it.
+                _, ok1 = sh(rsh(S, "chmod +x /root/drv.run && test -s /root/drv.run"),
+                            timeout=120)
+                _, ok2 = sh(rsh(S, "/root/drv.run --check >/root/drvcheck.log 2>&1"),
+                            timeout=900)
+                if ok1 == 0 and ok2 == 0:
+                    return True, cand
+                tried.append(f"{url}  -> HTTP=200 but CORRUPT "
+                             f"(test -s rc={ok1}, --check rc={ok2})")
+                continue
+            tried.append(f"{url}  -> HTTP={code or '?'} curl_rc={crc}")
+    return False, None
+
+
 def install_driver(S, ver, arch, log):
     """Replace the host driver in the rented VM.  Returns (ok, detail, actual).
 
@@ -353,29 +396,19 @@ def install_driver(S, ver, arch, log):
     # So classify: an HTTP 404 means genuinely absent; anything else (disk
     # full, DNS, connection reset, rate-limiting, timeout) is transport and is
     # labelled [HARNESS].
-    fetched, use_ver = False, None
-    tried = []
-    for cand in candidates:
-        for url in driver_urls(cand):
-            out, rc = sh(rsh(S,
-                f"curl -sS -L --max-time 1500 -w '\\nHTTP=%{{http_code}}' "
-                f"-o /root/drv.run {url} 2>&1; echo \" CURLRC=$?\"; "
-                f"df -P /root | tail -1"), timeout=1800)
-            code = ""
-            m = re.search(r"HTTP=(\d+)", out)
-            if m:
-                code = m.group(1)
-            crc = re.search(r"CURLRC=(\d+)", out)
-            crc = crc.group(1) if crc else "?"
-            if rc == 0 and code == "200":
-                _, crc2 = sh(rsh(S, "chmod +x /root/drv.run && test -s /root/drv.run"),
-                             timeout=120)
-                if crc2 == 0:
-                    fetched, use_ver = True, cand
-                    break
-            tried.append(f"{url}  -> HTTP={code or '?'} curl_rc={crc}")
+    # NVIDIA's CDN returns intermittent HTTP 403 to some rented hosts.
+    # MEASURED on the RTX 4070 box: 550.40.07 got 403 at both paths, then
+    # 565.57.01 downloaded fine seconds later, then 570/580/610 got 403 again.
+    # That is throttling / IP reputation, not a missing file -- so retry the
+    # whole candidate list a few times with backoff before giving up on a row.
+    fetched, use_ver, tried = False, None, []
+    for _attempt in range(3):
+        if _attempt:
+            time.sleep(30 * _attempt)
+        fetched, use_ver = _fetch_installer(S, candidates, tried)
         if fetched:
             break
+
     if not fetched:
         only404 = all("HTTP=404" in t for t in tried) and tried
         if only404:
