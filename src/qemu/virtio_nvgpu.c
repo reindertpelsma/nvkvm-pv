@@ -1478,106 +1478,28 @@ static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 
 #define TYPE_NVKVM_GPU "nvkvm-gpu"
 
-#define NVKVM_GPU_NBARS 6
-
 typedef struct NvkvmGpu NvkvmGpu;
-
-/* Per-BAR opaque for the MMIO handlers: which device, which BAR. */
-typedef struct NvkvmGpuBar {
-	NvkvmGpu *gpu;
-	int       index;
-} NvkvmGpuBar;
 
 struct NvkvmGpu {
 	PCIDevice    parent_obj;
 
-	/* fake-bars: advertise BAR *geometry* copied from the host GPU so a driver
-	 * that validates a device by its memory regions (NVIDIA's Xorg DDX does
-	 * exactly that, and rejects this device today because it has none) gets
-	 * past that check.  OFF by default: libcuda is happy with an identity-only
-	 * device, and a device advertising a 256 MB aperture is one something might
-	 * try to use directly instead of going through RM, so the working path must
-	 * not depend on this.
+	/* No state at all, deliberately: this device IS its config-space identity
+	 * and nothing more.  It registers no BAR, so the guest's PCI core records
+	 * no regions for it and there is nothing for a guest driver to map.
 	 *
-	 * SECURITY: this advertises geometry in emulated config space.  It does NOT
-	 * map host MMIO into the guest.  The regions below are ordinary QEMU
-	 * MemoryRegions backed by handler functions that return zero and drop
-	 * writes; there is no host BAR, no mapping and no DMA path behind them.
-	 * "The guest never receives the physical device, no BAR is mapped to it, no
-	 * DMA path to host memory" stays literally true. */
-	bool         fake_bars;
-
-	MemoryRegion bar_mr[NVKVM_GPU_NBARS];
-	NvkvmGpuBar  bar_ctx[NVKVM_GPU_NBARS];
-	bool         logged_read[NVKVM_GPU_NBARS];
-	bool         logged_write[NVKVM_GPU_NBARS];
+	 * A `fake-bars` property once lived here which advertised the host GPU's
+	 * BAR *geometry* (sizes/flags copied from the host's /sys/.../resource) to
+	 * get NVIDIA's Xorg DDX past its device-validation check.  It was removed:
+	 * it had no consumers -- CUDA, Vulkan, OpenGL and vLLM all work without it
+	 * -- and the DDX path it unblocked is blocked further on regardless, at
+	 * NVKMS, which would need a virtual NVKMS to answer for nvkvm's own head
+	 * rather than the host's connectors.  Keeping a dormant switch whose only
+	 * job is to make this device LOOK like it has BARs is a liability on a
+	 * boundary the whole project sells on.  The measurements it produced, and
+	 * the sha to revert if someone builds that virtual NVKMS, are in
+	 * docs/internal/mint-guest-desktop.md. */
 };
 DECLARE_INSTANCE_CHECKER(NvkvmGpu, NVKVM_GPU, TYPE_NVKVM_GPU)
-
-/* Benign MMIO.  The whole point of these is the log line: it converts "does a
- * driver only VALIDATE the BARs, or does it actually poke them?" from a guess
- * into an observation.  First read and first write per BAR are reported, then
- * they go quiet so a polling driver cannot flood the log. */
-static uint64_t nvkvm_gpu_bar_read(void *opaque, hwaddr addr, unsigned size)
-{
-	NvkvmGpuBar *b = opaque;
-
-	if (!b->gpu->logged_read[b->index]) {
-		b->gpu->logged_read[b->index] = true;
-		info_report("nvkvm-gpu: FIRST BAR%d READ  off=0x%" HWADDR_PRIx
-			    " size=%u -> returning 0 (no host MMIO behind this)",
-			    b->index, addr, size);
-	}
-	return 0;
-}
-
-static void nvkvm_gpu_bar_write(void *opaque, hwaddr addr, uint64_t val,
-				unsigned size)
-{
-	NvkvmGpuBar *b = opaque;
-
-	if (!b->gpu->logged_write[b->index]) {
-		b->gpu->logged_write[b->index] = true;
-		info_report("nvkvm-gpu: FIRST BAR%d WRITE off=0x%" HWADDR_PRIx
-			    " size=%u val=0x%" PRIx64 " -> dropped",
-			    b->index, addr, size, val);
-	}
-}
-
-static const MemoryRegionOps nvkvm_gpu_bar_ops = {
-	.read       = nvkvm_gpu_bar_read,
-	.write      = nvkvm_gpu_bar_write,
-	.endianness = DEVICE_LITTLE_ENDIAN,
-};
-
-/* One line of /sys/.../resource is "start end flags".  Return the size of BAR
- * `idx` on the host GPU, and its flags, or 0 if that BAR is unused. */
-static uint64_t nvkvm_host_bar_geometry(const char *bdf, int idx,
-					uint64_t *flags_out)
-{
-	char path[128];
-	FILE *f;
-	uint64_t start = 0, end = 0, flags = 0;
-	int i;
-
-	snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/resource", bdf);
-	f = fopen(path, "r");
-	if (!f)
-		return 0;
-	for (i = 0; i <= idx; i++) {
-		if (fscanf(f, "%" SCNx64 " %" SCNx64 " %" SCNx64,
-			   &start, &end, &flags) != 3) {
-			fclose(f);
-			return 0;
-		}
-	}
-	fclose(f);
-	if (end <= start)
-		return 0;
-	if (flags_out)
-		*flags_out = flags;
-	return end - start + 1;
-}
 
 /* Read a hex value (e.g. "0x10de\n") from a host sysfs PCI attribute.
  * Returns def on any failure. */
@@ -1621,7 +1543,6 @@ static const char *nvkvm_first_host_gpu_bdf(char *buf, size_t buflen)
 
 static void nvkvm_gpu_realize(PCIDevice *pdev, Error **errp)
 {
-	NvkvmGpu *gpu = NVKVM_GPU(pdev);
 	char bdf[32];
 	const char *b = nvkvm_first_host_gpu_bdf(bdf, sizeof(bdf));
 	uint16_t vendor = 0x10de, device = 0x2504, svid = 0x10de, sdid = 0x0000;
@@ -1646,62 +1567,9 @@ static void nvkvm_gpu_realize(PCIDevice *pdev, Error **errp)
 	pci_set_word(pdev->config + PCI_SUBSYSTEM_VENDOR_ID, svid);
 	pci_set_word(pdev->config + PCI_SUBSYSTEM_ID, sdid);
 
-	if (gpu->fake_bars) {
-		/* Copy the host GPU's BAR geometry.  /sys/.../resource is generated by
-		 * the PCI core from pci_dev->resource[], which is filled at enumeration
-		 * from config space -- there is no driver callback in that path, which
-		 * is why this has to happen here in the device model and cannot be done
-		 * from nvkvm-guest.ko (it binds long after the core has already decided
-		 * this device has no regions).
-		 *
-		 * Flags are copied per BAR rather than blanket-64-bit: on the reference
-		 * card BAR0 is a 16 MB 32-bit non-prefetchable register aperture and
-		 * BAR1/BAR3 are 64-bit prefetchable.  Registers must not be
-		 * prefetchable, and the large ones must be 64-bit or they fight guest
-		 * firmware for low address space. */
-		static const int bars[] = { 0, 1, 3 };
-		size_t n;
-
-		for (n = 0; n < ARRAY_SIZE(bars); n++) {
-			int      i    = bars[n];
-			uint64_t hflags = 0;
-			uint64_t size = b ? nvkvm_host_bar_geometry(b, i, &hflags) : 0;
-			uint8_t  type;
-			char     name[32];
-
-			if (!size)
-				continue;
-
-			/* PCI_BASE_ADDRESS_MEM_TYPE_64 is bit 2 of the host flag word;
-			 * PCI_BASE_ADDRESS_MEM_PREFETCH is bit 3. */
-			type = PCI_BASE_ADDRESS_SPACE_MEMORY;
-			if (hflags & PCI_BASE_ADDRESS_MEM_TYPE_64)
-				type |= PCI_BASE_ADDRESS_MEM_TYPE_64;
-			if (hflags & PCI_BASE_ADDRESS_MEM_PREFETCH)
-				type |= PCI_BASE_ADDRESS_MEM_PREFETCH;
-
-			gpu->bar_ctx[i].gpu   = gpu;
-			gpu->bar_ctx[i].index = i;
-			snprintf(name, sizeof(name), "nvkvm-gpu-bar%d", i);
-			memory_region_init_io(&gpu->bar_mr[i], OBJECT(gpu),
-					      &nvkvm_gpu_bar_ops, &gpu->bar_ctx[i],
-					      name, size);
-			pci_register_bar(pdev, i, type, &gpu->bar_mr[i]);
-
-			info_report("nvkvm-gpu: fake-bars: BAR%d size=%" PRIu64
-				    " MiB type=%s%s (geometry only -- reads return 0, "
-				    "writes dropped, no host MMIO mapped)",
-				    i, size >> 20,
-				    (type & PCI_BASE_ADDRESS_MEM_TYPE_64) ? "64-bit" : "32-bit",
-				    (type & PCI_BASE_ADDRESS_MEM_PREFETCH) ? " prefetchable" : "");
-		}
-	}
+	/* No pci_register_bar() call here, and there must not be one: a region
+	 * registered on this device is a region the guest can map. */
 }
-
-static Property nvkvm_gpu_props[] = {
-	DEFINE_PROP_BOOL("fake-bars", NvkvmGpu, fake_bars, false),
-	DEFINE_PROP_END_OF_LIST(),
-};
 
 static void nvkvm_gpu_class_init(ObjectClass *klass, void *data)
 {
@@ -1709,14 +1577,12 @@ static void nvkvm_gpu_class_init(ObjectClass *klass, void *data)
 	PCIDeviceClass *k  = PCI_DEVICE_CLASS(klass);
 	(void)data;
 
-	device_class_set_props(dc, nvkvm_gpu_props);
-
 	k->realize   = nvkvm_gpu_realize;
 	k->vendor_id = 0x10de;                 /* overridden from host in realize */
 	k->device_id = 0x2504;
 	k->revision  = 0xa1;
 	k->class_id  = PCI_CLASS_DISPLAY_VGA;
-	dc->desc     = "nvkvm emulated NVIDIA GPU PCI identity (BARs off by default)";
+	dc->desc     = "nvkvm emulated NVIDIA GPU PCI identity (no BARs, no MMIO, no DMA)";
 	set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 

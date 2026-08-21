@@ -198,9 +198,12 @@ install uses on an NVIDIA card either.
 
 ## The NVIDIA DDX — how far it gets, and the exact gap
 
-> **Superseded.**  "The gap is PCI BARs" below was true of the *first* wall and
-> `fake-bars` removed it.  The real blocker is one denied NVKMS command; see
+> **Superseded.**  "The gap is PCI BARs" below was true of the *first* wall, and
+> an experimental `fake-bars` property removed that wall.  The real blocker is
+> one denied NVKMS command; see
 > ["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command).
+> `fake-bars` itself has since been **removed from the tree** — what it measured
+> is preserved [here](#the-nvidia-ddx-with-fake-bars-the-bar-gap-was-real-and-it-was-not-the-only-one).
 
 
 The path a real NVIDIA box uses is the NVIDIA DDX.  Neither `nvidia_drv.so` nor
@@ -395,15 +398,72 @@ needs the cursor plane on our side.
 
 ## The NVIDIA DDX with `fake-bars`: the BAR gap was real, and it was not the only one
 
-`-device nvkvm-gpu,fake-bars=on` (env `NVKVM_FAKE_BARS=1` in `run_test_vm.sh`,
-**off by default**) advertises the host GPU's BAR *geometry*, read per-BAR from
-the host's `/sys/.../resource` so it tracks the actual card:
+> ### `fake-bars` HAS BEEN REMOVED FROM THE TREE — commit `NVKVM_FAKEBARS_REMOVAL_SHA`
+>
+> There is no `fake-bars` device property and no `NVKVM_FAKE_BARS` environment
+> variable any more.  `nvkvm-gpu` registers no PCI region at all: it is its
+> config-space identity and nothing else.  **Do not try to set either of them** —
+> QEMU will refuse the property and the run will not start.
+>
+> Everything this section and the two below it measured still stands.  They are
+> the record of a completed experiment, not instructions.
+>
+> **Why it went.**  It had **no consumers**: CUDA, Vulkan, OpenGL and vLLM all
+> work without it, and nothing anyone runs touches the DDX.  The path it
+> unblocked is blocked further on anyway (the NVKMS denial below), and even if
+> the DDX did initialise it would walk the *host's* connector topology, so a
+> virtual NVKMS is needed regardless.  Default-off is not free either — every
+> refactor has to preserve it, every audit has to cover it, and a future bug
+> could enable it.  This project's central claim is that the guest never
+> receives the physical device and no BAR is mapped to it; a dormant flag whose
+> only job is to make the device *look* like it has BARs is a security-relevant
+> surface sitting on exactly that boundary.
+>
+> **Nothing is lost.**  The measurement it produced is preserved in full
+> immediately below, and git history is exact.
+>
+> **To bring it back**, if someone builds the virtual NVKMS that is the only
+> thing which could ever use it:
+>
+> ```bash
+> git revert NVKVM_FAKEBARS_REMOVAL_SHA
+> ```
+>
+> That restores the property, the per-BAR geometry copy from the host's
+> `/sys/.../resource`, and the instrumented MMIO handlers that returned zero and
+> logged the first access per BAR.
+>
+> ### What `fake-bars` did, and what it measured
+>
+> It advertised the host GPU's BAR **geometry** — sizes and type/prefetch flags,
+> copied per-BAR from the host's `/sys/.../resource` — in the emulated device's
+> config space.  It mapped no host MMIO: the regions were ordinary QEMU
+> `MemoryRegion`s behind handlers that returned zero and dropped writes.
+>
+> | measured with `fake-bars` on | result |
+> |---|---|
+> | NVIDIA DDX device validation | **passes** — before, it failed here and never opened a single NVIDIA char device |
+> | `/dev/nvidiactl` opens | 3 |
+> | `/dev/nvidia0` opens | 5 |
+> | RM ioctls through nvkvm | **every one returns 0** — the forwarding works and the DDX gets real answers |
+> | BAR MMIO reads/writes, whole run | **ZERO** — the DDX only *validates* the regions; it never pokes them. The instrumented handlers existed to answer exactly this and never fired. |
+> | where it stops instead | `NVKMS_IOCTL_DECLARE_EVENT_INTEREST` (`cmdType=33`) → **`EACCES`**, denied by our default-deny NVKMS allowlist → `(EE) NVIDIA(GPU-0): Failed to select a display subsystem` |
+> | `tests/validate.sh`, both ways on one build | 28 PASS / 0 FAIL / 0 SKIP with it off, and 28/28 with it on |
+>
+> The zero-MMIO row is the load-bearing one: it is the difference between "a
+> driver wants to map this device" and "a driver wants to *see* that this device
+> has regions", and it says the DDX only ever wanted the latter.  See
+> ["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command)
+> for the NVKMS denial and why widening the allowlist is not the fix.
+
+It advertised the host GPU's BAR *geometry*, read per-BAR from the host's
+`/sys/.../resource` so it tracked the actual card:
 
     nvkvm-gpu: fake-bars: BAR0 size=16 MiB  type=32-bit
     nvkvm-gpu: fake-bars: BAR1 size=256 MiB type=64-bit prefetchable
     nvkvm-gpu: fake-bars: BAR3 size=32 MiB  type=64-bit prefetchable
 
-and the guest then reports exactly the host's layout, flags included
+and the guest then reported exactly the host's layout, flags included
 (`0x40200`, `0x14220c`), with `resource0`, `resource1`, `resource1_wc`,
 `resource3`, `resource3_wc` all present where before there were none.
 
@@ -431,13 +491,16 @@ right:
 
 | measurement | result | what it means |
 |---|---|---|
-| BAR MMIO reads/writes, whole run | **0** | the DDX only *validates* the regions; it never pokes them. The instrumented handlers exist precisely to answer this and they never fired. |
-| `/dev/nvidia-modeset` opens | **0** | it never reached NVKMS, so nothing in this experiment could have driven the host's display. |
-| nvkvm allowlist `DENY` lines | 4, all identical to a plain boot | nvkvm denied the DDX nothing. |
+| BAR MMIO reads/writes, whole run | **0** | the DDX only *validates* the regions; it never pokes them. The instrumented handlers existed precisely to answer this and they never fired. **This row still stands.** |
+| `/dev/nvidia-modeset` opens | **0** | ~~it never reached NVKMS~~ — **WRONG, corrected 2026-08-21**: it opens NVKMS every time, at the same point the host does. The trace shim did not log `open()`, so this counted nothing. |
+| nvkvm allowlist `DENY` lines | 4, all identical to a plain boot | ~~nvkvm denied the DDX nothing~~ — **WRONG, same correction**: this run stopped earlier for a configuration reason. There is exactly one DENY that matters, `nvkms cmdType=33`. |
 
-So the remaining blocker is inside the DDX's own device init, after it has
-talked to RM successfully — not a missing forward, not a denied command, and
-not a BAR it wanted to map.
+So the remaining blocker looked, from here, like something inside the DDX's own
+device init after a successful RM conversation. It is not: it is one denied
+NVKMS command, and the two struck rows above are why that took another pass to
+see. Read
+["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command)
+for the corrected picture.
 
 Note it is configured as `NVIDIA(G0)`, a PRIME *GPU screen*, rather than
 `NVIDIA(0)`: with `AllowEmptyInitialConfiguration` and no display outputs of its
@@ -447,28 +510,35 @@ would give it belongs to the host.
 
 ### Security
 
-`fake-bars` advertises **geometry in emulated config space**. It does not map
-host MMIO into the guest. The regions are ordinary QEMU `MemoryRegion`s backed
-by handlers that return zero and drop writes; there is no host BAR behind them
-and no DMA path. The standing claim — *the guest never receives the physical
-device, no BAR is mapped to it, no DMA path to host memory* — remains literally
-true, and the zero-MMIO measurement above is evidence nothing tried to use one.
+`fake-bars` advertised **geometry in emulated config space**. It did not map
+host MMIO into the guest. The regions were ordinary QEMU `MemoryRegion`s backed
+by handlers that returned zero and dropped writes; there was no host BAR behind
+them and no DMA path. The standing claim — *the guest never receives the
+physical device, no BAR is mapped to it, no DMA path to host memory* — was
+literally true with it on, and the zero-MMIO measurement above is evidence
+nothing tried to use one.
 
 `tests/validate.sh` was run **both ways** on the same build: 28 PASS / 0 FAIL /
 0 SKIP with `fake-bars` off (and no `resourceN` files), and 28 PASS / 0 FAIL /
 0 SKIP with it on.
 
+That it was defensible is not why it stayed, and it did not stay: a dormant
+switch on the one boundary this project sells on has to earn its keep, and with
+no consumer and a blocked path behind it, it did not. Removed in
+`NVKVM_FAKEBARS_REMOVAL_SHA`.
+
 ## RESOLVED (2026-08-21): the DDX stops on ONE denied NVKMS command
 
 Measured on a rented headless RTX 3070 box, host driver 575.51.03, guest Ubuntu
-24.04 cloud image, `NVKVM_FAKE_BARS=1`, with the bare-metal host of the same box
-as the control.  The handoff below this section is kept for the trail it
+24.04 cloud image, on a build that still carried `fake-bars` (enabled for the
+run; the property has since been removed — see above), with the bare-metal host
+of the same box as the control.  The handoff below this section is kept for the trail it
 records; the parts of it that are now **wrong** are called out inline.
 
 ### The mechanism, in three syscalls
 
-With `fake-bars`, the guest DDX and the bare-metal DDX are byte-identical
-through the entire RM conversation — every `TRACE ALLOC` / `TRACE CTRL`, same
+With `fake-bars` enabled, the guest DDX and the bare-metal DDX were
+byte-identical through the entire RM conversation — every `TRACE ALLOC` / `TRACE CTRL`, same
 handles, same `nvstatus`, same params, right down to the last
 `NV2081_CTRL` call.  Then both open NVKMS, and there the two diverge:
 
@@ -540,8 +610,10 @@ satisfied by a **virtual NVKMS** that answers `QUERY_DISP` /
 `QUERY_CONNECTOR_STATIC_DATA` with nvkvm's own 1920x1080 head and terminates
 `SET_MODE`/`FLIP` at our KMS pipe.  That is a real piece of work (the NVKMS API
 surface, guest-side, versioned per driver branch) and it is the only shape that
-can work.  `fake-bars` remains correct and remains off by default; it is a
-prerequisite for that future work, not a step toward it on its own.
+can work.  `fake-bars` was a prerequisite for that future work rather than a
+step toward it on its own — which is precisely why it did not stay in the tree
+waiting for it: `git revert NVKVM_FAKEBARS_REMOVAL_SHA` brings it back in a
+minute on the day someone starts that work.
 
 Note also, and it is not new: **`cmdType 0 = ALLOC_DEVICE` is already allowed
 today** (Vulkan/EGL need it), so a guest can already allocate an NVKMS device on
@@ -629,9 +701,10 @@ box this ran on was handed back, so everything below is what survives.
 
 ### Current state
 
-`-device nvkvm-gpu,fake-bars=on` (env `NVKVM_FAKE_BARS=1`, **still default off**)
-gets the DDX much further than before, but not to a working screen. The failure
-moved; it did not go away.
+`-device nvkvm-gpu,fake-bars=on` (env `NVKVM_FAKE_BARS=1`; **both removed from
+the tree in `NVKVM_FAKEBARS_REMOVAL_SHA` — this paragraph describes the build of
+the day, not anything you can run now**) got the DDX much further than before,
+but not to a working screen. The failure moved; it did not go away.
 
     (**) NVIDIA(G0): Enabling 2D acceleration
     (II) NVIDIA GLX Module  595.84
@@ -674,7 +747,7 @@ Specifically ruled out, with measurements:
 
 | ruled out | evidence |
 |---|---|
-| BAR discovery | was a real blocker; `fake-bars` fixes it and the DDX now opens `/dev/nvidiactl` and `/dev/nvidia0`, which it never did before |
+| BAR discovery | was a real blocker; `fake-bars` fixed it and the DDX then opened `/dev/nvidiactl` and `/dev/nvidia0`, which it never did before |
 | BAR *access* | **zero** MMIO reads/writes over an entire run — the instrumented handlers never fired. It validates geometry, never pokes it. |
 | nvkvm refusing something | 4 `DENY` lines, identical to a plain boot with no X at all |
 | a failing RM call | every `nvstatus` is 0 on both sides; the one guest-only `0x00000205 nvstatus=0x1f` is a first-client probe that **retries and succeeds with byte-identical params to the host** |
