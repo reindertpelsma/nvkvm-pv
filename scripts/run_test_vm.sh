@@ -150,37 +150,44 @@ VM_SERIAL="${VM_SERIAL:-stdio}"
 # swallow every key and click.  virtio-tablet sends absolute coordinates, so the
 # host and guest pointers stay together without grabbing the mouse.
 #
-# virtio-mouse is the RELATIVE device, and it is not redundant with the tablet.
-# A tablet reports "the pointer is at (x, y)"; it never reports "the pointer
-# moved by (dx, dy)".  Anything that takes a pointer lock -- every first-person
-# game, and plenty of 3D tools -- hides the cursor and reads deltas, so with a
-# tablet alone there is nothing for it to read and the view simply does not
-# turn.  Observed with Minecraft rendering perfectly at 60 fps in the guest and
-# mouse-look dead.
+# virtio-mouse, the RELATIVE device, is OPT-IN and off by default.  It is not
+# redundant with the tablet -- a tablet reports "the pointer is at (x, y)" and
+# never "the pointer moved by (dx, dy)", so anything that takes a pointer lock
+# (every first-person game) reads deltas and gets nothing, and the view does not
+# turn.  Observed with Minecraft rendering at 60 fps in the guest and mouse-look
+# dead.
 #
-# Both devices together is the right answer rather than a compromise: QEMU uses
-# the tablet while the window is ungrabbed, so the desktop keeps the seamless
-# pointer described above, and delivers relative motion through the mouse once
-# the window has grabbed input.
+# It is off by default because ADDING IT CHANGES THE DEFAULT DESKTOP.  QEMU keeps
+# one "current" mouse handler and makes it whichever was most recently
+# ACTIVATED (ui/input.c: activate does QTAILQ_INSERT_HEAD, find_handler returns
+# the first match), and the GUEST decides that by enabling the device -- so
+# cmdline ordering does not control it.  Shipping both silently made the
+# relative mouse current: `info mice` reported
 #
-# THE GUEST CANNOT TAKE THE GRAB.  Adding a relative device does not let a guest
-# application capture the host pointer, and that distinction is the whole point:
-# every grab in ui/gtk.c is a user gesture -- ctrl-alt-g
-# ("user-request-main-window"), a left-button press once the guest is in
-# relative mode ("relative-mode-click", and note the tablet keeps
-# qemu_input_is_absolute() true so even that cannot fire while it is active), or
-# the "Grab On Hover" menu item, which is opt-in and off by default.  QEMU has
-# no channel through which it could learn that a guest application took a
-# pointer lock, so it cannot react to one.
+#     Mouse #4: QEMU Virtio Tablet (absolute)
+#   * Mouse #5: QEMU Virtio Mouse
 #
-# That is deliberately the same consent model as a browser's Pointer Lock API:
-# the page asks, and the USER grants it with a gesture.  A VM window that a
-# guest could silently make swallow the host pointer would be a worse version of
-# the thing browsers fixed years ago.
+# with the tablet present but not current.  qemu_input_is_absolute() is then
+# false, which arms the implicit grab in ui/gtk.c -- a plain left click takes
+# BOTH pointer and keyboard, hides the cursor, and the pointer cannot leave the
+# window until ctrl-alt-g.  That is the correct behaviour for a game and quite
+# wrong for a desktop, where hovering should just move the pointer.
+#
+# So: default is tablet only, and the window behaves like a window.  With
+# VM_RELATIVE_MOUSE=1 both devices exist and the monitor's `mouse_set <n>`
+# switches between them live, no restart -- `mouse_set` on the tablet to get the
+# desktop back, on the mouse to play.  Either way the guest can never take the
+# grab itself: every grab in ui/gtk.c is a user gesture (ctrl-alt-g, a click
+# while in relative mode, or the opt-in Grab On Hover), QEMU has no channel to
+# learn a guest app wanted a pointer lock, and while grabbed the window title
+# carries "Press Ctrl+Alt+G to release grab".  Same consent model as a browser's
+# Pointer Lock API, and it should stay that way.
 INPUT_ARGS=""
 if [ "$VM_DISPLAY" != "none" ]; then
     INPUT_ARGS="-device virtio-keyboard-pci -device virtio-tablet-pci"
-    INPUT_ARGS="$INPUT_ARGS -device virtio-mouse-pci"
+    if [ "${VM_RELATIVE_MOUSE:-0}" = "1" ]; then
+        INPUT_ARGS="$INPUT_ARGS -device virtio-mouse-pci"
+    fi
 fi
 
 # Preflight KVM before exec'ing QEMU.  Without this the user gets QEMU's bare
