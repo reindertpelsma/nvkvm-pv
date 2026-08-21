@@ -10,6 +10,109 @@ Three artefacts, built in this order:
 
 Steps 1 and 2 are one script. Step 3 is done by cloud-init on first guest boot.
 
+The QEMU delta is a **patch series** in [`patches/`](../../patches/) plus a file
+copy, so `scripts/build_qemu.sh` is a convenience and not the only path —
+[Building from scratch, by hand](#building-from-scratch-by-hand) is the same
+sequence as commands you can type. [What this does to
+QEMU](#what-this-does-to-qemu) is the whole surface in one table.
+
+## You may not need to build this
+
+Two prebuilt paths exist and both are produced from a tag by
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml), on a
+GitHub-hosted runner, from the same `scripts/build_qemu.sh` and `Dockerfile`
+this page describes:
+
+| | |
+|---|---|
+| `ghcr.io/reindertpelsma/nvkvm-pv` | the container image, built by the `Dockerfile` |
+| `nvkvm-<version>-linux-x86_64.tar.gz` | the built QEMU tree plus the tag's source, on the [releases page](https://github.com/reindertpelsma/nvkvm-pv/releases) |
+
+Build from source anyway if you want the GTK/SDL window (`NVKVM_QEMU_UI=1` —
+the release binary is headless), a compute-only build, an older glibc than
+Ubuntu 24.04's, or if you are changing anything under `src/`.
+
+### Verify before you run either
+
+An attestation nobody checks is decoration, so this is the whole point of
+publishing them. [`gh`](https://cli.github.com/) checks the artifact in your
+hand against a signed statement about which repository, commit and workflow run
+produced it:
+
+```bash
+# the image, resolved from the registry
+gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:latest \
+    --repo reindertpelsma/nvkvm-pv \
+    --signer-workflow reindertpelsma/nvkvm-pv/.github/workflows/release.yml
+
+# the tarball, on disk
+gh attestation verify nvkvm-<version>-linux-x86_64.tar.gz \
+    --repo reindertpelsma/nvkvm-pv \
+    --signer-workflow reindertpelsma/nvkvm-pv/.github/workflows/release.yml
+```
+
+`--repo` is not optional in spirit: without it `verify` accepts an attestation
+from *any* repository, which downgrades a provenance check to a signature check.
+`--signer-workflow` narrows it further to the one workflow file allowed to
+produce these, so a different workflow in this same repository — added by
+someone who got write access — would not satisfy it.
+
+`gh attestation verify` reaches out to `api.github.com` for the attestation and
+to Sigstore for the trust root. To verify on a machine with neither, fetch both
+in advance and hand them over:
+
+```bash
+gh attestation download nvkvm-<version>-linux-x86_64.tar.gz --repo reindertpelsma/nvkvm-pv
+gh attestation trusted-root > trusted_root.jsonl
+# ... on the offline machine:
+gh attestation verify nvkvm-<version>-linux-x86_64.tar.gz --repo reindertpelsma/nvkvm-pv \
+    --bundle sha256:<digest>.jsonl --custom-trusted-root trusted_root.jsonl
+```
+
+### What is in the tarball, and how to check it against the tag
+
+| | |
+|---|---|
+| `qemu-nvkvm/` | the build output of `scripts/build_qemu.sh` — `bin/qemu-system-x86_64` and QEMU's data files |
+| `src/stub/nvkvm_stub` | the built isolate stub. It is *also* embedded in the QEMU binary; this copy is the `NVKVM_STUB_PATH` runtime fallback (step 1b below) |
+| everything else | the repository at that tag, verbatim — the workflow produces it with `git archive` |
+
+The source half is `git archive` output on purpose: it makes "does this tarball
+match the tag?" answerable rather than a matter of trust.
+
+```bash
+V=<version>                                     # e.g. v0.1.0
+tar xzf "nvkvm-$V-linux-x86_64.tar.gz"
+rm -rf "nvkvm-$V/qemu-nvkvm" "nvkvm-$V/src/stub/nvkvm_stub" "nvkvm-$V/RELEASE.md"
+
+git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm
+mkdir ref && git -C nvkvm archive --format=tar --prefix="nvkvm-$V/" "$V" | tar -x -C ref
+
+diff -r "ref/nvkvm-$V" "nvkvm-$V"               # silence == identical to the tag
+```
+
+The three paths removed first are the only things the workflow adds: the two
+build outputs and a generated `RELEASE.md`.
+
+The guest kernel module is deliberately absent from both artifacts. It is an
+out-of-tree module and has to be compiled against the running guest kernel, so
+there is no such thing as a prebuilt one that is right for your guest —
+`src/guest/` ships instead, and [the guest kernel module](#the-guest-kernel-module)
+below is what happens to it.
+
+### Installing the tarball
+
+```bash
+sudo cp -a qemu-nvkvm /opt/qemu-nvkvm
+sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
+```
+
+`/opt/qemu-nvkvm/bin/qemu-system-x86_64` is where `scripts/run_test_vm.sh` looks
+(`scripts/run_test_vm.sh:30`); `QEMU_BIN` overrides it if you would rather leave
+the tree where you unpacked it. Runtime packages and the measured glibc floor
+are in `RELEASE.md` inside the tarball — it is a real binary built on Ubuntu
+24.04, so an older distro needs the source build.
+
 ## Host prerequisites
 
 - Linux with KVM and an NVIDIA GPU with the driver installed. QEMU's device

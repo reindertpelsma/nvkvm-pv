@@ -14,18 +14,44 @@
 FROM ubuntu:24.04 AS build
 
 ARG DEBIAN_FRONTEND=noninteractive
+# The QEMU build dependencies, by name, rather than `build_qemu.sh
+# --install-deps`.  Two reasons, and the second one is why this line exists at
+# all: it keeps apt in its own cached layer, so editing src/ rebuilds QEMU
+# without re-running a package manager -- and it makes the script take its
+# NORMAL path (probe, find everything present, proceed), which is the path a
+# user on a bare host follows and the same reasoning .github/workflows/ci
+# records for qemu-build.yml.
+#
+# 2026-08-21: this image did not build before this list was added.  The header
+# below used to say the script installs its own dependencies; it stopped doing
+# that when it grew a probe-and-report step, and the Dockerfile was not updated
+# -- so the build stage died in "[1/9] Checking build dependencies" with
+# thirteen missing packages.  Keep this list in step with qemu-build.yml's.
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
         build-essential git ca-certificates \
+        ninja-build meson libglib2.0-dev libpixman-1-dev \
+        python3 python3-venv python3-tomli libslirp-dev pkg-config \
+        libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/nvkvm
 # Only what the build actually reads, so that editing a doc or the compose
-# file does not invalidate the QEMU build layer and re-clone 200 MB.
+# file does not invalidate the QEMU build layer and re-clone 200 MB.  Ordered
+# least-volatile first, for the same reason.
+#
+# patches/ is not optional and was missing here: the QEMU delta moved out of
+# inline sed into a patch series, and build_qemu.sh step 3 now exits 1 with
+# "no *.patch files found" when the directory is absent -- correctly, since
+# without it the build would produce a stock QEMU that has never heard of
+# virtio-nvgpu.  The image did not build at all until this line was added
+# (2026-08-21).
 COPY scripts/build_qemu.sh ./scripts/build_qemu.sh
+COPY patches ./patches
 COPY src ./src
 
-# build_qemu.sh installs its own build dependencies, clones QEMU, applies the
-# nvkvm device and installs to /opt/qemu-nvkvm + /usr/lib/nvkvm.
+# build_qemu.sh clones QEMU, applies the nvkvm patch series, builds the isolate
+# stub and installs to /opt/qemu-nvkvm + /usr/lib/nvkvm.  It does NOT install
+# packages -- see the dependency list above.
 RUN bash scripts/build_qemu.sh
 
 # ── runtime stage: QEMU plus the repo, without the build tree ─────────────

@@ -1,11 +1,16 @@
 # nvkvm in a container.  See the Dockerfile header and the README FAQ.
 #
-#   docker compose up --build
-#   ssh -p 2222 ubuntu@127.0.0.1        # into the guest, once it has booted
+#   docker compose pull && docker compose up    # the published image
+#   docker compose up --build                   # or build QEMU here instead
+#   ssh -p 2222 ubuntu@127.0.0.1                # into the guest, once it has booted
 services:
   nvkvm:
+    # Both, on purpose.  `image:` names the published artifact so `pull` works
+    # and nobody has to build QEMU to try this; `build:` keeps `--build`
+    # working for anyone changing src/ -- and the tag is what the release
+    # workflow pushes, so the two are the same thing built two ways.
+    image: ghcr.io/reindertpelsma/nvkvm-pv:latest
     build: .
-    image: nvkvm:local
     # Capabilities: drop everything, then add back only what the isolate needs
     # to reach its STRONGEST sandbox rung.  This is not the same as dropping
     # everything -- `cap_drop: [ALL]` alone makes nvkvm WEAKER, not safer:

@@ -101,5 +101,7 @@ reproduce identically on bare metal.
 
 ## Scope of this file
 
-`nvkvm` is unreleased and unversioned. There are no supported versions and no
-backports: fixes land on `main`.
+`nvkvm` is experimental and has no supported versions and no backports. Fixes
+land on `main`; a release tag or a published image is a snapshot of it, not a
+branch that gets patched. If you are running one and a fix lands, take a newer
+snapshot.
