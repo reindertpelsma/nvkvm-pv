@@ -36,9 +36,22 @@ Details: [the isolate model](docs/internal/isolate-model.md) and
 
 | from | to |
 |---|---|
-| guest process | isolate, guest kernel, VMM |
+| guest process | isolate, guest kernel, VMM, **another guest process** |
 | guest kernel | isolate, VMM |
 | isolate | VMM, host |
+
+**Guest process → guest process is in scope, with a caveat worth stating.** Each
+guest process gets its own isolate on the host, with its own RM client, so one
+process's GPU objects are not meant to be reachable from another's — and we
+treat a way to reach them as a vulnerability. A recent audit found one and it is
+fixed.
+
+But that separation is **additive to whatever the guest OS already provides, not
+a substitute for it.** Two guest processes running as the same user can already
+reach each other by ordinary means — `ptrace`, `/proc/<pid>/mem` — and nvkvm
+neither prevents that nor tries to. So the GPU-level separation is only
+meaningful between guest processes that are themselves separated: different
+UIDs, or containers inside the guest.
 
 **Out of scope**, as safe by construction: isolate → guest process, guest kernel
 → guest process, VMM → anything. The VMM and the host are trusted; the guest is
