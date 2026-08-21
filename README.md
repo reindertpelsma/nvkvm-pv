@@ -62,7 +62,8 @@ Not yet for untrusted multi-tenant hosting — see below.
 ## What it is not
 
 - **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
-  security boundary you should rely on. It also runs in **containers**, where
+  security boundary you should rely on — read [`SECURITY.md`](SECURITY.md)
+  before you decide where to run this. It also runs in **containers**, where
   Linux namespaces are usually blocked — the isolate falls back to UID separation,
   which is weaker; see [the isolate model](docs/internal/isolate-model.md). We
   audit it ourselves and publish what we find, fixed or not: the
@@ -575,6 +576,7 @@ validating. Verify your own workload against a host run all the same; see
 | [Reading the parity numbers](docs/reference/parity.md) | What the host/guest ratios do and do not establish |
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
+| [`SECURITY.md`](SECURITY.md) | Threat model, what is known broken, how to report a vulnerability |
 | [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
 
 ## Status
