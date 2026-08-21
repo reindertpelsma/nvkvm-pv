@@ -1,0 +1,87 @@
+# Pointer lock in the GTK window — what is ruled in and out, 2026-08-21
+
+**Status: unresolved.** Written while the only machine that could test it was
+being returned, so that whoever picks this up does not repeat the eliminations.
+
+## The model that is wanted
+
+Two modes, as specified by the user, and VirtualBox is the reference:
+
+**Normal** — host tracks the mouse and hides its cursor over the window (the
+guest draws its own); the pointer leaves the window whenever it likes and the
+guest has no say; only coordinates are delivered, on hover; **a click is
+forwarded to the guest like a click in a web app, and does NOT grab**; host OS
+keyboard shortcuts are not intercepted; the guest sees an absolute pointer that
+can teleport.
+
+**Grab** — entered from a menu item or a shortcut, never as a side effect. The
+guest tracks the mouse. The host stops tracking entirely: no cursor anywhere, no
+coordinates. Real pointer lock. The guest sees relative motion only and does its
+own tracking. Keyboard forwards fully except the escape combo. A guest
+application taking its own pointer lock then works, because the host already
+granted it.
+
+## Confirmed defect, independent of the rest
+
+`ui/gtk.c` ~line 995 implicitly grabs on the first left click while in relative
+mode (`gd_grab_pointer(vc, "relative-mode-click")`). That contradicts the model
+above and should be removed: grab is a setting or a shortcut. This does not
+depend on the unresolved question below.
+
+## What was measured, and what it eliminates
+
+Tested live on the RTX 4070 box: `mouse_set 5` (make the relative virtio-mouse
+current), then grab, then try to look around in Minecraft. **Motion did not
+reach the game.** Host-side device switching is therefore NOT sufficient on its
+own, which matters because that is exactly what a patch tying grab to
+`qemu_mouse_set()` would do.
+
+Ruled out as explanations:
+
+- **Not `qemu_input_is_absolute()` returning the wrong thing.** It returns the
+  first handler matching `REL|ABS` and tests its ABS bit (`ui/input.c:461`).
+  With the relative mouse at the list head it correctly returns false.
+- **Not the guest flipping the device back.** `info mice` after the failed test
+  still showed `* Mouse #5: QEMU Virtio Mouse`. QEMU was in relative mode
+  throughout.
+- **Not a missing device in the guest.** `/proc/bus/input/devices` shows both
+  `QEMU Virtio Tablet` (event5) and `QEMU Virtio Mouse` (event6).
+- **Not missing Wayland protocol support.** libweston 13.0.0 exports
+  `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1` and
+  `zwp_relative_pointer_v1`, and Xwayland has the relative pointer bound —
+  `xinput list` on `:2` shows `xwayland-relative-pointer:16`.
+
+So on the host side the deltas should have been queued: `gd_motion_event`
+(`ui/gtk.c:893`) takes its relative branch at
+`else if (s->last_set && s->ptr_owner == vc)` and calls `qemu_input_queue_rel`,
+gated only on being grabbed.
+
+## The part nobody has looked at
+
+The delivery chain is longer than a normal VM's, and only its two ends were
+checked:
+
+    QEMU --relative--> virtio-mouse (event6) --> weston --> Wayland
+    pointer-constraints / relative-pointer --> Xwayland (rootful, fullscreen)
+    --> the X client
+
+Xwayland here is a **weston client**, not an evdev reader — that is why
+`xinput list` shows `xwayland-pointer:16` rather than the QEMU devices. Untested
+links, in the order worth testing:
+
+1. Does weston actually deliver relative motion from event6 while it also holds
+   the tablet? A compositor with both an absolute and a relative pointer is the
+   unusual part of this setup.
+2. Does the X client's pointer grab become a Wayland pointer *constraint*, and
+   does weston honour it?
+3. Was the grab genuinely active during the test? "grab doesn't let me move
+   mouse" is also consistent with the grab never being established.
+
+A `wayland-info` in the guest, and weston's own log with pointer debug, would
+settle (1) and (2) quickly on a machine with a display.
+
+## Warning for whoever resumes this
+
+Do not merge a patch that assumes host-side device switching is sufficient
+without re-testing this end to end. The measurement above says it is not, and
+the reason is not yet known.
