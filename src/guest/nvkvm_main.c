@@ -1039,6 +1039,41 @@ static unsigned int nvkvm_ctrl_list_entry_size(__u32 cmd)
 	return 0;
 }
 
+/*
+ * RM_ALLOC alloc-params for a class with no entry in the size-by-hClass tables
+ * below.
+ *
+ * The tables are exhaustive only for the classes somebody has already been
+ * bitten by.  When a class is missing, `ap_size` stays 0, the guest copies
+ * nothing, and the stub writes a NULL `pAllocParms` into the forwarded NVOS21 /
+ * NVOS64 — so the host RM allocates the object from an ALL-DEFAULT parameter
+ * block while the caller believes it asked for something specific.  Nothing is
+ * denied and no status is non-zero; the object is simply not the one the caller
+ * requested, and the damage surfaces several layers later.
+ *
+ * That has now cost this project five separate bugs (#84 twice, #99, #101, and
+ * the Hopper Vulkan failure: HOPPER_USERMODE_A / 0xc661 was unsized, so its
+ * `bBar1Mapping` never reached RM, `GET_ADDR_SPACE_TYPE` answered REGMEM where
+ * bare metal answers VIDMEM, and the userspace driver freed the channel it had
+ * just built and then allocated HOPPER_COMPUTE_A under the dead handle).
+ *
+ * So stop failing silently.  For an unsized class, forward a bounded window of
+ * the caller's buffer instead of nothing, and leave the caller's
+ * `alloc_parms_size` alone — a native caller routinely passes 0 there and lets
+ * RM size the struct by class, which is exactly the behaviour we want to
+ * reproduce.  The window stops at the end of the page holding the pointer, so
+ * it can never fault into an unmapped neighbour: the first byte is mapped
+ * because userspace just handed us the pointer.
+ */
+#define NVKVM_ALLOC_PARMS_PROBE 256u
+
+static size_t nvkvm_alloc_parms_probe_len(__u64 uptr)
+{
+	size_t to_page_end = (size_t)PAGE_SIZE - (size_t)(uptr & (PAGE_SIZE - 1));
+
+	return min_t(size_t, (size_t)NVKVM_ALLOC_PARMS_PROBE, to_page_end);
+}
+
 static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct nvkvm_fd_ctx *ctx = filp->private_data;
@@ -1792,6 +1827,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = sizeof(struct nv_gr_allocation_parameters);
 				break;
 			}
+			if (ap_size == 0) {
+				/* Unsized class: forward a bounded window rather
+				 * than a NULL parameter block.  NVOS21 has no
+				 * paramsSize field at all, so RM always sizes by
+				 * class here — it just needs the bytes. */
+				ap_size = nvkvm_alloc_parms_probe_len(
+						alloc->p_alloc_parms);
+				pr_warn_ratelimited(
+					"nvkvm: RM_ALLOC hClass=0x%x has no alloc-param size entry; forwarding a %zu-byte window\n",
+					alloc->h_class, ap_size);
+			}
 			if (ap_size > 0) {
 				aux_buf = kzalloc(ap_size, GFP_KERNEL);
 				if (!aux_buf) {
@@ -1823,6 +1869,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			 * size if provided, otherwise fall back to the per-class
 			 * size (same table as the nvos21 path above). */
 			size_t ap_size = alloc->alloc_parms_size;
+			bool ap_guessed = false;
 			if (ap_size == 0) {
 				switch (alloc->h_class) {
 				case NV01_DEVICE_0:
@@ -1926,6 +1973,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = sizeof(struct nv_gr_allocation_parameters);
 					break;
 				}
+				if (ap_size == 0) {
+					/* Unsized class.  Forward a bounded
+					 * window and, unlike the known-class
+					 * arm below, do NOT write a size back
+					 * into alloc_parms_size: the caller
+					 * passed 0 on purpose so that RM sizes
+					 * the struct by class, and a guessed
+					 * size is exactly the thing RM would
+					 * reject. */
+					ap_size = nvkvm_alloc_parms_probe_len(
+							alloc->p_alloc_parms);
+					ap_guessed = true;
+					pr_warn_ratelimited(
+						"nvkvm: RM_ALLOC hClass=0x%x has no alloc-param size entry; forwarding a %zu-byte window\n",
+						alloc->h_class, ap_size);
+				}
 			}
 			if (ap_size > NVKVM_SHM_SLOT_DEFAULT_SIZE) {
 				kfree(params_buf);
@@ -1946,8 +2009,12 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				}
 				aux_size = ap_size;
 				/* Sync the size back so the host driver sees a
-				 * consistent (params, paramsSize) pair. */
-				alloc->alloc_parms_size = (u32)ap_size;
+				 * consistent (params, paramsSize) pair — but only
+				 * when the size is a MEASURED one.  For a guessed
+				 * window the caller's 0 is the correct value to
+				 * forward; see nvkvm_alloc_parms_probe_len(). */
+				if (!ap_guessed)
+					alloc->alloc_parms_size = (u32)ap_size;
 
 				/* NV01_EVENT_OS_EVENT: Data is an FD pointing at one
 				 * of the /dev/nvidia* char devices (not a generic
