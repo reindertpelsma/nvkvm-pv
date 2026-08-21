@@ -19,7 +19,7 @@ rented for this run advertised 580.95.05 and all three came up on 575.51.03.
 | 535 | 535.43.08+, 535.86+ | — | yes (535.309.01) | already covered |
 | 545 | 545, 550.40.0x (<.53) | **545.23.08** | no | **newly booted, 28/28** |
 | 550 | 550.40.53–565 | **550.54.14** | no | **newly booted, 28/28** |
-| 570 | 570–575 | — | yes (575.51.03) | already covered |
+| 570 | 570–575 | **570.124.06** | yes (575.51.03) | already covered; 6-GPU boot 2026-08-21 |
 | 580 | 580–595 | **580.95.05, 595.84** | no | **newly booted** |
 | 610 | 610+ | **610.43.02** | no | **newly booted, 28/28** (27/28 before the cmdType-60 fix) |
 
@@ -193,11 +193,13 @@ ordinal remapping libcuda does on top of nvkvm's device list is consistent.
 
 ### Not covered
 
-Three or more GPUs; NVLink/P2P between guest GPUs; mixed GPU models in one
-host; `numa_status`, which stays `ENOENT` (as it was before this work — guest
-`nvidia-smi` probes it and tolerates its absence). Only one identity PCI device
-is created, so the guest PCI bus shows one NVIDIA card whatever the GPU count;
-CUDA/NVML/Vulkan go through RM and do not care.
+Mixed GPU models in one host; `numa_status`, which stays `ENOENT` (as it was
+before this work — guest `nvidia-smi` probes it and tolerates its absence).
+Only one identity PCI device is created, so the guest PCI bus shows one NVIDIA
+card whatever the GPU count; CUDA/NVML/Vulkan go through RM and do not care.
+
+Three-or-more GPUs and peer access between guest GPUs were open here and are
+now covered — see the 6x RTX A4000 section below.
 
 Exact strings, since a renderer check that does not print its renderer is not
 worth much:
@@ -209,6 +211,95 @@ worth much:
   and Mesa `llvmpipe`. The suite selects the NVIDIA one and would FAIL if only
   llvmpipe were present. That is not hypothetical; see the llvmpipe incident
   below.
+
+## Multi-GPU — 6x RTX A4000, 570.124.06 (measured 2026-08-21)
+
+Six GPUs in one guest: the most this project has run, and the first
+workstation-class card. Host: 6x RTX A4000 (Ampere GA104, sm_86, 16 GB each),
+driver 570.124.06, host BDFs `00:07.0`, `00:0a.0`, `00:0b.0`, `00:0d.0`,
+`00:0f.0`, `00:12.0`; guest Ubuntu 24.04 / kernel 6.8, 12 vCPU / 24 GB.
+QEMU selected **ABI profile 570** for host driver 570.124.06, as
+`docs/reference/abi-profiles.md` specifies for `566 <= major <= 579`.
+
+`validate.sh`: **28/28 PASS**, `cuda_device_count 6`. Guest `nvidia-smi -L`
+lists six A4000s whose UUIDs match the host's six exactly.
+
+### Sequential walk
+
+`tests/multi_gpu.c` over all six: **6/6 device(s) fully usable**, each with the
+guest-visible BDF equal to the host's and its own per-device bias verified
+(`bias=1000003` on device 0 through `bias=6000018` on device 5), so a
+misrouted launch could not have compared equal.
+
+### Six at once
+
+Six concurrent guest processes, one per GPU, `--device N --spin 30` so every
+process carries a *distinct* bias:
+
+```
+device 0  spin 30.0s: 699546 launches, bias=1000003, final result still correct
+device 1  spin 30.0s: 700242 launches, bias=2000006, final result still correct
+device 2  spin 30.0s: 696610 launches, bias=3000009, final result still correct
+device 3  spin 30.0s: 700641 launches, bias=4000012, final result still correct
+device 4  spin 30.0s: 702296 launches, bias=5000015, final result still correct
+device 5  spin 30.0s: 697904 launches, bias=6000018, final result still correct
+```
+
+Host during the overlap — all six cards busy simultaneously, so the six
+isolates are genuinely parallel rather than serialized behind one device:
+
+```
+0, 78 %   1, 79 %   2, 79 %   3, 79 %   4, 79 %   5, 78 %      (180 MiB each)
+```
+
+A `CUDA_VISIBLE_DEVICES` variant (six processes each pinned to one GPU, each
+therefore seeing its GPU as ordinal 0) also passed, ~930k launches per process
+over 40 s. That variant is the weaker of the two: with CVD every process shares
+`bias=1000003`, so it cannot detect a cross-GPU misroute. The `--device N` run
+above is the one that proves routing.
+
+### Peer access — host and guest agree exactly
+
+`tests/peer_gpu.c` run on the bare-metal host and in the guest. RTX A4000 has
+no NVLink connector and the six cards sit behind a PCIe host bridge (`PHB` for
+all 30 pairs in `nvidia-smi topo -m`), so no P2P is the *correct* answer:
+
+```
+MATRIX|canAccessPeer|src=0|self,0,0,0,0,0
+MATRIX|canAccessPeer|src=1|0,self,0,0,0,0
+MATRIX|canAccessPeer|src=2|0,0,self,0,0,0
+MATRIX|canAccessPeer|src=3|0,0,0,self,0,0
+MATRIX|canAccessPeer|src=4|0,0,0,0,self,0
+MATRIX|canAccessPeer|src=5|0,0,0,0,0,self
+TOTAL|pass=91 fail=0 skip=1
+VERDICT|PASS
+```
+
+The host and guest outputs are **byte-for-byte identical**, all 109 lines —
+including all 30 ordered pairs each of `cuMemcpyPeer`, `cuMemcpyPeerAsync` and
+device-to-device-via-host, every one byte-verified, and the same
+`peer_kernel SKIP` (no ordered pair reports P2P, so there is nothing to
+enable). Host says no P2P; guest says no P2P; nvkvm dropped nothing.
+
+### Render nodes
+
+The host's six NVIDIA render minors are **`renderD128`–`renderD133`,
+contiguous** — the third multi-GPU box in a row with no gap, so the
+non-contiguous renumbering path in `nvkvm_nvidia_render_minor()` is still
+unexercised anywhere. The guest exposes a single `renderD128` (graphics is one
+`drm_dev_alloc()`; compute nodes are per-GPU, `/dev/nvidia0`..`/dev/nvidia5`).
+Vulkan still enumerates all six A4000s plus llvmpipe (7 devices) because the
+ICD binds through the render node and then enumerates `/dev/nvidia*`.
+This is by design, not a shortfall.
+
+### QEMU log
+
+Clean apart from six `DENY ctrl cmd 0x00730102` lines — one per GPU, the
+`NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS` display control already recorded for
+545/550/595/610 and benign on a headless guest. No isolate deaths, no
+table-full, no map-VA errors; six devices did not strain the handle or
+mmap-token tables. Isolate sandbox reached its strongest rung
+(`auto -> namespace`).
 
 ## Finding: offscreen GL rendering is broken on 595 and 610
 
@@ -434,6 +525,7 @@ control commands the allowlist was generated without:
 |---|---|
 | 545.23.08 | `0x00730102`, `0x00730138` |
 | 550.54.14 | `0x00730102` |
+| 570.124.06 | `0x00730102` (6x, one per GPU) |
 | 580.95.05 | none observed |
 | 595.84 | ~~none observed~~ → `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
 | 610.43.02 | `0x00730102`, `0x2080019f`, `0x2080220b`, nvkms `cmdType=60` |
