@@ -434,6 +434,34 @@ static unsigned int         stub_elf_len = 0;
 #define CLOSE_RANGE_UNSHARE  (1U << 1)
 #endif
 
+/*
+ * Move an about-to-be-exec'd image descriptor clear of stdio.
+ *
+ * open()/memfd_create() return the LOWEST free descriptor.  When QEMU runs
+ * with stdin closed that is fd 0 -- and the very next thing the child does is
+ * dup2(sv[1], STDIN_FILENO), which destroys the image fd before it can be
+ * parked at 3.  The child then dup2()s the COMMAND SOCKET to fd 3 and
+ * fexecve()s it, so exec fails with EACCES and the isolate dies at 127 with no
+ * diagnostic.  Measured, not theorised: strace of tests/unit/test_isolate
+ * showed openat(...mock_stub) = 0, dup2(4,0) = 0, dup2(0,3) = 3,
+ * execveat(3,...) = EACCES.  It fails CLOSED (no stub runs), so this is an
+ * availability bug rather than an escape, but it takes the whole isolate with
+ * it whenever fd 0 happens to be free.
+ *
+ * Returns a descriptor >= 3 (possibly the original), or -1.  CLOEXEC is kept
+ * on the duplicate; the caller's dup2() to fd 3 clears it, as before.
+ */
+static int nvkvm_fd_clear_of_stdio(int fd)
+{
+	if (fd < 0 || fd >= 3)
+		return fd;
+	int nfd = fcntl(fd, F_DUPFD_CLOEXEC, 3);
+	if (nfd < 0)
+		return -1;
+	close(fd);
+	return nfd;
+}
+
 static void nvkvm_isolate_closefrom(int first)
 {
 	long r = syscall(__NR_close_range, first, ~0U, 0);
@@ -1622,6 +1650,13 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 					_exit(126);
 				close(syncpipe[0]);
 			}
+			/* Clear of stdio BEFORE stdin is rewired: see
+			 * nvkvm_fd_clear_of_stdio().  A memfd handed back as
+			 * fd 0 would otherwise be destroyed by the dup2 below
+			 * and we would fexecve the command socket. */
+			mfd = nvkvm_fd_clear_of_stdio(mfd);
+			if (mfd < 0)
+				_exit(127);
 			dup2(sv[1], STDIN_FILENO);
 			/* Park the memfd at fd 3 so closefrom preserves it. */
 			if (mfd != 3) {
@@ -1733,6 +1768,12 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			 * pivot into the empty tmpfs root, stub_path no longer exists,
 			 * so exec must go through this fd (fexecve), not the path. */
 			int binfd = open(stub_path, O_RDONLY | O_CLOEXEC);
+			if (binfd < 0)
+				_exit(127);
+			/* Clear of stdio BEFORE stdin is rewired: see
+			 * nvkvm_fd_clear_of_stdio().  open() returns the lowest
+			 * free fd, which is 0 when the parent has stdin closed. */
+			binfd = nvkvm_fd_clear_of_stdio(binfd);
 			if (binfd < 0)
 				_exit(127);
 			dup2(sv[1], STDIN_FILENO);
