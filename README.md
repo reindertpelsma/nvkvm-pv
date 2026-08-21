@@ -72,9 +72,15 @@ hung once and has not reproduced since.
   [boundary audit](docs/internal/audit-boundaries-2026-08-20.md) (19 findings
   across all three trust boundaries, 15 fixed, 4 named as open).
   **Do not put untrusted tenants behind it.**
-- **Not a virtual monitor.** There is no scanout path. A GPU-accelerated desktop
-  runs inside the guest and frames leave by *capture*, not by a virtual display.
-  See [Known limitations](docs/internal/known-limitations.md).
+- **One virtual display, not a multi-monitor setup.** There *is* a scanout path:
+  the guest gets a virtual KMS head, and its composited frames reach a QEMU
+  window by dma-buf (zero-copy on an NVIDIA-rendered host desktop, readback
+  otherwise). That head does not need a monitor, or even a display server, on
+  the host -- which is what makes a headless cloud GPU usable as a workstation.
+  What you do **not** get is more than one head: no multi-monitor guest, and no
+  guest-side control over modes, because forwarding NVKMS modesetting would hand
+  the guest the *host's* displays. See
+  [Known limitations](docs/internal/known-limitations.md).
 - **Not vGPU.** No SR-IOV, no hardware partitioning, no MIG. Sharing is
   cooperative, at the driver interface.
 - **Not a Windows guest solution.** Linux guests only.
@@ -220,8 +226,8 @@ bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and pr
 ```
 
 Most of the wall clock is QEMU. The script is a convenience, not the
-mechanism: everything it changes in upstream QEMU is five patch files in
-[`patches/`](patches/) — 94 lines, applied with `git apply` — plus a copy of the
+mechanism: everything it changes in upstream QEMU is nine patch files in
+[`patches/`](patches/) — 631 lines, applied with `git apply` — plus a copy of the
 device sources into `hw/misc/`.
 [`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
 same build by hand, command by command, if you would rather not run a script
