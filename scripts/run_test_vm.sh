@@ -149,9 +149,24 @@ VM_SERIAL="${VM_SERIAL:-stdio}"
 # no input devices at all, so a GTK/SDL window would show the guest desktop and
 # swallow every key and click.  virtio-tablet sends absolute coordinates, so the
 # host and guest pointers stay together without grabbing the mouse.
+#
+# virtio-mouse is the RELATIVE device, and it is not redundant with the tablet.
+# A tablet reports "the pointer is at (x, y)"; it never reports "the pointer
+# moved by (dx, dy)".  Anything that takes a pointer lock -- every first-person
+# game, and plenty of 3D tools -- hides the cursor and reads deltas, so with a
+# tablet alone there is nothing for it to read and the view simply does not
+# turn.  Observed with Minecraft rendering perfectly at 60 fps in the guest and
+# mouse-look dead.
+#
+# Both devices together is the right answer rather than a compromise: QEMU uses
+# the tablet while the window is ungrabbed, so the desktop keeps the seamless
+# pointer described above, and delivers relative motion through the mouse once
+# the window grabs input (ctrl-alt-g, or automatically when a guest application
+# takes a pointer lock).
 INPUT_ARGS=""
 if [ "$VM_DISPLAY" != "none" ]; then
     INPUT_ARGS="-device virtio-keyboard-pci -device virtio-tablet-pci"
+    INPUT_ARGS="$INPUT_ARGS -device virtio-mouse-pci"
 fi
 
 # Preflight KVM before exec'ing QEMU.  Without this the user gets QEMU's bare
