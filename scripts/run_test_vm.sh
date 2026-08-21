@@ -40,9 +40,13 @@ else
 fi
 
 # ── Paths ─────────────────────────────────────────────────────────────────
-IMG="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
-SEED="/opt/nvkvm-guest/seed.iso"
-SSH_PORT=2222
+# Overridable so a SECOND guest can run alongside the first: a distinct image
+# and a distinct ssh forward are all that a concurrent guest needs (each gets
+# its own virtio-nvgpu + nvkvm-gpu instance).  Sharing one GPU between two
+# live guests is a supported configuration.
+IMG="${VM_IMG:-/opt/nvkvm-guest/ubuntu-24.04.qcow2}"
+SEED="${VM_SEED-/opt/nvkvm-guest/seed.iso}"
+SSH_PORT="${VM_SSH_PORT:-2222}"
 
 # Validate required files.
 if [ ! -f "$IMG" ]; then
@@ -50,10 +54,17 @@ if [ ! -f "$IMG" ]; then
     echo "       Run scripts/setup_guest.sh first."
     exit 1
 fi
-if [ ! -f "$SEED" ]; then
-    echo "ERROR: cloud-init seed ISO not found at $SEED"
-    echo "       Run scripts/setup_guest.sh first."
-    exit 1
+# The seed ISO is cloud-init's, and only cloud images consume it.  A guest
+# installed from a live ISO (see setup_mint_guest.sh) has no cloud-init at all,
+# so VM_SEED= (empty) drops the drive rather than failing.
+SEED_ARG=""
+if [ -n "$SEED" ]; then
+    if [ ! -f "$SEED" ]; then
+        echo "ERROR: cloud-init seed ISO not found at $SEED"
+        echo "       Run scripts/setup_guest.sh first, or set VM_SEED= to boot without one."
+        exit 1
+    fi
+    SEED_ARG="-drive file=$SEED,format=raw,if=virtio,readonly=on"
 fi
 
 # ── Optional extra 9p exports ────────────────────────────────────────────
@@ -78,7 +89,7 @@ echo "Starting nvkvm test VM..."
 
 echo "QEMU         : $QEMU"
 echo "Disk image   : $IMG"
-echo "Seed ISO     : $SEED"
+echo "Seed ISO     : ${SEED:-(none)}"
 echo "Repo (9p)    : $REPO_ROOT  →  guest:/mnt/nvkvm  (tag: nvkvm_src)"
 echo "SSH          : ssh ubuntu@localhost -p $SSH_PORT"
 echo ""
@@ -94,6 +105,20 @@ echo ""
 # scanned out with dpy_gl_scanout_dmabuf, so there is no readback.
 VM_DISPLAY="${VM_DISPLAY:-none}"
 VM_SERIAL="${VM_SERIAL:-stdio}"
+
+# NOTE: we deliberately do NOT pass `-vga none`.  QEMU's default VGA is what
+# GRUB and the early kernel draw on; removing it leaves the guest with no
+# display device at all until nvkvm's KMS head comes up, which is why GRUB used
+# to stall in gfxterm video init with nothing on any console to say so.  The two
+# problems that once motivated `-vga none` are both *selection* problems and are
+# solved by naming things instead of deleting them:
+#   * screendump grabbing the text console -> give this device an id (below) so
+#     the console CAN be named.  The naming itself currently trips a QEMU
+#     abort; see the doc.  Not a reason to delete the boot console.
+#   * a compositor in the guest picking the emulated card -> select the DRM node
+#     by DRIVER, not by index (bochs-drm usually enumerates first as card0).
+#     See scripts/setup_mint_guest.sh's run-session.sh, and
+#     docs/internal/mint-guest-desktop.md.
 
 # With a window there has to be something to type on: the headless config has
 # no input devices at all, so a GTK/SDL window would show the guest desktop and
@@ -111,12 +136,18 @@ exec "$QEMU" \
     -cpu host \
     \
     -drive file="$IMG",format=qcow2,if=virtio \
-    -drive file="$SEED",format=raw,if=virtio,readonly=on \
+    $SEED_ARG \
     \
     -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=net0 \
     \
-    -device virtio-nvgpu-pci-non-transitional \
+    `# id= is needed to name this device's console at all.  The emulated VGA is` \
+    `# console 0, so a bare 'screendump f.ppm' captures the BOOT console rather` \
+    `# than the desktop.  NOTE: 'screendump <file> nvkvm0' currently ABORTS` \
+    `# QEMU -- not our bug to trigger but ours to hit; see` \
+    `# docs/internal/mint-guest-desktop.md "screendump by device id".  Until` \
+    `# that is fixed, capture the desktop from inside the guest instead.` \
+    -device virtio-nvgpu-pci-non-transitional,id=nvkvm0 \
     \
     `# Identity-only NVIDIA PCI device at slot 7 (0000:00:07.0) — gives the` \
     `# DRM render node an NVIDIA-vendor parent so the Vulkan ICD binds it.` \

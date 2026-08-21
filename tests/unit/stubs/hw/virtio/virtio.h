@@ -28,5 +28,12 @@ typedef struct VirtQueueElement { int _dummy; } VirtQueueElement;
 #define g_free(p)         free(p)
 #define g_realloc(p, s)   realloc((p), (size_t)(s))
 #define g_malloc(s)       malloc(s)
+/* Added for the -fsyntax-only gate over src/qemu/ (tests/qemu_syntax_check.sh):
+ * nvkvm_isolate_handlers.c uses these three, no unit-test binary links them, and
+ * without a declaration GCC 14+ makes the implicit call a hard error -- which
+ * masks the real implicit-declaration bugs the gate exists to find (4edada7). */
+#define g_malloc0(s)      calloc(1, (size_t)(s))
+#define g_strdup(s)       strdup(s)
+#define g_strlcpy(d, s, n) ((size_t)snprintf((d), (n), "%s", (s)))
 
 #endif /* QEMU_VIRTIO_STUB_H */

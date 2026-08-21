@@ -1,0 +1,65 @@
+name: Bug report
+description: Something does not work in a guest
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Most of what we learn comes from hardware and driver combinations we
+        cannot rent. A report that says *"it failed"* costs us a round trip;
+        one with the four fields below is usually diagnosable on sight.
+
+        **Please check whether the host does the same thing first.** Six
+        apparent nvkvm bugs have turned out to reproduce identically on bare
+        metal — if your workload also fails outside the guest, the bug is not
+        here, and knowing that saves us both a day.
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Paste the output of these, please — not a summary of it.
+      value: |
+        # on the HOST
+        nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
+        cat /proc/driver/nvidia/version
+        uname -r ; . /etc/os-release ; echo "$PRETTY_NAME"
+
+        # in the GUEST
+        uname -r ; . /etc/os-release ; echo "$PRETTY_NAME"
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: validate
+    attributes:
+      label: tests/validate.sh output
+      description: >
+        Run `bash tests/validate.sh` inside the guest and paste the whole thing,
+        including the TOTAL/VERDICT line. If it never got far enough to run,
+        say so and paste what did happen instead.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: >
+        What you ran, what you expected, what you got. Error messages verbatim.
+        If QEMU printed anything on stderr, that is usually the most useful part
+        of the whole report.
+    validations:
+      required: true
+
+  - type: textarea
+    id: host-check
+    attributes:
+      label: Does it happen on the host too?
+      description: >
+        The same binary, run outside the guest. "Not tested" is an acceptable
+        answer — it is just much less useful than either "yes" or "no".
+    validations:
+      required: true

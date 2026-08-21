@@ -290,6 +290,29 @@ VM_DISPLAY="gtk,gl=on" VM_SERIAL=none NVKVM_PRESENT_MODE=gl \
     scripts/run_test_vm.sh
 ```
 
+The window **switches to the guest's GPU head by itself** the moment that head
+first presents. It opens on QEMU's emulated VGA (console 0) so GRUB and the
+early kernel are visible, then moves to nvkvm's console once the guest
+compositor comes up, logging one line when it does:
+
+```
+nvkvm: guest display is live -- switched window to console page 1
+```
+
+It switches exactly once. If you then pick a different tab yourself it will not
+drag you back, and with `-vga none` there is only one console so nothing
+happens at all.
+
+Add `show-tabs=on` to see the tab bar and switch by hand — worth doing if you
+are debugging the head, because without it a window sitting on the boot console
+looks exactly like a hung guest:
+
+```bash
+VM_DISPLAY="gtk,gl=on,show-tabs=on" ... scripts/run_test_vm.sh
+```
+
+(The same toggle lives in the window's **View → Show Tabs** menu.)
+
 `VM_DISPLAY` != `none` also adds `virtio-keyboard-pci` and `virtio-tablet-pci`,
 without which the window would show the desktop and swallow every key and
 click. The tablet reports absolute coordinates, so the host and guest pointers
@@ -307,8 +330,43 @@ env XDG_RUNTIME_DIR=/run/user/1000 LIBSEAT_BACKEND=seatd \
             --xwayland
 ```
 
-Four details here are load-bearing, and each one fails in a way that does not
+Five details here are load-bearing, and each one fails in a way that does not
 look like its cause:
+
+- **Pick the DRM node by DRIVER, never by index.** This is the one that fails
+  *silently and looks like success*, so take it first. If the VM boots with an
+  emulated VGA present -- which it does by default, so that GRUB and the early
+  kernel have somewhere to draw -- the guest has **two** DRM devices, and the
+  emulated one usually enumerates first:
+
+  ```
+  card0 -> bochs-drm      <- NOT the GPU
+  card1 -> nvidia         <- nvkvm's head
+  ```
+
+  A compositor that takes `card0` (weston's default is the first it finds) will
+  come up, composite, animate, and screenshot perfectly -- **on llvmpipe**. The
+  only tell is a line most people never read:
+
+  ```
+  EGL vendor: Mesa Project
+  GL renderer: llvmpipe (LLVM 20.1.2, 256 bits)
+  ```
+
+  Resolve it by driver instead, and pass it explicitly:
+
+  ```bash
+  for c in /sys/class/drm/card[0-9]*; do
+      [ "$(basename "$(readlink -f "$c/device/driver")")" = nvidia ] &&
+          NVCARD=$(basename "$c") && break
+  done
+  weston --backend=drm --drm-device="$NVCARD" ...
+  ```
+
+  **Always confirm `GL renderer` says NVIDIA before believing any graphics
+  result.** Card indices are not stable across configurations: with no emulated
+  VGA the same head is `card0`, so a hardcoded index is right until the day it
+  quietly is not.
 
 - **`--socket=wayland-0`, not an arbitrary name.** snapd's AppArmor profile
   permits only `/run/user/[0-9]*/wayland-[0-9]*`. With any other socket name,

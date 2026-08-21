@@ -1,0 +1,73 @@
+# kernel-matrix.yml — does nvkvm-guest.ko still build on the kernels we claim?
+#
+# The guest module is out-of-tree and the supported range is 5.15-7.0, which is
+# a promise made in the README against kernels nobody here has installed.  The
+# only way that promise stays true is if something checks it, and the thing
+# that checks it already exists: tests/kernel_matrix.sh compiles the module in
+# a throwaway container per distro, against that distro's own headers and its
+# own toolchain.  This workflow is a thin wrapper -- one runner per image so
+# they go in parallel and a failure names the kernel directly in the check list,
+# rather than one job whose log has to be read to find out which row broke.
+#
+# The image set is the script's own default plus ubuntu:26.04, spelled out here
+# so the matrix can fan out.  It spans the whole claimed range on purpose --
+# both ends of "5.15-7.0" are in it, because an unchecked endpoint is where a
+# support claim quietly stops being true:
+#
+#   ubuntu:22.04  5.15   the supported FLOOR
+#   debian:12     6.1    LTS
+#   ubuntu:24.04  6.8    current LTS
+#   debian:13     6.12   the version DRM node support starts at
+#   ubuntu:25.04  6.14
+#   fedora:42     6.19   a non-Debian toolchain -- catches gcc/glibc drift the
+#                        Debian family does not
+#   ubuntu:26.04  7.0    the supported CEILING
+#
+# STRICT_SKIP=1 turns "this image had no kernel headers" into a failure.  Run by
+# hand a SKIP is visible and fine; in CI it is a green job that compiled nothing.
+#
+# A PASS here means the module COMPILES.  It says nothing about whether it loads
+# or works -- that needs a booted guest on that kernel, which is what
+# tests/validate.sh does on real hardware.  Keep docs/reference/guest-kernels.md
+# as the record of what has actually been run.
+name: kernel-matrix
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: kernel-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: guest module @ ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    # kernel_matrix.sh puts its own 1800s timeout around each container and
+    # reports "container did not run" as a failure. Give the job more than that
+    # so the script's message wins rather than Actions killing it mid-sentence.
+    timeout-minutes: 45
+    strategy:
+      # Every row is an independent question. Stopping the others because one
+      # failed just means a second push to find out about the second failure.
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:22.04
+          - debian:12
+          - ubuntu:24.04
+          - debian:13
+          - ubuntu:25.04
+          - fedora:42
+          - ubuntu:26.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build nvkvm-guest.ko
+        env:
+          STRICT_SKIP: "1"
+        run: bash tests/kernel_matrix.sh "${{ matrix.image }}"
