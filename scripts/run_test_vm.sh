@@ -106,6 +106,20 @@ echo ""
 VM_DISPLAY="${VM_DISPLAY:-none}"
 VM_SERIAL="${VM_SERIAL:-stdio}"
 
+# NOTE: we deliberately do NOT pass `-vga none`.  QEMU's default VGA is what
+# GRUB and the early kernel draw on; removing it leaves the guest with no
+# display device at all until nvkvm's KMS head comes up, which is why GRUB used
+# to stall in gfxterm video init with nothing on any console to say so.  The two
+# problems that once motivated `-vga none` are both *selection* problems and are
+# solved by naming things instead of deleting them:
+#   * screendump grabbing the text console -> give this device an id (below) so
+#     the console CAN be named.  The naming itself currently trips a QEMU
+#     abort; see the doc.  Not a reason to delete the boot console.
+#   * a compositor in the guest picking the emulated card -> select the DRM node
+#     by DRIVER, not by index (bochs-drm usually enumerates first as card0).
+#     See scripts/setup_mint_guest.sh's run-session.sh, and
+#     docs/internal/mint-guest-desktop.md.
+
 # With a window there has to be something to type on: the headless config has
 # no input devices at all, so a GTK/SDL window would show the guest desktop and
 # swallow every key and click.  virtio-tablet sends absolute coordinates, so the
@@ -127,7 +141,13 @@ exec "$QEMU" \
     -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=net0 \
     \
-    -device virtio-nvgpu-pci-non-transitional \
+    `# id= is needed to name this device's console at all.  The emulated VGA is` \
+    `# console 0, so a bare 'screendump f.ppm' captures the BOOT console rather` \
+    `# than the desktop.  NOTE: 'screendump <file> nvkvm0' currently ABORTS` \
+    `# QEMU -- not our bug to trigger but ours to hit; see` \
+    `# docs/internal/mint-guest-desktop.md "screendump by device id".  Until` \
+    `# that is fixed, capture the desktop from inside the guest instead.` \
+    -device virtio-nvgpu-pci-non-transitional,id=nvkvm0 \
     \
     `# Identity-only NVIDIA PCI device at slot 7 (0000:00:07.0) — gives the` \
     `# DRM render node an NVIDIA-vendor parent so the Vulkan ICD binds it.` \
