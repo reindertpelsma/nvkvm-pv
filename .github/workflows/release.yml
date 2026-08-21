@@ -1,7 +1,7 @@
 # release.yml — publish the two things a user should not have to build.
 #
 # WHY THIS EXISTS
-#     The only way in today is `git clone` followed by a ~35-minute QEMU build.
+#     The only way in today is `git clone` followed by a full QEMU build.
 #     That is a fine story for someone who already decided to use nvkvm and a
 #     bad one for someone deciding whether to try it.  This workflow produces
 #     the two artifacts that remove that wait:
@@ -23,7 +23,10 @@
 #     step a silent no-op.  For a nightly that means testing nothing; for a
 #     RELEASE it would mean shipping a binary built from patches nobody proved
 #     still apply.  A release is the last place to accept that trade, so both
-#     builds here start from an empty runner and take the full ~35 minutes.
+#     builds here start from an empty runner and do the whole thing.  Measured:
+#     ~5 minutes per job on ubuntu-24.04.  (qemu-build.yml's header says ~35;
+#     that number is older than these runners.  Nothing here depends on which
+#     is right -- the timeouts are 90 either way.)
 #
 #     The two builds are also independent on purpose, rather than one build
 #     whose output is copied into the other artifact.  They exercise different
@@ -110,7 +113,7 @@ jobs:
   #
   # WHAT GOES IN IT, AND WHY
   #     `qemu-nvkvm/`  the built QEMU tree.  This is the artifact's reason to
-  #                    exist -- the 35 minutes a user does not spend.
+  #                    exist -- the QEMU build a user does not have to run.
   #     the source     the tag's tree, verbatim, via `git archive`.  Not padding:
   #                    scripts/run_test_vm.sh exports the repo root to the guest
   #                    over 9p at /mnt/nvkvm, and the guest builds
@@ -131,8 +134,9 @@ jobs:
     name: release tarball
     needs: meta
     runs-on: ubuntu-24.04
-    # Same 90 as qemu-build.yml, and for the same reason: the build is ~35 min,
-    # 90 gives headroom without letting a hung ninja burn a 6-hour job slot.
+    # Same 90 as qemu-build.yml, and for the same reason: whatever the build
+    # actually costs on the runner of the day, 90 gives headroom without
+    # letting a hung ninja burn a 6-hour job slot.
     timeout-minutes: 90
     permissions:
       contents: read

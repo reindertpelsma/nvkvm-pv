@@ -93,7 +93,7 @@ Not yet for untrusted multi-tenant hosting — see below.
 | Guest | Linux, kernel 5.15 – 7.0 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
-| Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script, ~35 min |
+| Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script |
 
 ## Install
 
@@ -128,7 +128,7 @@ you intend to keep:
 
 ```bash
 docker compose pull && docker compose up   # the published image
-docker compose up --build                  # or build it here, ~35 min
+docker compose up --build                  # or build QEMU here instead
 ```
 
 The guest comes up with the module loaded and the GPU present — no manual
@@ -164,7 +164,7 @@ conflicting NVIDIA package.
 
 ### Prebuilt tarball, on a bare host
 
-The full sandbox rung, without the 35-minute build. From the
+The full sandbox rung, without building QEMU yourself. From the
 [releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
 
 ```bash
@@ -192,7 +192,7 @@ bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 9.2 wit
 bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and prepares a disk
 ```
 
-About 35 minutes, most of it QEMU. The script is a convenience, not the
+Most of the wall clock is QEMU. The script is a convenience, not the
 mechanism: everything it changes in upstream QEMU is five patch files in
 [`patches/`](patches/) — 94 lines, applied with `git apply` — plus a copy of the
 device sources into `hw/misc/`.

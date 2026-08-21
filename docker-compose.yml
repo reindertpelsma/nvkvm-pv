@@ -1,12 +1,12 @@
 # nvkvm in a container.  See the Dockerfile header and the README FAQ.
 #
 #   docker compose pull && docker compose up    # the published image
-#   docker compose up --build                   # or build it here, ~35 min
+#   docker compose up --build                   # or build QEMU here instead
 #   ssh -p 2222 ubuntu@127.0.0.1                # into the guest, once it has booted
 services:
   nvkvm:
     # Both, on purpose.  `image:` names the published artifact so `pull` works
-    # and nobody has to wait 35 minutes to try this; `build:` keeps `--build`
+    # and nobody has to build QEMU to try this; `build:` keeps `--build`
     # working for anyone changing src/ -- and the tag is what the release
     # workflow pushes, so the two are the same thing built two ways.
     image: ghcr.io/reindertpelsma/nvkvm-pv:latest
