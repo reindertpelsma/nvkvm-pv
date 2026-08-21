@@ -1,0 +1,503 @@
+# release.yml — publish the two things a user should not have to build.
+#
+# WHY THIS EXISTS
+#     The only way in today is `git clone` followed by a ~35-minute QEMU build.
+#     That is a fine story for someone who already decided to use nvkvm and a
+#     bad one for someone deciding whether to try it.  This workflow produces
+#     the two artifacts that remove that wait:
+#
+#       1. a tarball with the built QEMU tree in it, for a bare host
+#       2. a container image on ghcr.io, for `docker run`
+#
+#     Both are built HERE, on a GitHub-hosted runner, from the tag being
+#     released -- not uploaded from somebody's laptop.  That is the whole point
+#     of the build-provenance attestation each one carries: a downloader can
+#     check, with `gh attestation verify`, that the bytes they hold came out of
+#     this workflow in this repository at that commit.  An artifact built
+#     locally and pushed could carry no such claim.
+#
+# WHAT IS DELIBERATELY NOT HERE
+#     No cache, anywhere.  qemu-build.yml explains why at length ("NO CACHE,
+#     DELIBERATELY"): the QEMU tree is patched in place and idempotency is
+#     decided by `git apply --reverse --check`, so a cached tree makes the patch
+#     step a silent no-op.  For a nightly that means testing nothing; for a
+#     RELEASE it would mean shipping a binary built from patches nobody proved
+#     still apply.  A release is the last place to accept that trade, so both
+#     builds here start from an empty runner and take the full ~35 minutes.
+#
+#     The two builds are also independent on purpose, rather than one build
+#     whose output is copied into the other artifact.  They exercise different
+#     things: the tarball job runs `scripts/build_qemu.sh` on a bare host, which
+#     is the path a source user follows, and the image job runs the Dockerfile,
+#     which is the path a container user follows.  A release is exactly when you
+#     want both proven, and the runner minutes are free.
+#
+# TRIGGERS
+#     A `v*` tag cuts a real release.  workflow_dispatch runs everything except
+#     creating the GitHub Release, so the pipeline can be exercised end to end
+#     -- artifact built, image pushed, attestations created and verifiable --
+#     without an announcement attached to it.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp artifacts with (default: v0.0.0-dev.<sha>)'
+        required: false
+        type: string
+
+# Never cancel a release mid-flight.  Unlike ci.yml these jobs have side
+# effects -- a pushed image layer, a registry attestation -- and a half-pushed
+# release is worse than a slow one.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege at the top; each job widens only what it needs.  The three
+# write scopes below appear per-job, not here:
+#   id-token: write     mint the OIDC token the attestation is signed against
+#   attestations: write record the attestation on this repository
+#   contents: write     create the GitHub Release and upload to it
+#   packages: write     push the image, and the image's attestation, to ghcr
+permissions:
+  contents: read
+
+jobs:
+  # One place that decides what this run is called, so the tarball name, the
+  # image tag and the release title cannot drift apart.
+  meta:
+    name: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tarball: ${{ steps.v.outputs.tarball }}
+      image: ${{ steps.v.outputs.image }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            # A dispatch has no tag.  Stamp it so the artifact is obviously not
+            # a release: nobody should mistake a button-press build for one.
+            VERSION="v0.0.0-dev.${GITHUB_SHA::7}"
+          fi
+
+          # A hyphen is the semver prerelease marker: v0.1.0 is a release,
+          # v0.0.1-rc1 and v0.0.0-dev.abc1234 are not.  This decides both the
+          # GitHub Release flag and whether the image gets `latest`.
+          case "$VERSION" in *-*) PRE=true ;; *) PRE=false ;; esac
+
+          # Platform and version in the filename, because a bare `nvkvm.tar.gz`
+          # in a downloads folder six months from now is unidentifiable -- and
+          # this binary is genuinely platform-specific (x86-64 only, by design:
+          # the isolate stub is x86-64 assembly).
+          echo "version=$VERSION"                                   >> "$GITHUB_OUTPUT"
+          echo "tarball=nvkvm-$VERSION-linux-x86_64.tar.gz"         >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${{ github.repository }}"             >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE"                                    >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION prerelease=$PRE"
+
+  # ── The tarball ───────────────────────────────────────────────────────────
+  #
+  # WHAT GOES IN IT, AND WHY
+  #     `qemu-nvkvm/`  the built QEMU tree.  This is the artifact's reason to
+  #                    exist -- the 35 minutes a user does not spend.
+  #     the source     the tag's tree, verbatim, via `git archive`.  Not padding:
+  #                    scripts/run_test_vm.sh exports the repo root to the guest
+  #                    over 9p at /mnt/nvkvm, and the guest builds
+  #                    src/guest/*.c against ITS OWN kernel there.  The guest
+  #                    module cannot be shipped prebuilt for that reason, so its
+  #                    sources are not optional -- and every path in docs/ then
+  #                    resolves inside the tarball instead of pointing back at a
+  #                    clone the user was told they did not need.
+  #     nvkvm_stub     the built isolate stub, the one build output that is not
+  #                    inside the QEMU tree.  It is embedded in the QEMU binary
+  #                    already; this is the NVKVM_STUB_PATH fallback copy.
+  #
+  # Using `git archive HEAD` for the source half is deliberate: it is exactly
+  # the tag's tracked content, so "does this tarball match the tag?" is a
+  # question with an answer, not an inspection of whatever the runner had lying
+  # in its working directory.
+  tarball:
+    name: release tarball
+    needs: meta
+    runs-on: ubuntu-24.04
+    # Same 90 as qemu-build.yml, and for the same reason: the build is ~35 min,
+    # 90 gives headroom without letting a hung ninja burn a 6-hour job slot.
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.sum.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The same list qemu-build.yml installs, for the same reason: a
+      # dependency problem should fail in an obviously-labelled step rather
+      # than inside the build script, and build_qemu.sh then runs its normal
+      # path -- probe, find everything present, proceed -- which is the path a
+      # user follows.  Keep the two lists identical; if they drift, the nightly
+      # is no longer testing what the release ships.
+      - name: install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            ninja-build meson libglib2.0-dev libpixman-1-dev \
+            python3 python3-venv python3-tomli git libslirp-dev pkg-config \
+            libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd
+
+      # Headless, i.e. the script's default (NVKVM_QEMU_UI unset), which is
+      # also what the container ships and what run_test_vm.sh defaults to
+      # (-display none).  Building GTK/SDL in would link the binary against
+      # libgtk-3.so.0 and libSDL2, so a headless server that downloaded this
+      # tarball would get a QEMU that does not start at all -- a worse failure
+      # than not having a window.  Someone who wants the window builds from
+      # source with NVKVM_QEMU_UI=1; docs/howto/build.md says so.
+      #
+      # The prefix is a staging directory rather than /opt because /opt is not
+      # writable by the runner user, and because the tree has to be packed from
+      # somewhere anyway.  QEMU 9.2 locates its data files relative to
+      # /proc/self/exe, so the tree still works wherever it is extracted.
+      - name: build the isolate stub and QEMU
+        env:
+          NVKVM_QEMU_SRC: ${{ github.workspace }}/.qemu-src
+          NVKVM_QEMU_PREFIX: ${{ github.workspace }}/.stage-qemu
+        run: bash scripts/build_qemu.sh
+
+      # Identical to qemu-build.yml's check, and it is not redundant here.
+      # Patch 0001 registers the device sources with meson; if it silently
+      # no-ops the build still SUCCEEDS and the device is simply absent.  That
+      # produces a tarball that installs cleanly and cannot run a guest.  Ask
+      # the binary directly, before packing it.
+      - name: the built QEMU actually has the device
+        env:
+          NVKVM_QEMU_PREFIX: ${{ github.workspace }}/.stage-qemu
+        run: |
+          set -euo pipefail
+          BIN="$NVKVM_QEMU_PREFIX/bin/qemu-system-x86_64"
+          test -x "$BIN" || { echo "no binary at $BIN"; exit 1; }
+          "$BIN" --version
+          # To a file, then grep it.  `qemu ... | grep -q` under `set -o
+          # pipefail` fails even on a MATCH: grep exits at the first hit, qemu
+          # takes SIGPIPE, and pipefail reports 141 for the whole pipeline.
+          "$BIN" -device help > devices.txt 2>&1
+          grep -q 'virtio-nvgpu' devices.txt || {
+            echo "built QEMU has no virtio-nvgpu device -- the hw/misc"
+            echo "meson.build patch did not take."
+            grep -i virtio devices.txt | head -20
+            exit 1; }
+          test -x src/stub/nvkvm_stub || { echo "no isolate stub"; exit 1; }
+          rm -f devices.txt
+          echo "virtio-nvgpu present"
+
+      - name: assemble the tarball
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          TARBALL: ${{ needs.meta.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          ROOT="nvkvm-$VERSION"
+          mkdir -p stage
+          # The tag's tracked tree, verbatim.
+          git archive --format=tar --prefix="$ROOT/" HEAD | tar -x -C stage
+          # The two build outputs.
+          cp -a "$GITHUB_WORKSPACE/.stage-qemu" "stage/$ROOT/qemu-nvkvm"
+          install -m 0755 src/stub/nvkvm_stub "stage/$ROOT/src/stub/nvkvm_stub"
+
+          # The glibc floor is a real constraint on a prebuilt binary and the
+          # one thing a downloader cannot see from the outside, so measure it
+          # rather than assert it.  Ubuntu 24.04 runners mean 2.39-ish; read the
+          # actual versioned symbols instead of hardcoding the runner image.
+          GLIBC=$(objdump -T "stage/$ROOT/qemu-nvkvm/bin/qemu-system-x86_64" \
+                  | sed -n 's/.*GLIBC_\([0-9][0-9.]*\).*/\1/p' | sort -V | tail -1)
+          QEMUV=$("stage/$ROOT/qemu-nvkvm/bin/qemu-system-x86_64" --version | head -1)
+
+          cat > "stage/$ROOT/RELEASE.md" <<EOF
+          # nvkvm $VERSION — prebuilt, linux-x86_64
+
+          Built by \`.github/workflows/release.yml\` on a GitHub-hosted
+          ubuntu-24.04 runner, from commit \`$GITHUB_SHA\`, run
+          $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID.
+
+          | | |
+          |---|---|
+          | QEMU | $QEMUV |
+          | glibc floor | $GLIBC — built on Ubuntu 24.04; an older distro needs the source build |
+          | display backends | none (headless). Build from source with \`NVKVM_QEMU_UI=1\` for a GTK/SDL window. |
+
+          ## Check that this is what it claims to be
+
+          \`\`\`bash
+          gh attestation verify $TARBALL --repo $GITHUB_REPOSITORY \\
+              --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml
+          \`\`\`
+
+          That checks the tarball's digest against a signed statement that this
+          repository's release workflow produced it. The \`.sha256\` file beside
+          the download only proves the bytes are intact; it is there for people
+          without \`gh\` and it proves nothing about origin.
+
+          ## What is in here
+
+          | | |
+          |---|---|
+          | \`qemu-nvkvm/\` | the built QEMU 9.2 with \`virtio-nvgpu\` patched in |
+          | \`src/stub/nvkvm_stub\` | the built isolate stub (also embedded in the QEMU binary; this is the \`NVKVM_STUB_PATH\` fallback) |
+          | everything else | the repository at this tag, verbatim (\`git archive\`) |
+
+          The **guest kernel module is not prebuilt and cannot be** — it has to
+          be compiled against your guest's kernel. \`src/guest/\` is here for
+          that; \`scripts/run_test_vm.sh\` exports this directory to the guest
+          over 9p at \`/mnt/nvkvm\` and cloud-init builds it on first boot.
+
+          ## Install
+
+          \`\`\`bash
+          sudo cp -a qemu-nvkvm /opt/qemu-nvkvm
+          sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
+          \`\`\`
+
+          \`scripts/run_test_vm.sh\` looks for \`/opt/qemu-nvkvm/bin/qemu-system-x86_64\`.
+          To run from here without installing, set
+          \`QEMU_BIN=\$PWD/qemu-nvkvm/bin/qemu-system-x86_64\` instead.
+
+          Runtime packages (Debian/Ubuntu names; this is the Dockerfile's
+          runtime stage, which is the same set):
+
+          \`\`\`
+          libglib2.0-0t64 libpixman-1-0 libslirp0 libepoxy0 libgbm1 libegl1
+          libdrm2 libattr1 seabios ipxe-qemu
+          wget ca-certificates qemu-utils genisoimage openssh-client sshpass
+          \`\`\`
+
+          Then \`docs/howto/run.md\`.
+          EOF
+
+          # --sort/--owner/--group: the archive should not carry a runner's
+          # numeric uid into someone's `sudo tar x`.
+          tar --sort=name --owner=0 --group=0 --numeric-owner \
+              -C stage -czf "$TARBALL" "$ROOT"
+          ls -lh "$TARBALL"
+
+      - name: checksum
+        id: sum
+        env:
+          TARBALL: ${{ needs.meta.outputs.tarball }}
+        run: |
+          set -euo pipefail
+          sha256sum "$TARBALL" > "$TARBALL.sha256"
+          cat "$TARBALL.sha256"
+          echo "sha256=$(cut -d' ' -f1 < "$TARBALL.sha256")" >> "$GITHUB_OUTPUT"
+
+      # The attestation is over the tarball only.  Attesting the .sha256 as
+      # well would add nothing: the attestation already binds the tarball's
+      # digest, which is strictly more than the checksum file says.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: ${{ needs.meta.outputs.tarball }}
+
+      # Uploaded as a workflow artifact rather than straight to a release, so
+      # that a workflow_dispatch run produces something downloadable and
+      # verifiable too.  Proving the pipeline should not require cutting a tag.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.meta.outputs.tarball }}
+          path: |
+            ${{ needs.meta.outputs.tarball }}
+            ${{ needs.meta.outputs.tarball }}.sha256
+          retention-days: 14
+          if-no-files-found: error
+
+  # ── The container image ───────────────────────────────────────────────────
+  image:
+    name: ghcr image
+    needs: meta
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: tags
+        id: tags
+        env:
+          IMAGE: ${{ needs.meta.outputs.image }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          TAGS="$IMAGE:$VERSION"
+          # `latest` follows real releases only.  Pointing it at a prerelease --
+          # or at a workflow_dispatch build -- would mean `docker pull` hands an
+          # unsuspecting user a release candidate, which is the one thing the
+          # tag is supposed to promise it does not do.
+          if [ "${{ needs.meta.outputs.prerelease }}" = "false" ]; then
+            TAGS="$TAGS,$IMAGE:latest"
+          fi
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "$TAGS"
+
+      # No `cache-from`/`cache-to`, and that is the same decision qemu-build.yml
+      # documents.  Docker would key the `RUN bash scripts/build_qemu.sh` layer
+      # on the COPYed sources, so a release whose src/ is unchanged since the
+      # last build would reuse a layer built from an older patch set without
+      # ever re-running `git apply`.  On a release that is not a slow build
+      # avoided, it is an unproven one shipped.
+      #
+      # The Dockerfile copies only scripts/build_qemu.sh and src/ into the build
+      # stage precisely so a doc edit does not invalidate that layer -- keep
+      # that property; do not "simplify" it to `COPY . .`.
+      #
+      # provenance: false disables buildx's own SLSA attestation.  Two
+      # provenance mechanisms on one image is not twice the assurance, it is two
+      # things to explain; and without it the tag resolves to a single image
+      # manifest, so the digest we attest below is exactly the digest a `docker
+      # pull` gets. The attestation this project promises is the GitHub one.
+      - name: build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          provenance: false
+          tags: ${{ steps.tags.outputs.tags }}
+          # image.source is what links the package to this repository on GitHub
+          # -- without it the package page has no repo, no README and no
+          # inherited visibility.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.description=Run CUDA, PyTorch and Vulkan inside a KVM guest on the host's NVIDIA GPU
+
+      # Against the pushed digest, not a local tag, so this tests the artifact
+      # people will actually pull.  Same question as the tarball job asks: did
+      # patch 0001 take?  A green Docker build proves the image exists, not that
+      # the device is in it.  The entrypoint is overridden because the real one
+      # wants /dev/kvm and a guest disk.
+      - name: the pushed image actually has the device
+        env:
+          REF: ${{ needs.meta.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint /opt/qemu-nvkvm/bin/qemu-system-x86_64 \
+            "$REF" --version
+          # To a file, then grep it -- see the same note in the tarball job:
+          # `... | grep -q` under pipefail fails on a match, not on a miss.
+          docker run --rm --entrypoint /opt/qemu-nvkvm/bin/qemu-system-x86_64 \
+            "$REF" -device help > devices.txt 2>&1
+          grep -q 'virtio-nvgpu' devices.txt || {
+            echo "pushed image has no virtio-nvgpu device"
+            grep -i virtio devices.txt | head -20
+            exit 1; }
+          echo "virtio-nvgpu present in ${REF}"
+
+      # After the smoke test, deliberately: an attestation says "this repository
+      # built this", and there is no reason to sign that sentence about an image
+      # we have not looked inside.
+      #
+      # push-to-registry puts the attestation in ghcr next to the image, so
+      # `gh attestation verify oci://...` resolves it from the registry.
+      - name: attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ${{ needs.meta.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # ── The GitHub Release ────────────────────────────────────────────────────
+  #
+  # Tag pushes only.  A workflow_dispatch run still builds, pushes and attests
+  # everything above -- it just does not announce anything, which is what makes
+  # it usable as a rehearsal.
+  release:
+    name: github release
+    needs: [meta, tarball, image]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.meta.outputs.tarball }}
+
+      # Body written here rather than left to --generate-notes alone, because
+      # the first thing a downloader needs is the verify command for the exact
+      # artifact they are looking at, and that is not in a commit log.
+      - name: create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          TARBALL: ${{ needs.meta.outputs.tarball }}
+          IMAGE: ${{ needs.meta.outputs.image }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          cat > notes.md <<EOF
+          Both artifacts below were built from this tag by
+          [\`.github/workflows/release.yml\`]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$VERSION/.github/workflows/release.yml)
+          on a GitHub-hosted runner and carry a build-provenance attestation.
+          Verify before you run either — an attestation nobody checks is decoration.
+
+          ### Container (the quick way in)
+
+          \`\`\`bash
+          gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY
+          docker run --rm -it --device /dev/kvm --gpus all $IMAGE:$VERSION
+          \`\`\`
+
+          Needs \`/dev/kvm\` and, for the GPU, the NVIDIA container runtime. Note
+          that in a container the isolate falls back to UID separation, which is
+          weaker than the namespaced sandbox — see [SECURITY.md]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$VERSION/SECURITY.md).
+
+          ### Prebuilt tarball (bare host)
+
+          \`\`\`bash
+          gh attestation verify $TARBALL --repo $GITHUB_REPOSITORY
+          tar xzf $TARBALL && cd nvkvm-$VERSION
+          sudo cp -a qemu-nvkvm /opt/qemu-nvkvm
+          sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
+          \`\`\`
+
+          x86-64 only, headless QEMU, glibc floor and the full contents are in
+          \`RELEASE.md\` inside the tarball. The guest kernel module is **not**
+          prebuilt — it is compiled against your guest's kernel from
+          \`src/guest/\`, which is why the sources ship with it.
+
+          ---
+          EOF
+          FLAGS=(--title "nvkvm $VERSION" --notes-file notes.md --generate-notes)
+          # `if`, not `[ ... ] && ...`: under `set -e` the && form exits the
+          # shell on a false test, which would fail the release job for a
+          # non-prerelease tag -- i.e. exactly the real ones.
+          if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+          gh release create "$VERSION" "${FLAGS[@]}" \
+            "$TARBALL" "$TARBALL.sha256"

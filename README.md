@@ -93,47 +93,50 @@ Not yet for untrusted multi-tenant hosting — see below.
 | Guest | Linux, kernel 5.15 – 7.0 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
-| Build | QEMU 9.2 is built from source by the provided script |
+| Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script, ~35 min |
 
-## Build
+## Install
 
-```bash
-git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm && cd nvkvm
-bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 9.2 with the nvkvm device
-bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and prepares a disk
-```
+Three ways in, in the order most people should try them. The container is
+first because it is the only one that does not make you wait for a QEMU build.
 
-The script is a convenience, not the mechanism. Everything it changes in
-upstream QEMU is five patch files in [`patches/`](patches/) — 94 lines, applied
-with `git apply` — plus a copy of the device sources into `hw/misc/`.
-[`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
-same build by hand, command by command, if you would rather not run a script
-over your QEMU tree.
+Everything below is published from a tag by
+[`.github/workflows/release.yml`](.github/workflows/release.yml) on a
+GitHub-hosted runner and carries a
+[build-provenance attestation](#verifying-what-you-downloaded) — so "did this
+come from this repository?" is a question you can answer rather than assume.
 
-The guest also needs NVIDIA userspace libraries version-matched to your **host**
-driver. Assemble the bundle and stage it:
+### Docker (start here)
 
 ```bash
-V=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
-bash scripts/make_host_bundle.sh    # collects host-libs-$V/ from the installed driver
-```
-
-### With Docker
-
-```bash
-docker compose up --build       # builds QEMU, prepares a guest, boots it
+docker run --rm -it --device /dev/kvm --gpus all \
+    -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \
+    ghcr.io/reindertpelsma/nvkvm-pv:latest
 ssh -p 2222 ubuntu@127.0.0.1    # into the guest -- nvidia-smi already works
 ```
 
-That is the whole setup. The image builds from this repository alone (QEMU 9.2
-and the Ubuntu cloud image are fetched during the build and on first run), and
-the guest comes up with the module loaded and the GPU present — no manual
+Or with [`docker-compose.yml`](docker-compose.yml), which is the same thing with
+the capability set, the shared folder and the named volume already spelled out:
+
+```bash
+docker compose pull && docker compose up   # the published image
+docker compose up --build                  # or build it here, ~35 min
+```
+
+The guest comes up with the module loaded and the GPU present — no manual
 staging step.
 
 - **Requirements:** `/dev/kvm` and, for the GPU, the
   [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
   Both are already in [`docker-compose.yml`](docker-compose.yml). No
   `--privileged`, no added capabilities.
+- **Weaker isolation than on a bare host, and you should know before you
+  choose.** Containers usually block unprivileged user namespaces, so nvkvm's
+  per-VM isolate cannot build its namespaced sandbox and falls back to UID
+  separation. That is meaningfully weaker. Nothing about nvkvm is ready for
+  untrusted tenants either way — see [`SECURITY.md`](SECURITY.md) — but the
+  container is the weaker of the two rungs and the compose file's `cap_add` list
+  explains what it takes to reach even that one.
 - **The driver userspace is mounted read-only, not copied in.** The container
   hands the guest the host's NVIDIA libraries over a read-only 9p share and the
   guest links against them, so `apt upgrade` inside the guest cannot replace a
@@ -150,6 +153,84 @@ staging step.
 Verified end to end on an RTX 3060: cold `docker compose up` to `nvidia-smi`
 inside the guest, surviving a guest reboot and a guest `apt` install of a
 conflicting NVIDIA package.
+
+### Prebuilt tarball, on a bare host
+
+The full sandbox rung, without the 35-minute build. From the
+[releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
+
+```bash
+tar xzf nvkvm-<version>-linux-x86_64.tar.gz && cd nvkvm-<version>
+sudo cp -a qemu-nvkvm /opt/qemu-nvkvm
+sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
+bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image
+```
+
+x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
+source for that). It carries a glibc floor, since it is a real binary built on
+Ubuntu 24.04; the exact number and the runtime package list are in `RELEASE.md`
+inside the tarball.
+
+**The guest kernel module is not in there and cannot be** — it is compiled
+against *your* guest's kernel. That is why `src/guest/` ships with the tarball:
+`scripts/run_test_vm.sh` exports the unpacked directory to the guest over 9p at
+`/mnt/nvkvm`, and cloud-init builds the module there on first boot.
+
+### From source, if you want to hack on it
+
+```bash
+git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm && cd nvkvm
+bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 9.2 with the nvkvm device
+bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and prepares a disk
+```
+
+About 35 minutes, most of it QEMU. The script is a convenience, not the
+mechanism: everything it changes in upstream QEMU is five patch files in
+[`patches/`](patches/) — 94 lines, applied with `git apply` — plus a copy of the
+device sources into `hw/misc/`.
+[`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
+same build by hand, command by command, if you would rather not run a script
+over your QEMU tree. `--force` is what you want after editing anything under
+`src/qemu/`; see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the three traps in
+this build.
+
+### Staging the guest driver libraries
+
+Needed for the tarball and source paths, not for the container — the container
+assembles this itself on start-up from what the NVIDIA runtime injects.
+
+The guest needs NVIDIA userspace libraries version-matched to your **host**
+driver. Assemble the bundle and stage it:
+
+```bash
+V=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+bash scripts/make_host_bundle.sh    # collects host-libs-$V/ from the installed driver
+```
+
+### Verifying what you downloaded
+
+The release workflow signs a statement about each artifact — which repository
+built it, from which commit, in which workflow run — and
+[`gh`](https://cli.github.com/) checks it against the artifact in your hand:
+
+```bash
+# the image, resolved straight from the registry
+gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:latest \
+    --repo reindertpelsma/nvkvm-pv
+
+# the tarball, on disk
+gh attestation verify nvkvm-<version>-linux-x86_64.tar.gz \
+    --repo reindertpelsma/nvkvm-pv
+```
+
+Add `--signer-workflow reindertpelsma/nvkvm-pv/.github/workflows/release.yml`
+to pin *which* workflow, not just which repository, was allowed to produce it.
+That is the stronger check and it is the one to use if you are scripting this.
+
+`--repo` is the point of the exercise: without it, `verify` will accept an
+attestation from any repository, which makes it a signature check rather than a
+provenance check. The `.sha256` file beside each download only proves the bytes
+arrived intact.
 
 ## First result
 
@@ -416,7 +497,7 @@ container support, llvmpipe, bit-identical results.
 | [Reading the parity numbers](docs/reference/parity.md) | What the host/guest ratios do and do not establish |
 | [Tested platforms, full matrix](docs/reference/tested-platforms.md) | Every box, driver and footnote |
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
-| [`.github/workflows/`](.github/workflows/) | What CI checks on every push, and why each job exists |
+| [`.github/workflows/`](.github/workflows/) | What CI checks on every push, how a release is built and attested, and why each job exists |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 | [`SECURITY.md`](SECURITY.md) | Threat model, what is known broken, how to report a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | What is most useful to send, and three traps in the build |
