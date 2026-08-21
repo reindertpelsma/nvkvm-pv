@@ -1204,3 +1204,34 @@ The throughput gap is in the slot-batched upload loop, not in the per-chunk
 migration path — the chunk size was chosen so per-chunk overhead is negligible
 against the data copied. It has been characterised but not optimised.
 
+
+### Multi-process CUDA IPC (NCCL's SHM transport)
+
+Two RM controls in the `OS_UNIX` export-object family are **absent from the
+allowlist** while their siblings are present:
+
+| control | allowlist |
+|---|---|
+| `0x3d05` `EXPORT_OBJECT_TO_FD` | allowed |
+| `0x3d06` `IMPORT_OBJECT_FROM_FD` | allowed |
+| `0x3d08` | **denied** |
+| `0x3d0b` | **denied** |
+
+Reproduced on a 4x RTX 5060 (580.95.05): every 4-rank NCCL job in the guest
+adds exactly four `DENY ctrl cmd 0x00003d08` and four `0x00003d0b` lines to the
+QEMU log — one per rank — and NCCL then fails in `transport/shm.cc:590` with
+`Cuda failure 101 'invalid device ordinal'` after selecting `SHM/direct/direct`
+channels. The count scales one-to-one with rank count, so the denials are on
+the per-GPU IPC setup path.
+
+The causal link is **strong but not proven**: NCCL could not be made to work on
+the bare-metal host of that box either (it hangs in bootstrap, with and without
+`NCCL_P2P_DISABLE`/`NCCL_SHM_DISABLE`), so there was no passing control against
+which to confirm that allowing these two controls is sufficient. What is
+established is that the guest denies them, that only multi-process IPC reaches
+them, and that single-process multi-GPU work never does — `tests/multi_gpu.c`,
+`tests/peer_gpu.c` and `tests/multi_gpu_app.py` all pass with all four GPUs and
+produce none of these denials.
+
+Anyone picking this up should retest on a box where NCCL runs on bare metal
+first, rather than assuming the allowlist is the whole story.
