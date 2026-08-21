@@ -85,6 +85,15 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return nvkvm_prof()->uvm_map_ext_size;
 	case UVM_FREE:
 		return sizeof(struct uvm_free_params);
+	case UVM_UNMAP_EXTERNAL:
+		/* The teardown half of UVM_MAP_EXTERNAL_ALLOCATION.  Without this
+		 * entry the size lookup fails and the ioctl is rejected with
+		 * -ENOTTY before it is ever forwarded -- which also made the
+		 * UVM_UNMAP_EXTERNAL branch of the #94 vcache invalidation in
+		 * nvkvm_ioctl() unreachable.  Found on a 4x RTX 5060: libcuda
+		 * issues this once per ordered GPU pair on the peer paths, and
+		 * the bare-metal host returns 0 where the guest returned ENOTTY. */
+		return sizeof(struct uvm_unmap_external_params);
 	case UVM_MIGRATE:
 		return sizeof(struct uvm_migrate_params);
 	case UVM_SET_PREFERRED_LOCATION:
