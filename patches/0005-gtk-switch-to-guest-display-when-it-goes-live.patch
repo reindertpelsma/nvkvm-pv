@@ -92,7 +92,7 @@ upstreamable version.  Until someone writes that, this stays downstream.
  4 files changed, 48 insertions(+)
 
 diff --git a/include/ui/gtk.h b/include/ui/gtk.h
-index aa3d637..53398cb 100644
+index aa3d637..a5b7159 100644
 --- a/include/ui/gtk.h
 +++ b/include/ui/gtk.h
 @@ -158,6 +158,36 @@ void gd_update_windowsize(VirtualConsole *vc);
@@ -100,8 +100,8 @@ index aa3d637..53398cb 100644
  void gd_hw_gl_flushed(void *vc);
  
 +/*
-+ * nvkvm: one-shot auto-switch to the guest's GPU head.  See scripts/build_qemu.sh
-+ * for the full rationale.  Declared here because the surface path (ui/gtk.c) and
++ * nvkvm: one-shot auto-switch to the guest's GPU head.  Full rationale is in
++ * this patch's header.  Declared here because the surface path (ui/gtk.c) and
 + * both GL paths (ui/gtk-egl.c, ui/gtk-gl-area.c) all need it, and the latch has
 + * to be shared between them rather than per-file.
 + */
