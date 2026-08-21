@@ -547,18 +547,39 @@ def search(filt, limit, max_price, include_unsupported=False, prefer_untested=No
     return picked
 
 
-def wait_ssh(iid, budget=900):
-    """Poll until the instance reports running AND accepts ssh."""
+def wait_ssh(iid, budget=2400):
+    """Poll until the instance reports running AND accepts ssh.
+
+    Two changes forced by measurement on 2026-08-21:
+
+    1. BUDGET.  900s was not enough.  An RTX 3060 (instance 48257135) never
+       answered inside it and was recorded `no-ssh`, costing the entire Ampere
+       row of that sweep -- and Ampere had zero coverage to begin with.  A box
+       in run 2 took roughly ten minutes just to start answering, so 15 minutes
+       total left almost no margin.  Provisioning here is genuinely slow and
+       waiting is far cheaper than re-renting.
+
+    2. PROXY FALLBACK.  We ask for --direct and connect to
+       public_ipaddr:<mapped 22/tcp>, but that path is not always reachable --
+       some hosts firewall the mapped port even though the rental is fine.
+       Vast always also exposes a jump-host route (ssh_host/ssh_port, i.e.
+       ssh N.vast.ai), so try direct first and fall back to it rather than
+       declaring the box dead.  Returns whichever pair actually answered.
+    """
     deadline = time.time() + budget
     while time.time() < deadline:
         d = vast_json(f"show instance {iid}") or {}
         if d.get("actual_status") == "running":
-            host = d.get("public_ipaddr")
-            port = (d.get("ports") or {}).get("22/tcp")
-            port = port[0]["HostPort"] if port else d.get("ssh_port")
-            if host and port:
+            cands = []
+            direct_port = (d.get("ports") or {}).get("22/tcp")
+            if d.get("public_ipaddr") and direct_port:
+                cands.append((d["public_ipaddr"], direct_port[0]["HostPort"]))
+            if d.get("ssh_host") and d.get("ssh_port"):
+                cands.append((d["ssh_host"], d["ssh_port"]))
+            for host, port in cands:
                 out, rc = sh(f"ssh -o ConnectTimeout=12 -o StrictHostKeyChecking=no "
-                             f"-o UserKnownHostsFile=/dev/null -p {port} root@{host} 'echo OK'", timeout=40)
+                             f"-o UserKnownHostsFile=/dev/null -p {port} root@{host} 'echo OK'",
+                             timeout=40)
                 if "OK" in out:
                     return host, port
         time.sleep(20)
@@ -822,6 +843,20 @@ def run_one(offer, args):
     }
     out_recs = []
 
+    def bail(**kw):
+        """Record a whole-box failure AND make it visible to the finally block.
+
+        These used to `return [rec_for(...)]` directly, building a fresh list
+        that out_recs never saw -- so the finally block, which stamps
+        r["destroyed"] over out_recs, never touched them.  Every early failure
+        (no-ssh, build-failed, not-a-vm...) therefore reported destroyed=None
+        even when the instance had in fact been destroyed and verified, which
+        makes the one field that must be trustworthy in a spend report look
+        like an open question.
+        """
+        out_recs.append(rec_for("-", "-", "-", **kw))
+        return out_recs
+
     def rec_for(ver, prof, why, **kw):
         d = dict(base); d.update({"driver": ver, "abi_profile_expected": prof,
                                   "driver_rationale": why}); d.update(kw)
@@ -832,18 +867,18 @@ def run_one(offer, args):
                      f"--disk {args.disk} --ssh --direct --label {SWEEP_LABEL}", timeout=180)
         iid = parse_contract(out)
         if not iid:
-            return [rec_for("-", "-", "-", status="create-failed", detail=out[:300])]
+            return bail(status="create-failed", detail=out[:300])
         base["instance_id"] = iid
 
         host, port = wait_ssh(iid)
         if not host:
-            return [rec_for("-", "-", "-", status="no-ssh")]
+            return bail(status="no-ssh")
         S = (f"ssh -o ConnectTimeout=20 -o StrictHostKeyChecking=no "
              f"-o UserKnownHostsFile=/dev/null -p {port} root@{host}")
 
         kvm, _ = sh(f"{S} 'ls /dev/kvm 2>/dev/null && echo yes || echo no'", timeout=60)
         if "no" in kvm:
-            return [rec_for("-", "-", "-", status="no-kvm")]   # costs cents, not hours
+            return bail(status="no-kvm")   # costs cents, not hours
 
         # Driver swapping only works because this is a VM with the GPU passed
         # through.  Prove it rather than assume it: on a container rental the
@@ -852,8 +887,8 @@ def run_one(offer, args):
         virt, _ = sh(f"{S} 'systemd-detect-virt 2>/dev/null || echo unknown'", timeout=60)
         base["virt"] = virt.strip()
         if base["virt"] not in ("kvm", "qemu"):
-            return [rec_for("-", "-", "-", status="not-a-vm",
-                            detail=f"systemd-detect-virt={base['virt']}; cannot replace the driver")]
+            return bail(status="not-a-vm",
+                            detail=f"systemd-detect-virt={base['virt']}; cannot replace the driver")
 
         preinstalled, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=90)
         base["driver_preinstalled"] = preinstalled.strip()[:160]
@@ -880,15 +915,15 @@ def run_one(offer, args):
                "NEEDRESTART_SUSPEND=1 ")
         for step, cmd, tmo in [
             ("build",  f"cd /root/nvkvm && {ENV} bash scripts/build_qemu.sh --install-deps", 3600),
-            ("guest",  f"cd /root/nvkvm && {ENV} bash scripts/setup_guest.sh",              1200),
+            ("guest",  f"cd /root/nvkvm && {ENV} bash scripts/setup_guest.sh",              2700),
         ]:
             _, rc = sh(f"{S} '{cmd} > /root/{step}.log 2>&1'", timeout=tmo)
             if rc != 0:
                 errs, _ = sh(f"{S} \"grep -niE 'error|fatal|cannot|No space|Killed|undefined reference' "
                              f"/root/{step}.log | tail -25\"", timeout=60)
                 tail, _ = sh(f"{S} 'tail -60 /root/{step}.log'", timeout=60)
-                return [rec_for("-", "-", "-", status=f"{step}-failed",
-                                detail="ERRORS:\n" + errs[-1500:] + "\n\nTAIL:\n" + tail[-1500:])]
+                return bail(status=f"{step}-failed",
+                                detail="ERRORS:\n" + errs[-1500:] + "\n\nTAIL:\n" + tail[-1500:])
 
         todo = drivers_for(gpu, args.drivers)
 
@@ -912,8 +947,8 @@ def run_one(offer, args):
             if todo and todo[0][0] == cur0:
                 print(f"    (testing preinstalled {cur0} first, before any purge)", flush=True)
         if not todo:
-            return [rec_for("-", "-", "-", status="no-applicable-drivers",
-                            detail=f"arch={base['arch']} floor={ARCH_FLOOR.get(base['arch'])}")]
+            return bail(status="no-applicable-drivers",
+                            detail=f"arch={base['arch']} floor={ARCH_FLOOR.get(base['arch'])}")
 
         for ver, prof, why in todo:
             if stop_requested():
