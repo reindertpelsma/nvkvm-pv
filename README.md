@@ -100,10 +100,21 @@ whole test — not CPU flags, which a container inherits from its host, so
 `grep vmx /proc/cpuinfo` reads healthy inside one that has no `/dev/kvm`:
 
 ```bash
-ls -l /dev/kvm && test -w /dev/kvm && echo "KVM usable"
+exec 3<>/dev/kvm && echo "KVM usable" && exec 3>&-
 ```
 
-If the device is there but not writable, you are missing the `kvm` group.
+That opens the device rather than asking about it, which is the only test that
+counts: `test -w` consults permission bits, and permission bits are not the
+whole story — group membership does not take effect in a shell you were already
+in when it was granted.
+
+If it fails with permission denied, you are almost certainly not in the group
+that owns the node (`crw-rw---- root kvm` on most distributions):
+
+```bash
+sudo usermod -aG kvm "$USER"    # then log out and back in, or: newgrp kvm
+```
+
 Containers are fine **provided the device is passed in** — the
 [`docker-compose.yml`](docker-compose.yml) here does exactly that. What does not
 work is a container without it, or a VM whose host has nested virtualisation
