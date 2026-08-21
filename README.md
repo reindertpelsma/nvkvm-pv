@@ -285,11 +285,19 @@ per-frame counters over 60 consecutive one-second samples, every one of which
 was exactly 60 frames. The pipeline is limited by display refresh, not by
 forwarding overhead.
 
-Graphics is the one area where the guest is well short of the host rather than
-at parity: `glmark2-wayland` scores **6857 in the guest vs 21571 on the host**
-on the same box (~32%), while compute and bandwidth are at 1.00x. That gap is
-under investigation and is not yet explained
-([detail](docs/internal/known-limitations.md)).
+Graphics is the one area below parity, though far less than an earlier note
+here claimed. Re-measured on an RTX 3060 with one `glmark2` binary,
+sha256-identical on both sides: the full suite off-screen runs at **0.73x of
+host**, and **0.89x** with `clocksource=tsc` in the guest. The GPU itself is at
+parity — GL fill rate is 1.000x and draw-call submission is slightly *faster*
+in the guest.
+
+The remaining cost is not the present path. It is a cold first scene — the
+guest's first scene in a process runs ~0.37x and every one after it 0.88-0.93x,
+so a single-scene run measures the cold path and nothing else — plus clock
+reads leaving the vDSO under `kvm-clock`, which a benchmark that times every
+frame pays for directly. [Full decomposition and what was ruled
+out](tests/perf/results/glmark2_2026-08-21/RESULTS.md).
 
 ### Containers
 

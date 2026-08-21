@@ -722,6 +722,13 @@ the bare-metal host too, on the ffmpeg build used
   document that also carries a confirmed transcription error, and the
   re-validation pass explicitly marks it "unconfirmed on this driver"
   (`tests/perf/realapp_matrix.md`). Do not use it.
+- **"glmark2 6857 guest vs 21571 host, ~32%"** — superseded 2026-08-21. It is a
+  *single-scene* number, and in the guest a fresh process's first scene runs at
+  ~0.37x while every later scene runs at 0.88-0.93x, so a one-scene invocation
+  measures the cold path and nothing else. The full default suite off-screen,
+  one sha256-identical binary on both sides, is **0.73x** on a default guest and
+  **0.89x** with `clocksource=tsc`
+  (`tests/perf/results/glmark2_2026-08-21/RESULTS.md`).
 - The **2026-06-01 matrix** was taken on driver 580.159.04 with different
   toolkits on each side (host cuBLAS/cuFFT 11.5 vs guest 12.x). The
   2026-08-17 re-validation on 575.51.03 used one statically-linked binary per
