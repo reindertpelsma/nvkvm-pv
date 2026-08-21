@@ -1,0 +1,1 @@
+savedcmd_nvkvm-guest.mod := printf '%s\n'   nvkvm_main.o nvkvm_ioctl.o nvkvm_virtio.o nvkvm_mmap.o nvkvm_session.o nvkvm_hostfile.o nvkvm_drm.o nvkvm_kms.o | awk '!x[$$0]++ { print("./"$$0) }' > nvkvm-guest.mod

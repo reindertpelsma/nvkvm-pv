@@ -157,30 +157,54 @@ VM_SERIAL="${VM_SERIAL:-stdio}"
 # turn.  Observed with Minecraft rendering at 60 fps in the guest and mouse-look
 # dead.
 #
-# It is off by default because ADDING IT CHANGES THE DEFAULT DESKTOP.  QEMU keeps
-# one "current" mouse handler and makes it whichever was most recently
-# ACTIVATED (ui/input.c: activate does QTAILQ_INSERT_HEAD, find_handler returns
-# the first match), and the GUEST decides that by enabling the device -- so
-# cmdline ordering does not control it.  Shipping both silently made the
-# relative mouse current: `info mice` reported
+# WHY IT IS STILL OPT-IN.  QEMU keeps one "current" mouse handler and makes it
+# whichever was most recently ACTIVATED (ui/input.c: activate does
+# QTAILQ_INSERT_HEAD, find_handler returns the first match), and the GUEST
+# decides that by enabling the device -- so cmdline ordering does not control
+# it.  Shipping both silently made the relative mouse current: `info mice`
+# reported
 #
 #     Mouse #4: QEMU Virtio Tablet (absolute)
 #   * Mouse #5: QEMU Virtio Mouse
 #
 # with the tablet present but not current.  qemu_input_is_absolute() is then
-# false, which arms the implicit grab in ui/gtk.c -- a plain left click takes
-# BOTH pointer and keyboard, hides the cursor, and the pointer cannot leave the
-# window until ctrl-alt-g.  That is the correct behaviour for a game and quite
-# wrong for a desktop, where hovering should just move the pointer.
+# false, and in that state ui/gtk.c delivers pointer motion to the guest only
+# while the pointer is grabbed -- so hovering moves nothing and the desktop is
+# dead until the user grabs.  It used to be worse: a plain left click took BOTH
+# pointer and keyboard and was swallowed rather than forwarded.  That part is
+# gone, removed by patches/0006-gtk-no-implicit-grab-on-click.patch, so a click
+# is now just a click.
 #
-# So: default is tablet only, and the window behaves like a window.  With
-# VM_RELATIVE_MOUSE=1 both devices exist and the monitor's `mouse_set <n>`
-# switches between them live, no restart -- `mouse_set` on the tablet to get the
-# desktop back, on the mouse to play.  Either way the guest can never take the
-# grab itself: every grab in ui/gtk.c is a user gesture (ctrl-alt-g, a click
-# while in relative mode, or the opt-in Grab On Hover), QEMU has no channel to
-# learn a guest app wanted a pointer lock, and while grabbed the window title
-# carries "Press Ctrl+Alt+G to release grab".  Same consent model as a browser's
+# patches/0007-gtk-grab-switches-the-guest-pointing-device.patch is meant to fix
+# the TRANSITIONS -- grab activates a relative device, ungrab puts the absolute
+# one back.  TWO reasons that is not enough to flip this default:
+#
+#   * 0007 IS NOT KNOWN TO WORK.  The same switch performed by hand from the
+#     monitor (`mouse_set 5`, then grab) left mouse look dead in the guest on
+#     real hardware.  Read that patch's header: it carries the analysis and the
+#     one `evtest` command in the guest that says whether the break is above or
+#     below evdev.  Nobody has run it yet.
+#   * even if it works, it fixes the transitions and not the INITIAL state.  No
+#     grab has happened when the guest desktop first appears, and the guest has
+#     already chosen.  With both devices the window still opens in relative
+#     mode, and it takes one ctrl-alt-g in and out -- whose ungrab selects the
+#     tablet -- before hovering works.  Recoverable rather than stuck, still a
+#     bad first impression.
+#
+# Flip this default when someone with a display has confirmed, on hardware,
+# both that 0007 delivers motion and either that the guest leaves an absolute
+# device current at desktop time or that the one-cycle recovery is acceptable.
+# That is a measurement, not an argument.  The last version of this comment was
+# an argument, and it shipped the bug above.
+#
+# With VM_RELATIVE_MOUSE=1 both devices exist and the monitor's `mouse_set <n>`
+# switches between them by hand, live, no restart.  Either way the guest can
+# never take the grab itself: every grab in ui/gtk.c is a user gesture --
+# ctrl-alt-g or View -> Grab Input, and nothing else now that the click path is
+# gone.  QEMU has no channel to learn that a guest app wanted a pointer lock,
+# and while grabbed the window title carries "Press Ctrl+Alt+G to release grab".
+# 0007 deliberately changes none of that: it only decides which device a grab
+# the USER already asked for delivers to.  Same consent model as a browser's
 # Pointer Lock API, and it should stay that way.
 INPUT_ARGS=""
 if [ "$VM_DISPLAY" != "none" ]; then

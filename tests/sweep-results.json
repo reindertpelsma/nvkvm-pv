@@ -1,0 +1,1558 @@
+[
+ {
+  "gpu": "Quadro P4000",
+  "offer_id": 46119693,
+  "dph": 0.06708333333333333,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T21:57:28",
+  "status": "fail",
+  "instance_id": 48238089,
+  "host_driver": "575.51.03",
+  "validate": {
+   "gpu": "",
+   "driver": "",
+   "cuda": "",
+   "pass": 7,
+   "fail": 6,
+   "skip": 15,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "FAIL",
+     "detail": "nvkvm_guest not in lsmod (nvkvm-ish modules: none)"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "FAIL",
+     "detail": "missing/bad: nvidia0(absent) nvidiactl(absent) nvidia-uvm(absent) nvidia-uvm-tools(absent) nvidia-modeset(absent) present:none"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "FAIL",
+     "detail": "nvidia-smi exit=9: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver. Make sure that the latest NVIDIA driver is installed and running. "
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "SKIP",
+     "detail": "nvidia-smi failed"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "SKIP",
+     "detail": "nvidia-smi failed"
+    },
+    {
+     "name": "abi_profile",
+     "status": "SKIP",
+     "detail": "no nvkvm abi/driver line in dmesg (dmesg restricted, or module quiet)"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "FAIL",
+     "detail": "cuInit rc=100 (CUDA_ERROR_NO_DEVICE)"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "1 device(s): llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "FAIL",
+     "detail": "SOFTWARE RASTERISER: 'llvmpipe (LLVM 20.1.2, 256 bits)' (vendorID 0x10005) -- NVIDIA ICD not reachable"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "SKIP",
+     "detail": "no hardware Vulkan device"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/1, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='llvmpipe (LLVM 20.1.2, 256 bits)' GL_VENDOR='Mesa' GL_VERSION='OpenGL ES 3.2 Mesa 25.2.8-0ubuntu0.24.04.2'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "FAIL",
+     "detail": "SOFTWARE RASTERISER: GL_RENDERER='llvmpipe (LLVM 20.1.2, 256 bits)'"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "SKIP",
+     "detail": "software GL"
+    }
+   ]
+  },
+  "summary": "7P/6F/15S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660 S",
+  "offer_id": 32403176,
+  "dph": 0.06708333333333333,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T22:08:46",
+  "status": "fail",
+  "instance_id": 48239042,
+  "host_driver": "575.51.03",
+  "validate": {
+   "gpu": "",
+   "driver": "",
+   "cuda": "",
+   "pass": 7,
+   "fail": 6,
+   "skip": 15,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "FAIL",
+     "detail": "nvkvm_guest not in lsmod (nvkvm-ish modules: none)"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "FAIL",
+     "detail": "missing/bad: nvidia0(absent) nvidiactl(absent) nvidia-uvm(absent) nvidia-uvm-tools(absent) nvidia-modeset(absent) present:none"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "FAIL",
+     "detail": "nvidia-smi exit=9: NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver. Make sure that the latest NVIDIA driver is installed and running. "
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "SKIP",
+     "detail": "nvidia-smi failed"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "SKIP",
+     "detail": "nvidia-smi failed"
+    },
+    {
+     "name": "abi_profile",
+     "status": "SKIP",
+     "detail": "no nvkvm abi/driver line in dmesg (dmesg restricted, or module quiet)"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "FAIL",
+     "detail": "cuInit rc=100 (CUDA_ERROR_NO_DEVICE)"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "SKIP",
+     "detail": "cuInit failed"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "1 device(s): llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "FAIL",
+     "detail": "SOFTWARE RASTERISER: 'llvmpipe (LLVM 20.1.2, 256 bits)' (vendorID 0x10005) -- NVIDIA ICD not reachable"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "SKIP",
+     "detail": "no hardware Vulkan device"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/1, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='llvmpipe (LLVM 20.1.2, 256 bits)' GL_VENDOR='Mesa' GL_VERSION='OpenGL ES 3.2 Mesa 25.2.8-0ubuntu0.24.04.2'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "FAIL",
+     "detail": "SOFTWARE RASTERISER: GL_RENDERER='llvmpipe (LLVM 20.1.2, 256 bits)'"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "SKIP",
+     "detail": "software GL"
+    }
+   ]
+  },
+  "summary": "7P/6F/15S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660 Ti",
+  "offer_id": 48161397,
+  "dph": 0.0674074074074074,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T22:18:26",
+  "status": "fail",
+  "instance_id": 48239828,
+  "host_driver": "575.51.03",
+  "validate": {
+   "gpu": "NVIDIA GeForce GTX 1660 Ti",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 22,
+   "fail": 1,
+   "skip": 5,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  144.646735] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_75"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "FAIL",
+     "detail": "rc=999 (CUDA_ERROR_UNKNOWN)"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "SKIP",
+     "detail": "cuCtxCreate failed -- no context, nothing downstream can run"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "SKIP",
+     "detail": "cuCtxCreate failed -- no context, nothing downstream can run"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "SKIP",
+     "detail": "cuCtxCreate failed -- no context, nothing downstream can run"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "SKIP",
+     "detail": "cuCtxCreate failed -- no context, nothing downstream can run"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "SKIP",
+     "detail": "cuCtxCreate failed -- no context, nothing downstream can run"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "2 device(s): NVIDIA GeForce GTX 1660 Ti, llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti (vendorID 0x10DE)"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "PASS",
+     "detail": "4096 elements, data[i]=i*3+7 verified on NVIDIA GeForce GTX 1660 Ti (e.g. data[4095]=12292)"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/3, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='NVIDIA GeForce GTX 1660 Ti/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 575.51.03'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti/PCIe/SSE2"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "PASS",
+     "detail": "64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear"
+    }
+   ]
+  },
+  "summary": "22P/1F/5S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660 Ti",
+  "offer_id": 48161397,
+  "dph": 0.0674074074074074,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T22:33:46",
+  "tree": {
+   "commit": "63aac8e",
+   "dirty_files": [
+    "scripts/__pycache__/sweep_matrix.cpython-314.pyc",
+    "scripts/sweep_matrix.py"
+   ]
+  },
+  "status": "pass",
+  "instance_id": 48241076,
+  "host_driver": "575.51.03",
+  "validate": {
+   "gpu": "NVIDIA GeForce GTX 1660 Ti",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 20,
+   "fail": 0,
+   "skip": 8,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  146.163644] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_75"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "PASS",
+     "detail": "rc=0 ctx=0x5a53e80a42a0"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "PASS",
+     "detail": "8 MiB round trip byte-exact (8388608/8388608 bytes verified)"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "PASS",
+     "detail": "0xA5 and 0x00 over 8 MiB, all 8388608 bytes verified by readback"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "PASS",
+     "detail": "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "PASS",
+     "detail": "vec_add<<<4096,256>>> all 1048576 elements == 3*i (e.g. c[1048575]=3145725)"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "PASS",
+     "detail": "256x256 fp32 vs CPU ref: all 65536 elements within tol, max|delta|=0 (C[0][0]=103.0000 ref=103.0000)"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "SKIP",
+     "detail": "vk_probe died on signal 7; tail: CHECK|vk_loader|PASS|/lib/x86_64-linux-gnu/libvulkan.so.1 "
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "SKIP",
+     "detail": "vk_probe died on signal 7; tail: CHECK|vk_loader|PASS|/lib/x86_64-linux-gnu/libvulkan.so.1 "
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "SKIP",
+     "detail": "vk_probe died on signal 7; tail: CHECK|vk_loader|PASS|/lib/x86_64-linux-gnu/libvulkan.so.1 "
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "SKIP",
+     "detail": "vk_probe died on signal 7; tail: CHECK|vk_loader|PASS|/lib/x86_64-linux-gnu/libvulkan.so.1 "
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "SKIP",
+     "detail": "gl_probe died on signal 7; tail: CHECK|egl_loader|PASS|/lib/x86_64-linux-gnu/libEGL.so.1 "
+    },
+    {
+     "name": "gl_renderer",
+     "status": "SKIP",
+     "detail": "gl_probe died on signal 7; tail: CHECK|egl_loader|PASS|/lib/x86_64-linux-gnu/libEGL.so.1 "
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "SKIP",
+     "detail": "gl_probe died on signal 7; tail: CHECK|egl_loader|PASS|/lib/x86_64-linux-gnu/libEGL.so.1 "
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "SKIP",
+     "detail": "gl_probe died on signal 7; tail: CHECK|egl_loader|PASS|/lib/x86_64-linux-gnu/libEGL.so.1 "
+    }
+   ]
+  },
+  "summary": "20P/0F/8S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660 Ti",
+  "offer_id": 48161397,
+  "dph": 0.0674074074074074,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T23:06:36",
+  "tree": {
+   "commit": "ca5acf8",
+   "dirty_files": [
+    "scripts/sweep_matrix.py"
+   ]
+  },
+  "status": "pass",
+  "instance_id": 48243206,
+  "host_driver": "575.51.03",
+  "stage_rc": 0,
+  "validate_rc": 0,
+  "validate": {
+   "gpu": "NVIDIA GeForce GTX 1660 Ti",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 28,
+   "fail": 0,
+   "skip": 0,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  143.578312] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_75"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "PASS",
+     "detail": "rc=0 ctx=0x650fadb4d2a0"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "PASS",
+     "detail": "8 MiB round trip byte-exact (8388608/8388608 bytes verified)"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "PASS",
+     "detail": "0xA5 and 0x00 over 8 MiB, all 8388608 bytes verified by readback"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "PASS",
+     "detail": "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "PASS",
+     "detail": "vec_add<<<4096,256>>> all 1048576 elements == 3*i (e.g. c[1048575]=3145725)"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "PASS",
+     "detail": "256x256 fp32 vs CPU ref: all 65536 elements within tol, max|delta|=0 (C[0][0]=103.0000 ref=103.0000)"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "2 device(s): NVIDIA GeForce GTX 1660 Ti, llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti (vendorID 0x10DE)"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "PASS",
+     "detail": "4096 elements, data[i]=i*3+7 verified on NVIDIA GeForce GTX 1660 Ti (e.g. data[4095]=12292)"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/3, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='NVIDIA GeForce GTX 1660 Ti/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 575.51.03'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti/PCIe/SSE2"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "PASS",
+     "detail": "64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear"
+    }
+   ]
+  },
+  "summary": "28P/0F/0S",
+  "destroyed": true
+ },
+ {
+  "gpu": "RTX 3060",
+  "offer_id": 36328629,
+  "dph": 0.04138888888888889,
+  "driver_reported_by_vast": "580.142",
+  "started": "2026-08-20T23:19:37",
+  "tree": {
+   "commit": "6399a90",
+   "dirty_files": [
+    "scripts/sweep_matrix.py"
+   ]
+  },
+  "status": "pass",
+  "instance_id": 48243914,
+  "host_driver": "575.51.03",
+  "stage_rc": 0,
+  "validate_rc": 0,
+  "validate": {
+   "gpu": "NVIDIA GeForce RTX 3060",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 28,
+   "fail": 0,
+   "skip": 0,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 3060"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  162.971314] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 3060"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_86"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "PASS",
+     "detail": "rc=0 ctx=0x628dafcc32f0"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "PASS",
+     "detail": "8 MiB round trip byte-exact (8388608/8388608 bytes verified)"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "PASS",
+     "detail": "0xA5 and 0x00 over 8 MiB, all 8388608 bytes verified by readback"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "PASS",
+     "detail": "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "PASS",
+     "detail": "vec_add<<<4096,256>>> all 1048576 elements == 3*i (e.g. c[1048575]=3145725)"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "PASS",
+     "detail": "256x256 fp32 vs CPU ref: all 65536 elements within tol, max|delta|=0 (C[0][0]=103.0000 ref=103.0000)"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "2 device(s): NVIDIA GeForce RTX 3060, llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 3060 (vendorID 0x10DE)"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "PASS",
+     "detail": "4096 elements, data[i]=i*3+7 verified on NVIDIA GeForce RTX 3060 (e.g. data[4095]=12292)"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/3, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='NVIDIA GeForce RTX 3060/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 575.51.03'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 3060/PCIe/SSE2"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "PASS",
+     "detail": "64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear"
+    }
+   ]
+  },
+  "summary": "28P/0F/0S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660 S",
+  "offer_id": 32403176,
+  "dph": 0.06708333333333333,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T23:45:02",
+  "tree": {
+   "commit": "1e06d74",
+   "dirty_files": [
+    "scripts/sweep_matrix.py"
+   ]
+  },
+  "status": "pass",
+  "instance_id": 48245405,
+  "host_driver": "575.51.03",
+  "stage_rc": 0,
+  "validate_rc": 0,
+  "validate": {
+   "gpu": "NVIDIA GeForce GTX 1660 SUPER",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 28,
+   "fail": 0,
+   "skip": 0,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 SUPER"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  139.217824] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 SUPER"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_75"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "PASS",
+     "detail": "rc=0 ctx=0x594d5564b310"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "PASS",
+     "detail": "8 MiB round trip byte-exact (8388608/8388608 bytes verified)"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "PASS",
+     "detail": "0xA5 and 0x00 over 8 MiB, all 8388608 bytes verified by readback"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "PASS",
+     "detail": "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "PASS",
+     "detail": "vec_add<<<4096,256>>> all 1048576 elements == 3*i (e.g. c[1048575]=3145725)"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "PASS",
+     "detail": "256x256 fp32 vs CPU ref: all 65536 elements within tol, max|delta|=0 (C[0][0]=103.0000 ref=103.0000)"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "2 device(s): NVIDIA GeForce GTX 1660 SUPER, llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 SUPER (vendorID 0x10DE)"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "PASS",
+     "detail": "4096 elements, data[i]=i*3+7 verified on NVIDIA GeForce GTX 1660 SUPER (e.g. data[4095]=12292)"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/3, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='NVIDIA GeForce GTX 1660 SUPER/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 575.51.03'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 SUPER/PCIe/SSE2"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "PASS",
+     "detail": "64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear"
+    }
+   ]
+  },
+  "summary": "28P/0F/0S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660 Ti",
+  "offer_id": 48161395,
+  "dph": 0.0674074074074074,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-20T23:59:42",
+  "tree": {
+   "commit": "e8e472f",
+   "dirty_files": []
+  },
+  "status": "pass",
+  "instance_id": 48246218,
+  "host_driver": "575.51.03",
+  "stage_rc": 0,
+  "validate_rc": 0,
+  "validate": {
+   "gpu": "NVIDIA GeForce GTX 1660 Ti",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 28,
+   "fail": 0,
+   "skip": 0,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  148.655651] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_75"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "PASS",
+     "detail": "rc=0 ctx=0x55b4df02e2a0"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "PASS",
+     "detail": "8 MiB round trip byte-exact (8388608/8388608 bytes verified)"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "PASS",
+     "detail": "0xA5 and 0x00 over 8 MiB, all 8388608 bytes verified by readback"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "PASS",
+     "detail": "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "PASS",
+     "detail": "vec_add<<<4096,256>>> all 1048576 elements == 3*i (e.g. c[1048575]=3145725)"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "PASS",
+     "detail": "256x256 fp32 vs CPU ref: all 65536 elements within tol, max|delta|=0 (C[0][0]=103.0000 ref=103.0000)"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "2 device(s): NVIDIA GeForce GTX 1660 Ti, llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti (vendorID 0x10DE)"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "PASS",
+     "detail": "4096 elements, data[i]=i*3+7 verified on NVIDIA GeForce GTX 1660 Ti (e.g. data[4095]=12292)"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/3, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='NVIDIA GeForce GTX 1660 Ti/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 575.51.03'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce GTX 1660 Ti/PCIe/SSE2"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "PASS",
+     "detail": "64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear"
+    }
+   ]
+  },
+  "summary": "28P/0F/0S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660",
+  "offer_id": 43339009,
+  "dph": 0.06898148148148148,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-21T00:13:14",
+  "tree": {
+   "commit": "e8e472f",
+   "dirty_files": []
+  },
+  "status": "no-ssh",
+  "instance_id": 48247053,
+  "destroyed": true
+ },
+ {
+  "gpu": "RTX 3070",
+  "offer_id": 17691131,
+  "dph": 0.07518518518518519,
+  "driver_reported_by_vast": "570.195.03",
+  "started": "2026-08-21T00:28:31",
+  "tree": {
+   "commit": "e8e472f",
+   "dirty_files": []
+  },
+  "status": "build-failed",
+  "instance_id": 48247968,
+  "host_driver": "575.51.03",
+  "detail": "ed Translation-en [1245 kB]\nGet:33 http://archive.ubuntu.com/ubuntu jammy-updates/restricted amd64 c-n-f Metadata [584 B]\nGet:34 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 Packages [1281 kB]\nGet:35 http://archive.ubuntu.com/ubuntu jammy-updates/universe Translation-en [322 kB]\nGet:36 http://archive.ubuntu.com/ubuntu jammy-updates/universe amd64 c-n-f Metadata [30.8 kB]\nGet:37 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 Packages [76.5 kB]\nGet:38 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse Translation-en [15.9 kB]\nGet:39 http://archive.ubuntu.com/ubuntu jammy-updates/multiverse amd64 c-n-f Metadata [756 B]\nGet:40 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 Packages [70.2 kB]\nGet:41 http://archive.ubuntu.com/ubuntu jammy-backports/main Translation-en [11.4 kB]\nGet:42 http://archive.ubuntu.com/ubuntu jammy-backports/main amd64 c-n-f Metadata [412 B]\nGet:43 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 Packages [30.8 kB]\nGet:44 http://archive.ubuntu.com/ubuntu jammy-backports/universe Translation-en [16.9 kB]\nGet:45 http://archive.ubuntu.com/ubuntu jammy-backports/universe amd64 c-n-f Metadata [676 B]",
+  "destroyed": true
+ },
+ {
+  "gpu": "RTX 2060S",
+  "offer_id": 35825964,
+  "dph": 0.08027777777777778,
+  "driver_reported_by_vast": "580.126.09",
+  "started": "2026-08-21T00:33:35",
+  "tree": {
+   "commit": "e8e472f",
+   "dirty_files": []
+  },
+  "status": "pass",
+  "instance_id": 48248277,
+  "host_driver": "575.51.03",
+  "stage_rc": 0,
+  "validate_rc": 0,
+  "validate": {
+   "gpu": "NVIDIA GeForce RTX 2060 SUPER",
+   "driver": "575.51.03",
+   "cuda": "12.9",
+   "pass": 28,
+   "fail": 0,
+   "skip": 0,
+   "total": 28,
+   "checks": [
+    {
+     "name": "guest_module",
+     "status": "PASS",
+     "detail": "nvkvm_guest size=114688 refcnt=0"
+    },
+    {
+     "name": "dev_nodes",
+     "status": "PASS",
+     "detail": "5/5: nvidia0(195:0) nvidiactl(195:255) nvidia-uvm(241:0) nvidia-uvm-tools(241:1) nvidia-modeset(195:254)"
+    },
+    {
+     "name": "nvidia_smi_gpu",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 2060 SUPER"
+    },
+    {
+     "name": "nvidia_smi_driver",
+     "status": "PASS",
+     "detail": "575.51.03"
+    },
+    {
+     "name": "nvidia_smi_cuda",
+     "status": "PASS",
+     "detail": "12.9"
+    },
+    {
+     "name": "abi_profile",
+     "status": "PASS",
+     "detail": "[  139.218265] nvkvm: host NVIDIA driver 575.51.03, slot_size=65536;"
+    },
+    {
+     "name": "cuda_libcuda",
+     "status": "PASS",
+     "detail": "/usr/local/nvidia-guest/lib/libcuda.so.1"
+    },
+    {
+     "name": "cuda_init",
+     "status": "PASS",
+     "detail": "rc=0"
+    },
+    {
+     "name": "cuda_driver_version",
+     "status": "PASS",
+     "detail": "CUDA 12.9 (raw 12090)"
+    },
+    {
+     "name": "cuda_device_count",
+     "status": "PASS",
+     "detail": "1"
+    },
+    {
+     "name": "cuda_device_name",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 2060 SUPER"
+    },
+    {
+     "name": "cuda_compute_cap",
+     "status": "PASS",
+     "detail": "sm_75"
+    },
+    {
+     "name": "cuda_ctx_create",
+     "status": "PASS",
+     "detail": "rc=0 ctx=0x5d7603589310"
+    },
+    {
+     "name": "cuda_htod_dtoh_8mib",
+     "status": "PASS",
+     "detail": "8 MiB round trip byte-exact (8388608/8388608 bytes verified)"
+    },
+    {
+     "name": "cuda_memset_d8",
+     "status": "PASS",
+     "detail": "0xA5 and 0x00 over 8 MiB, all 8388608 bytes verified by readback"
+    },
+    {
+     "name": "cuda_ptx_jit",
+     "status": "PASS",
+     "detail": "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0"
+    },
+    {
+     "name": "cuda_kernel_launch",
+     "status": "PASS",
+     "detail": "vec_add<<<4096,256>>> all 1048576 elements == 3*i (e.g. c[1048575]=3145725)"
+    },
+    {
+     "name": "cuda_matmul",
+     "status": "PASS",
+     "detail": "256x256 fp32 vs CPU ref: all 65536 elements within tol, max|delta|=0 (C[0][0]=103.0000 ref=103.0000)"
+    },
+    {
+     "name": "vk_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libvulkan.so.1"
+    },
+    {
+     "name": "vk_instance",
+     "status": "PASS",
+     "detail": "vkCreateInstance rc=0"
+    },
+    {
+     "name": "vk_physical_device",
+     "status": "PASS",
+     "detail": "2 device(s): NVIDIA GeForce RTX 2060 SUPER, llvmpipe (LLVM 20.1.2, 256 bits)"
+    },
+    {
+     "name": "vk_device_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 2060 SUPER (vendorID 0x10DE)"
+    },
+    {
+     "name": "vk_compute_dispatch",
+     "status": "PASS",
+     "detail": "4096 elements, data[i]=i*3+7 verified on NVIDIA GeForce RTX 2060 SUPER (e.g. data[4095]=12292)"
+    },
+    {
+     "name": "egl_loader",
+     "status": "PASS",
+     "detail": "/lib/x86_64-linux-gnu/libEGL.so.1"
+    },
+    {
+     "name": "egl_context",
+     "status": "PASS",
+     "detail": "EGL_EXT_platform_device dev 0/3, EGL 1.5"
+    },
+    {
+     "name": "gl_renderer",
+     "status": "PASS",
+     "detail": "GL_RENDERER='NVIDIA GeForce RTX 2060 SUPER/PCIe/SSE2' GL_VENDOR='NVIDIA Corporation' GL_VERSION='OpenGL ES 3.2 NVIDIA 575.51.03'"
+    },
+    {
+     "name": "gl_renderer_is_nvidia",
+     "status": "PASS",
+     "detail": "NVIDIA GeForce RTX 2060 SUPER/PCIe/SSE2"
+    },
+    {
+     "name": "gl_draw_pixel_check",
+     "status": "PASS",
+     "detail": "64x64 FBO: inside(16,16)=RGBA(255,127,0,255)==triangle, outside(48,48)=RGBA(0,0,0,255)==clear"
+    }
+   ]
+  },
+  "summary": "28P/0F/0S",
+  "destroyed": true
+ },
+ {
+  "gpu": "GTX 1660",
+  "offer_id": 43339014,
+  "dph": 0.06898148148148148,
+  "driver_reported_by_vast": "580.95.05",
+  "started": "2026-08-21T00:47:57",
+  "tree": {
+   "commit": "d21d3ff",
+   "dirty_files": [
+    "scripts/sweep_matrix.py"
+   ]
+  },
+  "status": "no-ssh",
+  "instance_id": 48249059,
+  "destroyed": true
+ }
+]

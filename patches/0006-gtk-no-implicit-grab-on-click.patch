@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Fri, 21 Aug 2026 19:43:19 +0200
+Subject: [PATCH 1/2] ui/gtk: do not grab the pointer on a click
+
+A plain left click in the guest window took the host's pointer and
+keyboard, hid the cursor, and did not reach the guest.  The window was
+usable again only after Ctrl+Alt+G.  Nothing the user did asked for
+that.
+
+gd_button_event() grabbed on the first left click whenever the current
+input device was relative, and returned TRUE, so the click that
+triggered the grab was also swallowed rather than forwarded.  Upstream
+means this as a convenience for a guest with only a PS/2-style mouse,
+where nothing tracks the host cursor and a grab is the only way to point
+at anything.  It is the wrong default the moment a guest has a desktop:
+there, a click is a click, and the pointer must be free to leave the
+window afterwards.
+
+It is also the one grab path a guest could reach without the user
+choosing it.  The guest decides which input device is current -- QEMU
+keeps one current mouse handler and it is whichever was activated last,
+which happens when the GUEST enables the device -- so a guest that
+enabled a relative mouse armed this branch, and then the user's next
+click handed over the pointer.  Not an escape (the click is still the
+user's, and Ctrl+Alt+G still releases), but the guest chose the
+precondition, and "every grab is a user gesture" reads better when it is
+the whole truth.
+
+After this, entering grab mode is the View menu item or Ctrl+Alt+G, and
+nothing else.  That is the model the two modes are specified against:
+ungrabbed the pointer belongs to the host and clicks are forwarded as
+they are to any window; grabbed the guest has the pointer until the user
+asks for it back.  It is the same split VirtualBox has.
+
+Removing the block leaves `s` unused in this function, so it goes too.
+Grab On Hover is untouched: it is an explicit opt-in menu setting and it
+takes only the keyboard.
+
+VERIFIED: builds --enable-gtk (NVKVM_QEMU_UI=1), no new warnings.  NOT
+verified interactively -- the machine this was written on has no display.
+The change is a deletion of one branch, so what it does is visible in
+the diff; what has not been watched is a real click landing in a real
+guest.
+
+NOT upstreamable as-is: upstream wants this behaviour for the
+mouse-only case, and dropping it outright would regress those guests.
+The upstreamable version is a display option (`-display gtk,
+grab-on-click=off`) defaulting to today's behaviour, which is a bigger
+change than nvkvm needs.
+---
+ ui/gtk.c | 20 +++++++-------------
+ 1 file changed, 7 insertions(+), 13 deletions(-)
+
+diff --git a/ui/gtk.c b/ui/gtk.c
+index daa3dd6..23ca23f 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -988,21 +988,15 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
+                                 void *opaque)
+ {
+     VirtualConsole *vc = opaque;
+-    GtkDisplayState *s = vc->s;
+     InputButton btn;
+ 
+-    /* implicitly grab the input at the first click in the relative mode */
+-    if (button->button == 1 && button->type == GDK_BUTTON_PRESS &&
+-        !qemu_input_is_absolute(vc->gfx.dcl.con) && s->ptr_owner != vc) {
+-        if (!vc->window) {
+-            gtk_check_menu_item_set_active(GTK_CHECK_MENU_ITEM(s->grab_item),
+-                                           TRUE);
+-        } else {
+-            gd_grab_pointer(vc, "relative-mode-click");
+-        }
+-        return TRUE;
+-    }
+-
++    /*
++     * nvkvm: no implicit grab here.  Upstream took BOTH pointer and keyboard on
++     * the first left click whenever the current device was relative, and
++     * swallowed that click.  A click is a click: it is forwarded to the guest
++     * like any other, and the grab is entered only by the View menu item or
++     * Ctrl+Alt+G.  See this patch's commit message.
++     */
+     if (button->button == 1) {
+         btn = INPUT_BUTTON_LEFT;
+     } else if (button->button == 2) {

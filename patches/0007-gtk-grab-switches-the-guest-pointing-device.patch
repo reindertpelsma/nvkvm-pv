@@ -1,0 +1,314 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Fri, 21 Aug 2026 19:44:27 +0200
+Subject: [PATCH 2/2] ui/gtk: make the pointer grab switch the guest's pointing
+ device
+
+*** THIS PATCH IS NOT KNOWN TO WORK.  The mechanism it automates was
+*** tried by hand on real hardware -- `mouse_set <relative index>` from
+*** the monitor, then take the grab -- and mouse look in the guest still
+*** did not move.  Read "What the hardware said" below before merging it
+*** anywhere that matters.  It is on gpu-untested for that reason.
+
+Ctrl+Alt+G confines the host cursor and changes nothing else, so the
+guest keeps receiving whatever kind of coordinates it was receiving
+before.  With a virtio-tablet current that is ABSOLUTE coordinates, and
+a tablet says "the pointer is at (x, y)", never "it moved by (dx, dy)",
+so a guest reading deltas for pointer lock gets nothing.
+
+gd_grab_pointer() takes the GDK seat grab, records the pointer position,
+sets ptr_owner and updates the caption.  It never touches which input
+handler is current.  QEMU keeps exactly one current mouse handler and it
+is whichever was activated last (qemu_input_handler_activate() does
+QTAILQ_INSERT_HEAD, qemu_input_find_handler() returns the first match),
+and the GUEST picks that by enabling a device
+(virtio_input_hid_change_active() activates on DRIVER_OK), so nothing on
+the command line decides it either.
+
+So: on grab, activate a relative device; on ungrab, put the absolute one
+back.  Both directions go through the public interface --
+qmp_query_mice() to read the list, qemu_mouse_set() to activate -- which
+is exactly what the monitor's `info mice` and `mouse_set` do, so nothing
+new is exported from ui/input.c and the monitor sees the same state.
+
+WHAT THE HARDWARE SAID.  Before the test box was returned, the switch
+was performed by hand: `mouse_set` onto the relative virtio-mouse, then
+grab.  Mouse look still did not work.  That is a negative result about
+the whole approach, not about this code's details, and it is why the
+patch header opens the way it does.  What it does NOT tell us is where
+the chain breaks, because the manual test exercised the same host path
+this patch automates and stopped at the same place.
+
+Reading the path afterwards, the host side looks correct and the
+remaining suspects are guest-side.  All of the following is READING, not
+measurement, and is written down so the next person starts further along
+rather than because it is established:
+
+  * qemu_input_is_absolute() finds the head-most REL|ABS handler and
+    tests its ABS bit, so after the switch it is correctly false;
+  * gd_motion_event() then takes its relative branch and queues
+    qemu_input_queue_rel() deltas -- but only while `s->last_set &&
+    s->ptr_owner == vc`, i.e. only while grabbed, which was the case;
+  * qemu_input_find_handler() prefers handlers bound to the event's
+    console and falls back to unbound ones.  virtio-input devices are
+    unbound unless `display=` is set, so the fallback loop applies and
+    returns the head-most REL handler, which is the one just activated;
+  * virtio_input_send() DROPS every event when !vinput->active, and
+    active tracks VIRTIO_CONFIG_S_DRIVER_OK.  A device the guest has not
+    driven swallows input silently.  In the guest under test both event
+    nodes existed (pci-0000:00:09.0-event-mouse relative,
+    pci-0000:00:0a.0-event-mouse tablet), which says the driver probed
+    both, so this is probably not it -- but it is the one place in the
+    host chain that can fail without a symptom;
+  * that leaves the guest's own stack.  It runs weston with Xwayland as
+    a rootful client.  Two things there are worth suspecting before
+    anything else: whether libinput/weston is driving the seat pointer
+    from the tablet alone and treating the relative node as a device it
+    has bound but is not using, and whether the application's pointer
+    lock resolves at all under rootful Xwayland, which needs
+    zwp_pointer_constraints_v1 / relative_pointer_v1 from the
+    compositor.  If the second is the problem then no host-side change
+    can fix it, and the delta source was never the question.
+
+THE ONE TEST THAT SPLITS THIS, and it needs no game: in the guest, while
+grabbed, run
+    sudo evtest /dev/input/by-path/pci-0000:00:09.0-event-mouse
+and move the mouse.  REL_X/REL_Y events mean the entire QEMU-side chain
+including this patch works and the bug is above evdev, in
+libinput/weston/Xwayland.  Silence means the break is at or below
+virtio-input and this patch is looking in the right place but is not
+enough.  Everything else should wait on that answer.
+
+Edge cases handled, none of them measured either:
+
+  * NO RELATIVE DEVICE, which is the default tablet-only config: the
+    lookup returns 0 and grab never calls qemu_mouse_set().  Not an
+    error path -- byte for byte the old behaviour, in both directions;
+  * ALREADY RELATIVE when the grab is taken: nothing to switch, and
+    nothing saved to restore;
+  * NO ABSOLUTE DEVICE: ungrab finds no candidate and leaves the guest
+    alone, which is right for a relative-only guest;
+  * RESTORE WHAT WAS CURRENT, not merely "an absolute device".  Grab
+    saves the current index and ungrab re-activates that exact one.  It
+    is saved only when it was absolute, because restoring a relative
+    device on ungrab would defeat the point.  With nothing saved, or
+    with the saved device unplugged since (qemu_mouse_set() then fails),
+    ungrab falls back to any absolute device;
+  * TWO DEVICES OF A KIND: take the one closest to the head of the
+    handler list, i.e. the most recently activated.  qmp_query_mice()
+    prepends, so that is the LAST match in its list.
+
+Interaction with the existing auto-ungrab in gd_mouse_mode_change()
+("release the grab at switching to absolute mode"), which both
+directions fire re-entrantly from inside qemu_input_handler_activate():
+
+  * on grab we activate a RELATIVE device, so qemu_input_is_absolute()
+    is false when the notifier runs and its body is skipped.  The switch
+    happens after ptr_owner is set, so the notifier sees a consistent
+    owner;
+  * on ungrab we activate an ABSOLUTE device, which is what that
+    notifier reacts to -- but ptr_owner has already been cleared, so its
+    `if (s->ptr_owner && ...)` is false.  No second ungrab, no loop;
+  * the notifier's own trigger still works.  When the GUEST goes
+    absolute mid-grab it ungrabs as before, and the restore then finds
+    an already-absolute device and returns without calling
+    qemu_mouse_set().  That guard is what stops a re-entrant activate,
+    and it also stops a stale saved index from overriding the guest.
+
+One incidental change on the grab path: s->last_set is cleared.
+gd_motion_event() derives deltas from s->last_x/last_y, which until the
+grab were written by absolute motion events -- and no motion event
+arrives while the pointer is outside the window, so they can be
+arbitrarily stale.  Without this the first motion after a grab emits
+that staleness as one large delta.  The edge-warp path in the same
+function clears last_set for the same reason.
+
+Known left open: if the window manager breaks the GDK grab, ui/gtk.c
+already leaves ptr_owner stale, and now the guest is left on the
+relative device too until the user toggles the grab twice.
+gd_grab_broken_event() is Windows-only and does not ungrab even there,
+so there is no hook to extend; that is its own change.
+
+NOT VERIFIED, restated because it is the point: no grab was taken on
+this machine, no guest saw a delta, `info mice` was never run against a
+QEMU carrying this patch.  It has a clean --enable-gtk build
+(NVKVM_QEMU_UI=1, the only configuration that compiles a line of this
+file) with no new warnings, and that is all.
+
+NOT UPSTREAMABLE AS WRITTEN.  The gap is general -- upstream's grab is a
+host-side window concept with no opinion about which guest device should
+be current, and every front end that grabs has the same problem; ui/sdl2.c
+has its own grab and is untouched here, so the two backends now differ.
+The upstreamable version is a shared helper in ui/input.c that front ends
+call, with the mode choice expressed once instead of per backend.
+---
+ ui/gtk.c | 135 +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 135 insertions(+)
+
+diff --git a/ui/gtk.c b/ui/gtk.c
+index 23ca23f..fb3cd43 100644
+--- a/ui/gtk.c
++++ b/ui/gtk.c
+@@ -35,6 +35,7 @@
+ #include "qapi/qapi-commands-control.h"
+ #include "qapi/qapi-commands-machine.h"
+ #include "qapi/qapi-commands-misc.h"
++#include "qapi/qapi-commands-ui.h"
+ #include "qemu/cutils.h"
+ #include "qemu/error-report.h"
+ #include "qemu/main-loop.h"
+@@ -1621,6 +1622,134 @@ static void gd_ungrab_keyboard(GtkDisplayState *s)
+     trace_gd_ungrab(vc->label, "kbd");
+ }
+ 
++/*
++ * nvkvm: make the grab decide which pointing device the guest sees.
++ *
++ * gd_grab_pointer() confines the host cursor but never touches which mouse
++ * handler is current, so a grab taken while a tablet is current still delivers
++ * ABSOLUTE coordinates and a guest that takes a pointer lock reads no deltas.
++ * Grab makes the relative device current; ungrab puts back the absolute one.
++ *
++ * READ THE COMMIT MESSAGE BEFORE TRUSTING THIS.  Doing the same switch by hand
++ * from the monitor (`mouse_set <relative index>`, then grab) was tried on real
++ * hardware and did NOT produce motion in the guest.  This code is the necessary
++ * half of the fix, not the demonstrated whole of it.
++ */
++
++/* Index of the absolute device to restore on ungrab; 0 = nothing saved. */
++static int nvkvm_gd_saved_mouse;
++
++/*
++ * One walk over the mouse list.  Returns the index of the device to make
++ * current for `absolute`, or 0 when the guest has none; *cur / *cur_abs
++ * describe whichever device is current right now (*cur is 0 when the guest has
++ * no mouse at all).
++ *
++ * qmp_query_mice() marks the HEAD of QEMU's handler list current and builds its
++ * answer by PREPENDING, so the list it hands back runs tail-to-head: the match
++ * closest to the head -- the most recently activated one, i.e. the device the
++ * guest most recently chose to enable -- is the LAST match in the list, not the
++ * first.  That is why the loop below overwrites `found` instead of stopping.
++ */
++static int nvkvm_gd_pick_mouse(bool absolute, int *cur, bool *cur_abs)
++{
++    MouseInfoList *mice, *entry;
++    int found = 0;
++
++    *cur = 0;
++    *cur_abs = false;
++
++    mice = qmp_query_mice(NULL);
++    for (entry = mice; entry != NULL; entry = entry->next) {
++        MouseInfo *m = entry->value;
++
++        if (m->current) {
++            *cur = (int)m->index;
++            *cur_abs = m->absolute;
++        }
++        if (m->absolute == absolute) {
++            found = (int)m->index;
++        }
++    }
++    qapi_free_MouseInfoList(mice);
++
++    return found;
++}
++
++static void nvkvm_gd_grab_set_relative(GtkDisplayState *s)
++{
++    bool cur_abs = false;
++    int cur = 0;
++    int rel;
++
++    nvkvm_gd_saved_mouse = 0;
++
++    rel = nvkvm_gd_pick_mouse(false, &cur, &cur_abs);
++    if (rel == 0 || rel == cur) {
++        /*
++         * No relative device at all -- the default tablet-only config -- or the
++         * guest already has one current.  Change nothing, so the grab behaves
++         * exactly as it did before this patch.
++         */
++        return;
++    }
++
++    if (!qemu_mouse_set(rel, NULL)) {
++        /* Raced with an unplug.  Keep whatever is current; a confined cursor
++         * is still better than a half-applied switch. */
++        return;
++    }
++
++    /* Only an absolute device is worth restoring by index; see
++     * nvkvm_gd_ungrab_set_absolute(). */
++    nvkvm_gd_saved_mouse = cur_abs ? cur : 0;
++
++    /*
++     * gd_motion_event() derives relative deltas from s->last_x/last_y, which
++     * up to now were written by ABSOLUTE motion events -- and no motion event
++     * arrives at all while the pointer is outside the window, so they can be
++     * arbitrarily stale.  Clearing last_set makes the first event after the
++     * grab seed the position instead of emitting that staleness as one huge
++     * delta, which the guest would render as the view snapping round.  The
++     * edge-warp path in gd_motion_event() clears it for the same reason.
++     */
++    s->last_set = FALSE;
++}
++
++static void nvkvm_gd_ungrab_set_absolute(void)
++{
++    bool cur_abs = false;
++    int cur = 0;
++    int want = nvkvm_gd_saved_mouse;
++    int abs_idx;
++
++    nvkvm_gd_saved_mouse = 0;
++
++    abs_idx = nvkvm_gd_pick_mouse(true, &cur, &cur_abs);
++    if (cur_abs) {
++        /*
++         * Already absolute -- and this is the case that matters for the
++         * auto-ungrab in gd_mouse_mode_change().  That notifier fires from
++         * INSIDE qemu_input_handler_activate() when the guest makes an absolute
++         * device current while we hold the grab, and it reaches this function
++         * through gd_ungrab_pointer().  Calling qemu_mouse_set() here would
++         * re-enter the notifier and undo the guest's own choice, so don't.
++         */
++        return;
++    }
++    if (want != 0 && qemu_mouse_set(want, NULL)) {
++        return;
++    }
++    /*
++     * Nothing was saved (the grab found the guest already relative), or the
++     * saved device has been unplugged since.  Fall back to any absolute device;
++     * with none -- a relative-only guest -- leave the guest alone, as before.
++     */
++    if (abs_idx != 0 && abs_idx != want) {
++        qemu_mouse_set(abs_idx, NULL);
++    }
++}
++
+ static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
+ {
+     GdkDisplay *display = gtk_widget_get_display(vc->gfx.drawing_area);
+@@ -1637,6 +1766,9 @@ static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
+     gdk_device_get_position(gd_get_pointer(display),
+                             NULL, &vc->s->grab_x_root, &vc->s->grab_y_root);
+     vc->s->ptr_owner = vc;
++    /* nvkvm: after ptr_owner is set, so the mouse-mode notifier this can fire
++     * sees an owner and a relative console, and therefore does not ungrab. */
++    nvkvm_gd_grab_set_relative(vc->s);
+     gd_update_caption(vc->s);
+     trace_gd_grab(vc->label, "ptr", reason);
+ }
+@@ -1656,6 +1788,9 @@ static void gd_ungrab_pointer(GtkDisplayState *s)
+     gdk_device_warp(gd_get_pointer(display),
+                     gtk_widget_get_screen(vc->gfx.drawing_area),
+                     vc->s->grab_x_root, vc->s->grab_y_root);
++    /* nvkvm: after ptr_owner is cleared above, so the mouse-mode notifier this
++     * can fire finds no owner and cannot recurse back into an ungrab. */
++    nvkvm_gd_ungrab_set_absolute();
+     gd_update_caption(s);
+     trace_gd_ungrab(vc->label, "ptr");
+ }

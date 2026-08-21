@@ -1,13 +1,13 @@
 # QEMU patches
 
-Everything nvkvm changes in **upstream QEMU** is in this directory: five patch
-files, 94 added lines and 2 removed, against the `v9.2.0` tag
+Everything nvkvm changes in **upstream QEMU** is in this directory: nine patch
+files, 631 added lines and 15 removed, against the `v9.2.0` tag
 (`ae35f033b874c627d81d51070187fbf55f0bf1a7`). Nothing else in the QEMU tree is
 edited.
 
 They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
-A reader deciding whether to trust this can read five diffs; a maintainer
+A reader deciding whether to trust this can read nine diffs; a maintainer
 bumping the QEMU version resolves conflicts with ordinary tools instead of
 rewriting editing logic; and "is it already applied?" is answered by
 `git apply --reverse --check` rather than by grepping the tree for a comment
@@ -20,6 +20,11 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | `0003-egl-helpers-import-dmabuf-via-texstorage.patch` | `ui/egl-helpers.c` | imports dma-bufs with `glEGLImageTargetTexStorageEXT`; NVIDIA rejects the legacy OES bind for external-only images |
 | `0004-console-do-not-abort-on-deviceless-console.patch` | `ui/console.c` | skips non-graphic consoles in `qemu_console_lookup_by_device()`, which otherwise aborts QEMU on `screendump` |
 | `0005-gtk-switch-to-guest-display-when-it-goes-live.patch` | `include/ui/gtk.h`, `ui/gtk.c`, `ui/gtk-egl.c`, `ui/gtk-gl-area.c` | switches the GTK window to the guest's head the first time it presents real content, once, and only from the page the window opened on |
+| `0006-gtk-no-implicit-grab-on-click.patch` | `ui/gtk.c` | drops upstream's grab-on-first-left-click, so entering grab mode is Ctrl+Alt+G or the View menu and nothing else |
+| `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | on grab, makes a relative mouse the guest's current device; on ungrab, restores the absolute one. **Not known to work** — see its header |
+| `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
+| `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. Pointer lock was **reported working** on that box; the evtest that would prove it was never read — see its header |
+| `0010-sdl2-separate-cursor-hiding-from-input-ownership.patch` | `ui/sdl2.c` | Four grab-mode defects with one root cause: `gui_grab` conflates "hiding the host cursor" with "the guest owns your input". Only an explicit grab locks; adds the keyboard grab SDL never took; one keypress is one toggle; the caption stops lying. Verified interactively on an RTX 3050. |
 
 Each patch's commit message says *why* it is there. Read those before changing
 one — several of them record a measurement (a driver version, an error code)
@@ -27,7 +32,7 @@ that is the whole justification for the change.
 
 ## Which of these should stop existing
 
-Three of the five carry `ui/` changes, and `ui/` is the surface we would most
+Eight of the ten carry `ui/` changes, and `ui/` is the surface we would most
 like to shed — it is generic front-end code, shared with every other QEMU user,
 and the part a reviewer has least reason to trust us with.
 
@@ -51,8 +56,45 @@ something worth looking at". A `dpy_console_request_focus()`-shaped mechanism,
 with the front end owning the policy, would be the upstreamable version. Until
 someone writes that, this stays downstream.
 
+`0006` is a behaviour change upstream deliberately wants for mouse-only guests,
+so it cannot go as-is; the upstreamable version is a display option
+(`-display gtk,grab-on-click=off`) defaulting to today's behaviour.
+
+`0007` and `0009` are the same idea in two front ends, which is itself the
+argument for the upstreamable version: a shared helper in `ui/input.c` that
+expresses "a grab wants a relative device" once, instead of once per backend.
+`0007` was tried by hand and did not work — on GTK it cannot, because that
+backend never asks the compositor for a lock. `0009` is the same change where
+the lock is real, and pointer lock was reported working with it in place.
+Neither has an evtest trace behind it; both headers say so at the top.
+
+`0008` is two things wearing one number, and only one of them is ours. Its
+first three parts — SDL had no `dpy_gl_scanout_dmabuf`, nothing on the scanout
+path created a window, and nothing ever set `qemu_egl_display` for an SDL
+window — are plain upstream gaps, and `ui/sdl2.c` is the last front end with a
+GL context and no dma-buf scanout. Those belong on qemu-devel roughly as they
+stand. The window-raise is nvkvm policy in a generic front end, exactly like
+`0005`, and would need the same `dpy_console_request_focus()`-shaped mechanism
+before it could go anywhere.
+
 `0001` and `0002` are downstream by nature: they register a device that is not
 upstream and claim a virtio ID that is not assigned. They will never leave.
+
+## "It works, but it is slow"
+
+A second hardware session, on an RTX 3050, took `0008` + `0009` + `0010` all the way: desktop rendering, pointer lock working, Super forwarded to the guest, and a single
+ctrl-alt-g each way. `0010` is what closed the gap between "the lock engages" and "the
+mode is usable".
+
+The earlier session with `0008` + `0009` reported the SDL window usable
+and pointer lock working, and also reported it as slow. That is not diagnosed.
+The ranked suspects, the check for each, and the reason none of them is a line
+of code in `0008`, are written out under **IF IT IS SLOW** in
+[`0008-sdl2-show-the-guest-gpu-head.patch`](0008-sdl2-show-the-guest-gpu-head.patch).
+The short version: `nvkvm_present_decide_mode()` defaults to **readback**
+unless `NVKVM_PRESENT_MODE=gl` is in the environment, and readback copies 8 MB
+out of the GPU and 8 MB back into it every frame. Check `grep "window mode"` in
+the QEMU log before looking anywhere else.
 
 ## What is *not* here
 
@@ -72,9 +114,10 @@ git apply         /path/to/nvkvm/patches/*.patch
 `scripts/build_qemu.sh` does exactly this, plus the same `--reverse --check`
 already-applied test for each patch so a re-run is a no-op.
 
-`0005` only touches files that are compiled when QEMU is configured
-`--enable-gtk` (`NVKVM_QEMU_UI=1`). The default headless build applies it and
-never compiles a line of it.
+`0005`–`0007` only touch files that are compiled when QEMU is configured
+`--enable-gtk`, and `0008`–`0009` only files compiled when it is configured
+`--enable-sdl` (both come from `NVKVM_QEMU_UI=1`). The default headless build
+applies all five and never compiles a line of them.
 
 ## Regenerating them after a QEMU version bump
 

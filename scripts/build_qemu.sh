@@ -3,7 +3,7 @@
 #                 minimal KVM-only QEMU binary at /opt/qemu-nvkvm.
 #
 # This script is a CONVENIENCE, not the mechanism.  Everything it does to
-# upstream QEMU is five patch files in patches/, applied with `git apply`;
+# upstream QEMU is ten patch files in patches/, applied with `git apply`;
 # everything it adds is a file copy.  docs/howto/build.md walks the identical
 # sequence by hand, and you can follow it instead of running this — that is the
 # point of keeping the delta as patches rather than as sed expressions.
@@ -249,15 +249,15 @@ fi
 
 # ── 3. Apply the QEMU patch series ────────────────────────────────────────
 #
-# Everything nvkvm changes in *upstream* QEMU lives in patches/ as four
+# Everything nvkvm changes in *upstream* QEMU lives in patches/ as nine
 # ordinary patch files.  "What does this do to my QEMU?" is therefore answered
-# by reading four diffs, not by reading this script and mentally executing the
+# by reading nine diffs, not by reading this script and mentally executing the
 # edits it generates.  Each patch carries a header saying why it exists;
 # patches/README.md is the index, and docs/howto/build.md walks the same steps
 # by hand.
 #
 # This step used to be sed plus inline `python3 - <<EOF` heredocs that mutated
-# the four files in place.  Three things were wrong with that:
+# the four files it then touched in place.  Three things were wrong with that:
 #   * it produced no diff, so the delta was not reviewable;
 #   * it was not replicable by hand -- `git apply` is, a sed replacement is not;
 #   * a QEMU version bump meant rewriting the editing logic rather than
@@ -328,7 +328,7 @@ fi
 # ── 4. Copy nvkvm QEMU source files into hw/misc/ ─────────────────────────
 # The device itself is NOT a patch: it is ~12,900 lines of new files that touch
 # nothing upstream, so a patch would be 12,900 lines of pure addition and no
-# easier to review than the files it copies.  Patches are for the four upstream
+# easier to review than the files it copies.  Patches are for the upstream
 # files we modify; new files are copied.
 echo "[4/9] Copying nvkvm QEMU source files to $QEMU_SRC/hw/misc/..."
 cp "$REPO_ROOT/src/qemu/"*.c "$QEMU_SRC/hw/misc/"
