@@ -2,6 +2,12 @@
 # build_qemu.sh — clone QEMU 9.2, patch virtio-nvgpu into it, and build a
 #                 minimal KVM-only QEMU binary at /opt/qemu-nvkvm.
 #
+# This script is a CONVENIENCE, not the mechanism.  Everything it does to
+# upstream QEMU is five patch files in patches/, applied with `git apply`;
+# everything it adds is a file copy.  docs/howto/build.md walks the identical
+# sequence by hand, and you can follow it instead of running this — that is the
+# point of keeping the delta as patches rather than as sed expressions.
+#
 # Guarded: if /opt/qemu-nvkvm/bin/qemu-system-x86_64 already exists the script
 # prints a message and exits successfully WITHOUT rebuilding anything.  Pass
 # --force to rebuild over an existing install -- you need it after editing
@@ -241,13 +247,95 @@ else
     echo "[2/9] QEMU source already present at $QEMU_SRC — skipping clone."
 fi
 
-# ── 3. Copy nvkvm QEMU source files into hw/misc/ ─────────────────────────
-echo "[3/9] Copying nvkvm QEMU source files to $QEMU_SRC/hw/misc/..."
+# ── 3. Apply the QEMU patch series ────────────────────────────────────────
+#
+# Everything nvkvm changes in *upstream* QEMU lives in patches/ as four
+# ordinary patch files.  "What does this do to my QEMU?" is therefore answered
+# by reading four diffs, not by reading this script and mentally executing the
+# edits it generates.  Each patch carries a header saying why it exists;
+# patches/README.md is the index, and docs/howto/build.md walks the same steps
+# by hand.
+#
+# This step used to be sed plus inline `python3 - <<EOF` heredocs that mutated
+# the four files in place.  Three things were wrong with that:
+#   * it produced no diff, so the delta was not reviewable;
+#   * it was not replicable by hand -- `git apply` is, a sed replacement is not;
+#   * a QEMU version bump meant rewriting the editing logic rather than
+#     resolving conflicts with ordinary tools.
+#
+# Idempotency is decided by `git apply --reverse --check` -- "does this patch
+# un-apply cleanly?", i.e. is it already in the tree.  The old script grepped
+# the tree for a comment string taken from the patch body, so rewording a
+# comment silently made the patch apply a second time.
+#
+# The whole pending set is --check'ed as ONE unit before anything is written.
+# git apply is all-or-nothing per invocation, so that is what guarantees a
+# mismatch fails with the tree untouched rather than half-mutated.
+echo "[3/9] Applying the QEMU patch series..."
+
+PATCH_DIR="$REPO_ROOT/patches"
+shopt -s nullglob
+NVKVM_PATCHES=( "$PATCH_DIR"/*.patch )
+shopt -u nullglob
+if [ "${#NVKVM_PATCHES[@]}" -eq 0 ]; then
+    echo "ERROR: no *.patch files found in $PATCH_DIR" >&2
+    echo "  The QEMU delta lives there; without it the build produces a stock" >&2
+    echo "  QEMU that does not know what virtio-nvgpu is." >&2
+    exit 1
+fi
+
+cd "$QEMU_SRC"
+NVKVM_PENDING=()
+for _p in "${NVKVM_PATCHES[@]}"; do
+    _name="$(basename "$_p")"
+    if git apply --reverse --check "$_p" 2>/dev/null; then
+        echo "  already applied: $_name"
+    elif git apply --check "$_p" 2>/dev/null; then
+        NVKVM_PENDING+=( "$_p" )
+    else
+        cat >&2 <<EOF
+
+ERROR: $_name neither applies to nor is already applied to
+       $QEMU_SRC
+
+This almost always means one of:
+  * the QEMU tree is not $QEMU_VERSION (the patches are written against the
+    v$QEMU_VERSION tag and nothing else);
+  * the tree was hand-edited, or half-patched by an older build script;
+  * the patch was edited and no longer matches upstream context.
+
+git's own reason follows.  To start clean:
+    rm -rf $QEMU_SRC && $0 --force
+EOF
+        git apply --check "$_p" >&2 || true
+        exit 1
+    fi
+done
+
+if [ "${#NVKVM_PENDING[@]}" -eq 0 ]; then
+    echo "  all ${#NVKVM_PATCHES[@]} patches already applied — nothing to do."
+else
+    if ! git apply --check "${NVKVM_PENDING[@]}"; then
+        echo "ERROR: the patch series does not apply as a set — tree untouched." >&2
+        exit 1
+    fi
+    git apply "${NVKVM_PENDING[@]}"
+    for _p in "${NVKVM_PENDING[@]}"; do
+        echo "  applied: $(basename "$_p")"
+    done
+fi
+
+# ── 4. Copy nvkvm QEMU source files into hw/misc/ ─────────────────────────
+# The device itself is NOT a patch: it is ~12,900 lines of new files that touch
+# nothing upstream, so a patch would be 12,900 lines of pure addition and no
+# easier to review than the files it copies.  Patches are for the four upstream
+# files we modify; new files are copied.
+echo "[4/9] Copying nvkvm QEMU source files to $QEMU_SRC/hw/misc/..."
 cp "$REPO_ROOT/src/qemu/"*.c "$QEMU_SRC/hw/misc/"
 cp "$REPO_ROOT/src/qemu/"*.h "$QEMU_SRC/hw/misc/"
 
-# ── 4. Copy ABI / common headers into hw/misc/nvkvm_inc/ ──────────────────
-echo "[4/9] Copying ABI and common headers to $QEMU_SRC/hw/misc/nvkvm_inc/..."
+# ── 5. Copy ABI / common headers into hw/misc/nvkvm_inc/ ──────────────────
+echo "[5/9] Copying ABI and common headers to $QEMU_SRC/hw/misc/nvkvm_inc/..."
 mkdir -p "$QEMU_SRC/hw/misc/nvkvm_inc"
 # Rebuild fix 2026-07-04: the nvkvm .c/.h include SEVERAL headers from src/abi + src/common
 # (nvgpu.h, uvm.h, nvkvm_proto.h AND nvkvm_abi.h, nvkvm_isolate_proto.h, nvkvm_ring.h, ...),
@@ -263,12 +351,18 @@ cp "$REPO_ROOT/src/qemu/nvkvm_linux_types.h" \
 # must land in hw/misc/ alongside the sources (bench-rebuild fix 2026-07-29).
 cp "$REPO_ROOT/src/stub/nvkvm_stub_bin.h" "$QEMU_SRC/hw/misc/"
 
-# ── 5. Fix include paths in the copied files ──────────────────────────────
-echo "[5/9] Fixing include paths in copied files..."
+# ── 6. Fix include paths in the copied files ──────────────────────────────
+echo "[6/9] Fixing include paths in copied files..."
 # The nvkvm sources use relative paths like ../../src/common/foo.h and
 # ../../src/abi/bar.h that are correct relative to src/qemu/ but wrong inside
 # hw/misc/.  Rewrite EVERY such include (across all copied .c and .h) to the
 # local nvkvm_inc/ sub-directory — generalized so new headers don't break it.
+#
+# These two seds survive the move to a patch series on purpose: they rewrite
+# only files nvkvm owns and that this script just copied in, so they are part
+# of "install our sources", not part of "modify QEMU".  Nothing upstream is
+# touched here, and re-running them is a no-op because the copy is fresh.
+#
 # Rebuild fix 2026-07-19: the previous sed used '|' as BOTH the s/// delimiter AND
 # inside the regex alternation (common|abi), so GNU sed parsed the alternation '|'
 # as end-of-command -> "unknown option to `s'".  Use '#' as the delimiter instead.
@@ -280,397 +374,6 @@ sed -i -E \
 sed -i \
     's|#include <linux/types.h>|#include "linux_types_compat.h"|g' \
     "$QEMU_SRC/hw/misc/nvkvm_inc/"*.h
-
-# ── 6. Patch hw/misc/meson.build ─────────────────────────────────────────
-echo "[6/9] Patching $QEMU_SRC/hw/misc/meson.build..."
-
-MESON_BUILD="$QEMU_SRC/hw/misc/meson.build"
-
-# Only patch once (idempotent).
-if ! grep -q 'virtio_nvgpu.c' "$MESON_BUILD"; then
-    # Insert the nvkvm block before the final line of the file.
-    # We use a Python one-liner to keep things portable and avoid sed
-    # multi-line headaches.
-    python3 - "$MESON_BUILD" <<'PYEOF'
-import sys
-
-path = sys.argv[1]
-with open(path, 'r') as fh:
-    lines = fh.readlines()
-
-nvkvm_block = """\
-
-nvkvm_inc = include_directories('nvkvm_inc')
-
-system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
-  'virtio_nvgpu.c',
-  'virtio_nvgpu_pci.c',
-  'nvkvm_dispatch.c',
-  'nvkvm_frontend.c',
-  'nvkvm_objects.c',
-  'nvkvm_mmap_host.c',
-  'nvkvm_handle.c',
-  'nvkvm_isolate.c',
-  'nvkvm_isolate_handlers.c',
-  'nvkvm_tables.c',
-  'nvkvm_present_egl.c',
-))
-"""
-
-# Insert the block before the very last non-empty line.
-insert_pos = len(lines)
-for i in range(len(lines) - 1, -1, -1):
-    if lines[i].strip():
-        insert_pos = i
-        break
-
-lines.insert(insert_pos, nvkvm_block)
-
-with open(path, 'w') as fh:
-    fh.writelines(lines)
-
-print("  meson.build patched successfully.")
-PYEOF
-else
-    echo "  meson.build already contains virtio_nvgpu.c — skipping patch."
-fi
-
-# ── 6b. Patch hw/virtio/virtio.c — extend virtio_device_names table ──────────
-# QEMU's virtio_device_names[] in virtio.c has entries only up to ID ~41.
-# Our device type is 50, so we must extend the table; otherwise
-# virtio_id_to_name() asserts "device_id < G_N_ELEMENTS(virtio_device_names)".
-VIRTIO_C="$QEMU_SRC/hw/virtio/virtio.c"
-if ! grep -q 'virtio-nvgpu' "$VIRTIO_C"; then
-    # The table ends with a line like: [VIRTIO_ID_GPIO] = "virtio-gpio",
-    # We append our entry right after it (before the closing brace).
-    python3 - "$VIRTIO_C" <<'PYEOF'
-import sys, re
-
-path = sys.argv[1]
-with open(path, 'r') as fh:
-    text = fh.read()
-
-# Rebuild fix 2026-07-04: insert our entry RIGHT AFTER the [VIRTIO_ID_GPIO] line
-# inside virtio_device_names[].  The old code used text.rfind('};') which matched
-# the LAST '};' in the file — the virtio_device_info TypeInfo, NOT the names table —
-# corrupting an unrelated struct and breaking the build.  Anchor on the real entry.
-# Rebuild fix 2026-07-19: in QEMU 9.2.0 the [VIRTIO_ID_GPIO] entry is the LAST in the
-# initializer and has NO trailing comma ("virtio-gpio" then "};").  Make the trailing
-# comma optional in the match, and always emit our own entries WITH the needed comma.
-m = re.search(r'^([ \t]*)\[VIRTIO_ID_GPIO\][ \t]*=[ \t]*"virtio-gpio",?[ \t]*\n', text, re.M)
-if not m:
-    print("  ERROR: could not find [VIRTIO_ID_GPIO] entry in virtio_device_names[]", file=sys.stderr)
-    sys.exit(1)
-indent = m.group(1)
-entry = '%s[VIRTIO_ID_GPIO] = "virtio-gpio",\n%s[50] = "virtio-nvgpu",\n' % (indent, indent)
-text = text[:m.start()] + entry + text[m.end():]
-with open(path, 'w') as fh:
-    fh.write(text)
-print("  virtio.c patched successfully (after VIRTIO_ID_GPIO).")
-PYEOF
-else
-    echo "  virtio.c already contains virtio-nvgpu entry — skipping patch."
-fi
-
-# ── 6b. Patch ui/egl-helpers.c: import dma-bufs with TexStorage ───────────
-#
-# QEMU's egl_dmabuf_import_texture() binds an imported dma-buf with
-# glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, ...).  NVIDIA hands the guest's
-# scanout buffers out as *external-only* EGLImages and rejects that call:
-# measured on an RTX 4070 / 595.84, the 2D bind returns GL_INVALID_OPERATION
-# (0x0502) while glEGLImageTargetTexStorageEXT (GL_EXT_EGL_image_storage)
-# succeeds on the very same image.  Without this, -display gtk,gl=on imports
-# every frame, drops it, and shows a black window -- so the only usable path is
-# NVKVM_PRESENT_MODE=readback, which costs a full ~8MB glReadPixels per frame on
-# the main loop and cannot reach 60fps at 1080p.
-#
-# Same fix as nvkvm_import_dmabuf_tex() in src/qemu/nvkvm_present_egl.c.
-echo "[6b/9] Patching ui/egl-helpers.c for TexStorage dma-buf import..."
-if grep -q "glEGLImageTargetTexStorageEXT" "$QEMU_SRC/ui/egl-helpers.c"; then
-    echo "  egl-helpers.c already patched -- skipping."
-else
-    python3 - "$QEMU_SRC/ui/egl-helpers.c" <<'EGLPATCH'
-import sys
-path = sys.argv[1]
-src = open(path).read()
-old = """    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
-    eglDestroyImageKHR(qemu_egl_display, image);"""
-new = """    {
-        /* nvkvm: NVIDIA rejects the legacy OES bind for external-only
-         * dma-buf images (GL_INVALID_OPERATION); EXT_EGL_image_storage
-         * takes the same image as immutable GL_TEXTURE_2D storage. */
-        static PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC nvkvm_tex_storage;
-        static bool nvkvm_looked_up;
-        if (!nvkvm_looked_up) {
-            nvkvm_looked_up = true;
-            nvkvm_tex_storage = (PFNGLEGLIMAGETARGETTEXSTORAGEEXTPROC)
-                eglGetProcAddress("glEGLImageTargetTexStorageEXT");
-        }
-        if (nvkvm_tex_storage) {
-            nvkvm_tex_storage(GL_TEXTURE_2D, (GLeglImageOES)image, NULL);
-        } else {
-            glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
-        }
-    }
-    eglDestroyImageKHR(qemu_egl_display, image);"""
-if old not in src:
-    sys.exit("egl-helpers.c: expected bind sequence not found")
-open(path, 'w').write(src.replace(old, new, 1))
-print("  ui/egl-helpers.c patched.")
-EGLPATCH
-fi
-
-# ── 6c. Patch ui/console.c: do not abort when a console has no "device" ──────
-#
-# `screendump <file> nvkvm0` killed QEMU outright:
-#
-#   Unexpected error in object_property_find_err() at ../qom/object.c:1349:
-#   Property 'qemu-fixed-text-console.device' not found
-#
-# qemu_console_lookup_by_device() walks EVERY console and reads the "device"
-# link with &error_abort.  But "device" (and "head") are class properties of
-# qemu-graphic-console only -- text consoles never have them -- so the walk
-# aborts the moment it steps over a text console on the way to the console it
-# was asked for.  The sibling loop at qemu_graphic_console_lookup_unused()
-# already guards with QEMU_IS_GRAPHIC_CONSOLE(); this one simply forgot.
-#
-# It is order-dependent, not device-specific: a VGA whose console happens to be
-# first in the list is found before the walk reaches any text console and so
-# survives, which is exactly why this went unnoticed.  nvkvm's console is
-# registered later and sits behind one.
-#
-# Non-graphic consoles can never be the answer here anyway, so skipping them is
-# both the minimal fix and the upstream-shaped one.
-echo "[6c/9] Patching ui/console.c for console lookup abort..."
-if grep -q "nvkvm: .device. and .head. are class properties" "$QEMU_SRC/ui/console.c"; then
-    echo "  console.c already patched -- skipping."
-else
-    python3 - "$QEMU_SRC/ui/console.c" <<'CONPATCH'
-import sys
-path = sys.argv[1]
-src = open(path).read()
-old = """    QTAILQ_FOREACH(con, &consoles, next) {
-        obj = object_property_get_link(OBJECT(con),
-                                       "device", &error_abort);
-        if (DEVICE(obj) != dev) {
-            continue;
-        }
-        h = object_property_get_uint(OBJECT(con),
-                                     "head", &error_abort);"""
-new = """    QTAILQ_FOREACH(con, &consoles, next) {
-        /* nvkvm: "device" and "head" are class properties of
-         * qemu-graphic-console ONLY.  Text consoles do not have them, and both
-         * reads below pass &error_abort -- so walking past a text console on
-         * the way to the requested one aborts QEMU ("Property
-         * 'qemu-fixed-text-console.device' not found").  A device whose
-         * console happens to come first is found before the walk gets there,
-         * which is why this is order-dependent rather than device-specific.
-         * A non-graphic console can never be the match, so skip it. */
-        if (!QEMU_IS_GRAPHIC_CONSOLE(con)) {
-            continue;
-        }
-        obj = object_property_get_link(OBJECT(con),
-                                       "device", &error_abort);
-        if (DEVICE(obj) != dev) {
-            continue;
-        }
-        h = object_property_get_uint(OBJECT(con),
-                                     "head", &error_abort);"""
-if old not in src:
-    sys.exit("console.c: qemu_console_lookup_by_device() body not found as expected")
-open(path, 'w').write(src.replace(old, new, 1))
-print("  ui/console.c patched.")
-CONPATCH
-fi
-
-# ── 6d. Patch the GTK UI: show the guest's GPU head when it goes live ───────
-#
-# QEMU's default VGA is console 0 and nvkvm's scanout console registers second,
-# so the GTK window opens on the BOOT console and stays there forever: ui/gtk.c
-# builds one notebook page per console in index order and nothing ever changes
-# the current page.  The guest desktop renders perfectly on console 1 while the
-# user watches a login prompt on console 0 -- from outside, indistinguishable
-# from a hang.
-#
-# A console goes live the first time it gets real content.  Every console starts
-# on a PLACEHOLDER surface ("Guest has not initialized the display (yet)"), so
-# for the surface paths the first non-placeholder surface is that moment; for
-# the GL paths, a scanout texture is real content by definition.
-#
-# The rule is deliberately narrow -- fire only while the window is still on the
-# page it opened on (page 0), only for a page above it, and at most once:
-#   * the VGA going live is page 0, so it cannot consume the one shot;
-#   * nvkvm going live is a page above 0, so it does;
-#   * once fired -- or once the user has moved the tab themselves -- the
-#     condition can never hold again, so the user is never dragged back;
-#   * with -vga none there is only page 0, so it is a no-op.
-# A latch, not a policy engine, and it needs no new state to decide.
-#
-# All five entry points are hooked, not just the one the default present mode
-# happens to use: readback goes through gd_switch(), while NVKVM_PRESENT_MODE=gl
-# goes through the egl/gl-area scanout paths and would otherwise silently never
-# switch.  (*_scanout_dmabuf both funnel into *_scanout_texture, so hooking the
-# texture entry covers the dma-buf one too.)
-echo "[6d/9] Patching GTK UI for guest-head auto-switch..."
-if grep -q "nvkvm_gd_maybe_autoswitch" "$QEMU_SRC/include/ui/gtk.h"; then
-    echo "  GTK UI already patched -- skipping."
-else
-    python3 - "$QEMU_SRC" <<'GTKPATCH'
-import sys, os
-root = sys.argv[1]
-
-def patch(relpath, edits):
-    path = os.path.join(root, relpath)
-    src = open(path).read()
-    for old, new in edits:
-        if src.count(old) != 1:
-            sys.exit("%s: anchor not found exactly once (%d): %.60r"
-                     % (relpath, src.count(old), old))
-        src = src.replace(old, new, 1)
-    open(path, 'w').write(src)
-    print("  %s patched." % relpath)
-
-# 1. the shared latch + helper, after struct GtkDisplayState is complete
-patch('include/ui/gtk.h', [(
-"""/* ui/gtk-egl.c */""",
-"""/*
- * nvkvm: one-shot auto-switch to the guest's GPU head.  See scripts/build_qemu.sh
- * for the full rationale.  Declared here because the surface path (ui/gtk.c) and
- * both GL paths (ui/gtk-egl.c, ui/gtk-gl-area.c) all need it, and the latch has
- * to be shared between them rather than per-file.
- */
-extern bool nvkvm_gd_auto_switched;
-
-static inline void nvkvm_gd_maybe_autoswitch(VirtualConsole *vc)
-{
-    GtkNotebook *nb;
-    gint page;
-
-    if (nvkvm_gd_auto_switched || !vc || !vc->s || !vc->s->notebook ||
-        !vc->tab_item) {
-        return;
-    }
-    nb = GTK_NOTEBOOK(vc->s->notebook);
-    page = gtk_notebook_page_num(nb, vc->tab_item);
-    /* page < 0 means this console was detached into its own window. */
-    if (page > 0 && gtk_notebook_get_current_page(nb) == 0) {
-        nvkvm_gd_auto_switched = true;
-        gtk_notebook_set_current_page(nb, page);
-        /* One line, once: the window moving on its own is surprising if you
-         * are not expecting it, and this is the only record that it happened. */
-        fprintf(stderr, "nvkvm: guest display is live -- switched window to "
-                        "console page %d\\n", page);
-    }
-}
-
-/* ui/gtk-egl.c */""")])
-
-# 2. define the latch, and hook the non-GL surface path
-patch('ui/gtk.c', [
-("""static void gd_switch(DisplayChangeListener *dcl,
-                      DisplaySurface *surface)
-{""",
- """bool nvkvm_gd_auto_switched;
-
-static void gd_switch(DisplayChangeListener *dcl,
-                      DisplaySurface *surface)
-{"""),
-("""    if (resized) {
-        gd_update_windowsize(vc);
-    } else {
-        gd_update_full_redraw(vc);
-    }
-}""",
- """    if (resized) {
-        gd_update_windowsize(vc);
-    } else {
-        gd_update_full_redraw(vc);
-    }
-
-    if (!surface_is_placeholder(surface)) {
-        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
-    }
-}"""),
-])
-
-# 3. GL / EGL paths
-patch('ui/gtk-egl.c', [
-("""    if (resized) {
-        gd_update_windowsize(vc);
-    }
-
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
-}""",
- """    if (resized) {
-        gd_update_windowsize(vc);
-    }
-
-    if (!surface_is_placeholder(surface)) {
-        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
-    }
-
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
-}"""),
-("""    gtk_egl_set_scanout_mode(vc, true);
-    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
-                         backing_id, false);
-}""",
- """    gtk_egl_set_scanout_mode(vc, true);
-    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
-                         backing_id, false);
-
-    nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: a scanout texture is real content */
-}"""),
-])
-
-# 4. GL-area path
-patch('ui/gtk-gl-area.c', [
-("""        surface_gl_create_texture(vc->gfx.gls, surface);
-    }
-    vc->gfx.ds = surface;
-
-    if (resized) {
-        gd_update_windowsize(vc);
-    }
-}""",
- """        surface_gl_create_texture(vc->gfx.gls, surface);
-    }
-    vc->gfx.ds = surface;
-
-    if (resized) {
-        gd_update_windowsize(vc);
-    }
-
-    if (!surface_is_placeholder(surface)) {
-        nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: head just went live */
-    }
-}"""),
-("""    gtk_gl_area_set_scanout_mode(vc, true);
-    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
-                         backing_id, false);
-}""",
- """    gtk_gl_area_set_scanout_mode(vc, true);
-    egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
-                         backing_id, false);
-
-    nvkvm_gd_maybe_autoswitch(vc);   /* nvkvm: a scanout texture is real content */
-}"""),
-])
-GTKPATCH
-    python3 - "$QEMU_SRC/ui/gtk-gl-area.c" <<'GLAREA'
-import sys
-path = sys.argv[1]
-src = open(path).read()
-old = """    gd_gl_area_scanout_texture(dcl, texture, y0_top,
-                               backing_width, backing_height,
-                               x, y, width, height, NULL);"""
-if src.count(old) != 1:
-    sys.exit("gtk-gl-area.c: scanout_dmabuf -> scanout_texture call not found")
-print("  ui/gtk-gl-area.c: dmabuf path funnels through scanout_texture (already hooked).")
-GLAREA
-fi
 
 # ── 7. Configure QEMU ─────────────────────────────────────────────────────
 #
