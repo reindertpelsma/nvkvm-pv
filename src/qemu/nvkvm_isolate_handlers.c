@@ -3743,6 +3743,35 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 {
 	memset(resp, 0, sizeof(*resp));
 
+	/*
+	 * S-2: REALIZE_UVM_MAPPING is MMAP_ON_ISOLATE's sibling -- it hands a
+	 * guest-named isolate a mapping made from a guest-named fd handle -- but
+	 * it was the one handler of the pair that took the guest's word for the
+	 * pairing.  It read req->isolate_id straight through to
+	 * nvkvm_isolate_realize_uvm_fd() and never looked at req->session_id or
+	 * req->fd_handle_id at all, even though the guest already puts both on
+	 * the wire (nvkvm_virtio.c:1546-1551).  So one isolate could drive a UVM
+	 * realize -- and burn GPA window space, see the iso_mmap_alloc note
+	 * below -- inside ANY other isolate in the VM, naming an fd handle it
+	 * does not own.
+	 *
+	 * Same two independent assertions MMAP_ON_ISOLATE checks, in the same
+	 * order and with the same answer: the handle must belong to the session
+	 * the caller claims, and that session must own the isolate named.
+	 * h->session_id is QEMU's own bookkeeping, not the guest's word for it.
+	 */
+	struct nvkvm_handle *fh = nvkvm_handle_get(&nv->handles, req->fd_handle_id);
+	if (!fh ||
+	    fh->session_id != req->session_id ||
+	    !session_has_isolate(nv, req->session_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm: realize_uvm: handle/isolate session mismatch "
+			  "(fd_h=%u h_sess=%u req_sess=%u iso=%u)\n",
+			  req->fd_handle_id, fh ? fh->session_id : 0,
+			  req->session_id, req->isolate_id);
+		resp->status = (uint32_t)-EPERM;
+		return 0;
+	}
+
 	/* §8a.1 — pointer presence. */
 	if (!state_buf || !intent_buf) {
 		resp->status = (uint32_t)-EINVAL;
