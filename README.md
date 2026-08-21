@@ -143,6 +143,41 @@ Verified end to end on an RTX 3060: cold `docker compose up` to `nvidia-smi`
 inside the guest, surviving a guest reboot and a guest `apt` install of a
 conflicting NVIDIA package.
 
+## Continuous integration
+
+Everything that can be checked without a GPU is checked on every push, in about
+a minute:
+
+| Workflow | What it is for |
+|---|---|
+| [`ci.yml`](.github/workflows/ci.yml) | The unit suite, a two-second compile check over `src/qemu/`, and `shellcheck` on `scripts/` |
+| [`kernel-matrix.yml`](.github/workflows/kernel-matrix.yml) | Builds `nvkvm-guest.ko` against six distro kernels spanning the supported 5.15–7.0 range |
+| [`qemu-build.yml`](.github/workflows/qemu-build.yml) | The full `build_qemu.sh` — nightly and on `main`, because it takes ~35 minutes |
+
+Run the fast lane yourself:
+
+```bash
+bash tests/unit/run_tests.sh        # or: make -C tests/unit check
+bash tests/qemu_syntax_check.sh
+bash tests/kernel_matrix.sh         # needs Docker
+```
+
+Use `run_tests.sh`, not `make run`. `make run` exits non-zero by design —
+`test_isolate` fails 5 of its 7 cases on pre-existing API drift, documented in
+`tests/unit/Makefile` — which makes it useless as a pass/fail signal.
+`run_tests.sh` names those five cases explicitly, so the suite is green when
+exactly those fail and red for anything else: a sixth failure, one of the five
+starting to pass, a suite that fails to build, or a suite that quietly loses
+assertions.
+
+**No GPU work runs in CI.** GitHub-hosted runners have no NVIDIA device, so
+[`tests/validate.sh`](tests/validate.sh) is not attempted there; hardware
+coverage comes from [`scripts/sweep_matrix.py`](scripts/sweep_matrix.py) against
+rented boxes. That script tars the *working tree*, not `HEAD`, so it refuses to
+spend money when the two differ — check it yourself with
+`scripts/sweep_matrix.py --check-tree`, and override deliberately with
+`--allow-dirty`.
+
 ## First result
 
 ```bash
@@ -574,6 +609,7 @@ validating. Verify your own workload against a host run all the same; see
 | [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |
 | [Reading the parity numbers](docs/reference/parity.md) | What the host/guest ratios do and do not establish |
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
+| [`.github/workflows/`](.github/workflows/) | What CI checks on every push, and why each job exists |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 | [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
 
