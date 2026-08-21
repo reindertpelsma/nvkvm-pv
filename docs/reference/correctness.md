@@ -205,12 +205,22 @@ installed from NVIDIA's official `.run` with `--kernel-module-type=open`.
 
 | host driver | ABI profile nvkvm selected | HOST `vk_compute_dispatch` | GUEST `validate.sh` (before fix) |
 |---|---|---|---|
-| 565.57.01  | 550 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
+| 550.54.14  | 550 | **PASS** | measured after the fix only — 28/28 |
+| 565.57.01  | 550 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL (not re-run after the fix) |
 | 570.124.06 | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
-| 570.148.08 | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
+| 570.148.08 | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL (not re-run after the fix) |
 | 575.57.08  | 570 | **PASS** | **27/28** — `vk_compute_dispatch` FAIL |
 | 580.65.06  | 580 | **PASS** | 28/28 |
 | 580.126.09 | 580 | **PASS** | 28/28 |
+
+Every profile selection above matches what
+[ABI profiles](abi-profiles.md) predicts for that version, on Hopper as
+elsewhere: 550.54.14 → 550, 565.57.01 → 550, 570.x and 575.57.08 → 570, 580.x →
+580. **535.86.05 could not be booted here at all** — its open kernel module does
+not compile against Linux 6.8 (`crypto_tfm_ctx_aligned` and `DRM_UNLOCKED` are
+both gone), so the 535 profile still has no Hopper measurement. That is the same
+"no longer builds against a modern kernel" wall the 515–530 profiles hit, now
+reached one branch higher on a 6.8 host.
 
 **The host column is the whole argument.** Every driver, 570.124.06 included,
 runs the probe correctly on bare metal. A driver that works on the host and
@@ -300,11 +310,18 @@ being wrong here is silent. Letting RM size its own struct cannot be.
 
 ### Verified
 
-| host driver | before | after |
-|---|---|---|
-| 570.124.06 | 27/28, `vk_compute_dispatch` FAIL | **28/28 PASS** |
-| 575.57.08  | 27/28, `vk_compute_dispatch` FAIL | **28/28 PASS** |
-| 580.126.09 | 28/28 | **28/28** (no regression) |
+| host driver | ABI profile | before | after |
+|---|---|---|---|
+| 570.124.06 | 570 | 27/28, `vk_compute_dispatch` FAIL | **28/28 PASS** |
+| 575.57.08  | 570 | 27/28, `vk_compute_dispatch` FAIL | **28/28 PASS** |
+| 550.54.14  | 550 | not measured | **28/28 PASS** |
+| 580.126.09 | 580 | 28/28 | **28/28** (no regression) |
+
+The 550.54.14 row is there because it is the high side of the 550 intra-branch
+ABI boundary, and this is the only Hopper part the project has had — a
+consumer card cannot stand in for it. GA100 needed two fixes that had been
+silently wrong on every consumer Ampere die, so cross-architecture substitution
+is not a safe assumption for anything architecture-specific.
 
 Host-side unit suite (`tests/unit`): `test_ctrl_gate`, `test_dispatch`,
 `test_frontend`, `test_handle` all pass.

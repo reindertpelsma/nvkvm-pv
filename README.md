@@ -378,10 +378,11 @@ Every row below reached a real CUDA kernel launch through the forwarder.
 | RTX 5090 | **Blackwell GB202** | 580.178.04 | 580 | 28/28 |
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
-| H100 PCIe | **Hopper GH100** | 565.57.01 | 550 | 27/28 (`vk_compute_dispatch` — nvkvm bug, pre-580 only, see below) |
-| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 27/28 (`vk_compute_dispatch`) |
-| H100 PCIe | **Hopper GH100** | 570.148.08 | 570 | 27/28 (`vk_compute_dispatch`) |
-| H100 PCIe | **Hopper GH100** | 575.57.08 | 570 | 27/28 (`vk_compute_dispatch`) |
+| H100 PCIe | **Hopper GH100** | 550.54.14 | 550 | 28/28 |
+| H100 PCIe | **Hopper GH100** | 565.57.01 | 550 | 27/28 before the `0xc661` fix; not re-run after |
+| H100 PCIe | **Hopper GH100** | 570.124.06 | 570 | 28/28 (27/28 before the `0xc661` fix) |
+| H100 PCIe | **Hopper GH100** | 570.148.08 | 570 | 27/28 before the `0xc661` fix; not re-run after |
+| H100 PCIe | **Hopper GH100** | 575.57.08 | 570 | 28/28 (27/28 before the `0xc661` fix) |
 | H100 PCIe | **Hopper GH100** | 580.65.06 | 580 | 28/28 |
 | H100 PCIe | **Hopper GH100** | 580.126.09 | 580 | 28/28 |
 | RTX 3050 Laptop | Ampere GA107 mobile | 580.173.02 | 580 | 28/28 |
