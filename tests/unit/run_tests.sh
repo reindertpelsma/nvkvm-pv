@@ -87,6 +87,19 @@ declare -A MARKER_SUITES=(
 ISOLATE_TOTAL=9
 ISOLATE_KNOWN_FAIL="concurrent_ioctl out_of_order_ioctl sequential_ioctl sync_mmap_munmap"
 
+# Cases that legitimately differ BY ENVIRONMENT, and so cannot be pinned either
+# way.  poll_unpoll passes on a normal host but fails on the GitHub runner: CI
+# runs inside a container where the isolate cannot take the namespace rung it
+# takes locally, so the spawn path -- and therefore whether the fd relay reaches
+# a live stub -- is not the same.  Pinning it as failing breaks the local run;
+# pinning it as passing breaks CI.  Listing it here means "either outcome is
+# accepted, everything else must match exactly", which keeps the regression
+# guard sharp for the cases that ARE deterministic.
+#
+# This is a hole, and it is deliberate rather than accidental.  Do not add to
+# this list to silence a case you have not explained.
+ISOLATE_ENV_DEPENDENT="poll_unpoll"
+
 ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist mock_stub"
 
 rc=0
@@ -170,7 +183,20 @@ printf '  known-failing: %s\n' "$ISOLATE_KNOWN_FAIL"
 if [ "$iso_ran" -ne "$ISOLATE_TOTAL" ]; then
     fail "test_isolate ran $iso_ran cases, expected $ISOLATE_TOTAL"
 fi
-if [ "$iso_failed" != "$ISOLATE_KNOWN_FAIL" ]; then
+# Drop the environment-dependent cases from BOTH sides before comparing, so the
+# comparison is over the deterministic cases only.
+iso_cmp=""
+for c in $iso_failed; do
+    skip=0
+    for e in $ISOLATE_ENV_DEPENDENT; do [ "$c" = "$e" ] && skip=1; done
+    [ "$skip" -eq 0 ] && iso_cmp="$iso_cmp $c"
+done
+iso_cmp="$(printf '%s\n' $iso_cmp | sort | tr '\n' ' ' | sed 's/ $//')"
+
+printf '  env-dependent: %s (either outcome accepted)\n' "$ISOLATE_ENV_DEPENDENT"
+printf '  compared    : %s\n' "${iso_cmp:-<none>}"
+
+if [ "$iso_cmp" != "$ISOLATE_KNOWN_FAIL" ]; then
     fail "test_isolate's failing set changed."
     echo "      A case that is failing but not listed is a REGRESSION -- fix it."
     echo "      A listed case that now passes means the isolate-id drift got"
