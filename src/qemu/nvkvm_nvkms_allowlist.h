@@ -52,10 +52,36 @@
  *
  * So 61/62 are not "query-class" as guessed above; they bracket a vblank
  * semaphore control around a registered surface, which is consistent with where
- * they land in the observed 0/17/60/18 (and 17/61/18/62) sequences.  Re-read the
- * enum at the matching tag before trusting these on a new branch: it grows by
- * APPENDING, so old values are stable, but a number seen on 610 may simply not
- * exist on 575.
+ * they land in the observed 0/17/60/18 (and 17/61/18/62) sequences.
+ *
+ * 2026-08-21, LATER, and it invalidates the paragraph above: "it grows by
+ * APPENDING, so old values are stable" is FALSE, and the names just given are
+ * the 575 names attached to a cmdType that was measured on 610.  The enum has
+ * been edited mid-list at least twice.  515->575 INSERTS CHECK_LUT_NOTIFIER at
+ * 13 (everything >= 13 shifts +1); 580->610 DELETES EXPORT_VRR_SEMAPHORE_SURFACE
+ * at 56 and VRR_SIGNAL_SEMAPHORE at 64 (everything above shifts down).  So:
+ *
+ *   value  515.105.01           575/580                  610.43.02
+ *     17   UNREGISTER_SURFACE   REGISTER_SURFACE         REGISTER_SURFACE
+ *     18   GRANT_SURFACE (!)    UNREGISTER_SURFACE       UNREGISTER_SURFACE
+ *     60   (out of range)       SET_FLIPLOCK_GROUP       ENABLE_VBLANK_SEM_CONTROL
+ *     61   (out of range)       ENABLE_VBLANK_SEM_CTRL   DISABLE_VBLANK_SEM_CONTROL
+ *     62   (out of range)       DISABLE_VBLANK_SEM_CTRL  ACCEL_VBLANK_SEM_CONTROLS
+ *
+ * Two things follow.  The cmdType 60 investigated above was measured on 610, so
+ * it is ENABLE_VBLANK_SEM_CONTROL, not SET_FLIPLOCK_GROUP -- which fits the
+ * observed 0/17/60/18 sequence far better and explains why 610 does not issue
+ * 61/62.  And on a 515/520 host this list admits GRANT_SURFACE, one of the very
+ * cross-client sharing verbs the top of this file says must not be reachable.
+ *
+ * This gate is therefore only trustworthy on 575/580, where it was captured.
+ * The fix is not a renumbering -- any fixed table is wrong on some branch -- it
+ * is the per-version ABI-profile plumbing the UVM gate already has
+ * (struct nvkvm_abi_profile, src/common/nvkvm_abi.h), with the allowlist
+ * expressed in NAMES resolved through the profile.  Written up, with the full
+ * vendor-tag table and the shape of the fix, in
+ * docs/internal/nvkms-allowlist-abi-drift.md.  Deliberately NOT changed here:
+ * renumbering for 610 would break 575/580, and widening is never the answer.
  *
  * WHAT IS DELIBERATELY *NOT* HERE, and why (2026-08-21)
  * ----------------------------------------------------

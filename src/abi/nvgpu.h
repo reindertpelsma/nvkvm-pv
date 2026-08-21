@@ -255,10 +255,30 @@ struct nvos55_parameters {
 
 /* ── NV_ESC_RM_SHARE ─────────────────────────────────────────────────────── */
 
+/*
+ * 24 bytes, status at +20 -- NOT 16/+12.  RS_SHARE_POLICY is a struct, not a
+ * word: { NvU32 target; RS_ACCESS_MASK accessMask; NvU16 type; NvU8 action; }
+ * where RS_ACCESS_MASK is RsAccessLimb limbs[SDK_RS_ACCESS_MAX_LIMBS] = one
+ * NvU32 (open-gpu-kernel-modules src/common/sdk/nvidia/inc/rs_access.h:63-103).
+ * That is 4+4+2+1 padded to 12, so NVOS57_PARAMETERS (nvos.h:2261-2267) is
+ * 4 + 4 + 12 + 4 = 24 with status at +20.
+ *
+ * The old 16-byte definition truncated sharePolicy to its first word, so RM
+ * read type/action out of whatever followed and applied a share policy the
+ * caller never asked for -- and, worse, the stub's status write-back is gated
+ * on (off + 4) <= param_size, so at param_size 16 the `off = 20` case for
+ * NV_ESC_RM_SHARE never fired and nvstatus stayed 0.  Every RM_SHARE reported
+ * NV_OK regardless of RM's actual verdict, on an access-control verb.
+ */
 struct nvos57_parameters {
 	nvhandle_t h_client;
 	nvhandle_t h_object;
-	__u32      share_policy;    /* RS_SHARE_POLICY */
+	/* RS_SHARE_POLICY sharePolicy, spelled out */
+	__u32      share_target;
+	__u32      share_access_mask;   /* RS_ACCESS_MASK: 1 limb */
+	__u16      share_type;          /* RS_SHARE_TYPE_*  */
+	__u8       share_action;        /* RS_SHARE_ACTION_ */
+	__u8       share_pad;
 	__u32      status;
 };
 

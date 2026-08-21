@@ -56,7 +56,13 @@ func TestFrontendStructSizes(t *testing.T) {
 		{"nvos00_parameters (RM_FREE)", Sizes.Nvos00, 16},
 		{"nvos54_parameters (RM_CONTROL)", Sizes.Nvos54, 32},
 		{"nvos55_parameters (RM_DUP_OBJECT)", Sizes.Nvos55, 28}, // 575 SDK: 7 fields
-		{"nvos57_parameters (RM_SHARE)", Sizes.Nvos57, 16},
+		// nvos57: 24, not 16. sharePolicy is RS_SHARE_POLICY (a struct:
+		// target/accessMask/type/action = 12 bytes after padding), not a
+		// single word. status is at +20. The former 16-byte expectation
+		// matched our own wrong header rather than the driver, so this row
+		// asserted nothing; at 16 the stub's `off = 20` status write-back for
+		// NV_ESC_RM_SHARE never fired and every share reported NV_OK.
+		{"nvos57_parameters (RM_SHARE)", Sizes.Nvos57, 24},
 		// nvos32: real ABI is 184 (prefix + union). The earlier 88-byte def
 		// truncated the AllocSize union (size/offset/address at +88), so the
 		// legacy graphics allocation path (libGLX) got size=0 / no address and

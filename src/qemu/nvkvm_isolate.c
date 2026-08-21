@@ -384,6 +384,16 @@ static int nvkvm_child_enter_mount_ns(void)
 #ifndef MFD_CLOEXEC
 #define MFD_CLOEXEC 0x0001U
 #endif
+#ifndef MFD_ALLOW_SEALING
+#define MFD_ALLOW_SEALING 0x0002U
+#endif
+#ifndef F_ADD_SEALS
+#define F_ADD_SEALS   1033
+#define F_SEAL_SEAL   0x0001
+#define F_SEAL_SHRINK 0x0002
+#define F_SEAL_GROW   0x0004
+#define F_SEAL_WRITE  0x0008
+#endif
 static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 {
 	return (int)syscall(SYS_memfd_create, name, (unsigned long)flags);
@@ -757,10 +767,33 @@ static void reader_signal_sync(struct nvkvm_isolate *iso, int err,
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
-/* Variant for OPEN_DEVICE: also carries the SCM_RIGHTS fd. */
+/*
+ * Variant for OPEN_DEVICE: also carries the SCM_RIGHTS fd.
+ *
+ * R2-M1 follow-up: the reader's defensive close loop above closes any fd
+ * attached to a response type that has no business carrying one -- but it
+ * EXEMPTS the two types that do, and both of those hand the fd to a
+ * single-slot field.  Overwriting that field without closing what was there
+ * drops the previous fd on the floor inside QEMU, which is the same
+ * fd-exhaustion DoS the close loop exists to prevent, reached by the two
+ * doors it deliberately leaves open.  A stub does it by answering when
+ * nobody asked: every unsolicited ISOLATE_RESP_OPEN_DEVICE (or
+ * _PRESENT_EXPORT) with an fd attached leaks the last one, in a loop, until
+ * the VMM is out of descriptors.  It also covers the honest race -- a
+ * response that arrives after its waiter timed out leaves an fd in the slot
+ * that nothing ever consumes.
+ *
+ * Close before overwrite, which is what nvkvm_present_egl.c:810 already does
+ * for the same shape of single-slot fd handoff ("drop the frame the display
+ * hasn't taken yet").  Guarded on >= 0 so the sentinel is never closed, and
+ * done under the same lock as the store so a waiter cannot be reading the
+ * field while we retire it.
+ */
 static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
 {
 	pthread_mutex_lock(&iso->sync_lock);
+	if (iso->sync_open_fd >= 0 && iso->sync_open_fd != fd)
+		close(iso->sync_open_fd);
 	iso->sync_error    = err;
 	iso->sync_open_fd  = fd;
 	iso->sync_done     = true;
@@ -768,10 +801,13 @@ static void reader_signal_sync_open(struct nvkvm_isolate *iso, int err, int fd)
 	pthread_mutex_unlock(&iso->sync_lock);
 }
 
-/* PRESENT_EXPORT (#106): dedicated slot, carries the dma-buf SCM_RIGHTS fd. */
+/* PRESENT_EXPORT (#106): dedicated slot, carries the dma-buf SCM_RIGHTS fd.
+ * Same close-before-overwrite as reader_signal_sync_open above; see there. */
 static void reader_signal_present(struct nvkvm_isolate *iso, int err, int fd)
 {
 	pthread_mutex_lock(&iso->present_sync_lock);
+	if (iso->present_fd >= 0 && iso->present_fd != fd)
+		close(iso->present_fd);
 	iso->present_err  = err;
 	iso->present_fd   = fd;
 	iso->present_done = true;
@@ -1318,7 +1354,20 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			 * Every sync op resets it under sync_lock before its own wait;
 			 * resetting it here under iso->lock is a cross-lock data race that
 			 * can re-park a stale ENTER_LOOP waiter from a just-killed slot. */
+			/*
+			 * Retire, don't just forget: a response that raced its
+			 * waiter's timeout can leave a live fd in either slot,
+			 * and the old occupant's reader is long joined, so this
+			 * is the last chance to close it.  Without this the
+			 * close-before-overwrite above still leaks one fd per
+			 * slot across a kill/create cycle.
+			 */
+			if (iso->sync_open_fd >= 0)
+				close(iso->sync_open_fd);
 			iso->sync_open_fd = -1;
+			if (iso->present_fd >= 0)
+				close(iso->present_fd);
+			iso->present_fd   = -1;
 			iso->reader_started = false;
 			iso->run_uid      = 0;
 			iso->run_gid      = 0;
@@ -1329,6 +1378,38 @@ static struct nvkvm_isolate *alloc_isolate_slot(struct nvkvm_isolate_table *t,
 			iso->ring_gpa     = 0;
 			iso->ring_kvm_slot = -1;
 			iso->ring_ready   = false;
+			/*
+			 * Reset the cross-isolate RM relay list.  It was the one
+			 * piece of per-slot state nothing cleared, and the usual
+			 * "is this still the isolate I mean" guard does not catch
+			 * it: ids are handed out modulo NVKVM_ISOLATE_MAX and the
+			 * slot index is `id % NVKVM_ISOLATE_MAX`, so a slot reused
+			 * after a full lap of the id space comes back with the
+			 * IDENTICAL id.  iso->id == isolate_id in
+			 * nvkvm_isolate_note_foreign_handle() is therefore true for
+			 * the new occupant, which inherits the dead one's list and
+			 * is told "already relayed" for handles it has never seen.
+			 * The relay is skipped, the fd never arrives, and
+			 * cross-isolate sharing (CUDA VMM shareable handles / the
+			 * NCCL SHM transport) is broken for that slot until the VM
+			 * restarts.  A guest forces it deterministically with
+			 * NVKVM_ISOLATE_MAX short-lived processes.
+			 *
+			 * Under xrm_lock because the broker runs on QEMU's pooled
+			 * IOCTL workers, not on this thread.  No cycle: the two xrm
+			 * helpers take xrm_lock and nothing else, and this is the
+			 * only place that takes it under t->lock.
+			 *
+			 * Here rather than in nvkvm_isolate_kill(): this is the one
+			 * site that claims a slot (the only `in_use = true` in the
+			 * file), so clearing here makes "a fresh occupant starts
+			 * with an empty relay list" structural rather than a
+			 * property of whichever teardown path ran last.
+			 */
+			pthread_mutex_lock(&iso->xrm_lock);
+			iso->xrm_n = 0;
+			memset(iso->xrm_handles, 0, sizeof(iso->xrm_handles));
+			pthread_mutex_unlock(&iso->xrm_lock);
 			*id_out = id;
 			return iso;
 		}
@@ -1480,7 +1561,20 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 	}
 
 	if (stub_elf && stub_elf_len > 0) {
-		int mfd = nvkvm_memfd_create("nvkvm_stub", MFD_CLOEXEC);
+		/*
+		 * MFD_ALLOW_SEALING so we can seal the image WRITE-shut below.
+		 * A memfd is always O_RDWR -- there is no O_RDONLY memfd -- and
+		 * this fd is dup2()'d to fd 3 for fexecve, which clears
+		 * FD_CLOEXEC, and closefrom() starts at 4.  So the stub runs with
+		 * a live read-write descriptor for its own text.  Without the
+		 * seal it can mmap(PROT_WRITE, MAP_SHARED, 3, 0) a writable alias
+		 * of its own running image and rewrite itself, which defeats the
+		 * seccomp PROT_EXEC denial that bounds the severity of every
+		 * other stub finding.  (The on-disk spawn path below opens the
+		 * binary O_RDONLY, so only this path is affected.)
+		 */
+		int mfd = nvkvm_memfd_create("nvkvm_stub",
+					     MFD_CLOEXEC | MFD_ALLOW_SEALING);
 		if (mfd < 0) {
 			close(sv[0]);
 			close(sv[1]);
@@ -1493,6 +1587,28 @@ int nvkvm_isolate_create(struct nvkvm_isolate_table *t,
 			close(sv[1]);
 			iso->in_use = false;
 			return -EIO;
+		}
+		/*
+		 * Seal before fork/exec, while the image is still ours alone.
+		 * F_SEAL_WRITE makes mmap(PROT_WRITE, MAP_SHARED) return EPERM
+		 * and write() return EPERM for every holder of the fd, forever;
+		 * SHRINK|GROW pin the length; SEAL stops the set being reopened.
+		 * F_SEAL_WRITE requires no outstanding writable mapping -- we
+		 * only ever write(2) this fd, never mmap it -- and does not
+		 * affect execve.  Fail CLOSED: if the seal does not take, the
+		 * writable alias exists and we must not spawn.
+		 */
+		if (fcntl(mfd, F_ADD_SEALS,
+			  F_SEAL_SEAL | F_SEAL_SHRINK |
+			  F_SEAL_GROW | F_SEAL_WRITE) < 0) {
+			int e = errno;
+			fprintf(stderr, "nvkvm: refusing to spawn isolate: "
+				"could not seal stub memfd: %s\n", strerror(e));
+			close(mfd);
+			close(sv[0]);
+			close(sv[1]);
+			iso->in_use = false;
+			return -e;
 		}
 		lseek(mfd, 0, SEEK_SET);
 

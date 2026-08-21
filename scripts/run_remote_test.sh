@@ -7,6 +7,13 @@
 #   - VM SSH at port 2222 on the vast.ai host
 #   - 9p mount tag `nvkvm_src` exposing the repo root to the guest
 #
+# DEVELOPMENT HARNESS ONLY. `restart` below executes
+# `bash $REMOTE_DIR/scripts/run_test_vm.sh` on the HOST as root, and
+# $REMOTE_DIR is the same tree run_test_vm.sh exports to the guest over 9p
+# READ-WRITE. So guest root rewrites that script and the next `restart` runs it
+# with host root privileges. Never point this at a guest you do not fully
+# trust. See CONTRIBUTING.md, "The dev VM harness is not a sandbox".
+#
 # Usage:
 #   scripts/run_remote_test.sh test_ioctl_fwd
 #   scripts/run_remote_test.sh cuinit_test
