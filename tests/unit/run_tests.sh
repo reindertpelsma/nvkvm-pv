@@ -16,12 +16,11 @@
 #      every expected binary exists.  A suite that vanishes is a failure, not
 #      a smaller test run.
 #
-#   2. test_isolate fails 5 of its 7 cases at RUNTIME (every ioctl against a
-#      spawned isolate returns -ENOENT).  That is pre-existing API drift
-#      between the test and the isolate table, documented in the Makefile --
-#      not a regression, and not something to "fix" by deleting the test.  But
-#      it makes `make run` exit non-zero BY DESIGN, and a suite that is red by
-#      default is a suite nobody reads.
+#   2. test_isolate fails 4 of its 7 cases at RUNTIME.  That is a real
+#      outstanding defect -- see the long note above ISOLATE_KNOWN_FAIL for what
+#      was diagnosed and what is still open -- not something to "fix" by
+#      deleting the test.  But it makes `make run` exit non-zero BY DESIGN, and
+#      a suite that is red by default is a suite nobody reads.
 #
 # So the known-failing cases are named here, individually.  The suite is green
 # when exactly those five fail.  It goes red if a sixth one fails, if one of
@@ -53,12 +52,39 @@ declare -A MARKER_SUITES=(
     [test_ctrl_gate]="test_ctrl_gate: PASS"
 )
 
-# test_isolate is handled on its own, below.  These five cases are EXPECTED to
-# fail: every ioctl issued against a spawned isolate comes back -ENOENT because
-# the test and the isolate table disagree about what isolate id gets handed
-# back.  Re-deriving that is a real piece of work nobody has done yet.
+# test_isolate is handled on its own, below.  These four cases are EXPECTED to
+# fail.  The explanation that used to sit here -- "the test and the isolate
+# table disagree about what isolate id gets handed back" -- was wrong, and was
+# hiding a real bug behind a shrug.  What was actually happening, established by
+# strace rather than by reading, was three independent faults stacked on top of
+# each other:
+#
+#   1. A PRODUCTION bug, now fixed (see the isolate fd-0 commit).  open() hands
+#      back the lowest free descriptor; with stdin closed that is fd 0, and the
+#      child's next statement, dup2(sv[1], STDIN_FILENO), destroyed the image fd
+#      before it could be parked at fd 3.  The child then fexecve()d the command
+#      SOCKET and died EACCES.  This was never a test problem at all.
+#
+#   2. mock_stub was dynamically linked.  The isolate child pivot_root()s into
+#      an empty tmpfs before exec, so the loader is gone and execveat() returns
+#      ENOENT.  Fixed by building it -static (see the Makefile).
+#
+#   3. mock_stub predates ISOLATE_CMD_SETUP_RING (12), which QEMU issues at
+#      isolate creation and then WAITS on.  The mock fell through to a silent
+#      `default: break`, the wait timed out, and QEMU declared the entire
+#      isolate dead -- so every subsequent ioctl returned -ENOENT and looked
+#      like an id mismatch.  Fixed by answering RESP_ERROR/ENOSYS, which
+#      satisfies the wait without killing the isolate.
+#
+# Fixing those took the suite from 2/7 to 3/7 and made the remaining failures
+# deterministic (-ENOENT every time, instead of alternating -ECONNRESET/-ENOTSOCK
+# /-ENOENT run to run).  The four below still fail: the isolate reports itself
+# not-alive by the time the ioctl is issued, and its stub receives EOF
+# immediately after exec rather than any command.  That is a REAL remaining
+# defect, not an id disagreement, and nobody has run it to ground yet.  Do not
+# replace this note with a guess.
 ISOLATE_TOTAL=7
-ISOLATE_KNOWN_FAIL="concurrent_ioctl out_of_order_ioctl poll_unpoll sequential_ioctl sync_mmap_munmap"
+ISOLATE_KNOWN_FAIL="concurrent_ioctl out_of_order_ioctl sequential_ioctl sync_mmap_munmap"
 
 ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate mock_stub"
 

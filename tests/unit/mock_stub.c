@@ -16,6 +16,7 @@
 #include <stdint.h>
 #include <time.h>
 #include <stdlib.h>
+#include <errno.h>
 
 /* Include proto directly */
 #include "../../src/common/nvkvm_isolate_proto.h"
@@ -116,6 +117,28 @@ int main(void)
 			_exit(0);
 
 		default:
+			/*
+			 * DECLINE, don't ignore.  Every sync command the QEMU
+			 * side issues is waited on; a command this mock does
+			 * not implement (ISOLATE_CMD_SETUP_RING is the one that
+			 * bites -- it is sent at isolate creation) used to fall
+			 * through here silently, the wait timed out, and QEMU
+			 * declared the whole isolate dead.  Every later ioctl in
+			 * the suite then failed -ENOENT, which looked like an
+			 * isolate-id bug and is not one.
+			 *
+			 * RESP_ERROR satisfies the wait via reader_signal_sync()
+			 * without killing the isolate, so the caller takes its
+			 * normal degraded path -- for SETUP_RING that is the
+			 * documented "fall back to the socket path".
+			 */
+			{
+				struct isolate_resp_error resp = {
+					.type = ISOLATE_RESP_ERROR,
+					.err  = ENOSYS,
+				};
+				send(sock, &resp, sizeof(resp), 0);
+			}
 			break;
 		}
 	}

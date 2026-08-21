@@ -47,8 +47,12 @@ test_frontend: $(FRONTEND_SRCS)
 test_handle: $(HANDLE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(HANDLE_SRCS) $(LDFLAGS)
 
+# -static is load-bearing.  The isolate child pivot_root()s into an empty tmpfs
+# before it fexecve()s the stub, so a dynamically linked mock cannot be started
+# at all: the loader is gone and execveat() returns ENOENT.  The real stub is
+# exec'd the same way; this just makes the mock survive the same environment.
 mock_stub: mock_stub.c
-	$(CC) $(CFLAGS) -o $@ mock_stub.c
+	$(CC) $(CFLAGS) -static -o $@ mock_stub.c
 
 test_isolate: $(ISOLATE_SRCS) mock_stub
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ $(ISOLATE_SRCS) $(LDFLAGS)
@@ -62,11 +66,13 @@ test_open_scm: $(OPEN_SCM_SRCS)
 test_ctrl_gate: $(CTRL_GATE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(CTRL_GATE_SRCS)
 
-# NOTE: test_isolate currently fails 5 of its 7 cases at RUNTIME (every ioctl
-# against a spawned isolate returns -ENOENT).  That is API drift between the
-# test and the isolate table, not a build problem -- all seven binaries compile
-# and the other six suites pass.  Fixing it needs someone to re-derive what
-# isolate id the table hands back; until then `make run` exits non-zero.
+# NOTE: test_isolate currently fails 4 of its 7 cases at RUNTIME.  It is not a
+# build problem -- all seven binaries compile and the other six suites pass.
+# It is also NOT the "isolate id disagreement" this note used to claim; that
+# guess was masking a real production bug (the child fexecve'd its own command
+# socket when fd 0 was free).  run_tests.sh carries the full diagnosis and the
+# list of what is still genuinely broken.  Until that is run to ground `make
+# run` exits non-zero -- use `make check` / run_tests.sh for a pass/fail signal.
 run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate
 	./test_dispatch
 	./test_frontend
