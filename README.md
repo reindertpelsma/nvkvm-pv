@@ -42,11 +42,12 @@ It is fast because the guest is not in a hot path. Control calls are forwarded;
 the work itself is not. A kernel launch reaches the GPU as a store to a mapped
 doorbell page, so there is no per-operation cost to pay:
 
-> **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of bare metal**, on three
+> **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of bare metal**, on four
 > machines, published to Geekbench's own servers where neither we nor you can
-> edit them: [RTX 3050 Laptop 99.9%](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
-> · [A100 80GB 98.0%](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405)
-> · [H100 PCIe 98.8%](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612).
+> edit them: [RTX 4070 99.6%](https://browser.geekbench.com/v7/gpu/compare/87004?baseline=87011)
+> · [RTX 3050 Laptop 99.9%](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
+> · [H100 PCIe 98.8%](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612)
+> · [A100 80GB 98.0%](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405).
 > Guest on one side, the same physical box on the other.
 
 Our own numbers agree: a 32-billion-parameter model through vLLM runs at

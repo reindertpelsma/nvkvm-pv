@@ -11,6 +11,7 @@ Geekbench's own browser so a reader can check them without trusting us:
 
 | card | guest | host | ratio | published |
 |---|---|---|---|---|
+| RTX 4070 (Ada) | 181346 | 182134 | **99.6%** | [compare](https://browser.geekbench.com/v7/gpu/compare/87004?baseline=87011) |
 | RTX 3050 Laptop | 48335 | 48395 | **99.9%** | [compare](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862) |
 | A100 80GB PCIe | 203098 | 207234 | **98.0%** | [compare](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405) |
 | H100 PCIe | 261901 | 265071 | **98.8%** | [compare](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612) |
@@ -20,6 +21,11 @@ or above parity (Particle Physics 100.1%, Face Tracking 100.0%); the weakest is
 Video Filter at 93.2%.
 
 ## Two caveats, and both cut in nvkvm's favour
+
+**Two of these are bare metal on both sides, two are not.** The RTX 4070 and the
+RTX 3050 Laptop were measured against real hardware — the 4070's host row is an
+MS-7E26 desktop running Ubuntu 26.04, not a hypervisor guest. Those are the rows
+to quote for a bare-metal claim.
 
 **The "host" side is itself a VM on the datacenter cards.** Both the A100 and
 the H100 were rented as "dedicated" machines and both turned out to be
@@ -39,7 +45,10 @@ What it is *not* is a bare-metal number. The RTX 3050 row is the one to quote
 for that. We did not measure L1 against L0, so these figures do not separate
 nvkvm's cost from nesting's.
 
-**The guest was given less machine.** On the A100, 8 cores and 15.62 GB against
+**The guest was given less machine**, on every row and by a wide margin. On the
+RTX 4070 the guest had 4 cores and 15.62 GB against a Ryzen 9 7900 with 30 GB,
+and it still reached 99.6% with eight of eleven workloads at or above parity
+(Particle Physics 102.6%, Video Filter 102.3%; the weakest is RAW at 90.4%). On the A100, 8 cores and 15.62 GB against
 the host's 16 and 94.38 GB; on the H100, 16 cores and 62.79 GB against 20 and
 125.88 GB. Geekbench's GPU workloads still do CPU-side work, so the guest
 carries a handicap unrelated to forwarding.
