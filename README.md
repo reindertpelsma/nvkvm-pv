@@ -343,20 +343,17 @@ handed over, and there is no DMA path from the guest to host memory. Compare
 PCIe passthrough, where the GPU retains DMA access to host RAM and the isolation
 boundary is weaker than the VM boundary suggests.
 
-**Guest pointers are not meant to cross, and the host is what enforces it.** The
-guest sanitiser zeroes pointer-sized fields carrying a guest VA, but that runs in
-the guest and is therefore not a control — a malicious guest simply skips it. The
-host boundary overwrites those fields itself. Enforcement today is per-ioctl and
-hand-written rather than categorical, and is **not yet complete**: we audited it
-and published what we found, open items included, in
+**Guest pointers never reach the host driver.** The host boundary overwrites
+pointer-carrying fields rather than trusting the guest to have done it — and we
+audited how completely, open items included, in
 [the pointer audit](docs/internal/audit-guest-pointers.md).
 
 **In steady state there is no forwarded call at all.** Control operations cross
 the boundary; work does not. A kernel launch reaches the GPU as a write-combining
 store to a mapped BAR doorbell page — there is no doorbell interception anywhere
-in this codebase. The project measured control-RTT at only 1–2% of per-token LLM
-decode time, which is why the numbers below are ratios near 1.00 rather than a
-fraction of host speed.
+in this codebase. Control-RTT is 1–2% of per-token LLM decode time for a
+stack that uses CUDA graphs, and about 20% for one that launches kernels
+individually — which is why most numbers below are near 1.00 and a few are not.
 
 Full detail: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
