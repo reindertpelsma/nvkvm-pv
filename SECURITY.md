@@ -74,8 +74,15 @@ the audit rather than quietly dropped.
 ## Weaker configurations you should know about
 
 - **In containers**, Linux namespaces are usually blocked, so the isolate falls
-  back to UID separation. That is meaningfully weaker than the namespaced
-  sandbox. See [the isolate model](docs/internal/isolate-model.md).
+  back to UID separation — a weaker inner boundary than the namespaced sandbox.
+  Note what sits behind it, though: in a container the last boundary before the
+  host is the container runtime's, which is not our code and is scrutinised far
+  more heavily than ours. On a bare host the isolate sandbox **is** the last
+  boundary, and it is code we wrote and audited ourselves. So this is a trade
+  between a weaker boundary we control and a stronger one we do not, rather than
+  a straight downgrade — and a minimal image with nothing useful readable by
+  other UIDs strengthens the container side further. See
+  [the isolate model](docs/internal/isolate-model.md).
 - **Enforcement is per-ioctl and hand-written**, not categorical. It is audited
   but not complete, and a new ioctl added without its validation is the most
   likely way a hole appears.

@@ -171,13 +171,16 @@ staging step.
   [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
   Both are already in [`docker-compose.yml`](docker-compose.yml). No
   `--privileged`, no added capabilities.
-- **Weaker isolation than on a bare host, and you should know before you
-  choose.** Containers usually block unprivileged user namespaces, so nvkvm's
-  per-VM isolate cannot build its namespaced sandbox and falls back to UID
-  separation. That is meaningfully weaker. Nothing about nvkvm is ready for
-  untrusted tenants either way — see [`SECURITY.md`](SECURITY.md) — but the
-  container is the weaker of the two rungs and the compose file's `cap_add` list
-  explains what it takes to reach even that one.
+- **Isolation is a different trade here, not simply a downgrade.** Containers
+  usually block unprivileged user namespaces, so nvkvm's per-VM isolate cannot
+  build its namespaced sandbox and falls back to UID separation — a weaker inner
+  boundary. But it is not the last one: behind it sits the container boundary,
+  which is not our code and is far more scrutinised than ours. On a bare host,
+  the isolate sandbox **is** the last boundary before the host, and it is code we
+  wrote and audited ourselves. Which arrangement you prefer depends on what you
+  trust; a minimal image, with nothing useful readable by other UIDs, makes the
+  container case stronger still. Either way nvkvm is not ready for untrusted
+  tenants — see [`SECURITY.md`](SECURITY.md).
 - **The driver userspace is mounted read-only, not copied in.** The container
   hands the guest the host's NVIDIA libraries over a read-only 9p share and the
   guest links against them, so `apt upgrade` inside the guest cannot replace a
