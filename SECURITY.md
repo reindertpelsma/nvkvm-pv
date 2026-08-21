@@ -89,6 +89,9 @@ framebuffer), none of which are the configuration this project targets.
 
 We audit our own boundary and publish the results, fixed or not:
 
+- [Pre-release audit, 2026-08-21](docs/internal/audit-prerelease-2026-08-21.md) —
+  12 findings plus the suspected and ruled-out lists. The most serious was in
+  code one day old and is fixed.
 - [Boundary audit, 2026-08-20](docs/internal/audit-boundaries-2026-08-20.md) —
   19 findings across all three in-scope boundaries. 16 fixed, 1 partial (A-8,
   by decision), 1 open (A-9), and the low-severity set A-16 four-sixths done.

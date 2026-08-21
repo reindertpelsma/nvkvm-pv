@@ -54,6 +54,7 @@ page should link here rather than recite them.
 | [The Mint guest desktop](internal/mint-guest-desktop.md) | the DDX investigation end to end, including what `fake-bars` measured before it was removed from the tree |
 | [Narrow-MAXPHYADDR GPA windows](internal/gpa-window-narrow-maxphyaddr.md) | why the window base is computed rather than constant, and what happens when it does not fit |
 | [Boundary audit, 2026-08-20](internal/audit-boundaries-2026-08-20.md) | 19 findings across all three in-scope trust boundaries; 15 fixed, 4 named as open |
+| [Pre-release audit, 2026-08-21](internal/audit-prerelease-2026-08-21.md) | 12 findings, plus what was suspected and what was checked and found clean. The critical one was in code a day old and is fixed |
 | [Guest pointer audit](internal/audit-guest-pointers.md) | 14 unenforced paths against one invariant, 5 since fixed |
 
 Both audits name **locations, not techniques**: they contain no working bypass
