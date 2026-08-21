@@ -30,37 +30,35 @@ From a user's perspective, this is what it buys you:
   gets no MMIO window to it, and has no DMA path to host memory
 - **bring your own guest image** — a stock NVIDIA driver, not a licensed
   vGPU guest driver bound to one vendor's cloud
+- **boot an experimental guest kernel** without rebooting the host or losing
+  the GPU
 - **keep your existing container workflow** — Docker with
   `nvidia-container-toolkit` works unmodified inside the guest, so
   `docker run --gpus all` behaves as it does on the host
 - **pass several GPUs to one guest** — multiple devices are autodetected and
-  independently usable, verified concurrently on two cards
+  independently usable, verified on up to six cards in one guest
 
 It is fast because the guest is not in a hot path. Control calls are forwarded;
 the work itself is not. A kernel launch reaches the GPU as a store to a mapped
 doorbell page, so there is no per-operation cost to pay:
 
-> **A 32-billion-parameter model served through vLLM runs at 0.99-1.00x of host
-> speed inside the guest, and produces token-identical output at temperature 0.**
-> Seventeen other workloads — PyTorch, ResNet-50, BERT, Vulkan compute — land
-> between 0.95x and 1.00x. [See the numbers](#tested-applications).
+> **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of bare metal**, on three
+> machines, published to Geekbench's own servers where neither we nor you can
+> edit them: [RTX 3050 Laptop 99.9%](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
+> · [A100 80GB 98.0%](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405)
+> · [H100 PCIe 98.8%](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612).
+> Guest on one side, the same physical box on the other.
 
-That is **one** GPU. Tensor-parallel serving across several is correct but not
-yet fast — see [multi-GPU serving](#multi-gpu-serving-correct-not-yet-fast).
+Our own numbers agree: a 32-billion-parameter model through vLLM runs at
+**0.99–1.00x** of host speed and produces token-identical output at temperature
+0, and fifteen other workloads land at 1.00x. [See the
+numbers](#tested-applications).
 
-## Where it's useful
-
-- **A workstation you don't want to give up** — GPU work inside a VM while the
-  host keeps the display and the same card.
-- **One GPU, several VMs** — a homelab or shared dev box where every VM gets
-  GPU access, with no card each and no `vfio-pci` rebind between starts.
-- **Disposable environments** — CI runners or per-task VMs that come and go;
-  attaching costs under a second and needs no device reset.
-- **Kernel and driver work** — boot an experimental guest kernel without
-  rebooting the host or losing the GPU.
-- **Consumer GeForce** — cards that vGPU does not cover at all, with no licence.
-
-Not yet for untrusted multi-tenant hosting — see below.
+That is one GPU, with CUDA graphs, on throughput. Three shapes cost more, all
+measured: single-stream greedy decode without graphs (0.73–0.82x), tensor-parallel
+serving across several GPUs ([correct but not yet
+fast](#multi-gpu-serving-correct-not-yet-fast)), and NVENC video encode, which
+hangs outright on one driver.
 
 ## What it is not
 
@@ -83,8 +81,8 @@ Not yet for untrusted multi-tenant hosting — see below.
 - **Not vGPU.** No SR-IOV, no hardware partitioning, no MIG. Sharing is
   cooperative, at the driver interface.
 - **Not a Windows guest solution.** Linux guests only.
-- **Pinning host memory is slower than native**, and one registration is capped
-  at 2 GiB. Stock vLLM starts and runs; see
+- **Pinning host memory runs at 250-350 MB/s against 12-17 GB/s native** (~40x),
+  and one registration is capped at 2 GiB. Stock vLLM starts and runs; see
   [known limitations](docs/internal/known-limitations.md#pinned-host-memory) for
   the numbers.
 
@@ -171,16 +169,12 @@ staging step.
   [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
   Both are already in [`docker-compose.yml`](docker-compose.yml). No
   `--privileged`, no added capabilities.
-- **Isolation is a different trade here, and arguably a better one.** Containers
-  usually block unprivileged user namespaces, so the per-VM isolate falls back to
-  UID separation — a weaker inner boundary. What sits behind it matters more.
-  nvkvm's isolate sandboxes the **stub**; it does not sandbox the VMM, and QEMU
-  runs on the host unconfined. **Eleven of the nineteen findings in our own
-  boundary audit target the VMM**, so on a bare host that is where they land. In
-  a container they land in the container, behind a boundary that is not our code
-  and is scrutinised far more than ours. A minimal image with nothing useful
-  readable by other UIDs strengthens it further. Neither arrangement makes nvkvm
-  ready for untrusted tenants — see [`SECURITY.md`](SECURITY.md).
+- **The isolation trade differs from a bare host, and is not obviously worse.**
+  Containers block user namespaces, so the isolate falls back to UID separation —
+  but most of our audit findings target the VMM, which a container confines and a
+  bare host does not. Neither is ready for untrusted tenants:
+  [the trade in full](docs/internal/isolate-model.md),
+  [`SECURITY.md`](SECURITY.md).
 - **The driver userspace is mounted read-only, not copied in.** The container
   hands the guest the host's NVIDIA libraries over a read-only 9p share and the
   guest links against them, so `apt upgrade` inside the guest cannot replace a
@@ -430,8 +424,13 @@ The rest is guest vs host, one statically-linked binary run on both sides, RTX
 | reduction bandwidth | 122.0 | 119.7 GB/s | 0.98x |
 | Mandelbrot | 2.90e6 | 2.76e6 | 0.95x |
 
-Eleven more — N-body, Black-Scholes, SHA-256, 2D convolution, ResNet-50
-inference and AMP, ViT-B/16, PyTorch fp32 — all land at 1.00x. Full table and
+Eight more — N-body, Black-Scholes, SHA-256, 2D convolution, ResNet-50
+inference and AMP, ViT-B/16, PyTorch fp32 — all land at 1.00x. **Two rows in
+that table are not at parity, and they are not hidden**: a pitched 2D copy probe
+at 0.42x, and **NVENC h264 encode, which hangs in the guest on driver
+575.51.03** while the host encodes at 94 fps. Generic pitched copies are fine,
+so it is specific to the encoder's surface path; whether it is a 575-vs-580
+driver regression or a forwarder gap is undetermined. Full table and
 method: [`tests/perf/realapp_matrix.md`](tests/perf/realapp_matrix.md).
 
 Where the guest is measurably slower it is latency-bound control paths, never
@@ -493,6 +492,13 @@ sha256 over every `.py`/`.so`.
 | batch x32, output | 244.2 | 244.3 tok/s | 1.00x |
 | batch x64, total | 1311.4 | 1311.9 tok/s | 1.00x |
 
+**That number is contingent on CUDA graphs, and the hinge is measurable.** Run
+the identical benchmark with `--enforce-eager` and decode drops to **0.82x**: the
+forwarding tax is per *launch*, and a graph collapses a decode step into one.
+Every modern serving stack uses graphs, which is why the headline is 0.99x — but
+a stack that launches kernels one at a time pays about 20% on decode.
+[Both passes, side by side](tests/perf/llm_parity.md).
+
 At temperature 0 the guest produced **token-id identical** output to the host on
 all three tasks (long-chain reasoning, C11 lock-free ring codegen, 8k-token
 summarisation).
@@ -553,9 +559,10 @@ driver and footnote.
 | 2x RTX 4070 | Ada AD104 | 575 | 28/28, `cuda_device_count 2` |
 | 4x RTX 5060 | Blackwell GB206 | 580 | 28/28, `cuda_device_count 4` |
 
-Six architectures, and multiple GPUs in one guest work — four concurrent
-isolates on the 4x box sustained 13.3 million verified kernel launches with all
-four GPUs busy at once.
+Six architectures, and multiple GPUs in one guest work — six concurrent
+isolates on a 6x A4000 box each drove their own GPU, every result still
+element-wise correct, with all six busy at once
+([the run](tests/BOOT_MATRIX.md)).
 
 Several of those rows cost a bug fix to reach, and two of them looked like
 NVIDIA's bugs until the same test was run on bare metal:
