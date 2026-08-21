@@ -471,7 +471,10 @@ jobs:
 
           \`\`\`bash
           gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY
-          docker run --rm -it --device /dev/kvm --gpus all $IMAGE:$VERSION
+          docker run --rm -it --device /dev/kvm --gpus all \\
+              -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \\
+              -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \\
+              $IMAGE:$VERSION
           \`\`\`
 
           Needs \`/dev/kvm\` and, for the GPU, the NVIDIA container runtime. Note

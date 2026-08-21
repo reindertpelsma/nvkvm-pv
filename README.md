@@ -110,13 +110,21 @@ come from this repository?" is a question you can answer rather than assume.
 
 ```bash
 docker run --rm -it --device /dev/kvm --gpus all \
+    -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \
     -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \
     ghcr.io/reindertpelsma/nvkvm-pv:latest
 ssh -p 2222 ubuntu@127.0.0.1    # into the guest -- nvidia-smi already works
 ```
 
-Or with [`docker-compose.yml`](docker-compose.yml), which is the same thing with
-the capability set, the shared folder and the named volume already spelled out:
+`NVIDIA_DRIVER_CAPABILITIES` is not optional decoration: `--gpus all` alone
+gives the container `compute,utility`, and the guest then gets a compute-only
+driver with no GL or Vulkan libraries — which does not fail, it silently falls
+back to llvmpipe.
+
+[`docker-compose.yml`](docker-compose.yml) is the same thing with those
+capabilities, a tightened `cap_drop`/`cap_add` set, the shared folder and the
+named volume already spelled out, and is the better starting point for anything
+you intend to keep:
 
 ```bash
 docker compose pull && docker compose up   # the published image
