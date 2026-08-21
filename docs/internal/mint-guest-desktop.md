@@ -400,7 +400,9 @@ needs the cursor plane on our side.
 
 ## The NVIDIA DDX with `fake-bars`: the BAR gap was real, and it was not the only one
 
-> ### `fake-bars` HAS BEEN REMOVED FROM THE TREE — commit `NVKVM_FAKEBARS_REMOVAL_SHA`
+> ### `fake-bars` HAS BEEN REMOVED FROM THE TREE — commit `3ec68b6`
+>
+> (full sha `3ec68b6e17c2de47e243ca898cc112e059ccc6c1`)
 >
 > There is no `fake-bars` device property and no `NVKVM_FAKE_BARS` environment
 > variable any more.  `nvkvm-gpu` registers no PCI region at all: it is its
@@ -428,7 +430,7 @@ needs the cursor plane on our side.
 > thing which could ever use it:
 >
 > ```bash
-> git revert NVKVM_FAKEBARS_REMOVAL_SHA
+> git revert 3ec68b6
 > ```
 >
 > That restores the property, the per-BAR geometry copy from the host's
@@ -526,8 +528,7 @@ nothing tried to use one.
 
 That it was defensible is not why it stayed, and it did not stay: a dormant
 switch on the one boundary this project sells on has to earn its keep, and with
-no consumer and a blocked path behind it, it did not. Removed in
-`NVKVM_FAKEBARS_REMOVAL_SHA`.
+no consumer and a blocked path behind it, it did not. Removed in `3ec68b6`.
 
 ## RESOLVED (2026-08-21): the DDX stops on ONE denied NVKMS command
 
@@ -614,8 +615,8 @@ satisfied by a **virtual NVKMS** that answers `QUERY_DISP` /
 surface, guest-side, versioned per driver branch) and it is the only shape that
 can work.  `fake-bars` was a prerequisite for that future work rather than a
 step toward it on its own — which is precisely why it did not stay in the tree
-waiting for it: `git revert NVKVM_FAKEBARS_REMOVAL_SHA` brings it back in a
-minute on the day someone starts that work.
+waiting for it: `git revert 3ec68b6` brings it back in a minute on the day
+someone starts that work.
 
 Note also, and it is not new: **`cmdType 0 = ALLOC_DEVICE` is already allowed
 today** (Vulkan/EGL need it), so a guest can already allocate an NVKMS device on
@@ -706,9 +707,9 @@ box this ran on was handed back, so everything below is what survives.
 ### Current state
 
 `-device nvkvm-gpu,fake-bars=on` (env `NVKVM_FAKE_BARS=1`; **both removed from
-the tree in `NVKVM_FAKEBARS_REMOVAL_SHA` — this paragraph describes the build of
-the day, not anything you can run now**) got the DDX much further than before,
-but not to a working screen. The failure moved; it did not go away.
+the tree in `3ec68b6` — this paragraph describes the build of the day, not
+anything you can run now**) got the DDX much further than before, but not to a
+working screen. The failure moved; it did not go away.
 
     (**) NVIDIA(G0): Enabling 2D acceleration
     (II) NVIDIA GLX Module  595.84
