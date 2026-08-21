@@ -6,9 +6,11 @@ Xwayland hosted by weston on the nvkvm KMS head.  See "The Mint desktop" below.
 
 A stock distro **does** now boot into its own Xorg session on the nvkvm head —
 `modesetting` with `Option "AccelMethod" "none"`, GL clients accelerated on
-NVIDIA through render offload (`data/xorg/nvkvm-xorg.conf`).  What still does
-not work is the **NVIDIA DDX**, and as of 2026-08-21 we know exactly why and
-exactly why it is not a one-line fix: see
+NVIDIA through render offload (`data/xorg/nvkvm-xorg.conf`, installed as
+`/etc/X11/xorg.conf` by `scripts/stage_guest_libs.sh` alongside the driver
+libraries, so it is part of installation rather than a step to discover).  What
+still does not work is the **NVIDIA DDX**, and as of 2026-08-21 we know exactly
+why, and exactly why it is not a one-line fix: see
 ["RESOLVED (2026-08-21)"](#resolved-2026-08-21-the-ddx-stops-on-one-denied-nvkms-command)
 below.  This file records the whole trail, with the host checked as a control in
 every case.
@@ -634,8 +636,10 @@ GPU-accelerated through NVIDIA's own GLX vendor library:
         Option      "AccelMethod" "none"
     EndSection
 
-(the full file is `data/xorg/nvkvm-xorg.conf`; install it as
-`/etc/X11/xorg.conf` in the guest).  Measured in-guest, RTX 3070:
+(the full file is `data/xorg/nvkvm-xorg.conf`, which
+`scripts/stage_guest_libs.sh` installs as `/etc/X11/xorg.conf` in the guest —
+with `BusID` rewritten from the guest's own PCI tree, and never over an
+`xorg.conf` someone else wrote).  Measured in-guest, RTX 3070:
 
 | checked | result |
 |---|---|

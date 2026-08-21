@@ -11,6 +11,13 @@
 #                                      ld.so path via nvidia-guest.conf, AHEAD of
 #                                      the system dir) + allocator + ptxjit
 #
+# It also installs the guest's Xorg configuration (/etc/X11/xorg.conf, from
+# data/xorg/nvkvm-xorg.conf) at the end.  That is deliberate scope: a guest needs
+# three things installed -- the kernel module, this userspace, and one config
+# file -- and leaving the third to the user made it read as a defect instead of
+# a step.  It never overwrites an xorg.conf someone else wrote, and
+# NVKVM_STAGE_XORG=0 skips it.  See the block at the bottom.
+#
 # The bundle dir defaults to the host's current driver bundle; override with $1.
 set -u
 # Default bundle path follows the HOST driver version rather than a hardcoded
@@ -66,6 +73,10 @@ echo "stage_guest_libs: staging $V from $GFXBUNDLE"
 # the script still printed "done").  Route every copy through stage(): it says
 # STAGED or MISSING, and MISSING is remembered for the summary at the end.
 MISSING_LIBS=""
+# Files we install from the repo share rather than from the driver bundle (the
+# Xorg config below).  Tracked separately because a missing one of these does
+# not mean a broken GPU stack, so it must not be reported as a missing library.
+MISSING_FILES=""
 STAGED_N=0
 stage(){ # $1 basename-in-bundle  $2 destdir  [$3.. extra symlink names]
     local f="$1" dest="$2"; shift 2
@@ -391,10 +402,125 @@ if [ ! -f /etc/modprobe.d/blacklist-nvkvm-nouveau.conf ]; then
     echo "stage_guest_libs: blacklisted nouveau (reboot to take effect)"
 fi
 
+# ── the guest's own Xorg session ─────────────────────────────────────────────
+#
+# This is part of INSTALLATION, not a workaround the user is expected to find.
+# A guest already needs a kernel module built against its own kernel and an
+# NVIDIA userspace matched to the host driver; one config file is the smallest
+# item on that list, and this script is already the thing that does the other
+# one.  So install it here and it stops being a user-facing step at all.
+#
+# What it steers around: a stock distro left alone picks one of the two X paths
+# that CANNOT work on the nvkvm head -- NVIDIA's own DDX (it reaches the GPU
+# fine and then asks NVKMS about the HOST's physical displays) or `modesetting`
+# with glamor (whose scanout-pixmap import NVIDIA's EGL rejects, on bare metal
+# too).  The file selects the third path: `modesetting` with
+# AccelMethod "none", GL clients accelerated on NVIDIA via render offload.
+#
+# IT MUST BE /etc/X11/xorg.conf, AND NOT AN xorg.conf.d DROP-IN.  This is the
+# line someone will "tidy up" into a drop-in, so: with a drop-in, BOTH
+# OutputClasses still apply, Xorg tries the NVIDIA DDX FIRST, that fails the
+# screen, and the server EXITS rather than falling through to the second one.
+# An explicit Device section in /etc/X11/xorg.conf outranks OutputClass driver
+# selection, which is also why this needs nothing the distro ships removed.
+#
+# NVKVM_STAGE_XORG=0 skips this entirely -- for a guest that will never run an X
+# server, or whose X configuration is not ours to touch.
+XORGCONF=/etc/X11/xorg.conf
+if [ "${NVKVM_STAGE_XORG:-1}" != "1" ]; then
+    echo "stage_guest_libs: NVKVM_STAGE_XORG=$NVKVM_STAGE_XORG -- leaving $XORGCONF alone"
+else
+    SRC_XORG="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../data/xorg/nvkvm-xorg.conf"
+    if [ ! -f "$SRC_XORG" ]; then
+        # Only reachable if the script was copied out of the repo tree; the 9p
+        # share carries the whole checkout.  Not fatal -- compute does not need
+        # an X server -- so warn and carry on rather than failing the staging.
+        echo "stage_guest_libs: MISSING from the repo share: data/xorg/nvkvm-xorg.conf" >&2
+        echo "  (looked in $SRC_XORG) -- the guest's own X session will need it" >&2
+        echo "  installed by hand as $XORGCONF; see docs/howto/run.md." >&2
+        MISSING_FILES="$MISSING_FILES data/xorg/nvkvm-xorg.conf"
+    else
+        # BusID has to name nvkvm's PCI device in THIS guest.  The shipped file
+        # says PCI:0:7:0 because run_test_vm.sh puts it at addr=7, but that is a
+        # default and not a guarantee, so read the real address out of the
+        # guest's own PCI tree.  nvkvm-gpu is the only NVIDIA-vendor device a
+        # guest has (the virtio transport is 0x1af4), so the first 0x10de match
+        # is it.  NOTE the bases differ: a BDF is HEX and Xorg's BusID is
+        # DECIMAL, so 0000:00:1f.0 is "PCI:0:31:0" and copying the string across
+        # would silently name a device that does not exist.
+        NVBDF=""
+        for _d in /sys/bus/pci/devices/*; do
+            [ -r "$_d/vendor" ] || continue
+            [ "$(cat "$_d/vendor")" = "0x10de" ] || continue
+            NVBDF="$(basename "$_d")"
+            break
+        done
+        XORGTMP="$(mktemp)"
+        if [ -n "$NVBDF" ]; then
+            _rest="${NVBDF#*:}"                  # 0000:00:07.0 -> 00:07.0
+            _bus="${_rest%%:*}"                  #               -> 00
+            _devfn="${_rest#*:}"                 #               -> 07.0
+            BUSID="$(printf 'PCI:%d:%d:%d' "0x$_bus" "0x${_devfn%%.*}" "0x${_devfn#*.}")"
+            # Anchored on the BusID keyword so the worked example in the file's
+            # own header comment is left as written.
+            sed -E "s#(BusID[[:space:]]+)\"PCI:[0-9]+:[0-9]+:[0-9]+\"#\\1\"$BUSID\"#" \
+                "$SRC_XORG" > "$XORGTMP"
+        else
+            # No NVIDIA-vendor device: either graphics=off, or the guest module
+            # is not up yet.  Install it verbatim -- an X server is the only
+            # reader of this file and there is none running right now -- but say
+            # that the BusID is the shipped default and unverified.
+            BUSID="$(sed -n 's#.*BusID[[:space:]]*"\(PCI:[0-9:]*\)".*#\1#p' "$SRC_XORG" | head -1)"
+            cp -f "$SRC_XORG" "$XORGTMP"
+            echo "stage_guest_libs: no NVIDIA-vendor PCI device in this guest --" >&2
+            echo "  $XORGCONF gets the shipped BusID $BUSID, UNVERIFIED." >&2
+            echo "  Check it with: lspci -nn | grep NVIDIA" >&2
+        fi
+
+        if [ -f "$XORGCONF" ] && ! grep -q 'nvkvm-xorg.conf' "$XORGCONF"; then
+            # Someone else's X configuration.  Leave it exactly as it is:
+            # overwriting a user's xorg.conf unasked is not acceptable, and a
+            # desktop that stops coming up is a far worse outcome than a manual
+            # merge.  Say so loudly -- silently skipping would leave a guest
+            # whose X session does not work with nothing pointing at why.
+            echo "stage_guest_libs: WARNING $XORGCONF EXISTS AND IS NOT OURS -- LEFT UNTOUCHED" >&2
+            echo "  Your file is in charge; a stock X session may not come up on the nvkvm" >&2
+            echo "  head without the settings in:" >&2
+            echo "      $SRC_XORG" >&2
+            echo "  Compare with:  diff $XORGCONF $SRC_XORG" >&2
+            echo "  Then either merge its Device section in (Driver \"modesetting\"," >&2
+            echo "  BusID \"$BUSID\", Option \"AccelMethod\" \"none\") or install it wholesale." >&2
+            echo "  Set NVKVM_STAGE_XORG=0 to stop this script looking at all." >&2
+        elif [ -f "$XORGCONF" ] && cmp -s "$XORGTMP" "$XORGCONF"; then
+            echo "stage_guest_libs: $XORGCONF already current (BusID $BUSID)"
+        else
+            # Either absent, or an older copy of ours (the marker in line 1 is
+            # what makes that distinguishable) -- e.g. staged before the device
+            # moved slots.  Ours to update.
+            sudo mkdir -p "$(dirname "$XORGCONF")"
+            if sudo cp -f "$XORGTMP" "$XORGCONF" && sudo chmod 644 "$XORGCONF"; then
+                echo "stage_guest_libs: installed $XORGCONF (BusID $BUSID)"
+                echo "stage_guest_libs:   run GL clients with __NV_PRIME_RENDER_OFFLOAD=1" \
+                     "__GLX_VENDOR_LIBRARY_NAME=nvidia"
+            else
+                echo "stage_guest_libs: FAILED to install $XORGCONF" >&2
+                MISSING_FILES="$MISSING_FILES $XORGCONF"
+            fi
+        fi
+        rm -f "$XORGTMP"
+    fi
+fi
+
 # Summary.  This script used to print "done" unconditionally, which read as
 # success even when most of the bundle was absent.  Report what was missing and
 # exit non-zero so a caller/CI notices.
 echo "stage_guest_libs: staged $STAGED_N libs from $GFXBUNDLE (driver $V)"
+if [ -n "$MISSING_FILES" ]; then
+    # Not exit-worthy on its own: these are guest CONFIG files, so the GPU stack
+    # works without them and only the guest's own X session is affected.
+    echo "stage_guest_libs: not installed from the repo share:" >&2
+    for m in $MISSING_FILES; do echo "    $m" >&2; done
+fi
 if [ -n "$MISSING_LIBS" ]; then
     echo "stage_guest_libs: INCOMPLETE — missing from bundle:" >&2
     for m in $MISSING_LIBS; do echo "    $m" >&2; done

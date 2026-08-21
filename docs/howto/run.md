@@ -271,10 +271,42 @@ in the guest, and the corresponding host devices are never opened.
 
 ## The guest's own Xorg session (a stock distro desktop)
 
-A stock distro left alone picks one of the two X paths that cannot work on the
-nvkvm head — NVIDIA's DDX (which wants the *host's* display engine) or
-`modesetting` with glamor (whose scanout-pixmap import NVIDIA's EGL rejects,
-on bare metal too).  One file steers it to the third path, which does work:
+**Nothing to do — `scripts/stage_guest_libs.sh` installs this.**  Along with the
+NVIDIA libraries it writes `/etc/X11/xorg.conf` from
+`data/xorg/nvkvm-xorg.conf`, so a guest that has been staged already has it.
+The rest of this section is what that file is for, and what to do in the two
+cases where you have to think about it: you already have an `xorg.conf`, or you
+want X left alone.
+
+**Why the file is part of installation.**  A stock distro left alone picks one
+of the two X paths that cannot work on the nvkvm head — NVIDIA's DDX (which
+wants the *host's* display engine; see below) or `modesetting` with glamor
+(whose scanout-pixmap import NVIDIA's EGL rejects, on bare metal too).  The file
+names the third path — `modesetting` with `Option "AccelMethod" "none"` — which
+works.  A guest already needs a kernel module built against its own kernel and
+an NVIDIA userspace matched to the host driver; this is the third and smallest
+item on that list, and the same script installs all of it.
+
+**`BusID` is rewritten for your guest.**  The shipped file says `PCI:0:7:0`
+because `run_test_vm.sh` puts the device at `addr=7`; the staging script reads
+the real address out of the guest's own PCI tree instead (a BDF is hex and
+`BusID` is decimal, so `0000:00:1f.0` is `PCI:0:31:0` — a straight copy would be
+wrong).  It prints the value it used.
+
+**It will not overwrite an `xorg.conf` you wrote.**  The script recognises its
+own file by the `nvkvm-xorg.conf` marker on line 1.  Anything else is yours: it
+leaves the file exactly as it is and prints what to merge and where from.
+Overwriting someone's X configuration unasked is not an acceptable thing for a
+staging script to do, and a desktop that stops coming up is a much worse outcome
+than a manual merge.
+
+**To skip it entirely**, for a guest whose X server is not ours to touch:
+
+```bash
+NVKVM_STAGE_XORG=0 sudo -E bash /mnt/nvkvm/scripts/stage_guest_libs.sh
+```
+
+and then, if you do want it after all, it is one copy:
 
 ```bash
 # inside the guest, as root
@@ -282,9 +314,9 @@ cp /mnt/nvkvm/data/xorg/nvkvm-xorg.conf /etc/X11/xorg.conf
 # check BusID matches: lspci -nn | grep NVIDIA   (slot 7 by default)
 ```
 
-Then start X the distro's own way (display manager, `startx`, whatever it
-ships).  The X screen composites on the CPU; run GL applications on the GPU the
-way a PRIME laptop does:
+Start X the distro's own way (display manager, `startx`, whatever it ships).
+The X screen composites on the CPU; run GL applications on the GPU the way a
+PRIME laptop does:
 
 ```bash
 __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxgears -info
@@ -296,12 +328,24 @@ __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia glxgears -info
 Set the two variables in the session's environment (`/etc/environment`, or the
 `.desktop` files of the applications you care about) to make it the default.
 
-Do **not** try to do this with an `xorg.conf.d` drop-in: the NVIDIA driver
-package's `OutputClass` matches the same device, Xorg tries its driver first,
-that fails the screen and the server exits instead of falling through.  An
-explicit `Device` section in `/etc/X11/xorg.conf` outranks `OutputClass` driver
-selection and is the reason the file above does not require removing anything
-the distro ships.  Background and measurements:
+It has to be `/etc/X11/xorg.conf`, and **not** an `xorg.conf.d` drop-in — this
+is the tidy-up that looks obviously right and is not.  With a drop-in the NVIDIA
+driver package's `OutputClass` still matches the same device, Xorg tries its
+driver **first**, that fails the screen, and the server exits rather than
+falling through to the second one.  An explicit `Device` section in
+`/etc/X11/xorg.conf` outranks `OutputClass` driver selection, which is also why
+this file needs nothing the distro ships removed.
+
+**What is genuinely unavailable is NVIDIA's own X driver, the DDX.**  It reaches
+the GPU fine and then asks NVKMS to select a display subsystem — and the NVKMS
+behind this device is the *host's*, owning the host's connectors, not nvkvm's
+virtual head.  nvkvm denies that command (`NVKMS_IOCTL_DECLARE_EVENT_INTEREST`),
+and widening the allowlist only walks the DDX one rung further down a ladder
+that ends at the host's physical monitors.  Satisfying it needs a virtual NVKMS
+that answers for nvkvm's own head; that is real work, not a missing forward.  So
+`nvidia-settings` and anything else that requires that specific driver will not
+run in the guest.  Ordinary desktops, GL, Vulkan and CUDA are unaffected.
+Background and measurements:
 [`docs/internal/mint-guest-desktop.md`](../internal/mint-guest-desktop.md).
 
 ## Running the guest desktop in a window

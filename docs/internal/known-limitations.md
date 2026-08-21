@@ -610,6 +610,34 @@ The subsequent `GEM_EXPORT_NVKMS_MEMORY` → `IMPORT_OBJECT_FROM_FD` handshake
 (`src/guest/nvkvm_drm.c:558-642`) is what actually reconnects the import to the
 real host memory object. The `sg_table` exists to let the attachment succeed.
 
+### NVIDIA's own X driver (the DDX) cannot run in the guest — intrinsic
+
+The DDX reaches the GPU perfectly well — with BAR geometry advertised it opens
+`/dev/nvidiactl` and `/dev/nvidia0`, and every RM ioctl through nvkvm returns 0
+— and then asks NVKMS to select a display subsystem. The NVKMS behind this
+device is the **host's**: it owns the host's connectors, not nvkvm's virtual
+head. nvkvm denies that command (`NVKMS_IOCTL_DECLARE_EVENT_INTEREST`,
+`cmdType=33`), and allowing it one rung at a time simply walks the DDX down to
+`QUERY_CONNECTOR_STATIC_DATA` over the *host's* six physical connectors.
+Forwarding further would not give the guest a display; it would give the guest
+the host's display.
+
+Closing this needs a **virtual NVKMS** — one that answers `QUERY_DISP` /
+`QUERY_CONNECTOR_STATIC_DATA` with nvkvm's own 1920x1080 head and terminates
+`SET_MODE`/`FLIP` at our KMS pipe. That is a real piece of work, versioned per
+driver branch, not a missing forward.
+
+**Scope: narrow.** It costs you the things that require that specific driver —
+`nvidia-settings`, and professional-application features that depend on it. It
+does not cost you a desktop: a stock distro's own Xorg session runs on the nvkvm
+head with `modesetting` + `AccelMethod "none"`, GL clients accelerated on NVIDIA
+through render offload, and GL, Vulkan and CUDA are unaffected. The config that
+selects that path is installed by `scripts/stage_guest_libs.sh` as part of guest
+staging, so it is not a step anyone has to take.
+
+Mechanism, host-vs-guest traces and the measurements:
+`docs/internal/mint-guest-desktop.md`.
+
 ### The virtual head is deliberately minimal
 
 > Scope is deliberately minimal: one connector (fixed 1080p), one CRTC, one
