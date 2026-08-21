@@ -1,0 +1,57 @@
+{
+  "benchmark": "Blender Open Data",
+  "launcher": {
+    "version": "3.3.0",
+    "sha256": "c52cd088936d7cd8fac9b72f0d14055744e5d4ddd40f85ba299892350c494515",
+    "note": "identical binary on both sides, copied host->guest and checksummed on each"
+  },
+  "blender_version": "4.5.0",
+  "device_type": "CUDA",
+  "gpu": "NVIDIA GeForce RTX 4070",
+  "driver": "595.84",
+  "published": false,
+  "published_note": "opendata.blender.org submission requires a Blender ID login; no anonymous path in launcher 3.x",
+  "host": {
+    "kind": "bare metal",
+    "machine": "MS-7E26",
+    "os": "Ubuntu 26.04",
+    "kernel": "7.0.0-30-generic",
+    "cpu": "AMD Ryzen 9 7900 (24 threads)",
+    "ram_gb": 30,
+    "clocksource": "tsc",
+    "clock_gettime_ns": 15.5,
+    "runs": {
+      "monster":   {"total": [35.4328,35.3152,35.3173,35.3984,35.4552,35.2991,35.2931,31.3029],
+                    "no_sync": [34.1487,34.2165,34.0513,34.0515,30.0266]},
+      "junkshop":  {"total": [39.3547,39.346,39.4976,39.4912,39.3882,39.4369],
+                    "no_sync": [33.1663,33.1539,33.1964]},
+      "classroom": {"total": [30.6242,30.6546,30.6625,30.6588,30.6665,30.6314],
+                    "no_sync": [30.2401,30.2179,30.2167]}
+    }
+  },
+  "guest": {
+    "kind": "nvkvm-pv guest",
+    "os": "Ubuntu 24.04",
+    "vcpus": 4,
+    "ram_gb": 15.62,
+    "clocksource": "kvm-clock",
+    "clock_gettime_ns": 18.0,
+    "qemu_args": "-m 16G -smp 4 -cpu host -device virtio-nvgpu-pci-non-transitional -device nvkvm-gpu",
+    "runs": {
+      "monster":   {"total": [37.4898,33.3827,37.5162,33.3594,37.5346,37.5754,33.3278,33.3473],
+                    "no_sync": [30.0317,34.1392,34.1427,34.2075,30.0496,30.0177,30.0111]},
+      "junkshop":  {"total": [43.4957,43.4895,43.4994],
+                    "no_sync": [33.1263,33.1746]},
+      "classroom": {"total": [32.6857,32.6712,32.7159],
+                    "no_sync": [30.2408,30.2897]}
+    }
+  },
+  "summary": {
+    "gpu_render_parity_geomean": 0.9995,
+    "gpu_render_parity_range": [0.9986, 1.0007],
+    "total_time_parity_geomean": 0.9310,
+    "total_time_parity_range": [0.9063, 0.9422],
+    "sync_overhead_seconds": {"monster": 2.12, "junkshop": 4.10, "classroom": 2.00},
+    "note": "monster is bimodal (~30.03s / ~34.15s GPU time) identically on both sides; mode-matched comparison required"
+  }
+}
