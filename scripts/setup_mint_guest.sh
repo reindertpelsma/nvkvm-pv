@@ -286,11 +286,8 @@ done
 (
     for _ in $(seq 1 30); do
         sleep 2
-        cur=$(xrandr 2>/dev/null | awk '/^Screen 0:/ {print $8 $9 $10}')
-        case "$cur" in
-            *1920x1080*) : ;;
-            *) xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null ;;
-        esac
+        xrandr 2>/dev/null | grep -q "current 1920 x 1080" ||
+            xrandr --output XWAYLAND0 --mode 1920x1080 2>/dev/null
     done
 ) &
 xrandr 2>/dev/null | grep -E "^(Screen |XWAYLAND0 )"   # leave the proof in the log
