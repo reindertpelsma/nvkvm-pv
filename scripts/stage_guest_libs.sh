@@ -1,12 +1,17 @@
 #!/bin/bash
 # stage_guest_libs.sh — version-match the guest's NVIDIA userspace to the host
-# driver.  Runs INSIDE the guest (over 9p at /mnt/nvkvm).  Kept as a standalone
-# script (not inline in run_remote_test.sh) so shell variables expand on the
-# guest, not the local shell across the nested ssh host "ssh guest '...'" hops.
+# driver.  Runs INSIDE the guest, normally over 9p at /mnt/nvkvm; on a guest
+# with no 9p client at all (CentOS Stream 9 ships none) the bundle is instead
+# copied straight into the guest at /opt/nvkvm/host-libs-<version>, the same
+# layout make_host_bundle.sh/container-entrypoint.sh already use on the host
+# side of a container.  Kept as a standalone script (not inline in
+# run_remote_test.sh) so shell variables expand on the guest, not the local
+# shell across the nested ssh host "ssh guest '...'" hops.
 #
 # Two dirs matter and BOTH must match the host driver or NVML/libcuda refuse to
 # init ("Driver/library version mismatch" / cuInit 803):
-#   - /usr/lib/x86_64-linux-gnu      : where NVML/nvidia-smi resolve libnvidia-ml
+#   - $SYS (the distro's default ld.so system lib dir, detected below)
+#                                    : where NVML/nvidia-smi resolve libnvidia-ml
 #   - /usr/local/nvidia-guest/lib    : where CUDA apps resolve libcuda (on the
 #                                      ld.so path via nvidia-guest.conf, AHEAD of
 #                                      the system dir) + allocator + ptxjit
@@ -34,28 +39,69 @@ set -u
 #
 # Select by the version the guest module reports for the HOST driver, and if
 # that cannot be read, refuse to guess between multiple candidates.
+#
+# Search BOTH /mnt/nvkvm (the 9p share) and /opt/nvkvm (the no-9p delivery
+# path -- see the file header) rather than only the former.  Found on a
+# CentOS Stream 9 guest: the bundle had been copied to
+# /opt/nvkvm/host-libs-580.178.04 and this script still only ever globbed
+# /mnt/nvkvm/host-libs-*, so both the exact-version match and the
+# single-candidate fallback saw zero bundles and it refused to run without
+# $1 -- not because no bundle existed, but because this script only knew how
+# to look in the one place a 9p-having guest keeps it.
+BUNDLE_ROOTS="/mnt/nvkvm /opt/nvkvm"
 if [ -n "${1:-}" ]; then
     GFXBUNDLE="$1"
 else
     HOSTV="$( { dmesg 2>/dev/null || sudo -n dmesg 2>/dev/null; } \
               | sed -n 's/.*nvkvm: host NVIDIA driver \([0-9][0-9.]*\).*/\1/p' | tail -1 )"
-    if [ -n "$HOSTV" ] && [ -d "/mnt/nvkvm/host-libs-$HOSTV" ]; then
-        GFXBUNDLE="/mnt/nvkvm/host-libs-$HOSTV"
-        echo "stage_guest_libs: host driver is $HOSTV -> $GFXBUNDLE"
-    else
-        N=$(ls -d /mnt/nvkvm/host-libs-* 2>/dev/null | wc -l)
+    GFXBUNDLE=""
+    if [ -n "$HOSTV" ]; then
+        for _root in $BUNDLE_ROOTS; do
+            if [ -d "$_root/host-libs-$HOSTV" ]; then
+                GFXBUNDLE="$_root/host-libs-$HOSTV"
+                echo "stage_guest_libs: host driver is $HOSTV -> $GFXBUNDLE"
+                break
+            fi
+        done
+    fi
+    if [ -z "$GFXBUNDLE" ]; then
+        CANDIDATES="$(ls -d /mnt/nvkvm/host-libs-* /opt/nvkvm/host-libs-* 2>/dev/null)"
+        N=$(printf '%s\n' "$CANDIDATES" | grep -c .)
         if [ "$N" -eq 1 ]; then
-            GFXBUNDLE="$(ls -d /mnt/nvkvm/host-libs-* 2>/dev/null)"
+            GFXBUNDLE="$CANDIDATES"
         else
             echo "stage_guest_libs: cannot choose between $N bundles and the host" >&2
             echo "  driver version could not be read from dmesg${HOSTV:+ (got $HOSTV, no matching bundle)}." >&2
             echo "  Pass one explicitly:" >&2
-            ls -d /mnt/nvkvm/host-libs-* 2>/dev/null | sed 's/^/    /' >&2
+            printf '%s\n' "$CANDIDATES" | sed 's/^/    /' >&2
             exit 1
         fi
     fi
 fi
-SYS=/usr/lib/x86_64-linux-gnu
+# Guest system lib dir the dynamic linker actually searches by default.
+# Debian/Ubuntu ships the multiarch path /usr/lib/x86_64-linux-gnu, wired into
+# ld.so's default search path by the distro's own ld.so.conf.d; RHEL-family
+# distros (CentOS Stream, RHEL, Fedora, Rocky, Alma) never wire that path in
+# at all and use the traditional /usr/lib64 instead.  This used to be
+# hardcoded to the Debian path, so on a RHEL guest every stage() call
+# targeting $SYS "succeeded" (the copy itself works fine into a dir that
+# happens to exist) but landed libs somewhere ld.so never looks, so
+# nvidia-smi still failed with "couldn't find libnvidia-ml.so" even though
+# the file was sitting right there and the script reported all 24 staged.
+#
+# Detect via /etc/redhat-release (present on every RHEL-family distro,
+# including CentOS Stream, since forever) rather than by testing whether
+# /usr/lib/x86_64-linux-gnu EXISTS: on a guest that had already been
+# (mis-)staged once, an earlier run of the old hardcoded version had already
+# created that directory and left stale libs in it, so existence alone is not
+# evidence it is on the linker's search path -- confirmed on the real T4
+# guest, where nvidia-smi kept failing after a first "fixed" run for exactly
+# this reason.
+if [ -f /etc/redhat-release ]; then
+    SYS=/usr/lib64
+else
+    SYS=/usr/lib/x86_64-linux-gnu
+fi
 CUDADIR=/usr/local/nvidia-guest/lib
 sudo mkdir -p "$CUDADIR"   # ln -s below fails if it does not exist
 
@@ -371,7 +417,7 @@ JSON
 # error for every OpenCL app).
 if [ "${NVKVM_STAGE_OPENCL:-1}" = "1" ] &&
    { [ -e /usr/local/nvidia-guest/lib/libnvidia-opencl.so.1 ] ||
-     [ -e /usr/lib/x86_64-linux-gnu/libnvidia-opencl.so.1 ]; }; then
+     [ -e "$SYS/libnvidia-opencl.so.1" ]; }; then
     sudo mkdir -p /etc/OpenCL/vendors
     printf 'libnvidia-opencl.so.1\n' | sudo tee /etc/OpenCL/vendors/nvidia.icd >/dev/null
     echo "stage_guest_libs: OpenCL ICD -> /etc/OpenCL/vendors/nvidia.icd"
