@@ -48,9 +48,28 @@ services:
           devices:
             - driver: nvidia
               count: all
-              # graphics/display are what make the GL and Vulkan libraries
-              # appear in the container -- without them the guest gets a
-              # compute-only driver and Vulkan silently falls back to llvmpipe.
+              # `graphics` is what makes the GL and Vulkan libraries appear
+              # in the container; without it the guest gets a compute-only
+              # driver and Vulkan silently falls back to llvmpipe.
+              #
+              # `display` is NOT just libraries, and it is worth being explicit
+              # about what it grants: the NVIDIA container toolkit mounts
+              # /dev/nvidia-modeset for it -- the host's NVKMS config device,
+              # the modesetting interface.  nvkvm needs it because the display
+              # path forwards NVKMS (surface registration, vblank) to reach a
+              # scanout at all.  It is also exactly the device
+              # src/qemu/nvkvm_nvkms_allowlist.h gates: NVKMS is default-deny
+              # on the inner cmdType, admitting only device alloc/free, surface
+              # register/unregister and the vblank-semaphore ops, keyed on the
+              # driver version -- because the command enum is unvalued and
+              # NVIDIA renumbers it mid-branch.  Without that gate a guest
+              # could reach GRANT_SURFACE or SET_FLIPLOCK_GROUP on a
+              # host-global display engine.
+              #
+              # RUNNING COMPUTE ONLY?  Drop `display` and `graphics`, and pair
+              # it with graphics=off on the device and NVKVM_GRAPHICS=0 in the
+              # guest module.  That leaves no modesetting device in the
+              # container and no display code in the .ko.
               capabilities: [gpu, utility, compute, graphics, display, video]
     environment:
       # Guest sizing, same defaults as scripts/run_test_vm.sh.  Raise VM_MEM
