@@ -46,6 +46,7 @@ that it failed; those are early rows that predate the suite.
 | RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
 | A100 80GB PCIe | **Ampere GA100** (datacenter) | 580.126.09 | 580 | 28/28 \*\*\* |
 | 4x RTX 5060 | Blackwell GB206 | 580.95.05 | 580 | 28/28, `cuda_device_count 4` |
+| 6x Tesla T4 | **Turing TU104** (datacenter) | 580.178.04 | 580 | 28/28, `cuda_device_count 6` \*\*\*\* |
 | 6x RTX A4000 | **Ampere GA104** (workstation) | 570.124.06 | 570 | 28/28, `cuda_device_count 6` |
 
 
@@ -82,6 +83,34 @@ The guest was given less machine than the host, and this box is itself a VM
 with the A100 passed through — so 98.0% is nvkvm's cost measured while nested a
 level deeper than usual, which makes it a stronger result rather than a weaker
 one. [Why, and why the 3050 reads higher](parity.md).
+
+\*\*\*\* First Turing datacenter part, and the first **non-nested** multi-GPU
+box: six T4s on bare metal, one guest, no configuration beyond the usual boot.
+The guest saw all six (`/dev/nvidia0`..`nvidia5`, `nvidia-smi -L` 6,
+`cuda_device_count` 6, Vulkan enumerating six T4s), sustained **133.7 TFLOPS
+fp16 aggregate** with all six under concurrent GEMM load, verified five
+device-to-device copies byte-exact, and returned every card to its 4-10 MiB
+baseline afterwards with no lingering compute apps.
+
+It also exercised the paths a display-less card forces, which no consumer GPU
+here can: presentation had to run through **readback** rather than native
+scanout, and hardware **NVENC** encode was driven from inside the guest — a
+full XFCE desktop on the virtual head, captured and H.265-encoded to a browser
+at 1080p, 58 fps, 26 ms end-to-end (25-28% encoder utilisation on the host,
+one session, so genuinely the T4's encoder and not a software fallback).
+
+Two things this box exposed that a desktop host hides:
+
+- **`nvidia_drm` is not loaded by default** on a headless datacenter install,
+  so there are no NVIDIA render nodes at all and QEMU dies with `egl: no drm
+  render node available`. `modprobe nvidia-drm` creates them. The present path
+  needs a render node; a datacenter host may not have one until asked.
+- **`GL_RENDERER` is not a vendor string.** A T4 reports `Tesla T4/PCIe/SSE2`
+  with no "NVIDIA" in it, where consumer parts say `NVIDIA GeForce ...`.
+  `validate.sh` matched on it and failed the card as non-NVIDIA, taking
+  `gl_draw_pixel_check` down as an unexpected skip: 26/28 on a stack that was
+  working perfectly. Every Tesla, A-series and H-series row above was scored
+  by that same check, so it now matches `GL_VENDOR` too.
 
 Sustained compute is at parity; the 1.01x is noise. Single-stream greedy
 decoding is 27% slower, which is the honest number for that shape — hundreds of
