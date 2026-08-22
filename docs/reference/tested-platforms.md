@@ -123,23 +123,42 @@ and `drm_driver.date`). The guards now consult `RHEL_RELEASE_CODE`. Five
 unchecked `copy_to_user()` calls also had to go: RHEL builds modules with
 `-Werror` and the return is `__must_check`.
 
-With those fixed, on 5.14.0-737.el9:
+With those fixed, **CentOS Stream 9 scores 28/28** — the same as every Ubuntu
+row above it, on 5.14.0-737.el9:
 
 ```
 nvkvm: host reports 6 GPU(s); exposing 6
 nvkvm: virtual KMS head ready (1920x1080, 1 connector/crtc)
-cuInit 0, cuDeviceGetCount 6, ctx+256MiB alloc+free OK on all six
+TOTAL 28   PASS 28   FAIL 0   SKIP 0
 ```
 
-Two RHEL-specific gaps remain, neither in the forwarder:
+Getting from "module will not compile" to 28/28 took two more portability
+fixes, both of which had been invisible because the suite had only ever run on
+Debian-family guests:
 
-- **The kernel package ships no 9p at all** — not built in, not a module. The
-  repo cannot reach the guest the way it does everywhere else; it was scp'd in
-  for this run. virtiofs is the replacement RHEL does support.
-- **`stage_guest_libs.sh` hardcodes the Debian multiarch path**
-  (`/usr/lib/x86_64-linux-gnu`), which does not exist on RHEL (`/usr/lib64`),
-  so only 6 of 24 libraries staged and `nvidia-smi` could not find NVML.
-  `libcuda` landed in its own prefix and CUDA worked regardless.
+- **`stage_guest_libs.sh` hardcoded the Debian multiarch path**
+  (`/usr/lib/x86_64-linux-gnu`), which is not on RHEL's linker search path
+  (`/usr/lib64`), so only 6 of 24 libraries staged and `nvidia-smi` could not
+  find NVML. It also only looked for the bundle on the 9p share, which a RHEL
+  guest cannot have.
+- **`validate.sh` trusted PATH for `nvidia-smi`.** The suite runs under sudo,
+  and RHEL's sudo `secure_path` is `/sbin:/bin:/usr/sbin:/usr/bin` — no
+  `/usr/local/bin`, which is where the binary is staged. Debian's secure_path
+  includes it, so this could only ever appear on RHEL. All three `nvidia_smi_*`
+  checks recorded SKIP while the binary worked perfectly from a normal shell,
+  and an unexpected skip scores as not-a-pass: 25/28 INCOMPLETE on a working
+  stack. The same shape of false negative as the `GL_RENDERER` check above,
+  and found the same way — by running the suite somewhere it had never run.
+
+One RHEL gap remains, and it is not in the forwarder: **the kernel package
+ships no 9p at all** — not built in, not a module. The repo cannot reach the
+guest the way it does everywhere else; it was scp'd in for this run. virtiofs
+is the replacement RHEL does support.
+
+Weston on CentOS is packaged without the DRM backend (`unknown backend "drm"`),
+so the compositor path was not exercised there; the EGL/GL/Vulkan rungs that
+`validate.sh` covers all pass, including `gl_draw_pixel_check` rendering a real
+triangle into an FBO.
 
 Sustained compute is at parity; the 1.01x is noise. Single-stream greedy
 decoding is 27% slower, which is the honest number for that shape — hundreds of
