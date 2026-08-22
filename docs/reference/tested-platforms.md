@@ -250,16 +250,23 @@ exercises different code:
 |---|---|---|---|---|
 | RTX 4070 (Ada AD104) | 595.84 | GNOME/Wayland, real monitor | **readback**, then **native** | Mint desktop; Minecraft at max settings, 60 fps, chunk generation smooth, 35% GPU util; `nvtop` (NVML); GL zero-copy A/B against readback |
 | RTX 3050 (Ampere GA107) | 595.84 | GNOME/Wayland, real monitor | **native** | Mint desktop; pointer lock; keyboard grab (Super to guest); configurable head verified at 1600x900; OpenGL 4.6 reported by the guest |
+| 6x Tesla T4 (Turing TU104, datacenter) | 580.178.04 | **none — headless bare metal** | **headless** | Ubuntu guest: XFCE on the virtual head, weston+Xwayland, NVENC H.265 to a browser over an SSH tunnel; Minecraft 54 fps in-guest, 48 fps delivered, 25 ms end-to-end. CentOS Stream 9 guest: Xorg + openbox on the same head. |
 
 Both physical rows are on driver **595.84** and were verified by watching the
 screen, not by reading a log. Two GPU generations (Ada and Ampere) and two CPU
 vendors (Ryzen 9 7900 and Core i5-4460).
 
-**Not yet in this table, and it should be:** a headless run on rented hardware
-(no X on the host, frames leaving via a browser-based screencast), and a
-container with Xvfb, which is a readback row by construction. Both were done by
-the author and neither is recorded here with its driver version, so they are
-named rather than tabulated until someone writes down what they ran.
+The T4 row is the headless case in its strongest form: that card has **no
+display outputs at all**, so there is no host display server, no monitor, and
+nothing for a native path to import into. Frames leave by NVENC inside the
+guest and arrive in a browser. It also covers a second guest OS on the same
+head — CentOS Stream 9 running Xorg, where weston could not be used because
+EPEL packages it without the DRM backend.
+
+**Still not in this table, and it should be:** a container with Xvfb, which is
+a readback row by construction. That was done by the author but is not recorded
+here with its driver version, so it is named rather than tabulated until
+someone writes down what they ran.
 
 ### What the display path is fragile to
 
