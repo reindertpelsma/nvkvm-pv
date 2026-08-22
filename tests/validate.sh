@@ -1617,8 +1617,29 @@ static int probe_main(void) {
         emit("gl_renderer_is_nvidia", "FAIL", "SOFTWARE RASTERISER: GL_RENDERER='%s'", rend);
         finish("software GL"); return 1;
     }
-    if (!strstr(lower, "nvidia")) {
-        emit("gl_renderer_is_nvidia", "FAIL", "GL_RENDERER='%s' does not contain 'NVIDIA'", rend);
+    /*
+     * GL_RENDERER is not a vendor field.  Consumer parts spell it
+     * "NVIDIA GeForce RTX 4070/PCIe/SSE2", but DATACENTER parts drop the
+     * prefix entirely -- a Tesla T4 reports "Tesla T4/PCIe/SSE2" while
+     * GL_VENDOR still reads "NVIDIA Corporation" and GL_VERSION still reads
+     * "OpenGL ES 3.2 NVIDIA 580.178.04".  Matching on the renderer alone
+     * therefore failed every Tesla/A-series/H-series card as "non-NVIDIA",
+     * and took gl_draw_pixel_check down with it as an unexpected SKIP.
+     * Measured on 6x Tesla T4 / 580.178.04, 2026-08-22.
+     *
+     * GL_VENDOR is the field that actually names the vendor; the software
+     * rasteriser test above stays on GL_RENDERER, which is where llvmpipe
+     * and friends identify themselves.
+     */
+    char vlower[512]; size_t vk_;
+    const char *vsrc = vend ? vend : "";
+    for (vk_ = 0; vk_ < sizeof vlower - 1 && vsrc[vk_]; vk_++)
+        vlower[vk_] = (char)tolower((unsigned char)vsrc[vk_]);
+    vlower[vk_] = 0;
+    if (!strstr(lower, "nvidia") && !strstr(vlower, "nvidia")) {
+        emit("gl_renderer_is_nvidia", "FAIL",
+             "neither GL_RENDERER='%s' nor GL_VENDOR='%s' names NVIDIA",
+             rend, vend ? vend : "?");
         finish("non-NVIDIA GL"); return 1;
     }
     emit("gl_renderer_is_nvidia", "PASS", "%s", rend);
