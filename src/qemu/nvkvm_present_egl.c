@@ -418,7 +418,7 @@ static int nvkvm_present_decide_mode(NvkvmPresent *p)
 
 
 /* Push the pending frame to the GL console with no CPU copy. */
-static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
+static bool nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
                              uint32_t stride, uint32_t fourcc, uint64_t mod)
 {
     /* qemu_dmabuf_new takes ownership of fd (freed by qemu_dmabuf_close). */
@@ -426,7 +426,7 @@ static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
                                       fd, false, false);
     if (!buf) {
         close(fd);
-        return;
+        return false;   /* frame never reached the display */
     }
     qemu_console_resize(p->con, w, h);
     dpy_gl_scanout_dmabuf(p->con, buf);
@@ -462,6 +462,7 @@ static void nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
     }
     egl_fb_destroy(&p->fb);
     p->cur_buf = buf;
+    return true;
 }
 
 
@@ -638,25 +639,28 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, DisplaySurface *ds,
 
 /* Import the pending frame on our private NVIDIA EGL context, read it back to a
  * CPU surface, and push it to the 2D display.  Works for any host display GPU. */
-static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
+static bool nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
                                    uint32_t key,
                                    uint32_t w, uint32_t h, uint32_t stride,
                                    uint32_t fourcc, uint64_t mod)
 {
+    /* Declared before any goto so the error paths cannot jump over it. */
+    bool shown = false;
+
     if (!nvkvm_present_egl_ensure()) {
         close(fd);
-        return;
+        return false;   /* EGL unavailable: nothing was shown */
     }
     if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         qemu_egl_rn_ctx)) {
         close(fd);
-        return;
+        return false;   /* EGL unavailable: nothing was shown */
     }
 
     GLuint tex = nvkvm_present_cached_tex(p, owner, key, fd, w, h, stride,
                                           fourcc, mod);
     if (!tex) {
-        goto out_ctx;
+        goto out_ctx;   /* shown stays false */
     }
     egl_fb_setup_for_tex(&p->fb, w, h, tex, false);   /* keeps its FBO */
 
@@ -673,7 +677,7 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
     if (!ds || surface_width(ds) != (int)w || surface_height(ds) != (int)h) {
         fprintf(stderr, "nvkvm present: console surface unusable for %ux%u\n",
                 w, h);
-        goto out_ctx;
+        goto out_ctx;   /* shown stays false */
     }
     bool have_frame;
     if (nvkvm_pbo_ok()) {
@@ -699,12 +703,14 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
     }
     if (have_frame) {
         dpy_gfx_update(p->con, 0, 0, w, h);
+        shown = true;
     }
 
 out_ctx:
     eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                    EGL_NO_CONTEXT);
     close(fd);                             /* readback owns + consumes the fd */
+    return shown;
 }
 
 /*
@@ -789,6 +795,7 @@ static void nvkvm_present_reap_dead(NvkvmPresent *p)
  * Off unless the environment variable is set, so a normal run pays nothing.
  */
 static unsigned nvkvm_st_consumed, nvkvm_st_dropped;
+static unsigned nvkvm_st_failed, nvkvm_st_bucket_failed;
 static unsigned nvkvm_st_bucket_consumed, nvkvm_st_bucket_dropped;
 static double   nvkvm_st_present_us, nvkvm_st_bucket_us;
 static double   nvkvm_st_bucket_t0;
@@ -837,10 +844,22 @@ static void nvkvm_present_gfx_update(void *opaque)
         clock_gettime(CLOCK_MONOTONIC, &ta);
     }
 
+    /*
+     * Whether the frame actually reached the display.  This is not pedantry:
+     * with EGL unavailable (a container without the `graphics` driver
+     * capability, so no GBM backend) nvkvm_present_readback() closes the fd and
+     * returns at its first line, and the old code counted that as a presented
+     * frame.  The result was "60.0 frames/s dropped=0 present_mean=0.00ms"
+     * printed once a second at a completely blank screen, with the one line
+     * that said why -- "egl_init failed" -- having scrolled past at startup.
+     * Stats that say healthy while nothing is displayed are worse than no
+     * stats, because someone acts on them.
+     */
+    bool shown;
     if (nvkvm_present_decide_mode(p) == 1) {
-        nvkvm_present_gl(p, fd, w, h, stride, fourcc, mod);
+        shown = nvkvm_present_gl(p, fd, w, h, stride, fourcc, mod);
     } else {
-        nvkvm_present_readback(p, fd, owner, key, w, h, stride, fourcc, mod);
+        shown = nvkvm_present_readback(p, fd, owner, key, w, h, stride, fourcc, mod);
     }
 
     if (stats) {
@@ -848,28 +867,38 @@ static void nvkvm_present_gfx_update(void *opaque)
 
         clock_gettime(CLOCK_MONOTONIC, &tb);
         us = (tb.tv_sec - ta.tv_sec) * 1e6 + (tb.tv_nsec - ta.tv_nsec) / 1e3;
-        nvkvm_st_present_us += us;
-        nvkvm_st_bucket_us  += us;
-        nvkvm_st_consumed++;
-        nvkvm_st_bucket_consumed++;
+        if (shown) {
+            nvkvm_st_present_us += us;
+            nvkvm_st_bucket_us  += us;
+            nvkvm_st_consumed++;
+            nvkvm_st_bucket_consumed++;
+        } else {
+            nvkvm_st_failed++;
+            nvkvm_st_bucket_failed++;
+        }
 
         now = nvkvm_st_now();
         if (nvkvm_st_bucket_t0 == 0.0) {
             nvkvm_st_bucket_t0 = now;
         } else if (now - nvkvm_st_bucket_t0 >= 1.0) {
             fprintf(stderr,
-                    "nvkvm disp stats: %.1f frames/s dropped=%u "
-                    "present_mean=%.2fms (total consumed=%u dropped=%u)\n",
+                    "nvkvm disp stats: %.1f frames/s dropped=%u failed=%u "
+                    "present_mean=%.2fms (total consumed=%u dropped=%u "
+                    "failed=%u)%s\n",
                     nvkvm_st_bucket_consumed / (now - nvkvm_st_bucket_t0),
                     nvkvm_st_bucket_dropped,
+                    nvkvm_st_bucket_failed,
                     nvkvm_st_bucket_consumed
                         ? nvkvm_st_bucket_us / nvkvm_st_bucket_consumed / 1000.0
                         : 0.0,
-                    nvkvm_st_consumed, nvkvm_st_dropped);
+                    nvkvm_st_consumed, nvkvm_st_dropped, nvkvm_st_failed,
+                    nvkvm_st_bucket_failed && !nvkvm_st_bucket_consumed
+                        ? "  <-- NOTHING IS BEING DISPLAYED" : "");
             fflush(stderr);
             nvkvm_st_bucket_t0       = now;
             nvkvm_st_bucket_consumed = 0;
             nvkvm_st_bucket_dropped  = 0;
+            nvkvm_st_bucket_failed   = 0;
             nvkvm_st_bucket_us       = 0.0;
         }
     }
