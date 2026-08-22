@@ -117,6 +117,49 @@ unprivileged guest process could hang the entire VMM without corrupting
 anything. Those two are fixed; the remaining open items are listed by name in
 the audit rather than quietly dropped, each with the reason it is still there.
 
+## Can a container read the host's screen?
+
+No, unless it is given `CAP_SYS_ADMIN`. This gets asked because a GPU container
+is handed `/dev/dri/card*`, and a card node is what screen capture goes
+through. Measured rather than reasoned about, on an RTX 4070 driving a 4K
+GNOME/Wayland desktop, walking the real capture path
+`GETRESOURCES -> GETCRTC -> GETFB -> PRIME_HANDLE_TO_FD` (a GEM handle to the
+scanout buffer *is* the screen):
+
+| context | `SET_MASTER` | `GETFB` handle | screen readable |
+|---|---|---|---|
+| root on the host | `EBUSY` | 1 | **yes** |
+| container, Docker default caps | `EACCES` | **0** | **no** |
+| container, `--cap-add=SYS_ADMIN` | `EBUSY` | 1 | **yes** |
+
+The kernel returns the framebuffer's **metadata** to anyone who can open the
+node — resolution, pitch, bpp, whether a CRTC is active — but **withholds the
+GEM handle** without `CAP_SYS_ADMIN`. Resolution leaks; pixels do not.
+
+Note that root on the host captured the screen while **not** being DRM master.
+Capture is not gated by who holds the display. Three gates are easy to
+conflate and only one of them is a privilege check:
+
+| operation | gated by |
+|---|---|
+| DRM modesetting | master, i.e. **occupancy** (`CAP_SYS_ADMIN` to steal it) |
+| DRM capture (`GETFB` handle) | **`CAP_SYS_ADMIN`** — occupancy irrelevant |
+| NVKMS modeset ownership | **occupancy only** — no capability check at all |
+
+The third is the surprising one: `/dev/nvidia-modeset` is mode 0666 and
+`GrabModesetOwnership()` has no `capable()` test anywhere — it refuses only
+when someone already owns the display. On a machine with a monitor attached
+that is essentially always true, because the display server takes ownership at
+startup. The exposed window is a machine with a panel but no display server
+running, and it is not specific to containers: an unprivileged local user has
+the same access.
+
+**For nvkvm:** [`docker-compose.yml`](../docker-compose.yml) drops `ALL` and
+adds back `SETUID`, `SETGID`, `SETPCAP`, `SYS_CHROOT`. None is `CAP_SYS_ADMIN`,
+so an nvkvm container cannot read the host's screen even with `/dev/dri`
+present. **`--privileged` removes this entirely** — the device nodes are not
+the sensitive part, the capability set is.
+
 ## Weaker configurations you should know about
 
 - **In containers**, Linux namespaces are usually blocked, so the isolate falls
