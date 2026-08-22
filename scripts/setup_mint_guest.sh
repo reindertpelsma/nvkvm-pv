@@ -180,7 +180,7 @@ cat > /home/$GUEST_USER/run-session.sh <<'RS'
 #   weston                  - bare weston + Xwayland; the control path
 #   cinnamon                - Cinnamon's own Wayland session (crashes, see docs)
 exec > ~/session.log 2>&1
-echo "=== $(date) session: $(cat ~/session-choice 2>/dev/null) ==="
+echo "=== \$(date) session: \$(cat ~/session-choice 2>/dev/null) ==="
 export XDG_SESSION_TYPE=wayland
 
 # Pick the nvkvm card by DRIVER, never by index.  The VM boots with an emulated
@@ -190,12 +190,12 @@ export XDG_SESSION_TYPE=wayland
 # renders with llvmpipe: full speed, correct-looking screenshots, no GPU.
 NVCARD=
 for c in /sys/class/drm/card[0-9]*; do
-    [ -e "$c/device/driver" ] || continue
-    if [ "$(basename "$(readlink -f "$c/device/driver")")" = nvidia ]; then
-        NVCARD=$(basename "$c"); break
+    [ -e "\$c/device/driver" ] || continue
+    if [ "\$(basename "\$(readlink -f "\$c/device/driver")")" = nvidia ]; then
+        NVCARD=\$(basename "\$c"); break
     fi
 done
-echo "nvkvm DRM device: ${NVCARD:-NOT FOUND}"
+echo "nvkvm DRM device: \${NVCARD:-NOT FOUND}"
 
 # --idle-time=0 is load-bearing for an unattended head, and its absence does NOT
 # look like a timeout.  weston's default is 300s of no INPUT -- animating clients
@@ -204,17 +204,17 @@ echo "nvkvm DRM device: ${NVCARD:-NOT FOUND}"
 # holds that last frame forever: screendump returns a plausible desktop that is
 # byte-identical every time and reads exactly like a dead present path.
 start_weston() {
-    weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} --idle-time=0 "$@" &
-    WESTON_PID=$!
-    for _ in $(seq 1 60); do
-        [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/wayland-1" ] && return 0
+    weston --backend=drm \${NVCARD:+--drm-device=\$NVCARD} --idle-time=0 "\$@" &
+    WESTON_PID=\$!
+    for _ in \$(seq 1 60); do
+        [ -S "\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}/wayland-1" ] && return 0
         sleep 0.5
     done
     echo "weston socket never appeared"; return 1
 }
 
-case "$(cat ~/session-choice 2>/dev/null)" in
-  weston)   exec weston --backend=drm ${NVCARD:+--drm-device=$NVCARD} \
+case "\$(cat ~/session-choice 2>/dev/null)" in
+  weston)   exec weston --backend=drm \${NVCARD:+--drm-device=\$NVCARD} \
                         --xwayland --idle-time=0 ;;
   cinnamon) exec cinnamon-session-cinnamon --wayland ;;
   *)
@@ -233,7 +233,7 @@ case "$(cat ~/session-choice 2>/dev/null)" in
     # EGL_NATIVE_PIXMAP_KHR import that Xorg's modesetting+glamor requires.
     start_weston || exit 1
     ~/start-cinnamon-x11.sh &
-    wait $WESTON_PID
+    wait \$WESTON_PID
     ;;
 esac
 RS
@@ -244,20 +244,20 @@ cat > /home/$GUEST_USER/start-cinnamon-x11.sh <<'CX'
 # it.  Invoked by run-session.sh; safe to run by hand too.
 exec > ~/cinnamon-x11.log 2>&1
 set -x
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
+export WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-wayland-1}"
 
 pkill -f "Xwayland :2" 2>/dev/null
 sleep 1
 
 Xwayland :2 -fullscreen -geometry 1920x1080 &
-for _ in $(seq 1 60); do
+for _ in \$(seq 1 60); do
     [ -S /tmp/.X11-unix/X2 ] && break
     sleep 0.5
 done
 [ -S /tmp/.X11-unix/X2 ] || { echo "Xwayland :2 never came up"; exit 1; }
 
-export PATH="$HOME/bin:$PATH"     # for the cinnamon --x11 shim, see ~/bin/cinnamon
+export PATH="\$HOME/bin:\$PATH"     # for the cinnamon --x11 shim, see ~/bin/cinnamon
 export DISPLAY=:2
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=X-Cinnamon
@@ -289,7 +289,7 @@ CX
 mkdir -p /home/$GUEST_USER/bin
 cat > /home/$GUEST_USER/bin/cinnamon <<'SHIM'
 #!/bin/sh
-exec /usr/bin/cinnamon --x11 "$@"
+exec /usr/bin/cinnamon --x11 "\$@"
 SHIM
 chmod +x /home/$GUEST_USER/bin/cinnamon
 chmod +x /home/$GUEST_USER/run-session.sh /home/$GUEST_USER/start-cinnamon-x11.sh
@@ -297,7 +297,7 @@ echo cinnamon-x11 > /home/$GUEST_USER/session-choice
 
 # The guard is NOT optional.  /usr/bin/cinnamon-session is a shell wrapper that,
 # for a wayland session, re-execs itself through a LOGIN shell:
-#     exec bash -c "exec -l '$SHELL' -c '$0 -l $*'"
+#     exec bash -c "exec -l '\$SHELL' -c '\$0 -l \$*'"
 # so the session inherits the user's login environment.  That login shell
 # re-reads .bash_profile -- which would start the session again.  Without the
 # guard that is an infinite exec chain: it spins at 100% CPU, never spawns a
@@ -305,7 +305,7 @@ echo cinnamon-x11 > /home/$GUEST_USER/session-choice
 # The guard survives because exec preserves the environment.
 cat > /home/$GUEST_USER/.bash_profile <<'BP'
 [ -f ~/.bashrc ] && . ~/.bashrc
-if [ -z "$NVKVM_SESSION_LAUNCHED" ] && [ -z "$WAYLAND_DISPLAY" ] && [ "$XDG_VTNR" = 1 ]; then
+if [ -z "\$NVKVM_SESSION_LAUNCHED" ] && [ -z "\$WAYLAND_DISPLAY" ] && [ "\$XDG_VTNR" = 1 ]; then
   export NVKVM_SESSION_LAUNCHED=1
   exec ~/run-session.sh
 fi
@@ -315,7 +315,7 @@ chown -R $GUEST_USER:$GUEST_USER /home/$GUEST_USER/run-session.sh \
       /home/$GUEST_USER/session-choice /home/$GUEST_USER/.bash_profile
 
 # Build and load the guest module at boot.  RequiresMountsFor is load-bearing:
-# the 9p fstab entries are `nofail`, which removes them from local-fs.target's
+# the 9p fstab entries are \`nofail\`, which removes them from local-fs.target's
 # dependency set, so ordering After=local-fs.target guarantees nothing and the
 # unit loses the race on reboot -- leaving the guest with no DRM node and no
 # GPU.  Same bug, same fix as candidate 67a18e3 on the Ubuntu guest.
@@ -329,7 +329,7 @@ Before=getty@tty1.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest && exit 0; modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko'
+ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest && exit 0; modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/\$(uname -r)/build && insmod ./nvkvm-guest.ko'
 # Nodes created by a late insmod are root:root 0600 with no by-path links --
 # they miss the boot-time uevent flow.  Without this trigger no unprivileged
 # compositor can open the card.
