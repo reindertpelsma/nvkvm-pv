@@ -291,6 +291,7 @@ out:
 
 #include <pthread.h>
 #include <string.h>
+#include "qemu/thread.h"
 
 #define NVKVM_PRESENT_CACHE 8
 
@@ -368,51 +369,181 @@ typedef struct NvkvmPresent {
     unsigned pbo_idx;        /* the one this frame writes */
     bool     pbo_primed;     /* a transfer is in flight in the other one */
 
-    /* No cached DisplaySurface: the console owns it and may free it at any
-     * time (see nvkvm_present_readback).  Fetch it per frame. */
+    /* #125: the readback path no longer touches a DisplaySurface at all -- it
+     * fills `stage` below and the main loop wraps that.  The console still
+     * owns the surface it is shown, and still frees the one it displaces. */
 
     int  mode;               /* -1 undecided, 0 readback, 1 GL zero-copy */
+    char ui_renderer[128];   /* host UI's GL renderer, probed once (#125) */
+    unsigned probe_tries;    /* #125: the UI may not be up on frame 1 */
+
+    /*
+     * #125: the readback path runs on its own thread.
+     *
+     * It used to run on the main loop out of gfx_update, which forced
+     * eglMakeCurrent(our ctx) / eglMakeCurrent(NO_CONTEXT) around EVERY frame:
+     * EGL current-ness is per-thread, the UI backend keeps its own context on
+     * that same thread, and leaving ours bound breaks the UI's next draw.  So
+     * the import, the readback and the 8 MB copy all happened with the BQL
+     * held -- the guest's vCPUs stopped for the whole transfer -- and the two
+     * contexts took turns on one thread, which is also what made a Mesa/Xvfb
+     * host UI fail with EGL_BAD_ACCESS.
+     *
+     * Giving the NVIDIA context a thread of its own removes the conflict at
+     * the root rather than working around it: our context is made current once
+     * at thread start and stays current for the life of the VM, the UI's
+     * context is never disturbed because it lives on a different thread, and
+     * no display op ever runs off the main loop.  The thread hands finished
+     * pixels back through `stage`, and the main loop only wraps them in a
+     * DisplaySurface -- no pixel copy under the BQL at all.
+     */
+    QemuThread     thread;
+    QemuSemaphore  wake;
+    bool           thread_started;
+    bool           thread_failed;
+    int            thread_stop;
+
+    /*
+     * Double-buffered CPU staging.  The thread fills one buffer while the main
+     * loop copies out of the other, so neither waits on the other and a frame
+     * is never torn by a write landing mid-copy.
+     */
+    uint8_t  *stage[2];
+    uint32_t  stage_w, stage_h;
+    unsigned  stage_write;   /* buffer the thread writes next */
+    unsigned  stage_ready;   /* buffer holding the newest finished frame */
+    bool      stage_has_frame;
 } NvkvmPresent;
 
-/* Decide GL-zero-copy vs readback once, then cache.  Zero-copy is only valid
- * when the active UI console has GL *and* its renderer is the same NVIDIA GPU
- * the scanout buffer came from — a cross-vendor (Intel/AMD/llvmpipe) UI cannot
- * import an NVIDIA dma-buf, so those fall back to readback (always correct).
- * NVKVM_PRESENT_MODE=gl|readback overrides the probe. */
-static int nvkvm_present_decide_mode(NvkvmPresent *p)
+/* DRM_FORMAT_MOD_LINEAR; a linear buffer is the one layout a non-NVIDIA host
+ * GL stack can import, which is what makes cross-vendor zero-copy possible. */
+#define NVKVM_MOD_LINEAR 0ULL
+
+/* How many frames to keep re-probing the UI before settling on readback. */
+#define NVKVM_PROBE_TRIES 120
+
+/*
+ * #125: ask the host UI what GPU actually renders its window.
+ *
+ * This is the question the mode decision always needed and could not answer.
+ * The render-node EGL context we own is NVIDIA by construction, so querying it
+ * tells us nothing about the window -- on an Intel/AMD/Xvfb host the window is
+ * Mesa while the render node is still NVIDIA.  Guessing "GL" there produced a
+ * blank window, which is why the old code simply defaulted to readback and
+ * made the operator opt in to zero-copy by hand.
+ *
+ * dpy_gl_ctx_create() gives us a context on the UI's own display, so
+ * glGetString() through it reports the window's renderer.  Safe to bind and
+ * drop: both ui/gtk-egl.c and ui/sdl2-gl.c re-bind their context at the top of
+ * every draw, so leaving no context current cannot strand them.  Runs once,
+ * on the main loop, where the UI lives.
+ */
+static bool nvkvm_probe_ui_renderer(NvkvmPresent *p)
+{
+    QEMUGLParams params = { .major_ver = 2, .minor_ver = 0 };
+    QEMUGLContext ctx;
+
+    p->ui_renderer[0] = '\0';
+    if (!console_has_gl(p->con)) {
+        return false;
+    }
+    ctx = dpy_gl_ctx_create(p->con, &params);
+    if (!ctx) {
+        return false;
+    }
+    if (dpy_gl_ctx_make_current(p->con, ctx) != 0) {
+        dpy_gl_ctx_destroy(p->con, ctx);
+        return false;
+    }
+    const char *vendor   = (const char *)glGetString(GL_VENDOR);
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    snprintf(p->ui_renderer, sizeof(p->ui_renderer), "%s / %s",
+             vendor ? vendor : "?", renderer ? renderer : "?");
+    dpy_gl_ctx_destroy(p->con, ctx);
+    return true;
+}
+
+/*
+ * Decide GL-zero-copy vs readback once, then cache.  #125: this now probes the
+ * host UI's renderer instead of refusing to guess.
+ *
+ * Zero-copy is valid when the UI's own GL stack can import the guest's scanout
+ * dma-buf.  Two ways that holds:
+ *   - the window renders on NVIDIA too, so it takes the buffer in its native
+ *     block-linear layout; or
+ *   - the buffer is LINEAR, which any vendor's GL can import.
+ *
+ * Be clear about the second one: it does NOT fire for a scanout buffer today,
+ * and not by accident.  NVIDIA cannot use a LINEAR dma-buf as an EGLImage
+ * render target (measured in-guest: GL_INVALID_OPERATION on bind, incomplete
+ * FBO), which is how a compositor obtains its output framebuffer -- so the
+ * guest deliberately advertises only block-linear scanout modifiers
+ * (nvkvm_kms.c) and a guest compositor can never hand us a linear frame.  The
+ * branch is kept because it is the correct answer for any linear buffer that
+ * does reach here (the cursor plane accepts LINEAR), not because it makes an
+ * Intel iGPU host zero-copy.
+ *
+ * So on a cross-vendor host the honest answer is readback, and that is what
+ * gets chosen and reported.  Getting zero-copy there would need a detile blit
+ * on our NVIDIA context into a linear buffer the other vendor can import,
+ * which is a GPU pass plus an allocation both devices can reach -- a separate
+ * piece of work, not a mode choice.
+ *
+ * NVKVM_PRESENT_MODE=gl|readback still overrides the probe.
+ */
+static int nvkvm_present_decide_mode(NvkvmPresent *p, uint64_t mod)
 {
     if (p->mode != -1) {
         return p->mode;
     }
 
     const char *forced = getenv("NVKVM_PRESENT_MODE");
-    bool has_gl = console_has_gl(p->con);
+    bool has_gl  = console_has_gl(p->con);
+    bool probed  = nvkvm_probe_ui_renderer(p);
+    bool nvidia  = probed && (strcasestr(p->ui_renderer, "NVIDIA") != NULL);
+    bool linear  = (mod == NVKVM_MOD_LINEAR);
+    const char *why;
 
     if (forced && !strcmp(forced, "readback")) {
-        p->mode = 0;
+        p->mode = 0;  why = "forced by NVKVM_PRESENT_MODE=readback";
     } else if (forced && !strcmp(forced, "gl")) {
-        /* Operator asserts the window renders on the same NVIDIA GPU. */
         p->mode = has_gl ? 1 : 0;
-    } else {
+        why = has_gl ? "forced by NVKVM_PRESENT_MODE=gl"
+                     : "NVKVM_PRESENT_MODE=gl ignored: UI console has no GL";
+    } else if (!has_gl) {
+        p->mode = 0;  why = "UI console has no GL (e.g. -display vnc/curses)";
+    } else if (!probed) {
         /*
-         * Auto: default to readback — the universal, always-correct floor.
-         * Zero-copy GL scanout only works when the window's *own* GL renderer
-         * can import an NVIDIA dma-buf, i.e. the window is rendered on the same
-         * NVIDIA GPU.  We cannot reliably read the window's renderer vendor
-         * through QEMU's console API (the render-node EGL ctx we can query is
-         * NOT the window's context — e.g. on a software/Xvfb or Intel/AMD host
-         * the window is llvmpipe/Mesa while the render node is still NVIDIA, and
-         * a wrong "GL" choice yields a blank window).  So we do NOT guess GL
-         * from the render node; readback always shows the frame.  An operator on
-         * a confirmed NVIDIA-rendered host desktop sets NVKVM_PRESENT_MODE=gl for
-         * the zero-copy fast path.  (A future refinement can probe the window's
-         * context directly and auto-upgrade.)
+         * The probe runs on the first frame, and the UI backend may not have
+         * its window (and therefore its GL) up yet -- measured: on SDL the
+         * very first frame reports "no GL context" and a later one probes
+         * fine.  Committing to readback on that transient would strand an
+         * NVIDIA host on the slow path for the life of the VM, so keep
+         * retrying for a short while and only then settle.
          */
+        if (++p->probe_tries < NVKVM_PROBE_TRIES) {
+            return 0;         /* readback THIS frame; mode stays undecided */
+        }
+        p->mode = 0;  why = "UI never offered a GL context to probe";
+    } else if (nvidia) {
+        p->mode = 1;  why = "host UI renders on NVIDIA: native import";
+    } else if (linear) {
+        /* Unreachable for scanout; see the note above. */
+        p->mode = 1;  why = "host UI is cross-vendor but the buffer is linear";
+    } else {
         p->mode = 0;
+        why = "host UI is cross-vendor and the buffer is block-linear, "
+              "which only NVIDIA can import";
     }
 
-    fprintf(stderr, "nvkvm present: window mode=%s (console_has_gl=%d)\n",
-            p->mode ? "GL-zerocopy" : "readback", has_gl);
+    /* Report the mode actually used, and why -- an operator starting a desktop
+     * needs to know whether they got zero-copy or paid for a readback. */
+    fprintf(stderr,
+            "nvkvm present: display mode = %s (%s)%s%s\n",
+            p->mode ? "GL zero-copy" : "readback", why,
+            p->ui_renderer[0] ? "; host GL renderer: " : "",
+            p->ui_renderer[0] ? p->ui_renderer : "");
+    fflush(stderr);
     return p->mode;
 }
 
@@ -581,7 +712,7 @@ static bool nvkvm_pbo_ok(void)
  * only issued its transfer); the caller must not push the surface then, because
  * it still holds whatever was there before.
  */
-static bool nvkvm_fb_read_async(NvkvmPresent *p, DisplaySurface *ds,
+static bool nvkvm_fb_read_async(NvkvmPresent *p, uint8_t *dst,
                                 uint32_t w, uint32_t h)
 {
     const size_t sz = (size_t)w * h * 4;
@@ -615,16 +746,7 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, DisplaySurface *ds,
         const void *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, sz,
                                            GL_MAP_READ_BIT);
         if (src) {
-            const size_t dst_stride = surface_stride(ds);
-            if (dst_stride == (size_t)w * 4) {
-                memcpy(surface_data(ds), src, sz);
-            } else {
-                for (uint32_t y = 0; y < h; y++) {
-                    memcpy((uint8_t *)surface_data(ds) + y * dst_stride,
-                           (const uint8_t *)src + (size_t)y * w * 4,
-                           (size_t)w * 4);
-                }
-            }
+            memcpy(dst, src, sz);      /* staging is always tightly packed */
             glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
             have_frame = true;
         }
@@ -636,81 +758,81 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, DisplaySurface *ds,
     return have_frame;
 }
 
-/* Import the pending frame on our private NVIDIA EGL context, read it back to a
- * CPU surface, and push it to the 2D display.  Works for any host display GPU. */
-static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
-                                   uint32_t key,
-                                   uint32_t w, uint32_t h, uint32_t stride,
-                                   uint32_t fourcc, uint64_t mod)
+/* Size the staging pair for this geometry.  Returns false on OOM. */
+static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
 {
-    if (!nvkvm_present_egl_ensure()) {
-        close(fd);
-        return;
+    if (p->stage[0] && p->stage_w == w && p->stage_h == h) {
+        return true;
     }
-    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                        qemu_egl_rn_ctx)) {
-        close(fd);
-        return;
-    }
+    g_free(p->stage[0]);
+    g_free(p->stage[1]);
+    p->stage[0] = g_malloc0((size_t)w * h * 4);
+    p->stage[1] = g_malloc0((size_t)w * h * 4);
+    p->stage_w = w;
+    p->stage_h = h;
+    p->stage_write = 0;
+    p->stage_has_frame = false;
+    return p->stage[0] && p->stage[1];
+}
 
+/*
+ * #125: import the pending frame and read it back into staging.
+ *
+ * Runs ON THE PRESENT THREAD, where our NVIDIA context is already current and
+ * stays current -- so there is no eglMakeCurrent here, and nothing touches the
+ * QemuConsole: display ops belong to the main loop and are done by the BH this
+ * schedules.  Works regardless of the host's display GPU.
+ */
+static void nvkvm_readback_to_stage(NvkvmPresent *p, int fd, uint32_t owner,
+                                    uint32_t key,
+                                    uint32_t w, uint32_t h, uint32_t stride,
+                                    uint32_t fourcc, uint64_t mod)
+{
     GLuint tex = nvkvm_present_cached_tex(p, owner, key, fd, w, h, stride,
                                           fourcc, mod);
     if (!tex) {
-        goto out_ctx;
+        close(fd);
+        return;
     }
     egl_fb_setup_for_tex(&p->fb, w, h, tex, false);   /* keeps its FBO */
 
-    /*
-     * Never cache the DisplaySurface.  The console OWNS it: qemu_console_resize()
-     * creates and installs one itself (ui/console.c), and every
-     * dpy_gfx_replace_surface() frees the outgoing surface.  Ask the console
-     * for its current surface each frame rather than holding a pointer that a
-     * window resize or VM reset can free under us -- the glReadPixels below
-     * writes w*h*4 bytes (8 MB at 1080p) into whatever it is given.
-     */
-    qemu_console_resize(p->con, w, h);
-    DisplaySurface *ds = qemu_console_surface(p->con);
-    if (!ds || surface_width(ds) != (int)w || surface_height(ds) != (int)h) {
-        fprintf(stderr, "nvkvm present: console surface unusable for %ux%u\n",
-                w, h);
-        goto out_ctx;
+    if (!nvkvm_stage_ensure(p, w, h)) {
+        close(fd);
+        return;
     }
+    uint8_t *dst = p->stage[p->stage_write];
+
     bool have_frame;
     if (nvkvm_pbo_ok()) {
-        have_frame = nvkvm_fb_read_async(p, ds, w, h);
+        have_frame = nvkvm_fb_read_async(p, dst, w, h);
     } else {
-        egl_fb_read(ds, &p->fb);           /* glReadPixels texture -> CPU BGRA */
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, p->fb.framebuffer);
+        glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
+        glReadPixels(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, dst);
         have_frame = true;
     }
-    /*
-     * NVKVM_PRESENT_DUMP=<path>: write what the window is about to show, as a
-     * PPM.  On a headless host, or one whose compositor refuses screenshots,
-     * this is the only way to answer "is there a picture" without asking a
-     * human to look at the screen -- and a frame counter cannot answer it.
-     */
-    {
-        const char *dump = getenv("NVKVM_PRESENT_DUMP");
-        if (dump) {
-            static unsigned dn;
-            if ((dn++ % 120) == 0) {
-                nvkvm_write_ppm(dump, ds);
-            }
-        }
-    }
-    if (have_frame) {
-        dpy_gfx_update(p->con, 0, 0, w, h);
-    }
 
-out_ctx:
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
+    if (have_frame) {
+        /*
+         * Publish: the buffer just filled becomes the one the main loop shows,
+         * and the thread moves to the other one.  Two buffers are enough
+         * because the main loop consumes a frame before we can come back
+         * around to the buffer it is showing.
+         */
+        pthread_mutex_lock(&p->lock);
+        p->stage_ready     = p->stage_write;
+        p->stage_has_frame = true;
+        p->stage_write    ^= 1u;
+        pthread_mutex_unlock(&p->lock);
+    }
     close(fd);                             /* readback owns + consumes the fd */
 }
 
 /*
- * S-4: drop the cached imports of isolates that have died.  Main loop only --
- * eglDestroyImageKHR/glDeleteTextures need our context current, which is also
- * why this cannot run where the death is noticed.
+ * S-4: drop the cached imports of isolates that have died.  PRESENT THREAD
+ * only -- eglDestroyImageKHR/glDeleteTextures need our context current, and
+ * since #125 that context lives on the present thread, which is also why this
+ * cannot run where the death is noticed.
  *
  * Until this existed nothing ever invalidated on isolate death, so a dead
  * compositor's EGLImage held its dma-buf -- and the VRAM behind it -- pinned
@@ -745,10 +867,6 @@ static void nvkvm_present_reap_dead(NvkvmPresent *p)
     if (!any) {
         return;   /* nothing imported yet -- EGL may not even be up */
     }
-    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                        qemu_egl_rn_ctx)) {
-        return;
-    }
     bool dropped = false;
     for (int i = 0; i < NVKVM_PRESENT_CACHE; i++) {
         if (!p->cache[i].valid) {
@@ -771,8 +889,6 @@ static void nvkvm_present_reap_dead(NvkvmPresent *p)
          * re-runs egl_fb_setup_for_tex anyway. */
         egl_fb_destroy(&p->fb);
     }
-    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
-                   EGL_NO_CONTEXT);
 }
 
 /*
@@ -810,67 +926,257 @@ static double nvkvm_st_now(void)
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-/* GraphicHwOps.gfx_update — main loop, BQL held.  Drain the slot and present. */
+/* One consumed frame, `us` spent presenting it.  Called from the main loop on
+ * the GL path and from the present thread on the readback path -- never both
+ * in one run, since the mode is decided once. */
+static void nvkvm_st_frame(double us)
+{
+    double now;
+
+    nvkvm_st_present_us += us;
+    nvkvm_st_bucket_us  += us;
+    nvkvm_st_consumed++;
+    nvkvm_st_bucket_consumed++;
+
+    now = nvkvm_st_now();
+    if (nvkvm_st_bucket_t0 == 0.0) {
+        nvkvm_st_bucket_t0 = now;
+        return;
+    }
+    if (now - nvkvm_st_bucket_t0 >= 1.0) {
+        fprintf(stderr,
+                "nvkvm disp stats: %.1f frames/s dropped=%u "
+                "present_mean=%.2fms (total consumed=%u dropped=%u)\n",
+                nvkvm_st_bucket_consumed / (now - nvkvm_st_bucket_t0),
+                nvkvm_st_bucket_dropped,
+                nvkvm_st_bucket_consumed
+                    ? nvkvm_st_bucket_us / nvkvm_st_bucket_consumed / 1000.0
+                    : 0.0,
+                nvkvm_st_consumed, nvkvm_st_dropped);
+        fflush(stderr);
+        nvkvm_st_bucket_t0       = now;
+        nvkvm_st_bucket_consumed = 0;
+        nvkvm_st_bucket_dropped  = 0;
+        nvkvm_st_bucket_us       = 0.0;
+    }
+}
+
+/*
+ * #125: the present thread.
+ *
+ * Owns the NVIDIA EGL context for the life of the VM.  egl_init() makes the
+ * context current on the calling thread, so calling it HERE -- and only here --
+ * is what pins it to this thread; it is never made current anywhere else and
+ * never unbound, which is the whole point.  The UI keeps its own context on the
+ * main loop and the two never meet.
+ */
+static void *nvkvm_present_thread_fn(void *opaque)
+{
+    NvkvmPresent *p = opaque;
+
+    /*
+     * The display, config and context were created on the main loop under the
+     * BQL (see nvkvm_present_thread_start) -- egl_init() writes QEMU-global
+     * state (qemu_egl_display, qemu_egl_rn_ctx, qemu_egl_rn_gbm_dev) that the
+     * UI backend also reads, so it must not race the main loop.  All that is
+     * left here is to BIND that context to this thread, once, forever.
+     */
+    if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        qemu_egl_rn_ctx)) {
+        fprintf(stderr, "nvkvm present: could not bind the render-node context "
+                        "to the present thread (eglGetError=0x%04x); nothing "
+                        "will be displayed\n", (unsigned)eglGetError());
+        qatomic_set(&p->thread_failed, true);
+        return NULL;
+    }
+
+    for (;;) {
+        qemu_sem_wait(&p->wake);
+        if (qatomic_read(&p->thread_stop)) {
+            break;
+        }
+
+        nvkvm_present_reap_dead(p);   /* S-4; our context is current here */
+
+        pthread_mutex_lock(&p->lock);
+        if (!p->dirty || p->fd < 0) {
+            pthread_mutex_unlock(&p->lock);
+            continue;
+        }
+        int      fd     = p->fd;
+        uint32_t w      = p->w,  h = p->h, stride = p->stride;
+        uint32_t fourcc = p->fourcc;
+        uint64_t mod    = p->modifier;
+        uint32_t key    = p->key;
+        uint32_t owner  = p->owner;
+        p->fd    = -1;
+        p->dirty = false;
+        pthread_mutex_unlock(&p->lock);
+
+        struct timespec ta, tb;
+        bool stats = nvkvm_disp_stats();
+        if (stats) {
+            clock_gettime(CLOCK_MONOTONIC, &ta);
+        }
+
+        nvkvm_readback_to_stage(p, fd, owner, key, w, h, stride, fourcc, mod);
+
+        if (stats) {
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+            nvkvm_st_frame((tb.tv_sec - ta.tv_sec) * 1e6 +
+                           (tb.tv_nsec - ta.tv_nsec) / 1e3);
+        }
+
+        /* Ask the main loop to show it (display ops are main-loop only). */
+        qemu_bh_schedule(p->bh);
+    }
+    return NULL;
+}
+
+/* Main loop, BQL held.  Bring EGL up here, then hand the context to the
+ * thread; see nvkvm_present_thread_fn for why the split. */
+static bool nvkvm_present_thread_start(NvkvmPresent *p)
+{
+    if (qatomic_read(&p->thread_failed)) {
+        return false;
+    }
+    if (p->thread_started) {
+        return true;
+    }
+    if (!nvkvm_present_egl_ensure()) {
+        qatomic_set(&p->thread_failed, true);
+        return false;
+    }
+    /* egl_init() left the context current on THIS thread; release it so the
+     * present thread can take it.  A context is current on one thread at a
+     * time, and leaving it bound here is precisely the collision with the UI
+     * backend that this whole change exists to remove. */
+    eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                   EGL_NO_CONTEXT);
+    p->thread_started = true;
+    qemu_thread_create(&p->thread, "nvkvm-present", nvkvm_present_thread_fn,
+                       p, QEMU_THREAD_JOINABLE);
+    return true;
+}
+
+/*
+ * Show whatever the present thread has finished, on the main loop.
+ *
+ * One memcpy into the console's own surface -- deliberately NOT a new
+ * DisplaySurface per frame.  Wrapping each staging buffer with
+ * qemu_create_displaysurface_from() and calling dpy_gfx_replace_surface()
+ * would avoid this copy, but replacing the surface makes the UI backend
+ * rebuild its texture every frame (ui/sdl2-gl.c: sdl2_gl_switch() does
+ * surface_gl_destroy_texture + surface_gl_create_texture), and per-frame
+ * GL object churn on this path is exactly what killed the NVIDIA driver
+ * before -- see the import-cache note above.  A 1080p copy is ~1 ms and
+ * buys a stable texture; the work worth moving off the main loop (the
+ * import, the GPU readback and the PBO map) is already on the thread.
+ *
+ * qemu_console_resize() early-returns when the geometry is unchanged, so it
+ * costs nothing per frame and only builds a surface when the mode changes.
+ */
+static void nvkvm_present_publish(NvkvmPresent *p)
+{
+    pthread_mutex_lock(&p->lock);
+    bool     have = p->stage_has_frame;
+    unsigned idx  = p->stage_ready;
+    uint32_t w    = p->stage_w, h = p->stage_h;
+    p->stage_has_frame = false;
+    pthread_mutex_unlock(&p->lock);
+
+    if (!have || !p->stage[idx]) {
+        return;
+    }
+
+    qemu_console_resize(p->con, (int)w, (int)h);
+    DisplaySurface *ds = qemu_console_surface(p->con);
+    if (!ds || surface_width(ds) != (int)w || surface_height(ds) != (int)h) {
+        fprintf(stderr, "nvkvm present: console surface unusable for %ux%u\n",
+                w, h);
+        return;
+    }
+
+    const uint8_t *src        = p->stage[idx];
+    const size_t   dst_stride = surface_stride(ds);
+    if (dst_stride == (size_t)w * 4) {
+        memcpy(surface_data(ds), src, (size_t)w * h * 4);
+    } else {
+        for (uint32_t y = 0; y < h; y++) {
+            memcpy((uint8_t *)surface_data(ds) + y * dst_stride,
+                   src + (size_t)y * w * 4, (size_t)w * 4);
+        }
+    }
+
+    /*
+     * NVKVM_PRESENT_DUMP=<path>: write what the window is about to show, as a
+     * PPM.  On a headless host, or one whose compositor refuses screenshots,
+     * this is the only way to answer "is there a picture" without asking a
+     * human to look at the screen -- and a frame counter cannot answer it.
+     */
+    {
+        const char *dump = getenv("NVKVM_PRESENT_DUMP");
+        if (dump) {
+            static unsigned dn;
+            if ((dn++ % 120) == 0) {
+                nvkvm_write_ppm(dump, ds);
+            }
+        }
+    }
+    dpy_gfx_update(p->con, 0, 0, (int)w, (int)h);
+}
+
+/* GraphicHwOps.gfx_update — main loop, BQL held. */
 static void nvkvm_present_gfx_update(void *opaque)
 {
     NvkvmPresent *p = opaque;
 
-    nvkvm_present_reap_dead(p);      /* S-4, before anything is presented */
+    /* Readback path: the thread did the work; show the result. */
+    nvkvm_present_publish(p);
 
     pthread_mutex_lock(&p->lock);
-    if (!p->dirty || p->fd < 0) {
-        pthread_mutex_unlock(&p->lock);
-        return;
-    }
-    int      fd     = p->fd;
-    uint32_t w      = p->w,  h = p->h, stride = p->stride, fourcc = p->fourcc;
-    uint64_t mod    = p->modifier;
-    uint32_t key    = p->key;
-    uint32_t owner  = p->owner;
-    p->fd    = -1;            /* take ownership of this frame's fd */
-    p->dirty = false;
+    bool     pending = (p->dirty && p->fd >= 0);
+    uint64_t mod     = p->modifier;
     pthread_mutex_unlock(&p->lock);
 
-    struct timespec ta, tb;
-    bool stats = nvkvm_disp_stats();
-    if (stats) {
-        clock_gettime(CLOCK_MONOTONIC, &ta);
+    if (!pending) {
+        return;
     }
 
-    if (nvkvm_present_decide_mode(p) == 1) {
-        nvkvm_present_gl(p, fd, w, h, stride, fourcc, mod);
+    if (nvkvm_present_decide_mode(p, mod) == 1) {
+        /*
+         * GL zero-copy: hands the dma-buf straight to the UI, so it needs the
+         * UI's context and none of ours -- it belongs on the main loop and
+         * stays here.
+         */
+        pthread_mutex_lock(&p->lock);
+        if (!p->dirty || p->fd < 0) {
+            pthread_mutex_unlock(&p->lock);
+            return;
+        }
+        int      fd     = p->fd;
+        uint32_t w      = p->w, h = p->h, stride = p->stride;
+        uint32_t fourcc = p->fourcc;
+        uint64_t gmod   = p->modifier;
+        p->fd    = -1;
+        p->dirty = false;
+        pthread_mutex_unlock(&p->lock);
+
+        struct timespec ta, tb;
+        bool stats = nvkvm_disp_stats();
+        if (stats) {
+            clock_gettime(CLOCK_MONOTONIC, &ta);
+        }
+        nvkvm_present_gl(p, fd, w, h, stride, fourcc, gmod);
+        if (stats) {
+            clock_gettime(CLOCK_MONOTONIC, &tb);
+            nvkvm_st_frame((tb.tv_sec - ta.tv_sec) * 1e6 +
+                           (tb.tv_nsec - ta.tv_nsec) / 1e3);
+        }
     } else {
-        nvkvm_present_readback(p, fd, owner, key, w, h, stride, fourcc, mod);
-    }
-
-    if (stats) {
-        double now, us;
-
-        clock_gettime(CLOCK_MONOTONIC, &tb);
-        us = (tb.tv_sec - ta.tv_sec) * 1e6 + (tb.tv_nsec - ta.tv_nsec) / 1e3;
-        nvkvm_st_present_us += us;
-        nvkvm_st_bucket_us  += us;
-        nvkvm_st_consumed++;
-        nvkvm_st_bucket_consumed++;
-
-        now = nvkvm_st_now();
-        if (nvkvm_st_bucket_t0 == 0.0) {
-            nvkvm_st_bucket_t0 = now;
-        } else if (now - nvkvm_st_bucket_t0 >= 1.0) {
-            fprintf(stderr,
-                    "nvkvm disp stats: %.1f frames/s dropped=%u "
-                    "present_mean=%.2fms (total consumed=%u dropped=%u)\n",
-                    nvkvm_st_bucket_consumed / (now - nvkvm_st_bucket_t0),
-                    nvkvm_st_bucket_dropped,
-                    nvkvm_st_bucket_consumed
-                        ? nvkvm_st_bucket_us / nvkvm_st_bucket_consumed / 1000.0
-                        : 0.0,
-                    nvkvm_st_consumed, nvkvm_st_dropped);
-            fflush(stderr);
-            nvkvm_st_bucket_t0       = now;
-            nvkvm_st_bucket_consumed = 0;
-            nvkvm_st_bucket_dropped  = 0;
-            nvkvm_st_bucket_us       = 0.0;
+        /* Readback: wake the present thread, which drains the slot itself. */
+        if (nvkvm_present_thread_start(p)) {
+            qemu_sem_post(&p->wake);
         }
     }
 }
@@ -902,6 +1208,7 @@ int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
     p->dev  = dev;
     p->con  = graphic_console_init(dev, 0, &nvkvm_present_hwops, p);
     p->bh   = qemu_bh_new(nvkvm_present_bh, p);
+    qemu_sem_init(&p->wake, 0);   /* #125: present thread starts on first use */
     nv->present_ctx = p;
     fprintf(stderr, "nvkvm present: registered QemuConsole for guest GPU "
             "scanout (window display)\n");
@@ -929,6 +1236,15 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
         return;
     }
     nv->present_ctx = NULL;
+    /* #125: stop the present thread before tearing anything it touches down. */
+    if (p->thread_started) {
+        qatomic_set(&p->thread_stop, true);
+        qemu_sem_post(&p->wake);
+        qemu_thread_join(&p->thread);
+    }
+    qemu_sem_destroy(&p->wake);
+    g_free(p->stage[0]);
+    g_free(p->stage[1]);
     if (p->bh) {
         qemu_bh_delete(p->bh);
     }
