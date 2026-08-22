@@ -353,6 +353,21 @@ typedef struct NvkvmPresent {
          */
         uint32_t    owner;
         uint32_t    key, w, h, stride, fourcc;
+        /*
+         * The GEM handle is not an identity.  It comes out of an IDR, and an
+         * IDR hands back the LOWEST FREE id -- so a compositor that frees its
+         * scanout bo and allocates another gets the same `key` again, at the
+         * same geometry, because same-size buffers are exactly what a
+         * compositor cycles.  Matching on (owner, key, geometry) alone then
+         * returns the PREVIOUS buffer's EGLImage and the window shows a stale
+         * frame until some other handle happens to come along.
+         *
+         * `ino` is the identity the handle is not: every dma_buf gets its own
+         * inode in the dma-buf pseudo-filesystem, stable across dup(2) and
+         * SCM_RIGHTS, and a newly allocated buffer never reuses a live one's.
+         * Cheap enough to check per frame (one fstat).
+         */
+        uint64_t    ino;
         uint64_t    mod;
         EGLImageKHR image;
         GLuint      tex;
@@ -466,6 +481,14 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
                                        uint32_t fourcc, uint64_t mod)
 {
     int free_slot = -1;
+    struct stat st;
+    /*
+     * ino 0 = "could not tell".  Falling back to the old (owner, key, geometry)
+     * match is wrong in exactly the recycled-handle case this exists to catch,
+     * but re-importing every frame is what SIGSEGV'd libnvidia-eglcore (see the
+     * cache comment), so the safe failure is the stale frame, not the crash.
+     */
+    uint64_t ino = fstat(fd, &st) == 0 ? (uint64_t)st.st_ino : 0;
 
     for (int i = 0; i < NVKVM_PRESENT_CACHE; i++) {
         if (!p->cache[i].valid) {
@@ -477,11 +500,22 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
         if (p->cache[i].owner == owner && p->cache[i].key == key) {
             /* Same bo id, but the compositor may have reallocated it at a new
              * geometry -- then the cached import describes the wrong memory. */
-            if (p->cache[i].w == w && p->cache[i].h == h &&
+            if (p->cache[i].ino == ino &&
+                p->cache[i].w == w && p->cache[i].h == h &&
                 p->cache[i].stride == stride &&
                 p->cache[i].fourcc == fourcc && p->cache[i].mod == mod) {
                 p->cache[i].used = ++p->tick;
                 return p->cache[i].tex;
+            }
+            if (p->cache[i].ino != ino) {
+                /* Recycled GEM handle: same id, different buffer. */
+                static unsigned nrecycled;
+                if (nrecycled++ < 8) {
+                    fprintf(stderr, "nvkvm present: bo %u reused for a new "
+                            "dma-buf (ino %llu -> %llu); re-importing\n",
+                            key, (unsigned long long)p->cache[i].ino,
+                            (unsigned long long)ino);
+                }
             }
             glDeleteTextures(1, &p->cache[i].tex);
             eglDestroyImageKHR(qemu_egl_display, p->cache[i].image);
@@ -534,7 +568,7 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
         return 0;
     }
     p->cache[free_slot] = (typeof(p->cache[0])){
-        .valid = true, .owner = owner, .key = key, .w = w, .h = h,
+        .valid = true, .owner = owner, .key = key, .ino = ino, .w = w, .h = h,
         .stride = stride,
         .fourcc = fourcc, .mod = mod, .image = image, .tex = tex,
         .used = ++p->tick,
