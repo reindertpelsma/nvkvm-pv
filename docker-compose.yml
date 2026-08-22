@@ -41,9 +41,31 @@ services:
           devices:
             - driver: nvidia
               count: all
-              # graphics/display are what make the GL and Vulkan libraries
-              # appear in the container -- without them the guest gets a
-              # compute-only driver and Vulkan silently falls back to llvmpipe.
+              # What these actually gate, verified against libnvidia-container
+              # and nvidia-container-toolkit source.  Full detail with line
+              # references: docs/reference/container-capabilities.md
+              #
+              #   compute   /dev/nvidia-uvm{,-tools}, /tmp/nvidia-mps
+              #   display   /dev/nvidia-modeset -- needed, NVKMS is on the
+              #             ordinary Vulkan/EGL path, not only scanout
+              #   graphics  the GL/Vulkan libraries, plus /dev/dri/* (that part
+              #             is done by the toolkit, not by libnvidia-container)
+              #   utility   libnvidia-ml + nvidia-smi, which make_host_bundle.sh
+              #             needs in-container -- and, on the same flag, the
+              #             nvidia-persistenced and -fabricmanager sockets
+              #   video     libraries only, and it implies compute
+              #
+              # /dev/nvidiactl and every /dev/nvidiaN need NO capability at all,
+              # so the full RM ioctl surface is present whatever this list says.
+              # Libraries and the EGL app profile are not a boundary: they are
+              # data, and every ioctl they issue is reachable without them.
+              #
+              # utility cannot be dropped (the bundle needs NVML), so on a host
+              # running nvidia-persistenced its socket reaches this container.
+              # It cannot be masked from here -- the prestart hook mounts it
+              # after runc sets up the rootfs, so a tmpfs is just the surface it
+              # lands on, and a read-only mount makes the hook fail the start.
+              # Mitigate by not running the daemon, or with Docker userns-remap.
               capabilities: [gpu, utility, compute, graphics, display, video]
     environment:
       # Guest sizing, same defaults as scripts/run_test_vm.sh.  Raise VM_MEM

@@ -27,6 +27,7 @@ value is), or rationale (why it is that way).
 | [Allowlists](reference/allowlists.md) | all six default-deny gates, their contents and provenance |
 | [Virtio protocol](reference/virtio-protocol.md) | virtqueues, shared memory, request types, GPA windows |
 | [Device nodes](reference/device-nodes.md) | what appears in the guest, major/minor numbers, and why each one exists |
+| [Container capabilities](reference/container-capabilities.md) | what the NVIDIA container capability list actually gates: device nodes, cgroup rules, IPC sockets -- and what is not a boundary |
 | [Guest userspace libraries](reference/guest-userspace-libraries.md) | every library the guest needs, what breaks without it, and the version-matching traps |
 
 ## Internal

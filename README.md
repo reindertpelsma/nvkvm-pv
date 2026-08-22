@@ -144,6 +144,37 @@ Verified end to end on an RTX 3060: cold `docker compose up` to `nvidia-smi`
 inside the guest, surviving a guest reboot and a guest `apt` install of a
 conflicting NVIDIA package.
 
+#### What the `capabilities:` list actually grants
+
+That line reads like it gates GPU access. It mostly does not. Verified against
+libnvidia-container and nvidia-container-toolkit source — full detail and line
+references in [`docs/reference/container-capabilities.md`](docs/reference/container-capabilities.md).
+
+| capability | what it gates |
+|---|---|
+| *(none needed)* | `/dev/nvidiactl` and every `/dev/nvidiaN` — **always granted** |
+| `compute` | `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`, `/tmp/nvidia-mps` |
+| `display` | `/dev/nvidia-modeset` |
+| `graphics` *or* `display` | `/dev/dri/card*`, `/dev/dri/renderD*` — injected by the toolkit, not by libnvidia-container |
+| `utility` | the `nvidia-persistenced` and `nvidia-fabricmanager` sockets |
+| `video`, `ngx`, `compat32` | libraries only — no device, no socket |
+
+The full RM ioctl surface is therefore present in a container that requests no
+capabilities at all. What the list gates is UVM, modeset, and DRM.
+
+**Libraries and userspace config files are not a security boundary.** A driver
+library is data: it works by issuing ioctls on device nodes. If the node is not
+granted the library fails; if the node is granted, exactly the same ioctls are
+reachable without it — by hand, from any language. The EGL application profile
+that `graphics` writes is likewise a JSON hint, on a tmpfs *inside* the container
+rootfs, read by cooperative userspace and enforced by nothing. Only the device
+nodes and the sockets are a boundary.
+
+A node needs two things to be usable: a bind-mount to be visible, and a device
+cgroup rule to be openable — a visible node with no rule fails `open()` with
+`EPERM`. The rule is `c <major>:<minor> rw`, never `m`, so a container also
+cannot `mknod` its way to a device it was not granted.
+
 ## Continuous integration
 
 Everything that can be checked without a GPU is checked on every push, in about
@@ -178,7 +209,6 @@ rented boxes. That script tars the *working tree*, not `HEAD`, so it refuses to
 spend money when the two differ — check it yourself with
 `scripts/sweep_matrix.py --check-tree`, and override deliberately with
 `--allow-dirty`.
-
 ## First result
 
 ```bash
