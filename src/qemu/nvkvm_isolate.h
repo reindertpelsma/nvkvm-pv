@@ -271,7 +271,12 @@ struct nvkvm_isolate_table {
 	 * up front by nvkvm_isolate_cfg_check() at device realize.
 	 */
 	struct nvkvm_isolate_cfg cfg;
-	char                     cfg_error[256];  /* non-empty => config unusable */
+	/* 512, not 256: gcc measures the longest of these messages at 356 bytes
+	 * ("every rung failed") and 286 ("mode 'none' removes every boundary"),
+	 * so snprintf silently truncated them -- and both are the operator-facing
+	 * text explaining why isolation is unavailable or unsafe.  A security
+	 * message that stops mid-sentence is worse than a compiler warning. */
+	char                     cfg_error[512];  /* non-empty => config unusable */
 	char                     cfg_report[1024];/* what `auto` probed and chose */
 	/*
 	 * Owning VirtIONvgpu (opaque here to avoid a header cycle).  Set on the
