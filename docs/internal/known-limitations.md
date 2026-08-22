@@ -1345,3 +1345,17 @@ The throughput gap is in the slot-batched upload loop, not in the per-chunk
 migration path — the chunk size was chosen so per-chunk overhead is negligible
 against the data copied. It has been characterised but not optimised.
 
+
+### Corroborated on unrelated hardware, same day
+
+This is not specific to the T4 box or to CUDA.  On a completely different
+machine -- an RTX 4070 desktop, different host CPU vendor, different guest --
+nested nvkvm came up the same way: the L2 module loaded, `nvidia-smi` listed
+the GPU, and then **`clCreateContext` failed**.  That is OpenCL rather than the
+CUDA driver API, on different silicon, and it fails at the same point in the
+same order: enumeration works, context creation does not.
+
+Two machines, two APIs, one boundary.  Whatever this is, it is a property of
+the second forwarding hop and not of a card, a driver build, or a guest image
+-- which is the useful half of the finding, because it means a fix can be
+developed anywhere rather than only on rented multi-GPU hardware.
