@@ -1,0 +1,76 @@
+diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
+index 801cff1..03b7eca 100644
+--- a/accel/kvm/kvm-all.c
++++ b/accel/kvm/kvm-all.c
+@@ -3080,8 +3080,13 @@ out_unref:
+     return ret;
+ }
+ 
++/* nvkvm: how long to keep retrying a bare KVM_RUN EFAULT; see the use site. */
++#define NVKVM_EFAULT_BUDGET_MS 3000
++#define NVKVM_EFAULT_STEP_MS   5
++
+ int kvm_cpu_exec(CPUState *cpu)
+ {
++    int nvkvm_efault_ms = 0;
+     struct kvm_run *run = cpu->kvm_run;
+     int ret, run_ret;
+ 
+@@ -3153,6 +3158,44 @@ int kvm_cpu_exec(CPUState *cpu)
+                 break;
+             }
+             if (!(run_ret == -EFAULT && run->exit_reason == KVM_EXIT_MEMORY_FAULT)) {
++                /*
++                 * nvkvm: a bare KVM_RUN EFAULT is "come back later", not death.
++                 *
++                 * KVM resolves a memslot HVA through hva_to_pfn_remapped() for
++                 * a VM_IO|VM_PFNMAP VMA -- an NVIDIA GPU mapping.  The driver's
++                 * fault handler (nv_fault, kernel-open/nvidia/nv-mmap.c) has two
++                 * paths that return VM_FAULT_NOPAGE *without* installing a PTE:
++                 *
++                 *   if (!down_read_trylock(&nv_system_pm_lock))  -> NOPAGE
++                 *   if (!nvl->safe_to_mmap) { rm_schedule_gpu_wakeup(); NOPAGE; }
++                 *
++                 * Both mean "retry, the mapping is coming".  A userspace process
++                 * honours that by re-faulting.  KVM calls fixup_user_fault()
++                 * once, still finds no PTE via follow_pte(), and returns -EFAULT,
++                 * which QEMU has always treated as fatal -- so the guest dies on
++                 * a mapping that was about to be reinstated.
++                 *
++                 * RIP has not advanced when KVM_RUN returns, so re-entering the
++                 * guest simply re-executes the same access.  Retry on a budget
++                 * measured against a GPU wakeup (hundreds of ms), not a spinloop:
++                 * an earlier 64 x 200us attempt covered ~13ms and concluded,
++                 * wrongly, that the fault was permanent.
++                 */
++                if (run_ret == -EFAULT &&
++                    nvkvm_efault_ms < NVKVM_EFAULT_BUDGET_MS) {
++                    if (nvkvm_efault_ms == 0) {
++                        fprintf(stderr, "nvkvm: KVM_RUN EFAULT -- mapping not "
++                                "resolvable yet, retrying up to %d ms\n",
++                                NVKVM_EFAULT_BUDGET_MS);
++                    }
++                    g_usleep(NVKVM_EFAULT_STEP_MS * 1000);
++                    nvkvm_efault_ms += NVKVM_EFAULT_STEP_MS;
++                    continue;
++                }
++                if (run_ret == -EFAULT) {
++                    fprintf(stderr, "nvkvm: KVM_RUN EFAULT persisted for %d ms "
++                            "-- giving up\n", nvkvm_efault_ms);
++                }
+                 fprintf(stderr, "error: kvm run failed %s\n",
+                         strerror(-run_ret));
+ #ifdef TARGET_PPC
+@@ -3168,6 +3211,12 @@ int kvm_cpu_exec(CPUState *cpu)
+             }
+         }
+ 
++        if (nvkvm_efault_ms) {
++            fprintf(stderr, "nvkvm: KVM_RUN EFAULT cleared after %d ms\n",
++                    nvkvm_efault_ms);
++            nvkvm_efault_ms = 0;   /* nvkvm: forward progress */
++        }
++
+         trace_kvm_run_exit(cpu->cpu_index, run->exit_reason);
+         switch (run->exit_reason) {
+         case KVM_EXIT_IO:
