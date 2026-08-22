@@ -48,28 +48,51 @@ services:
           devices:
             - driver: nvidia
               count: all
-              # `graphics` is what makes the GL and Vulkan libraries appear
-              # in the container; without it the guest gets a compute-only
-              # driver and Vulkan silently falls back to llvmpipe.
+              # What these actually gate, read from libnvidia-container source
+              # rather than from the docs.  Capabilities select LIBRARIES, and
+              # -- at two places only -- DEVICE NODES.  Devices are what matter.
               #
-              # `display` is NOT just libraries, and it is worth being explicit
-              # about what it grants: the NVIDIA container toolkit mounts
-              # /dev/nvidia-modeset for it -- the host's NVKMS config device,
-              # the modesetting interface.  nvkvm needs it because the display
-              # path forwards NVKMS (surface registration, vblank) to reach a
-              # scanout at all.  It is also exactly the device
-              # src/qemu/nvkvm_nvkms_allowlist.h gates: NVKMS is default-deny
-              # on the inner cmdType, admitting only device alloc/free, surface
-              # register/unregister and the vblank-semaphore ops, keyed on the
-              # driver version -- because the command enum is unvalued and
-              # NVIDIA renumbers it mid-branch.  Without that gate a guest
-              # could reach GRANT_SURFACE or SET_FLIPLOCK_GROUP on a
-              # host-global display engine.
+              #   (none)    /dev/nvidiactl and /dev/nvidia0..N need NO capability
+              #             at all.  nvidiactl survives both filters and the
+              #             per-GPU nodes never reach them (device_mount_native,
+              #             nvc_mount.c:594-627, has no capability test).  That
+              #             is already the whole RM ioctl surface.
+              #   compute   the ONLY gate on /dev/nvidia-uvm (nvc_mount.c:783).
+              #             QEMU opens UVM directly, so this is non-negotiable.
+              #   display   the ONLY gate on /dev/nvidia-modeset (nvc_mount.c:786),
+              #             and it implies `graphics` (options.h:90).  NVKMS is
+              #             NOT scanout-only: the allowlist in
+              #             nvkvm_nvkms_allowlist.h was captured from a Vulkan/EGL
+              #             session, so dropping this while keeping `graphics`
+              #             gives a half-working graphics stack, not a headless one.
+              #   graphics  gates no device in libnvidia-container.  /dev/dri/*
+              #             comes from the toolkit's graphics modifier, on
+              #             `graphics` OR `display`.
+              #   utility   gates no device.  It is the only entry here that
+              #             grants host access nvkvm never uses: the persistenced
+              #             and fabricmanager daemon sockets (nvc_mount.c:769-771).
+              #             Kept because libnvidia-ml and nvidia-smi ride the same
+              #             flag and make_host_bundle.sh requires them.
+              #   video     gates NOTHING but library names (nvc_info.c:785), and
+              #             implies compute anyway (options.h:89).  Security-
+              #             cosmetic; keep it only for NVENC/NVDEC in the guest.
+              #   gpu       not a driver capability -- Docker filters it out
+              #             before the toolkit sees it.  Selects the nvidia
+              #             device driver; grants nothing.
               #
-              # RUNNING COMPUTE ONLY?  Drop `display` and `graphics`, and pair
-              # it with graphics=off on the device and NVKVM_GRAPHICS=0 in the
-              # guest module.  That leaves no modesetting device in the
-              # container and no display code in the .ko.
+              # Every grant is `c <major>:<minor> rw` -- read+write, never mknod
+              # -- on cgroup v1 (cgroup_legacy.c:84) and v2 alike (eBPF
+              # BPF_CGROUP_DEVICE).  So the container cannot mknod its way to a
+              # node it was not granted.
+              #
+              # None of this is a privilege boundary against container root:
+              # /dev/nvidia* are mode 0666 on the host, so a container-root
+              # process has the same reach as any unprivileged local user.  The
+              # guest is what is confined, by the allowlists in src/qemu/.
+              #
+              # COMPUTE ONLY?  [gpu, utility, compute] is the minimal set, with
+              # graphics=off on the device and NVKVM_GRAPHICS=0 in the module.
+              # No modeset device, no render node, no display code in the .ko.
               capabilities: [gpu, utility, compute, graphics, display, video]
     environment:
       # Guest sizing, same defaults as scripts/run_test_vm.sh.  Raise VM_MEM
