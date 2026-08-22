@@ -240,20 +240,34 @@ else
 fi
 
 # --- 1.3 nvidia-smi ----------------------------------------------------------
+#
+# Do not trust PATH alone.  stage_guest_libs.sh installs nvidia-smi into
+# /usr/local/bin, and this suite is normally run under sudo -- on a RHEL-family
+# guest sudo's secure_path is /sbin:/bin:/usr/sbin:/usr/bin, which does NOT
+# include /usr/local/bin (Debian's does).  So on CentOS Stream 9 all three
+# checks recorded SKIP "not on PATH" while nvidia-smi sat right there and
+# worked perfectly from a normal shell -- and an unexpected skip is scored as
+# not-a-pass, so a working stack read 25/28 INCOMPLETE.
 SMI_GPU=""; SMI_DRV=""; SMI_CUDA=""
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-    record nvidia_smi_gpu    SKIP "nvidia-smi not on PATH"
-    record nvidia_smi_driver SKIP "nvidia-smi not on PATH"
-    record nvidia_smi_cuda   SKIP "nvidia-smi not on PATH"
+NVSMI="$(command -v nvidia-smi 2>/dev/null || true)"
+if [ -z "$NVSMI" ]; then
+    for _c in /usr/local/bin/nvidia-smi /usr/bin/nvidia-smi /opt/bin/nvidia-smi; do
+        [ -x "$_c" ] && { NVSMI="$_c"; break; }
+    done
+fi
+if [ -z "$NVSMI" ]; then
+    record nvidia_smi_gpu    SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
+    record nvidia_smi_driver SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
+    record nvidia_smi_cuda   SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
 else
-    SMI_RAW="$(nvidia-smi 2>&1)"; SMI_RC=$?
+    SMI_RAW="$("$NVSMI" 2>&1)"; SMI_RC=$?
     if [ $SMI_RC -ne 0 ]; then
         record nvidia_smi_gpu    FAIL "nvidia-smi exit=$SMI_RC: $(echo "$SMI_RAW" | head -3 | tr '\n' ' ')"
         record nvidia_smi_driver SKIP "nvidia-smi failed"
         record nvidia_smi_cuda   SKIP "nvidia-smi failed"
     else
-        SMI_GPU="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
-        SMI_DRV="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
+        SMI_GPU="$("$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+        SMI_DRV="$("$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
         # Driver 610 renamed the banner fields: pre-610 prints
         #   "Driver Version: 580.95.05   CUDA Version: 13.0"
         # while 610+ prints
