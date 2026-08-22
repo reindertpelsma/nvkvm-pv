@@ -112,6 +112,35 @@ Two things this box exposed that a desktop host hides:
   working perfectly. Every Tesla, A-series and H-series row above was scored
   by that same check, so it now matches `GL_VENDOR` too.
 
+### First RHEL-family guest (CentOS Stream 9)
+
+Also brought up on the same box, as a second guest alongside the Ubuntu one.
+`nvkvm-guest.ko` had **never compiled on a RHEL kernel** — seven compat guards
+fired at once, because RHEL reports `LINUX_VERSION_CODE` 5.14 and backports
+large parts of 6.x underneath it (`class_create`, `vm_flags_clear`,
+`vma_start_write`, const `devnode`, the maple-tree VMA iterator, `pde_data`,
+and `drm_driver.date`). The guards now consult `RHEL_RELEASE_CODE`. Five
+unchecked `copy_to_user()` calls also had to go: RHEL builds modules with
+`-Werror` and the return is `__must_check`.
+
+With those fixed, on 5.14.0-737.el9:
+
+```
+nvkvm: host reports 6 GPU(s); exposing 6
+nvkvm: virtual KMS head ready (1920x1080, 1 connector/crtc)
+cuInit 0, cuDeviceGetCount 6, ctx+256MiB alloc+free OK on all six
+```
+
+Two RHEL-specific gaps remain, neither in the forwarder:
+
+- **The kernel package ships no 9p at all** — not built in, not a module. The
+  repo cannot reach the guest the way it does everywhere else; it was scp'd in
+  for this run. virtiofs is the replacement RHEL does support.
+- **`stage_guest_libs.sh` hardcodes the Debian multiarch path**
+  (`/usr/lib/x86_64-linux-gnu`), which does not exist on RHEL (`/usr/lib64`),
+  so only 6 of 24 libraries staged and `nvidia-smi` could not find NVML.
+  `libcuda` landed in its own prefix and CUDA worked regardless.
+
 Sustained compute is at parity; the 1.01x is noise. Single-stream greedy
 decoding is 27% slower, which is the honest number for that shape — hundreds of
 tiny launches per token with a sync between each. Anything that batches (vLLM,
