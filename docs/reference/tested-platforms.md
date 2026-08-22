@@ -73,7 +73,7 @@ Host/guest parity measured on that A100 with identical scripts, identical torch
 The Geekbench row is the one to check first, because it is the only line here a
 reader can verify without taking our word for it — both runs are published:
 [side by side](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405).
-Four such pairs now exist, 98.0–99.9%, and two of them are bare metal on both
+Five such pairs now exist, 96.2–99.9%, and three of them are bare metal on both
 sides: [all four, with what each does and does not establish](parity.md).
 All eleven workloads land between **93.2% and 100.1%**, two of them at or above
 parity (Particle Physics 100.1%, Face Tracking 100.0%); the weakest is Video
@@ -111,6 +111,28 @@ Two things this box exposed that a desktop host hides:
   `gl_draw_pixel_check` down as an unexpected skip: 26/28 on a stack that was
   working perfectly. Every Tesla, A-series and H-series row above was scored
   by that same check, so it now matches `GL_VENDOR` too.
+
+#### Host/guest parity on the T4
+
+[Published side by side](https://browser.geekbench.com/v7/gpu/compare/90743?baseline=90729)
+— Geekbench 7 GPU (OpenCL), bare metal on both sides:
+
+| | host | guest | ratio |
+|---|---|---|---|
+| **GPU Score** | **65851** | **63358** | **96.2%** |
+
+The guest was given half the cores (8 vs 16) and a twelfth of the memory
+(15.6 GB vs 187.6 GB), so 96.2% is measured while handicapped, not on equal
+footing. Five of eleven workloads land at or above parity — Feature Matching
+102.2%, Face Tracking 101.6%, Super Resolution 100.3%, Path Tracer 100.2%,
+Fluid Simulation 100.1%.
+
+**Video Filter is the weakest workload on this card (87.5%) and was also the
+weakest on the A100 (93.2%)** — the same workload, two architectures and two
+die families apart. Every other workload varies by card; this one does not.
+That consistency makes it a lead rather than noise: something in that
+workload's path costs more through the forwarder than the rest, and it is
+reproducible on demand.
 
 ### First RHEL-family guest (CentOS Stream 9)
 
