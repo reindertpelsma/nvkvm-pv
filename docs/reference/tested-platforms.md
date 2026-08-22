@@ -46,6 +46,7 @@ that it failed; those are early rows that predate the suite.
 | RTX 5070 | Blackwell GB205 | 580.95.05 | 580 | 28/28 |
 | A100 80GB PCIe | **Ampere GA100** (datacenter) | 580.126.09 | 580 | 28/28 \*\*\* |
 | 4x RTX 5060 | Blackwell GB206 | 580.95.05 | 580 | 28/28, `cuda_device_count 4` |
+| 6x Tesla T4 | **Turing TU104** (datacenter) | 580.178.04 | 580 | 28/28, `cuda_device_count 6` \*\*\*\* |
 | 6x RTX A4000 | **Ampere GA104** (workstation) | 570.124.06 | 570 | 28/28, `cuda_device_count 6` |
 
 
@@ -82,6 +83,82 @@ The guest was given less machine than the host, and this box is itself a VM
 with the A100 passed through — so 98.0% is nvkvm's cost measured while nested a
 level deeper than usual, which makes it a stronger result rather than a weaker
 one. [Why, and why the 3050 reads higher](parity.md).
+
+\*\*\*\* First Turing datacenter part, and the first **non-nested** multi-GPU
+box: six T4s on bare metal, one guest, no configuration beyond the usual boot.
+The guest saw all six (`/dev/nvidia0`..`nvidia5`, `nvidia-smi -L` 6,
+`cuda_device_count` 6, Vulkan enumerating six T4s), sustained **133.7 TFLOPS
+fp16 aggregate** with all six under concurrent GEMM load, verified five
+device-to-device copies byte-exact, and returned every card to its 4-10 MiB
+baseline afterwards with no lingering compute apps.
+
+It also exercised the paths a display-less card forces, which no consumer GPU
+here can: presentation had to run through **readback** rather than native
+scanout, and hardware **NVENC** encode was driven from inside the guest — a
+full XFCE desktop on the virtual head, captured and H.265-encoded to a browser
+at 1080p, 58 fps, 26 ms end-to-end (25-28% encoder utilisation on the host,
+one session, so genuinely the T4's encoder and not a software fallback).
+
+Two things this box exposed that a desktop host hides:
+
+- **`nvidia_drm` is not loaded by default** on a headless datacenter install,
+  so there are no NVIDIA render nodes at all and QEMU dies with `egl: no drm
+  render node available`. `modprobe nvidia-drm` creates them. The present path
+  needs a render node; a datacenter host may not have one until asked.
+- **`GL_RENDERER` is not a vendor string.** A T4 reports `Tesla T4/PCIe/SSE2`
+  with no "NVIDIA" in it, where consumer parts say `NVIDIA GeForce ...`.
+  `validate.sh` matched on it and failed the card as non-NVIDIA, taking
+  `gl_draw_pixel_check` down as an unexpected skip: 26/28 on a stack that was
+  working perfectly. Every Tesla, A-series and H-series row above was scored
+  by that same check, so it now matches `GL_VENDOR` too.
+
+### First RHEL-family guest (CentOS Stream 9)
+
+Also brought up on the same box, as a second guest alongside the Ubuntu one.
+`nvkvm-guest.ko` had **never compiled on a RHEL kernel** — seven compat guards
+fired at once, because RHEL reports `LINUX_VERSION_CODE` 5.14 and backports
+large parts of 6.x underneath it (`class_create`, `vm_flags_clear`,
+`vma_start_write`, const `devnode`, the maple-tree VMA iterator, `pde_data`,
+and `drm_driver.date`). The guards now consult `RHEL_RELEASE_CODE`. Five
+unchecked `copy_to_user()` calls also had to go: RHEL builds modules with
+`-Werror` and the return is `__must_check`.
+
+With those fixed, **CentOS Stream 9 scores 28/28** — the same as every Ubuntu
+row above it, on 5.14.0-737.el9:
+
+```
+nvkvm: host reports 6 GPU(s); exposing 6
+nvkvm: virtual KMS head ready (1920x1080, 1 connector/crtc)
+TOTAL 28   PASS 28   FAIL 0   SKIP 0
+```
+
+Getting from "module will not compile" to 28/28 took two more portability
+fixes, both of which had been invisible because the suite had only ever run on
+Debian-family guests:
+
+- **`stage_guest_libs.sh` hardcoded the Debian multiarch path**
+  (`/usr/lib/x86_64-linux-gnu`), which is not on RHEL's linker search path
+  (`/usr/lib64`), so only 6 of 24 libraries staged and `nvidia-smi` could not
+  find NVML. It also only looked for the bundle on the 9p share, which a RHEL
+  guest cannot have.
+- **`validate.sh` trusted PATH for `nvidia-smi`.** The suite runs under sudo,
+  and RHEL's sudo `secure_path` is `/sbin:/bin:/usr/sbin:/usr/bin` — no
+  `/usr/local/bin`, which is where the binary is staged. Debian's secure_path
+  includes it, so this could only ever appear on RHEL. All three `nvidia_smi_*`
+  checks recorded SKIP while the binary worked perfectly from a normal shell,
+  and an unexpected skip scores as not-a-pass: 25/28 INCOMPLETE on a working
+  stack. The same shape of false negative as the `GL_RENDERER` check above,
+  and found the same way — by running the suite somewhere it had never run.
+
+One RHEL gap remains, and it is not in the forwarder: **the kernel package
+ships no 9p at all** — not built in, not a module. The repo cannot reach the
+guest the way it does everywhere else; it was scp'd in for this run. virtiofs
+is the replacement RHEL does support.
+
+Weston on CentOS is packaged without the DRM backend (`unknown backend "drm"`),
+so the compositor path was not exercised there; the EGL/GL/Vulkan rungs that
+`validate.sh` covers all pass, including `gl_draw_pixel_check` rendering a real
+triangle into an FBO.
 
 Sustained compute is at parity; the 1.01x is noise. Single-stream greedy
 decoding is 27% slower, which is the honest number for that shape — hundreds of

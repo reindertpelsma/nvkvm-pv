@@ -924,6 +924,81 @@ GA10x die. It is deliberately **not** added to the tested-platforms table, whose
 stated bar is "reached a real CUDA kernel launch": this did not.
 
 
+### Nested nvkvm (L2-inside-L1): `cuCtxCreate` fails with 999 most of the time — OPEN, first double-forward test
+
+Measured 2026-08-22 on **6x Tesla T4** (Turing TU104, PCIe, datacenter — a card
+with 28/28 on the single-hop tested-platforms table), host driver 580.178.04,
+ABI profile 580. Topology: L0 bare metal -> L1 (an ordinary nvkvm guest, already
+verified 28/28-equivalent on this box) -> L2, a **second** nvkvm guest booted
+*inside* L1, using a copy of the same patched QEMU binary and the same
+`virtio-nvgpu-pci-non-transitional` + `nvkvm-gpu` device pair L1 itself sees from
+L0. No code changes were needed to reach this topology — `nvkvm_guest.ko` and the
+QEMU-side device do not know or care that their "host" is itself a forwarded
+guest.
+
+**Everything below `cuCtxCreate` works, twice-forwarded, cleanly:**
+
+```
+PASS  nvkvm_guest.ko load (L2, unmodified nvkvm-guest.ko)
+PASS  L2 sees "host reports 6 GPU(s)"                    (double hop)
+PASS  nvidia-smi inside L2 lists all 6 T4s               (double hop)
+PASS  cuInit                                              rc=0
+PASS  cuDriverGetVersion                                  13000
+PASS  cuDeviceGetCount                                    6
+PASS  cuDeviceGet / cuDeviceGetName                       "Tesla T4", any index
+FLAKY cuCtxCreate_v2                                       rc=999 (CUDA_ERROR_UNKNOWN) most attempts, rc=0 occasionally
+```
+
+**It is not deterministic and not device-specific.** Across ~9 back-to-back
+`cuCtxCreate` attempts (fresh process each time, so a fresh isolate each time)
+spread across all 6 device indices, **one attempt succeeded** (device 2, first
+attempt of the run) and every other attempt on every device — including that
+same device 2 on a later run — failed with 999. Re-running the identical,
+statically-linked-against-nothing-but-libdl test binary directly on L1 (single
+hop, no L2) succeeds every time, immediately, so the test binary and the T4s
+themselves are not in question — this is specific to the second forwarding hop.
+
+**Signature common to every observed failure**, with `NVKVM_DEBUG=1` on the L1
+QEMU process hosting L2: `cuCtxCreate` gets a long way into RM object setup —
+several `RM_ALLOC`s each followed by the QEMU-side `post-alloc SHARE`
+(`nvkvm_isolate_handlers.c:2765` grant), an `RM_MAP_MEMORY` that resolves a real
+`pLinear` address — and then, right before giving up: one more `RM_ALLOC` of
+class `0x40` (`NV01_MEMORY_LOCAL_USER`) succeeds, is **immediately** `RM_FREE`d
+(`cmd=0xc0104629`), a batch of `REAP_HANDLE`s runs, and `nvkvm_isolate: killed
+isolate N` ends the trace. No `UVM` string appears anywhere in the log for a
+failing attempt — the failure is upstream of `UVM_INITIALIZE`, inside RM setup,
+which rules out the UVM/`RS_SHARE_TYPE_ALL` dup path this file documents
+elsewhere in this doc as already fixed.
+
+The only non-zero `nvstatus` seen in *some* (not all) failing runs is 15
+consecutive `NV_ERR_NOT_SUPPORTED` (`0x56`) answers to RM control command
+`0x2080182a`, called in a tight retry loop — notable because the *same* command,
+on the *same* GPU, in the *same* process's `cuInit` a moment earlier, had
+returned `0x0`. But a later failing run showed the identical alloc-then-
+immediate-free-then-kill ending with **no** `0x56` anywhere in it, so that status
+is at most one symptom, not a confirmed single cause — same "strongest
+candidate, not a closed case" caveat the A100 entry above gives its own finding.
+
+**Not chased further**, for lack of time on the rented box: whether isolate/
+handle-table growth across repeated failed attempts (isolate ids and handle ids
+were still climbing after ~9 attempts, all leaking one alloc/free/reap cycle's
+worth of bookkeeping) is itself contributing to the failure rate, whether the
+one success was a genuine race won rather than a fluke, and whether this is the
+same root cause as the A100 finding above (both share the "clean enumeration,
+`cuCtxCreate` dies with 999, alloc/free of one object right before" shape, but
+the A100 case's confirmed mechanism — `RM_UNMAP_MEMORY`'s `p_linear_address`
+never refilled, `nvstatus 0x57` — does not appear here at all; if related, it is
+a different manifestation, not the same code path).
+
+**What a retry would need:** an `NVKVM_DEBUG=1` trace of a *successful*
+non-nested `cuCtxCreate` on this same L1, to diff against the doubly-forwarded
+failing traces above and see whether `0x2080182a` (or anything else) actually
+diverges, rather than being present-but-harmless in the working case too.
+Not done here because the only L1 available was the live demo QEMU process
+already serving a human audience, and restarting it to attach `NVKVM_DEBUG` was
+out of scope for this pass.
+
+
 ### Priority note: display matters on consumer and workstation parts, not datacenter
 
 Stated by the maintainer, recorded so nobody spends a night on the wrong bug.
@@ -1270,3 +1345,17 @@ The throughput gap is in the slot-batched upload loop, not in the per-chunk
 migration path — the chunk size was chosen so per-chunk overhead is negligible
 against the data copied. It has been characterised but not optimised.
 
+
+### Corroborated on unrelated hardware, same day
+
+This is not specific to the T4 box or to CUDA.  On a completely different
+machine -- an RTX 4070 desktop, different host CPU vendor, different guest --
+nested nvkvm came up the same way: the L2 module loaded, `nvidia-smi` listed
+the GPU, and then **`clCreateContext` failed**.  That is OpenCL rather than the
+CUDA driver API, on different silicon, and it fails at the same point in the
+same order: enumeration works, context creation does not.
+
+Two machines, two APIs, one boundary.  Whatever this is, it is a property of
+the second forwarding hop and not of a card, a driver build, or a guest image
+-- which is the useful half of the finding, because it means a fix can be
+developed anywhere rather than only on rented multi-GPU hardware.

@@ -2396,17 +2396,23 @@ forwarded:;
 					size_t list_bytes = (size_t)orig.num_channels *
 							    sizeof(__u32);
 					if (aux_size >= ctrl->params_size + 2 * list_bytes) {
-						if (orig.p_handles)
-							copy_to_user(
-								(void __user *)(uintptr_t)orig.p_handles,
-								(char *)aux_buf + ctrl->params_size,
-								list_bytes);
-						if (orig.p_list)
-							copy_to_user(
-								(void __user *)(uintptr_t)orig.p_list,
-								(char *)aux_buf + ctrl->params_size +
-								list_bytes,
-								list_bytes);
+						/* __must_check; see the note on the version
+						 * strings below -- unchecked, this fails the
+						 * build under RHEL's -Werror and silently
+						 * reports success on a bad guest pointer. */
+						if (orig.p_handles &&
+						    copy_to_user(
+							(void __user *)(uintptr_t)orig.p_handles,
+							(char *)aux_buf + ctrl->params_size,
+							list_bytes))
+							ret = -EFAULT;
+						if (orig.p_list &&
+						    copy_to_user(
+							(void __user *)(uintptr_t)orig.p_list,
+							(char *)aux_buf + ctrl->params_size +
+							list_bytes,
+							list_bytes))
+							ret = -EFAULT;
 					}
 					/* Restore pointers */
 					*(__u64 *)((char *)aux_buf + 8)  = orig.p_handles;
@@ -2434,10 +2440,11 @@ forwarded:;
 							(size_t)orig.list_size *
 							entry_size;
 						if (aux_size >= ctrl->params_size + list_bytes) {
-							copy_to_user(
+							if (copy_to_user(
 								(void __user *)(uintptr_t)orig.list_ptr,
 								(char *)aux_buf + ctrl->params_size,
-								list_bytes);
+								list_bytes))
+								ret = -EFAULT;
 						}
 						/* Restore original pointer so userspace sees its VA */
 						*(__u64 *)((char *)aux_buf + 8) = orig.list_ptr;
@@ -2485,19 +2492,34 @@ forwarded:;
 					    aux_size >= need) {
 						char *ext = (char *)aux_buf +
 							    ctrl->params_size;
-						/* Copy version strings to original user buffers */
-						if (orig.p_driver_version_buffer)
-							copy_to_user((void __user *)(uintptr_t)
-								     orig.p_driver_version_buffer,
-								     ext, sz);
-						if (orig.p_version_buffer)
-							copy_to_user((void __user *)(uintptr_t)
-								     orig.p_version_buffer,
-								     ext + sz, sz);
-						if (orig.p_title_buffer)
-							copy_to_user((void __user *)(uintptr_t)
-								     orig.p_title_buffer,
-								     ext + 2 * sz, sz);
+						/*
+						 * Copy version strings to original user buffers.
+						 *
+						 * The return value is not optional.  copy_to_user()
+						 * is __must_check, and RHEL builds modules with
+						 * -Werror, so ignoring it does not merely warn --
+						 * it fails the build outright on a CentOS/RHEL 9
+						 * guest (measured on 5.14.0-737.el9).  It was also
+						 * wrong on its own terms: a guest that passes a bad
+						 * pointer here got a success return and then read
+						 * whatever was already in its buffer.  Same
+						 * -EFAULT convention as the aux_buf copy below.
+						 */
+						if (orig.p_driver_version_buffer &&
+						    copy_to_user((void __user *)(uintptr_t)
+								 orig.p_driver_version_buffer,
+								 ext, sz))
+							ret = -EFAULT;
+						if (orig.p_version_buffer &&
+						    copy_to_user((void __user *)(uintptr_t)
+								 orig.p_version_buffer,
+								 ext + sz, sz))
+							ret = -EFAULT;
+						if (orig.p_title_buffer &&
+						    copy_to_user((void __user *)(uintptr_t)
+								 orig.p_title_buffer,
+								 ext + 2 * sz, sz))
+							ret = -EFAULT;
 					}
 					/*
 					 * Restore the original user-space pointer values
