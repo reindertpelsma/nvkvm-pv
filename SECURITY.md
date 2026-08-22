@@ -160,6 +160,63 @@ so an nvkvm container cannot read the host's screen even with `/dev/dri`
 present. **`--privileged` removes this entirely** — the device nodes are not
 the sensitive part, the capability set is.
 
+## Can a guest process read the *guest's* screen?
+
+Same question one level down, and until 2026-08-22 the answer was yes.
+
+nvkvm's virtual KMS head lives on the same `drm_device` as the render node, so
+`/dev/dri/card*` in the guest **is** the guest's display. DRM core hands master
+to the *first* opener of a primary node with no capability check at all:
+
+```c
+int drm_master_open(struct drm_file *file_priv) {
+	if (!dev->master)
+		ret = drm_new_set_master(dev, file_priv);   /* no capable() */
+```
+
+Explicit `SET_MASTER` *is* gated (`drm_master_check_perm` -> `CAP_SYS_ADMIN`),
+but an attacker never needs it. And master alone is enough to read pixels,
+because `drm_mode_getfb` withholds the GEM handle only from callers that are
+**neither** master **nor** `CAP_SYS_ADMIN`:
+
+```c
+if (!drm_is_current_master(file_priv) && !capable(CAP_SYS_ADMIN)) { r->handle = 0; }
+```
+
+So the chain was: open the node whenever nothing holds master -- before the
+compositor starts, across a VT switch, after it exits -- take master, and both
+drive and capture the display. Measured in a guest: an unprivileged uid-1000
+process took master and passed `ADDFB` byte-identically to root.
+
+Upstream nvidia-drm has the same gap: `__nv_drm_master_set()` only calls
+`nvKms->grabOwnership()`, which is occupancy, and `capable(`/`CAP_SYS_ADMIN`
+appear nowhere in `nvidia-drm`. On physical hardware logind/seatd hides it by
+opening the node as root and passing the fd. A virtualized head cannot lean on
+that, so **nvkvm gates harder than upstream**: opening the primary DRM node
+requires `CAP_SYS_ADMIN`, checked with `capable()` against the guest's **init**
+user namespace, so root inside an unprivileged user namespace does not qualify.
+
+| node | who may open it | what it is |
+|---|---|---|
+| `/dev/dri/renderD*` | anyone | render/compute; headless targets userspace allocates for itself |
+| `/dev/dri/card*` | **`CAP_SYS_ADMIN` only** | the real virtual display: scanout and capture |
+
+Verified with the node chowned to the caller and `chmod 0666`:
+
+| module state | result as uid 1000 |
+|---|---|
+| `privileged_modeset=Y` (default) | `open: FAILED (Permission denied)` |
+| `privileged_modeset=N` | master seized, `ADDFB` OK -- the old behaviour |
+
+The permission bits are irrelevant to the outcome, which is the point: the
+boundary is the capability. `privileged_modeset=N` restores upstream behaviour
+for anyone who needs an unprivileged compositor driving the head directly; it
+re-opens the hole above, so treat it as a debugging knob.
+
+Render clients are untouched, so CUDA and Vulkan are unaffected, and weston
+still drives the head normally (it is started by root, and under logind the
+compositor never calls `open()` itself -- it receives the fd).
+
 ## Weaker configurations you should know about
 
 - **In containers**, Linux namespaces are usually blocked, so the isolate falls

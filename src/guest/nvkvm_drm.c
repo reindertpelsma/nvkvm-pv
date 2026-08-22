@@ -26,6 +26,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/capability.h>
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <linux/pci.h>
@@ -978,6 +979,38 @@ static const struct drm_ioctl_desc nvkvm_drm_ioctls[] = {
 		   .flags = DRM_RENDER_ALLOW, .name = "NVIDIA_SEMSURF_FENCE_CREATE" },
 };
 
+/* #124: the virtual KMS head (nvkvm_kms.c) lives on this same drm_device, so the
+ * primary node /dev/dri/card* IS the guest's real display.  DRM core grants
+ * master to the FIRST opener of a primary node with no capability check at all
+ * (drm_master_open -> drm_new_set_master), so whenever nothing holds master --
+ * before the compositor starts, across a VT switch, after it exits -- any
+ * process that can open the node seizes the display: it can scan out its own
+ * framebuffer, and as master GETFB stops withholding GEM handles, so it can
+ * capture what the next session draws.  Measured: an unprivileged uid-1000
+ * guest process took master and passed ADDFB byte-identically to root.
+ *
+ * Upstream nvidia-drm has the same gap (__nv_drm_master_set only grabs NVKMS
+ * modeset ownership -- occupancy, not capability), and on physical hardware
+ * logind/seatd hides it by opening the node as root and passing the fd.  A
+ * virtualized head cannot lean on that, so we gate harder than upstream and
+ * require CAP_SYS_ADMIN to open the primary node at all.
+ *
+ * capable() -- not ns_capable() -- deliberately: the check is against the
+ * guest's INIT user namespace, so a process that is merely root inside an
+ * unprivileged user namespace does not qualify.
+ *
+ * This does not touch the render node: compute/Vulkan clients open renderD128
+ * and are unaffected, as are headless NVKMS surfaces userspace allocates for
+ * itself.  The logind model still works -- root opens the node and passes the
+ * fd, and the unprivileged compositor never calls open() itself.
+ */
+static bool nvkvm_privileged_modeset = true;
+module_param_named(privileged_modeset, nvkvm_privileged_modeset, bool, 0644);
+MODULE_PARM_DESC(privileged_modeset,
+	"require CAP_SYS_ADMIN (init user ns) to open the primary DRM node, i.e. to "
+	"drive or capture the guest's virtual display (default Y; N restores the "
+	"upstream nvidia-drm/DRM-core behaviour where first-to-open wins)");
+
 /* Each open of the render node gets its own forwarding context, sharing the
  * process's per-mm session + isolate (so renderD128 ⇄ /dev/nvidia0 correlate). */
 static int nvkvm_drm_open(struct drm_device *dev, struct drm_file *file)
@@ -985,6 +1018,18 @@ static int nvkvm_drm_open(struct drm_device *dev, struct drm_file *file)
 	struct nvkvm_fd_ctx *ctx;
 
 	(void)dev;
+
+	/* #124: display access is privileged; render access is not.
+	 * Tested negatively: with the node chowned to the caller and chmod 0666,
+	 * an uid-1000 process is still refused here -- the guarantee is the
+	 * capability, not the file mode.  Phrased as !render rather than
+	 * ==primary deliberately: a minor type we do not know about yet should
+	 * land on the privileged side, not walk through. */
+	if (nvkvm_privileged_modeset && !drm_is_render_client(file) &&
+	    !capable(CAP_SYS_ADMIN)) {
+		pr_debug("nvkvm: denying non-CAP_SYS_ADMIN open of primary DRM node\n");
+		return -EACCES;
+	}
 	ctx = nvkvm_fd_ctx_open_dev(NVKVM_DEV_DRM_RD(0), O_RDWR);
 	if (IS_ERR(ctx))
 		return PTR_ERR(ctx);
