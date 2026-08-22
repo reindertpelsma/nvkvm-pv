@@ -20,10 +20,36 @@
 #include <linux/version.h>
 
 /*
+ * RHEL/CentOS report an ancient LINUX_VERSION_CODE and then backport large
+ * parts of 6.x underneath it, so the version alone answers the wrong
+ * question.  On CentOS Stream 9 (5.14.0-737.el9, RHEL_RELEASE_CODE 2313 =
+ * 9.9) every guard below fired, and every one of them collided with an API
+ * the kernel already had: class_create had lost its owner argument,
+ * vm_flags_clear and vma_start_write were already defined, and devnode
+ * already took a const struct device *.  The module did not compile at all.
+ *
+ * RHEL exports RHEL_RELEASE_CODE for exactly this.  NVKVM_KERNEL_LT() asks
+ * "does this kernel BEHAVE like it predates x.y.z", which is the question
+ * every guard here actually wants answered.
+ *
+ * The 9.0 bound is deliberately coarse: it is where this was measured, not
+ * where each backport landed.  If an earlier 9.x minor turns out to lack one
+ * of these, tighten that guard then -- from a build failure, not a guess.
+ */
+#if defined(RHEL_RELEASE_CODE) && defined(RHEL_RELEASE_VERSION)
+#  define NVKVM_RHEL_GE(a, b)   (RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(a, b))
+#else
+#  define NVKVM_RHEL_GE(a, b)   0
+#endif
+
+#define NVKVM_KERNEL_LT(a, b, c) \
+	(LINUX_VERSION_CODE < KERNEL_VERSION(a, b, c) && !NVKVM_RHEL_GE(9, 0))
+
+/*
  * class_create() lost its `owner` argument in 6.4 (commit 1aaba11da9aa).
  * Older kernels take (owner, name).
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#if NVKVM_KERNEL_LT(6, 4, 0)
 #define nvkvm_class_create(name)   class_create(THIS_MODULE, (name))
 #else
 #define nvkvm_class_create(name)   class_create(name)
@@ -34,7 +60,7 @@
  * __private to force writers through an accessor.  Before that the field is
  * written directly, which is what the accessor does anyway.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 3, 0)
+#if NVKVM_KERNEL_LT(6, 3, 0)
 static inline void vm_flags_set(struct vm_area_struct *vma, unsigned long f)
 {
 	vma->vm_flags |= f;
@@ -51,7 +77,7 @@ static inline void vm_flags_clear(struct vm_area_struct *vma, unsigned long f)
  * the whole exclusion, so the empty shim is the correct behaviour there rather
  * than a weakening of it.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+#if NVKVM_KERNEL_LT(6, 4, 0)
 static inline void vma_start_write(struct vm_area_struct *vma)
 {
 }
@@ -62,7 +88,7 @@ static inline void vma_start_write(struct vm_area_struct *vma)
  * ff62b8e6588f constified the whole family).  Spell the parameter through this
  * macro so one definition satisfies both.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 2, 0)
+#if NVKVM_KERNEL_LT(6, 2, 0)
 #define NVKVM_DEVNODE_DEV   struct device *
 #else
 #define NVKVM_DEVNODE_DEV   const struct device *
@@ -105,8 +131,12 @@ static inline void vma_start_write(struct vm_area_struct *vma)
 /*
  * struct drm_driver lost its `date` field in 6.14 (commit 9f9ec6d5b4d1); the
  * value was never used for anything but the DRM_IOCTL_VERSION string.
+ *
+ * RHEL backports DRM aggressively for hardware enablement: 5.14.0-737.el9
+ * already has the field removed, several major versions ahead of its own
+ * version code.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+#if NVKVM_KERNEL_LT(6, 14, 0)
 #define NVKVM_DRM_DRIVER_DATE   .date = "20160202",
 #else
 #define NVKVM_DRM_DRIVER_DATE
@@ -135,8 +165,12 @@ static inline void vma_start_write(struct vm_area_struct *vma)
  * The maple-tree VMA iterator (VMA_ITERATOR / for_each_vma) arrived in 6.1.
  * Before that a mm's VMAs are a plain linked list through vm_next, walked
  * under the same mmap_read_lock.  Same traversal, same order, same lock.
+ *
+ * RHEL 9 backported the maple tree, so mm->mmap and vma->vm_next are gone
+ * there despite the 5.14 version code -- hence NVKVM_KERNEL_LT rather than a
+ * bare comparison.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+#if NVKVM_KERNEL_LT(6, 1, 0)
 #define VMA_ITERATOR(name, mm, addr) \
 	struct vm_area_struct *name = (mm)->mmap
 #define for_each_vma(vmi, vma) \
@@ -159,8 +193,9 @@ static inline void vma_start_write(struct vm_area_struct *vma)
 
 /*
  * PDE_DATA() was lowercased to pde_data() in 5.17 (commit 359745d78351).
+ * RHEL 9 carries the lowercase spelling at version code 5.14.
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 17, 0)
+#if NVKVM_KERNEL_LT(5, 17, 0)
 #define pde_data(inode)   PDE_DATA(inode)
 #endif
 
