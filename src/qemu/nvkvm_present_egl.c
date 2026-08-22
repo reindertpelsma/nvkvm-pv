@@ -376,6 +376,13 @@ typedef struct NvkvmPresent {
     uint64_t tick;           /* monotonic, bumped on every cache lookup */
     egl_fb fb;               /* reused; egl_fb_setup_for_tex keeps the FBO */
 
+    /* Readback path: two pixel buffer objects, written one frame ahead of
+     * being mapped.  See nvkvm_fb_read_async(). */
+    GLuint   pbo[2];
+    uint32_t pbo_w, pbo_h;   /* geometry the PBOs were sized for */
+    unsigned pbo_idx;        /* the one this frame writes */
+    bool     pbo_primed;     /* a transfer is in flight in the other one */
+
     /* No cached DisplaySurface: the console owns it and may free it at any
      * time (see nvkvm_present_readback).  Fetch it per frame. */
 
@@ -576,6 +583,93 @@ static GLuint nvkvm_present_cached_tex(NvkvmPresent *p, uint32_t owner,
     return tex;
 }
 
+/*
+ * NVKVM_PRESENT_SYNC=1 forces the old synchronous readback, for A/B timing.
+ * PBOs and glMapBufferRange are GL 3.0 / GLES 3.0; below that, fall back.
+ */
+static bool nvkvm_pbo_ok(void)
+{
+    static int ok = -1;
+    if (ok < 0) {
+        ok = epoxy_gl_version() >= 30 && getenv("NVKVM_PRESENT_SYNC") == NULL;
+    }
+    return ok;
+}
+
+/*
+ * Asynchronous readback.
+ *
+ * egl_fb_read() is a bare glReadPixels into the DisplaySurface: it flushes the
+ * pipeline, waits for the GPU to finish, then DMAs w*h*4 bytes across PCIe with
+ * the CPU blocked -- and it runs from gfx_update on the main loop with the BQL
+ * held, so the guest's vCPUs are stopped for the whole transfer.  That is why
+ * this path measured ~3 fps rather than merely "slower than zero-copy": the
+ * cost is not the bandwidth, it is stopping the VM to pay it.
+ *
+ * Screen capture does not work this way.  Read into a pixel buffer object --
+ * with one bound, glReadPixels queues a DMA and returns -- and map that buffer
+ * on the NEXT frame, by which point the transfer finished long ago and the map
+ * does not wait.  One frame of added latency buys back the stall.
+ *
+ * Returns false when there is nothing to show yet (the first frame, which has
+ * only issued its transfer); the caller must not push the surface then, because
+ * it still holds whatever was there before.
+ */
+static bool nvkvm_fb_read_async(NvkvmPresent *p, DisplaySurface *ds,
+                                uint32_t w, uint32_t h)
+{
+    const size_t sz = (size_t)w * h * 4;
+
+    if (p->pbo_w != w || p->pbo_h != h) {
+        if (p->pbo[0]) {
+            glDeleteBuffers(2, p->pbo);
+            p->pbo[0] = p->pbo[1] = 0;
+        }
+        glGenBuffers(2, p->pbo);
+        for (int i = 0; i < 2; i++) {
+            glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo[i]);
+            glBufferData(GL_PIXEL_PACK_BUFFER, sz, NULL, GL_STREAM_READ);
+        }
+        p->pbo_w = w;
+        p->pbo_h = h;
+        p->pbo_idx = 0;
+        p->pbo_primed = false;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, p->fb.framebuffer);
+    glReadBuffer(GL_COLOR_ATTACHMENT0_EXT);
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo[p->pbo_idx]);
+    glReadPixels(0, 0, w, h, GL_BGRA, GL_UNSIGNED_BYTE, NULL);
+
+    bool have_frame = false;
+    const unsigned prev = p->pbo_idx ^ 1u;
+    if (p->pbo_primed) {
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo[prev]);
+        const void *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, sz,
+                                           GL_MAP_READ_BIT);
+        if (src) {
+            const size_t dst_stride = surface_stride(ds);
+            if (dst_stride == (size_t)w * 4) {
+                memcpy(surface_data(ds), src, sz);
+            } else {
+                for (uint32_t y = 0; y < h; y++) {
+                    memcpy((uint8_t *)surface_data(ds) + y * dst_stride,
+                           (const uint8_t *)src + (size_t)y * w * 4,
+                           (size_t)w * 4);
+                }
+            }
+            glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+            have_frame = true;
+        }
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+
+    p->pbo_idx = prev;
+    p->pbo_primed = true;
+    return have_frame;
+}
+
 /* Import the pending frame on our private NVIDIA EGL context, read it back to a
  * CPU surface, and push it to the 2D display.  Works for any host display GPU. */
 static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
@@ -615,7 +709,13 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
                 w, h);
         goto out_ctx;
     }
-    egl_fb_read(ds, &p->fb);               /* glReadPixels texture -> CPU BGRA */
+    bool have_frame;
+    if (nvkvm_pbo_ok()) {
+        have_frame = nvkvm_fb_read_async(p, ds, w, h);
+    } else {
+        egl_fb_read(ds, &p->fb);           /* glReadPixels texture -> CPU BGRA */
+        have_frame = true;
+    }
     /*
      * NVKVM_PRESENT_DUMP=<path>: write what the window is about to show, as a
      * PPM.  On a headless host, or one whose compositor refuses screenshots,
@@ -631,7 +731,9 @@ static void nvkvm_present_readback(NvkvmPresent *p, int fd, uint32_t owner,
             }
         }
     }
-    dpy_gfx_update(p->con, 0, 0, w, h);
+    if (have_frame) {
+        dpy_gfx_update(p->con, 0, 0, w, h);
+    }
 
 out_ctx:
     eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
