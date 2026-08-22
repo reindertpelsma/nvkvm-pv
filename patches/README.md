@@ -1,13 +1,13 @@
 # QEMU patches
 
-Everything nvkvm changes in **upstream QEMU** is in this directory: nine patch
-files, 631 added lines and 15 removed, against the `v9.2.0` tag
+Everything nvkvm changes in **upstream QEMU** is in this directory: ten patch
+files, 760 added lines and 29 removed, against the `v9.2.0` tag
 (`ae35f033b874c627d81d51070187fbf55f0bf1a7`). Nothing else in the QEMU tree is
 edited.
 
 They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
-A reader deciding whether to trust this can read nine diffs; a maintainer
+A reader deciding whether to trust this can read ten diffs; a maintainer
 bumping the QEMU version resolves conflicts with ordinary tools instead of
 rewriting editing logic; and "is it already applied?" is answered by
 `git apply --reverse --check` rather than by grepping the tree for a comment
@@ -24,6 +24,7 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | on grab, makes a relative mouse the guest's current device; on ungrab, restores the absolute one. **Not known to work** — see its header |
 | `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
 | `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. Pointer lock was **reported working** on that box; the evtest that would prove it was never read — see its header |
+| `0010-kvm-retry-a-bare-KVM_RUN-EFAULT.patch` | `accel/kvm/kvm-all.c` | retries a bare `KVM_RUN` `EFAULT` for up to 3 s instead of killing the VM. An NVIDIA GPU mapping is `VM_IO\|VM_PFNMAP`, and `nv_fault()` returns `VM_FAULT_NOPAGE` **without installing a PTE** while the driver reinstates a revoked mapping; KVM turns that "come back later" into a fatal `EFAULT`. Measured clearing after **1465 ms** on the RTX 3050 laptop, which is why it looked permanent |
 
 Each patch's commit message says *why* it is there. Read those before changing
 one — several of them record a measurement (a driver version, an error code)
@@ -31,7 +32,7 @@ that is the whole justification for the change.
 
 ## Which of these should stop existing
 
-Seven of the nine carry `ui/` changes, and `ui/` is the surface we would most
+Seven of the ten carry `ui/` changes, and `ui/` is the surface we would most
 like to shed — it is generic front-end code, shared with every other QEMU user,
 and the part a reviewer has least reason to trust us with.
 
@@ -81,9 +82,12 @@ upstream and claim a virtio ID that is not assigned. They will never leave.
 
 ## "It works, but it is slow"
 
-A second hardware session, on an RTX 3050, took `0008` + `0009` + `0010` all the way: desktop rendering, pointer lock working, Super forwarded to the guest, and a single
-ctrl-alt-g each way. `0010` is what closed the gap between "the lock engages" and "the
-mode is usable".
+A second hardware session, on an RTX 3050, took `0008` + `0009` all the way: desktop
+rendering, pointer lock working, Super forwarded to the guest, and a single
+ctrl-alt-g each way. The half of `0009` that closed the gap between "the lock
+engages" and "the mode is usable" was written as a separate `0010` at the time
+and squashed in later (dcaff60); the number `0010` now belongs to the KVM
+EFAULT retry above.
 
 The earlier session with `0008` + `0009` reported the SDL window usable
 and pointer lock working, and also reported it as slow. That is not diagnosed.

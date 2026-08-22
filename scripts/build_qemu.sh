@@ -3,7 +3,7 @@
 #                 minimal KVM-only QEMU binary at /opt/qemu-nvkvm.
 #
 # This script is a CONVENIENCE, not the mechanism.  Everything it does to
-# upstream QEMU is nine patch files in patches/, applied with `git apply`;
+# upstream QEMU is ten patch files in patches/, applied with `git apply`;
 # everything it adds is a file copy.  docs/howto/build.md walks the identical
 # sequence by hand, and you can follow it instead of running this — that is the
 # point of keeping the delta as patches rather than as sed expressions.
@@ -249,9 +249,9 @@ fi
 
 # ── 3. Apply the QEMU patch series ────────────────────────────────────────
 #
-# Everything nvkvm changes in *upstream* QEMU lives in patches/ as nine
+# Everything nvkvm changes in *upstream* QEMU lives in patches/ as ten
 # ordinary patch files.  "What does this do to my QEMU?" is therefore answered
-# by reading nine diffs, not by reading this script and mentally executing the
+# by reading ten diffs, not by reading this script and mentally executing the
 # edits it generates.  Each patch carries a header saying why it exists;
 # patches/README.md is the index, and docs/howto/build.md walks the same steps
 # by hand.
