@@ -425,6 +425,82 @@ must be *fully* covered by managed ranges. This is exactly the rule U-6's
 not a union — so nvkvm's check and the driver's own semantics agree, which is
 the reassuring outcome for a control that was designed independently.
 
+## 2g. Shared anonymous memory / memfd, "both declare it UVM" — this is HMM, and it is unimplemented
+
+The most natural-sounding variant of all: the isolate creates the managed range
+at the guest's `G`; the pages live in the **memfd QEMU and the isolate already
+share** for GPA backing; QEMU maps that memfd at any VMM VA `H` and memslots it.
+GPU faults migrate as usual; a VMM-side fault finds the page resident on the GPU
+and the driver migrates it back. Each side uses its own pointer — the isolate
+`G`, the VMM `H` — and nobody has to agree on a number.
+
+It is a coherent design, and it names a real driver mechanism. It is also the
+one thing in this whole investigation that NVIDIA has explicitly not built.
+
+**"Both declare it UVM" has no API.** A managed range can only be created by
+`mmap` of `/dev/nvidia-uvm` (§2a-ter): there is no call that takes an existing
+anonymous or memfd VMA and makes it managed. So the range cannot live in the
+shared memfd by that route at all.
+
+**The mechanism that *does* make ordinary memory GPU-managed is HMM** — and HMM
+is restricted to **private anonymous** memory. `uvm_hmm_must_use_sysmem()`
+(`uvm_hmm.c:3917-3939`) is unambiguous, comment included:
+
+```c
+// TODO: Bug 3660968: Remove this hack as soon as HMM migration is implemented
+// for VMAs other than anonymous private memory.
+...
+    // migrate_vma_setup() can't migrate VM_SPECIAL so we have to force GPU
+    // remote mapping.
+    // TODO: Bug 3660968: add support for file-backed migrations.
+    return !vma_is_anonymous(vma) ||
+           (vma->vm_flags & VM_SPECIAL) ||
+           vma_is_dax(vma) ||
+           is_vm_hugetlb_page(vma);
+```
+
+A memfd mapping is neither private nor anonymous, so `must_use_sysmem` is true
+and the pages are **pinned in host memory with the GPU remote-mapping them over
+PCIe**. The "GPU faults, UVM migrates, done" step is precisely what gets
+disabled. A second refusal sits alongside it: GPU atomics on a `MAP_SHARED`
+VMA report a fatal fault outright (`uvm_hmm.c:2594-2602`,
+`vma->vm_flags & (VM_SHARED | VM_HUGETLB)` → `NV_ERR_NOT_SUPPORTED`).
+
+**And the return path is why file-backed is the unimplemented case.** The
+mechanism imagined for a VMM-side fault is real *for HMM*: a page migrated to
+the GPU is left as a **device-private swap entry**, and a CPU touch faults into
+`->migrate_to_ram`, which pulls it back. But device-private entries live in one
+mm's page tables and anon rmap. The shmem page cache cannot hold one — which is
+exactly what Bug 3660968 is about. So the second mapping in QEMU could never see
+"the page is resident on the GPU"; it would see an ordinary shmem page that UVM
+never touched.
+
+**Finally, the two halves of the idea are mutually exclusive.** To let two
+processes work against one `va_space` you would set
+`UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE` — but that makes
+`uvm_va_space_mm_enabled()` return false (`uvm_va_space_mm.c:172-180`), and
+`uvm_hmm_is_enabled()` requires `uvm_va_space_mm_enabled(va_space)`
+(`uvm_hmm.c:148-153`). Turning on the sharing turns off HMM. The design needs
+both at once and the driver offers them only apart.
+
+**Where it lands.** Accept the forced-sysmem outcome and you have arrived at
+§2e — pinned host memory, GPU mapping it remotely over PCIe, no migration to
+VRAM. The two roads converge: whichever way you avoid putting a managed range at
+one agreed address, you end up with correct, coherent, non-migrating memory.
+That may well be the right trade for nvkvm. It is just not unified memory, and
+it is worth being clear that the migration is what is being given up.
+
+### Does this clarify the original design?
+
+Partly, and in a way worth recording: it explains the *intent* behind
+`ARCHITECTURE.md`'s *"the stub owns the real UVM mapping in its own address
+space and the GPU reaches the memory by DMA"*. That sentence describes something
+close to this idea. But no implementation of it exists in the history — the
+stub-side UVM mmap is skipped (`do_stub_mirror`), `c8c6024`'s own commit message
+records `cuCtxCreate 800`, and both prior implementations mapped at the guest's
+`req->offset` in QEMU. So it reads as a design that was reasoned about and
+written down, not one that ran.
+
 ## 3. A claim in this tree that the measurements falsify
 
 `ARCHITECTURE.md:265-268`, and the revert commit that quotes it, both rest on:
