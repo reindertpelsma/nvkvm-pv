@@ -295,6 +295,37 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->status = le32_to_cpu(resp->status);
 			break;
 		}
+		/*
+		 * #127 poll arm/disarm.  These two were the ONLY request types
+		 * with no case here, so every completion fell to the default
+		 * arm below, which warns and reports EINVAL to the waiter.
+		 *
+		 * How it presented: OBSERVED on an RTX PRO 6000 Blackwell on
+		 * 2026-08-23 as a steady trickle of
+		 *     nvkvm: tx_done: unknown type 21
+		 * (35-58 per run, on 580.95.05, 590.48.01 and 610.57.04).
+		 * Nothing FAILED -- validate.sh was 28/28 throughout -- because
+		 * nvkvm_virtio_poll_arm()'s only caller treats a non-zero
+		 * return as "host-side poll unavailable" and falls back.  That
+		 * is the damage: the arm ALWAYS failed, so the fast wakeup this
+		 * request exists to provide never engaged once, and every
+		 * blocking sync paid the ~18ms poll-timeout fallback the
+		 * nvkvm_virtio_poll_arm() comment describes.  A silent
+		 * permanent fallback, not an error.
+		 *
+		 * Both responses are {status, reserved}, same as the sibling
+		 * *_ON_ISOLATE control-plane replies above.
+		 */
+		case NVKVM_REQ_POLL_ON_ISOLATE: {
+			struct nvkvm_resp_poll_on_isolate *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			break;
+		}
+		case NVKVM_REQ_UNPOLL_ON_ISOLATE: {
+			struct nvkvm_resp_unpoll_on_isolate *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			break;
+		}
 		case NVKVM_REQ_WRITE_MEMORY_HANDLE: {
 			struct nvkvm_resp_write_memory_handle *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
