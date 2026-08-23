@@ -640,6 +640,96 @@ resulting mapping is not one the guest's kernels can address.
 
 ---
 
+## 6b. M1 / M2 / M3 — measured, RTX 4060, driver 580.95.05, 2026-08-24
+
+Tooling: `tools/uvm_va_probe.c` plus an `LD_PRELOAD` tracer/fault-injector whose
+struct offsets and status codes come from `offsetof()` on the ogkm headers
+compiled in — nothing transcribed.
+
+### M1 — libcuda tolerates every failure an external range would produce, except one
+
+Baseline first: a managed allocation draws 92 UVM ioctls, and the commands aimed
+at the managed range are `VALIDATE_VA_RANGE`, `DISABLE_READ_DUPLICATION`,
+`MIGRATE`, `SET_PREFERRED_LOCATION`, `SET_ACCESSED_BY`,
+`ENABLE_READ_DUPLICATION`, `UNSET_ACCESSED_BY`, `UNSET_PREFERRED_LOCATION`.
+**The kernel's own access needs no `MIGRATE` at all** — GPU faults service it
+in-kernel — so migration is not on the data path; only an explicit
+`cudaMemPrefetchAsync` issues one.
+
+Then each command was made to return `NV_ERR_INVALID_ADDRESS`, one at a time —
+exactly what an external range yields:
+
+| injected cmd | `cudaMallocManaged` | data |
+|---|---|---|
+| 51 `MIGRATE` | ok | correct |
+| 42 / 43 `SET/UNSET_PREFERRED_LOCATION` | ok | correct |
+| 46 / 47 `SET/UNSET_ACCESSED_BY` | ok | correct |
+| 44 `ENABLE_READ_DUPLICATION` | ok | correct |
+| **45 `DISABLE_READ_DUPLICATION`** | **fails, error 1, NULL ptr** | — |
+
+`UVM_DISABLE_READ_DUPLICATION` is issued *during* `cudaMallocManaged` and its
+failure is fatal to the allocation. Failing all the others together while
+letting 45 succeed gives `DATA_CORRECT`, with `cudaMemAdvise` visibly returning
+`invalid argument` to the application and `cudaMemPrefetchAsync` returning
+success.
+
+**So M1 passes only conditionally**: nvkvm would have to answer cmd 45 itself
+rather than forward it. That answer is *true* for an external range — there is
+no read duplication on such a range, so "disabled" is the correct state — but it
+is nvkvm synthesising a UVM result rather than relaying one, which is a new kind
+of thing for this codebase and should be an explicit decision, not a detail.
+
+### M2 — external ranges are the mainstream path, and are vidmem-backed
+
+A plain `cudaMalloc` produces 24 `CREATE_EXTERNAL_RANGE` + `MAP_EXTERNAL_ALLOCATION`
+pairs at bases such as `0x200000000` and `0x10000000000`. Two consequences:
+
+- **The vidmem question is settled: yes.** External ranges routinely back VRAM;
+  `cudaMalloc` is that path. The trade is therefore *static placement instead of
+  adaptive migration*, not "always pinned in host memory". What is lost is UVM
+  choosing placement dynamically, plus oversubscription.
+  Whether QEMU can CPU-map a **vidmem** object for the memslot is a separate,
+  unresolved question — device VMAs and KVM memslots interact badly
+  (`nvkvm_isolate_handlers.c`, the `WINMAP` `mprotect` probe and anon fallback)
+  — and needs the VM harness, not a container box.
+- `0x200000000` is confirmed as a `CREATE_EXTERNAL_RANGE` base, exactly as §3
+  claimed when correcting the "libcuda picks the same VA" story.
+
+`cudaHostAlloc(Mapped)` + `cudaHostGetDevicePointer` gave `HOST_PTR ==
+DEVICE_PTR` and a clean value check — sysmem coherent between CPU and GPU.
+
+### M3 — overlap is policed, and this is the safe outcome
+
+Probing `CREATE_EXTERNAL_RANGE` against libcuda's own `va_space` fd:
+
+| target | result |
+|---|---|
+| exactly over a managed range | `NV_ERR_UVM_ADDRESS_IN_USE` |
+| inside a managed range | `NV_ERR_UVM_ADDRESS_IN_USE` |
+| exactly over a `cudaMalloc` GPU VA | `NV_ERR_UVM_ADDRESS_IN_USE` |
+| inside a `cudaMalloc` GPU VA | `NV_ERR_UVM_ADDRESS_IN_USE` |
+| fresh unused base | `NV_OK` |
+| same base twice | `NV_ERR_UVM_ADDRESS_IN_USE` |
+
+UVM's range tree is authoritative for the whole `va_space` and refuses overlap
+between managed ranges, external ranges and RM-assigned GPU VAs alike. The
+feared case — two owners of one GPU VA, page tables written by whoever came last
+— **does not occur**.
+
+Worth being precise about *why* RM-assigned addresses are visible to UVM: they
+are registered with it. libcuda routes GPU VA allocations through
+`CREATE_EXTERNAL_RANGE`/`MAP_EXTERNAL_ALLOCATION`, and channel ranges through
+`REGISTER_CHANNEL` — the same commands nvkvm's schema already marks
+`NVKVM_UVM_VA_CREATE`. So the arbitration holds because everything placed in a
+UVM-registered GPU VA space goes through UVM.
+
+For nvkvm's boundary this is doubly reassuring: a guest-supplied `G` that
+collides with anything is refused *by the driver*, so U-6 records nothing and
+the allocation degrades rather than landing on top of something. And the RM VA
+space in question is the guest process's own, created by its own isolate — a
+guest choosing `G` adversarially is choosing within its own GPU address space,
+not a shared one.
+
 ## 7. What would settle it: the two measurements that decide the external-range design
 
 §2e is the only option not blocked by the driver, and its remaining risk is not
