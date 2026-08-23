@@ -110,9 +110,28 @@ int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx)
 		 * unprivileged. Clear any admin access bits in rights mask.
 		 * gVisor does the equivalent by checking the allocation class
 		 * and rejecting admin ones — we follow suit.
+		 *
+		 * U-7 (docs/internal/audit-guest-pointers.md): this used to be
+		 * gated on `h_class == NV01_ROOT_CLIENT`, so for every OTHER
+		 * class the guest's own 8 bytes reached the driver in a pointer
+		 * field.  alloc_free.c:155-180 dereferences it when non-NULL —
+		 * rmapiParamsCopyIn("RightsRequested", ..., sizeof(RS_ACCESS_MASK))
+		 * is a 16-byte copy_from_user at a guest-named address inside the
+		 * isolate.  The value is never returned to the guest, so the
+		 * direct impact is an address-probing oracle: copy_from_user
+		 * failure surfaces as a distinguishable nvstatus, which is enough
+		 * to map the address space and defeat ASLR from inside the
+		 * isolate — a stepping stone for U-1/U-2/U-4.
+		 *
+		 * Zero it for EVERY class.  This is a no-op on the live path: the
+		 * guest already zeroes the field itself
+		 * (src/guest/nvkvm_ioctl.c:371) and restores the caller's
+		 * original VA on the way back (nvkvm_main.c:2290), so nothing
+		 * legitimate has ever depended on the host forwarding it.  Guest
+		 * code is not a security control, which is why this has to be
+		 * here too.
 		 */
-		if (h_class == NV01_ROOT_CLIENT)
-			p->p_rights_requested = 0;
+		p->p_rights_requested = 0;
 
 		ret = (int)host_ioctl(ctx->hfd->fd,
 			_IOWR('F', NV_ESC_RM_ALLOC,

@@ -8,7 +8,7 @@ mock_stub
 test_open_scm
 test_ctrl_gate
 test_nvkms_allowlist
-test_u5_params_size
+test_stub_ptr_sanitize
 
 # Generated: the U-5 function extracted from src/stub/nvkvm_stub.c at build time.
-u5_clamp.inc
+stub_sanitize.inc

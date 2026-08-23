@@ -862,6 +862,39 @@ static void aux_clear_ptr(void *aux_buf, uint32_t aux_size, uint32_t off)
 }
 
 /*
+ * U-7 (docs/internal/audit-guest-pointers.md) — never forward NVOS64's second
+ * pointer field.
+ *
+ * NVOS64_PARAMETERS carries TWO pointers: pAllocParms at offset 16, which the
+ * U-2 rewrite above replaces with our aux blob, and pRightsRequested at offset
+ * 24, which nothing host-side ever touched.  alloc_free.c:155-180 dereferences
+ * it when non-NULL — rmapiParamsCopyIn("RightsRequested", ...,
+ * sizeof(RS_ACCESS_MASK)) is a 16-byte copy_from_user at a guest-named address
+ * inside the isolate.  The copied value never comes back to the guest, so the
+ * direct impact is an address-probing oracle rather than a read: a
+ * copy_from_user failure surfaces as a distinguishable nvstatus, which is
+ * enough to map the isolate's address space and defeat its ASLR from inside —
+ * a stepping stone for U-1/U-2/U-4.
+ *
+ * No-op on the live path (the guest zeroes the field itself, see
+ * src/guest/nvkvm_ioctl.c:371, and restores the caller's original VA on the way
+ * back in nvkvm_main.c:2290), but guest code is not a security control.
+ *
+ * NVOS21 is exactly 32 bytes and its offset 24 is { status, pad } — real data,
+ * not a pointer — so the discriminator is param_size > 32.  NVOS64 is 48.
+ */
+static void zero_nvos64_rights(unsigned job_type, unsigned job_nr,
+			       void *param_buf, uint32_t param_size)
+{
+	static const uint64_t zero;
+
+	if (job_type != 'F' || job_nr != 0x2b || !param_buf || param_size < 36)
+		return;
+
+	__builtin_memcpy((char *)param_buf + 24, &zero, sizeof(zero));
+}
+
+/*
  * U-5 (docs/internal/audit-guest-pointers.md) — make the declared inner-params
  * size describe the buffer we actually allocated.
  *
@@ -1008,6 +1041,11 @@ static void worker_thread(void *arg)
 		 * actually allocated, now that the pointer names it. */
 		clamp_inner_params_size(job_type, job_nr, job.param_buf,
 					job.param_size, job.aux_size);
+
+		/* U-7: NVOS64 carries a second pointer at offset 24 that no
+		 * rewrite above reaches.  Never forward the guest's bytes. */
+		zero_nvos64_rights(job_type, job_nr, job.param_buf,
+				   job.param_size);
 
 		/*
 		 * NVKMS REGISTER_SURFACE (sub-cmd 17): the inner params carry up

@@ -2,7 +2,7 @@
 
 ## Status at a glance
 
-Severities below are **as first assessed**. Six findings have since been fixed;
+Severities below are **as first assessed**. Seven findings have since been fixed;
 the rest are open. Read this table before the detail.
 
 | finding | severity as found | status |
@@ -11,9 +11,10 @@ the rest are open. Read this table before the detail.
 | U-2 | CRITICAL | **fixed** — rewrite sites fail closed (`nvkvm_stub.c`, `U-2` markers) |
 | U-3 | CRITICAL | **fixed** — default-deny gate on `NVOS32.function`, only `ALLOC_SIZE` allowed |
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
-| U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_u5_params_size.c` |
+| U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_stub_ptr_sanitize.c` |
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
-| U-7 … U-13 | HIGH → UNKNOWN | open |
+| U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally on both paths (`nvkvm_frontend.c`, `zero_nvos64_rights` in `nvkvm_stub.c`) |
+| U-8 … U-13 | MEDIUM → UNKNOWN | open |
 | U-14 | by design | documented for completeness |
 
 A separate defect found while fixing U-6 — the host driver writing past a
@@ -492,7 +493,7 @@ ever shrink a copy to the buffer that actually exists.
 size comes from `hClass` via the alloc-param table — hence the `param_size >= 36`
 discriminator that selects `NVOS64` only.
 
-Pinned by `tests/unit/test_u5_params_size.c` (12 cases, including the exploit
+Pinned by `tests/unit/test_stub_ptr_sanitize.c` (12 cases, including the exploit
 record itself and the four layouts that must be left untouched). The function is
 **extracted from the stub source at build time** rather than copied into the
 test, so the suite cannot drift from the code it pins.
@@ -534,7 +535,7 @@ verified layout" justification for skipping the size floor is stale.
 
 ---
 
-### U-7 — OPEN — HIGH — `NVOS64.pRightsRequested` is never overwritten by anything
+### U-7 — FIXED 2026-08-23 — HIGH — `NVOS64.pRightsRequested` is never overwritten by anything
 
 **Field:** `NVOS64_PARAMETERS.pRightsRequested`, offset 24 (`src/abi/nvgpu.h:184`).
 **Driver dereferences it:** yes. `src/nvidia/src/kernel/rmapi/alloc_free.c:155-180`:
@@ -550,6 +551,34 @@ returned to the guest. So the direct impact is an address-probing oracle: `copy_
 surfaces as a distinguishable `nvstatus`, letting a guest map out the stub's address space and
 defeat its ASLR from inside the isolate. That is a stepping stone for U-1/U-2/U-4, not an end in
 itself.
+
+**Correction, 2026-08-23.** The claim above — *"No host-side site writes offset
+24 of an `RM_ALLOC` param buffer"* — is true exactly as scoped (`nvkvm_stub.c`,
+`nvkvm_isolate_handlers.c`) but misses a third path. `nvkvm_frontend.c`'s
+`nvkvm_handle_rm_alloc()` **did** write the field — but only under
+`if (h_class == NV01_ROOT_CLIENT)`, as an unrelated privilege check. For every
+other class it saved the guest's value, forwarded it verbatim to `host_ioctl`,
+and restored it afterwards. So the finding held on that path too; it was one
+`if` away from being invisible.
+
+**FIXED 2026-08-23** on both paths:
+
+- `nvkvm_frontend.c` — the zeroing is now unconditional rather than gated on
+  `NV01_ROOT_CLIENT`. The save/restore around the ioctl is unchanged, so the
+  guest still sees its own bytes come back.
+- `nvkvm_stub.c` — `zero_nvos64_rights()` zeroes offset 24 for `RM_ALLOC`
+  alongside the U-5 clamp. `NVOS21` is exactly 32 bytes and its offset 24 is
+  `{ status, pad }` — real data, not a pointer — so the discriminator is
+  `param_size > 32` (`>= 36` in the code, matching the U-5 clamp's).
+
+No-op on the live path: the guest already zeroes the field
+(`src/guest/nvkvm_ioctl.c:371`) and restores the caller's original VA on the way
+back (`nvkvm_main.c:2290`), so nothing legitimate ever depended on the host
+forwarding it. Guest code is not a security control, which is the whole reason
+this had to be done host-side as well.
+
+Pinned by `tests/unit/test_stub_ptr_sanitize.c` (5 U-7 cases, including the two
+layouts that must be left untouched).
 
 ---
 

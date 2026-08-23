@@ -1,6 +1,10 @@
 /*
- * test_u5_params_size.c — U-5: the declared inner-params size must never
- *                         exceed the aux blob the stub actually allocated.
+ * test_stub_ptr_sanitize.c — the stub's guest-pointer sanitisation, per
+ *                            docs/internal/audit-guest-pointers.md.
+ *
+ * U-5: the declared inner-params size must never exceed the aux blob the stub
+ *      actually allocated.
+ * U-7: NVOS64's second pointer (pRightsRequested) must never be forwarded.
  *
  * docs/internal/audit-guest-pointers.md, U-5.  The stub rewrites the pointer
  * field at offset 16 to name its own aux buffer (U-2), but the SIZE field that
@@ -22,7 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 
-#include "u5_clamp.inc"
+#include "stub_sanitize.inc"
 
 static int tests_run, tests_passed;
 
@@ -45,6 +49,29 @@ static void chk(const char *name, unsigned type, unsigned nr, uint32_t psz,
 	} else {
 		printf("  FAIL %-44s declared=%-10u aux=%-8u -> %u (want %u)\n",
 		       name, declared, aux, got, want);
+	}
+}
+
+static void chk_rights(const char *name, unsigned type, unsigned nr,
+		       uint32_t psz, uint64_t ptr, uint64_t want)
+{
+	unsigned char buf[64];
+	uint64_t got;
+
+	tests_run++;
+	memset(buf, 0xAA, sizeof buf);
+	memcpy(buf + 24, &ptr, sizeof ptr);
+	zero_nvos64_rights(type, nr, buf, psz);
+	memcpy(&got, buf + 24, sizeof got);
+
+	if (got == want) {
+		tests_passed++;
+		printf("  ok   %-44s 0x%016llx -> 0x%016llx\n",
+		       name, (unsigned long long)ptr, (unsigned long long)got);
+	} else {
+		printf("  FAIL %-44s 0x%016llx -> 0x%016llx (want 0x%016llx)\n",
+		       name, (unsigned long long)ptr, (unsigned long long)got,
+		       (unsigned long long)want);
 	}
 }
 
@@ -85,6 +112,26 @@ int main(void)
 	    'd', 0x2a, 32, 0x100000, 8, 0x100000, 24);
 	chk("an unrelated frontend nr",
 	    'F', 0x2c, 48, 0x100000, 8, 0x100000, 32);
+
+	/*
+	 * U-7.  NVOS64 carries pAllocParms@16 (rewritten by U-2) and
+	 * pRightsRequested@24, which no rewrite reached.  The driver does a
+	 * 16-byte copy_from_user through it when non-NULL; the value never
+	 * returns to the guest, so it is an ASLR oracle rather than a read.
+	 * NVOS21 is exactly 32 bytes and its offset 24 is { status, pad } —
+	 * real data — hence the param_size > 32 discriminator.
+	 */
+	puts("\nU-7  NVOS64.pRightsRequested @24  ('F' nr 0x2b)");
+	chk_rights("a guest-supplied pointer is zeroed",
+		   'F', 0x2b, 48, 0xdeadbeefcafef00dull, 0);
+	chk_rights("an already-zero field stays zero",
+		   'F', 0x2b, 48, 0, 0);
+	chk_rights("NVOS21 (32 bytes) must keep its status word",
+		   'F', 0x2b, 32, 0xdeadbeefcafef00dull, 0xdeadbeefcafef00dull);
+	chk_rights("RM_CONTROL is not an alloc, leave it alone",
+		   'F', 0x2a, 48, 0xdeadbeefcafef00dull, 0xdeadbeefcafef00dull);
+	chk_rights("a DRM ioctl (type 'd') is not an alloc",
+		   'd', 0x2b, 48, 0xdeadbeefcafef00dull, 0xdeadbeefcafef00dull);
 
 	printf("\n%d/%d tests passed\n", tests_passed, tests_run);
 	return tests_passed != tests_run;
