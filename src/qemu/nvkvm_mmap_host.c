@@ -98,51 +98,12 @@ void nvkvm_set_kvm_vm_fd(int fd)
  * Alignment: mappings are aligned to PAGE_SIZE (4 KiB). For BAR mappings
  * that must be 2 MiB aligned (huge pages), we align up to 2 MiB.
  */
-/*
- * mmap_win recycling.
- *
- * alloc_gpa() is a bump allocator, which was fine while mmap_win had no live
- * users.  It has one again -- /dev/nvidia-uvm mappings, which cannot live in
- * the sparse window -- and a CUDA process that allocates and frees managed
- * memory in a loop would otherwise walk the 16 GiB window to exhaustion and
- * silently lose unified memory for the rest of its life.  Two cheap reclaims,
- * in the order they are tried:
- *
- *   1. freeing the tail extent just lowers the watermark;
- *   2. anything else goes on a small exact-size LIFO that alloc_gpa() checks
- *      before bumping.
- *
- * Deliberately not a merging allocator: UVM mappings are few and repeat at the
- * same sizes, so exact-size reuse covers the real pattern.  Overflowing the
- * LIFO leaks window space rather than failing -- and running mmap_win dry
- * degrades to the anonymous-window fallback in the UVM mmap path, i.e. back to
- * the old behaviour, not to a broken VM.
- */
-#define NVKVM_MMAP_WIN_FREE_MAX 256
-struct nvkvm_mmap_win_free_ent { uint64_t off; size_t len; };
-static struct nvkvm_mmap_win_free_ent
-	mmap_win_free[NVKVM_MMAP_WIN_FREE_MAX];
-static uint32_t mmap_win_free_n;
-
 static uint64_t alloc_gpa(VirtIONvgpu *nv, size_t length)
 {
 	uint64_t gpa;
 	size_t align = (length >= (2 << 20)) ? (2 << 20) : 4096;
 
 	pthread_mutex_lock(&nv->mmap_win_lock);
-
-	/* Exact-size reuse before bumping. */
-	for (uint32_t i = mmap_win_free_n; i-- > 0; ) {
-		if (mmap_win_free[i].len != length)
-			continue;
-		if (mmap_win_free[i].off & (align - 1))
-			continue;
-		gpa = nv->mmap_win_gpa + mmap_win_free[i].off;
-		mmap_win_free[i] = mmap_win_free[--mmap_win_free_n];
-		pthread_mutex_unlock(&nv->mmap_win_lock);
-		return gpa;
-	}
-
 	/* Align current pointer */
 	nv->mmap_win_cur = (nv->mmap_win_cur + align - 1) & ~(align - 1);
 
@@ -168,29 +129,6 @@ static uint64_t alloc_gpa(VirtIONvgpu *nv, size_t length)
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out)
 {
 	*gpa_out = alloc_gpa(nv, length);
-}
-
-/* Return one mmap_win extent.  See the recycling note above alloc_gpa(). */
-void nvkvm_mmap_win_free(VirtIONvgpu *nv, uint64_t gpa, size_t length)
-{
-	if (!nv || !length || !nv->mmap_win_size)
-		return;
-	if (gpa < nv->mmap_win_gpa)
-		return;
-	uint64_t off = gpa - nv->mmap_win_gpa;
-	if (off >= nv->mmap_win_size ||
-	    length > nv->mmap_win_size - off)
-		return;
-
-	pthread_mutex_lock(&nv->mmap_win_lock);
-	if (off + length == nv->mmap_win_cur) {
-		nv->mmap_win_cur = off;
-	} else if (mmap_win_free_n < NVKVM_MMAP_WIN_FREE_MAX) {
-		mmap_win_free[mmap_win_free_n].off = off;
-		mmap_win_free[mmap_win_free_n].len = length;
-		mmap_win_free_n++;
-	}
-	pthread_mutex_unlock(&nv->mmap_win_lock);
 }
 
 /* ── Physical address width + GPA window placement ────────────────────────── */
@@ -569,46 +507,17 @@ int nvkvm_sparse_init(VirtIONvgpu *nv)
 	 * host VMM buffer now; nvkvm_sparse_ensure() installs the memslot at the
 	 * resolved base on first use (or falls back to the fixed base).
 	 */
-	/*
-	 * Carve a UVM sub-window off the TOP of the window.
-	 *
-	 * /dev/nvidia-uvm mappings are the one kind that cannot ride the single
-	 * sparse memslot: the driver pins them to vm_start == pgoff<<PAGE_SHIFT
-	 * so QEMU cannot MAP_FIXED them into the window buffer, and they need a
-	 * memslot of their own pointing at the real UVM VA.  KVM does not allow
-	 * memslots to overlap, so those GPAs have to come from a range the big
-	 * memslot does NOT cover -- while still being inside the window the
-	 * guest validates returned GPAs against (nvkvm_gpa_in_mmap_window),
-	 * which since #55 is exactly [BAR base, BAR base + advertised len).
-	 *
-	 * So: the VMM buffer and the ADVERTISED length stay the full window
-	 * (nv->sparse_total), the big memslot and the bump allocator stop short
-	 * of the reserve (nv->sparse_size), and the reserve is handed to the
-	 * mmap_win allocator, whose own GPA region was orphaned by #55 and had
-	 * no live user.
-	 */
-	size_t uvm_reserve = (size_t)NVKVM_MMAP_WIN_SIZE;
-	if (uvm_reserve > win / 8)
-		uvm_reserve = win / 8;
-	uvm_reserve &= ~((size_t)4095);
-
 	pthread_mutex_init(&nv->sparse_lock, NULL);
 	nv->sparse_gpa_base = 0;
-	nv->sparse_total    = win;
-	nv->sparse_uvm_size = uvm_reserve;
-	nv->sparse_size     = win - uvm_reserve;
+	nv->sparse_size     = win;
 	nv->sparse_vmm_va   = va;
 	nv->sparse_cur      = 0;
 	nv->sparse_kvm_slot = -1;
 	/* #80/H-1: window free-list (recycled extents). */
 	nv->sparse_free   = g_new0(struct nvkvm_gpa_extent, NVKVM_GPA_FREE_MAX);
 	nv->sparse_free_n = 0;
-	NVKVM_DBG("nvkvm_sparse_init: %llu GiB VMM buffer %p "
-		  "(%llu GiB allocatable + %llu GiB UVM reserve; "
-		  "memslot deferred to BAR base)\n",
-		  (unsigned long long)(win >> 30), va,
-		  (unsigned long long)(nv->sparse_size >> 30),
-		  (unsigned long long)(uvm_reserve >> 30));
+	NVKVM_DBG("nvkvm_sparse_init: %llu GiB VMM buffer %p (memslot deferred to BAR base)\n",
+		  (unsigned long long)(win >> 30), va);
 	return 0;
 }
 
@@ -653,7 +562,7 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 		 * corrupt every ioctl parameter slot, so prefer our own base.
 		 */
 		if (base < nv->gpa.sparse_base &&
-		    base + nv->sparse_total > nv->gpa.block_base) {
+		    base + nv->sparse_size > nv->gpa.block_base) {
 			fprintf(stderr,
 				"nvkvm: firmware placed the window BAR at GPA=0x%llx, "
 				"overlapping the shm/mmap regions at 0x%llx; using the "
@@ -665,7 +574,7 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 		}
 		if (nv->gpa.limit &&
 		    (base >= nv->gpa.limit ||
-		     nv->sparse_total > nv->gpa.limit - base)) {
+		     nv->sparse_size > nv->gpa.limit - base)) {
 			fprintf(stderr,
 				"nvkvm: firmware placed the window BAR at GPA=0x%llx "
 				"+%llu GiB, which crosses this VM's %u-bit GPA limit "
@@ -697,20 +606,6 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 	}
 	nv->sparse_gpa_base = base;
 	nv->sparse_kvm_slot = slot;
-	/*
-	 * Point the mmap_win allocator at the reserve now that the window's real
-	 * base is known.  Its old GPA region (block_base + 1 GiB) is outside the
-	 * advertised window since #55, so every GPA it used to hand out was
-	 * rejected by the guest -- which is why the UVM mapping path had no
-	 * usable memslot to live in.
-	 */
-	if (nv->sparse_uvm_size) {
-		pthread_mutex_lock(&nv->mmap_win_lock);
-		nv->mmap_win_gpa  = base + nv->sparse_size;
-		nv->mmap_win_size = nv->sparse_uvm_size;
-		nv->mmap_win_cur  = 0;
-		pthread_mutex_unlock(&nv->mmap_win_lock);
-	}
 	/* Debug hooks so the KVM fault path can map a faulting GPA back to the
 	 * window HVA and inspect its PTE via /proc/self/pagemap. */
 	nvkvm_dbg_window_va  = nv->sparse_vmm_va;
@@ -730,7 +625,7 @@ void nvkvm_sparse_fini(VirtIONvgpu *nv)
 	nvkvm_gpa_quar_purge(nv);   /* H-9: forget extents held back for this nv */
 	if (!nv->sparse_vmm_va) return;
 	if (nv->sparse_kvm_slot >= 0) kvm_remove_memory_region(nv->sparse_kvm_slot);
-	munmap(nv->sparse_vmm_va, nv->sparse_total);
+	munmap(nv->sparse_vmm_va, nv->sparse_size);
 	nv->sparse_vmm_va = NULL;
 	g_free(nv->sparse_free);
 	nv->sparse_free   = NULL;

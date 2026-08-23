@@ -1065,15 +1065,7 @@ static void nvkvm_get_config(VirtIODevice *vdev, uint8_t *config)
 	uint64_t base = nvkvm_sparse_ensure(nv);
 	if (base) {
 		nv->config_space.mmap_win_gpa = cpu_to_le64(base);
-		/* The FULL window, including the UVM reserve at its top: the
-		 * guest validates every returned GPA against this, and the
-		 * per-mmap /dev/nvidia-uvm memslots are handed out from the
-		 * reserve.  Advertising only nv->sparse_size would make the
-		 * guest reject its own UVM mappings with "GPA outside window".
-		 * See nvkvm_sparse_init(). */
-		nv->config_space.mmap_win_len =
-			cpu_to_le64((uint64_t)(nv->sparse_total ? nv->sparse_total
-							        : nv->sparse_size));
+		nv->config_space.mmap_win_len = cpu_to_le64((uint64_t)nv->sparse_size);
 	}
 	memcpy(config, &nv->config_space, sizeof(nv->config_space));
 }

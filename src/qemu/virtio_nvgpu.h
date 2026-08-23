@@ -323,13 +323,7 @@ typedef struct VirtIONvgpu {
 	 * KVM memory slot ID we installed at device realize.
 	 */
 	uint64_t            sparse_gpa_base;
-	size_t              sparse_size;   /* allocatable: excludes the UVM reserve */
-	/* Full window: the VMM buffer's length, and the length advertised to the
-	 * guest.  sparse_size + sparse_uvm_size.  The tail [sparse_size,
-	 * sparse_total) is NOT covered by the big memslot -- it is where the
-	 * per-mmap /dev/nvidia-uvm memslots live.  See nvkvm_sparse_init(). */
-	size_t              sparse_total;
-	size_t              sparse_uvm_size;
+	size_t              sparse_size;
 	void               *sparse_vmm_va;
 	uint64_t            sparse_cur;
 	int                 sparse_kvm_slot;
@@ -627,7 +621,6 @@ void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session);
 uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv);
 VirtIONvgpu *nvkvm_get_global_device(void);
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
-void nvkvm_mmap_win_free(VirtIONvgpu *nv, uint64_t gpa, size_t length);
 
 /*
  * KVM memory-slot pool — one freelist+watermark shared by every code path
