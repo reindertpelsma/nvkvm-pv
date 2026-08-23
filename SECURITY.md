@@ -291,6 +291,20 @@ compositor never calls `open()` itself -- it receives the fd).
 - **Enforcement is per-ioctl and hand-written**, not categorical. It is audited
   but not complete, and a new ioctl added without its validation is the most
   likely way a hole appears.
+- **The NVIDIA container capability list is not the GPU access control it looks
+  like.** `/dev/nvidiactl` and every `/dev/nvidiaN` are granted with no
+  capability at all, so the full RM ioctl surface is present in a container that
+  requests none. `compute` gates UVM, `display` gates modeset, and that is the
+  entire device story; libraries and the EGL application profile are data, not a
+  boundary. Source line references in
+  [container capabilities](docs/reference/container-capabilities.md).
+- **`utility` cannot be dropped, and it carries the `nvidia-persistenced`
+  socket.** The guest bundle needs NVML, which rides the same flag. On a host
+  running that daemon, container root can reach its RPC — persistence mode and
+  NUMA status — and the XDR decode path runs before the daemon's uid check. It
+  cannot be masked from `docker-compose.yml`, because the prestart hook mounts
+  it after runc sets up the rootfs. Either do not run the daemon, or use Docker
+  `userns-remap`.
 
 ## The rule we hold ourselves to on the allowlists
 
