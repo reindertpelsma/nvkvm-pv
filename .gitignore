@@ -52,3 +52,7 @@ tests/unit/test_stub_ptr_sanitize
 # generated at build time by tests/unit/Makefile (the U-5 function, extracted
 # from src/stub/nvkvm_stub.c so the test cannot drift from the code it pins)
 tests/unit/stub_sanitize.inc
+
+# scripts/sweep.sh run output: results, raw logs pulled off rented boxes,
+# and the instance registry the auto-destroy timer reads.
+sweep-runs/
