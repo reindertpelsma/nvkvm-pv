@@ -24,7 +24,7 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 | P-3 | high | sandbox self-modification | isolate → isolate | see below |
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
 | P-5 | high | design vs documentation | isolate → isolate | **open, needs a decision** |
-| P-6 | high | version drift in a gate | guest process → host NVKMS | **open** |
+| P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
 | P-7 | high | dev harness | guest → host root | **open, harness only** |
 | P-8 | high | process | — | **partly fixed** — see "the revert" |
 | P-9 | medium | shell quoting | — | build correctness |
@@ -151,7 +151,7 @@ stop claiming it. The comment should be corrected either way.
 
 ---
 
-## P-6 — the NVKMS gate compares raw enum indices that shift between branches
+## P-6 — FIXED — the NVKMS gate compares raw enum indices that shift between branches
 
 `nvkvm_nvkms_cmd_allowed(uint32_t)` is a plain switch with **no ABI-profile
 argument**, and the file asserts the vendor enum *"grows by APPENDING, so old
@@ -171,6 +171,22 @@ Impact is bounded — `GrantSurface` requires owning the surface and
 `ACQUIRE_SURFACE` is not allowlisted — so the finding is that the gate's
 guarantee is void off the two branches it was measured on. The neighbouring UVM
 gate *is* profile-corrected; this one is not, and that is the fix.
+
+**FIXED — `6bd8df6` ("key the allowlist on the driver version, and stop
+admitting GRANT_SURFACE") and `76831d3` ("the 570 branch renumbers MID-BRANCH,
+so key on major AND minor").** `nvkvm_nvkms_cmd_allowed(uint32_t)` no longer
+exists; the gate is `nvkvm_nvkms_cmd_allowed_ver(cmd_type, major, minor)`, which
+resolves the numbering through `nvkvm_nvkms_ops_for_version()` and **fails
+closed on an unrecognised version** (`if (!o.known) return false`).
+
+It also lands more precisely than this finding asked for. The table above places
+the 570 split somewhere between 570.172 and 570.211; the implementation narrows
+it to **570.195.03 and older number like 565, 570.207 and newer number like
+575**, i.e. somebody measured between the two points this document knew about.
+
+Pinned by `tests/unit/test_nvkms_allowlist.c` — 618 cases across every vendor tag
+nvkvm supports, including the specific check this finding is about: that the
+`GRANT_SURFACE` index is **denied** at each tag where it exists.
 
 ---
 
