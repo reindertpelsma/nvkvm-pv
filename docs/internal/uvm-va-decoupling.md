@@ -637,3 +637,52 @@ judgement about this project's threat model, not something a measurement
 settles. What the measurements do settle is that **"let the VMM pick the
 address" is not a way out of that trade** — it buys nothing, because the
 resulting mapping is not one the guest's kernels can address.
+
+---
+
+## 7. What would settle it: the two measurements that decide the external-range design
+
+§2e is the only option not blocked by the driver, and its remaining risk is not
+in the driver at all — it is whether **libcuda can be kept believing it holds a
+managed range** while nvkvm backs it with an external range. That is empirical
+and cheap to answer. Neither measurement needs a VM; both run on bare metal on
+one rented box.
+
+**M1 — the ioctl sequence libcuda actually issues against a managed range.**
+Trace `cuMemAllocManaged` → kernel launch → `cuCtxSynchronize` →
+`cuMemPrefetchAsync` → `cuMemFree`, recording every UVM cmd in order with its
+params (the `tools/nv_ioctl_trace.c` shim, or `strace -e ioctl`). This decides
+feasibility outright: §2e survives only if the commands on the **critical path**
+are ones an external range answers — `VALIDATE_VA_RANGE` (72) and `FREE` (34)
+both work — and the ones that fail (`MIGRATE` 51, `SET_PREFERRED_LOCATION` 42,
+`SET_ACCESSED_BY` 46, read-duplication 44/45) are either not issued for a plain
+allocation, or issued and tolerated. If libcuda hard-fails a `cuMemAllocManaged`
+when `UVM_MIGRATE` returns `NV_ERR_INVALID_ADDRESS`, the design is dead and the
+trace says so in one run.
+
+**M2 — a positive control for the substitution itself, end to end on hardware.**
+A small raw-ioctl C program: allocate an RM sysmem object; register a GPU VA
+space in a UVM va_space; `UVM_CREATE_EXTERNAL_RANGE(base=B)` +
+`UVM_MAP_EXTERNAL_ALLOCATION(base=B, hMemory)` at an arbitrary `B`; confirm
+`UVM_VALIDATE_VA_RANGE(B)` returns `NV_OK`; then have the GPU read/write at `B`
+and check the CPU sees it through a separate mapping of the same object at a
+*different* CPU address. That is §2e's whole claim — GPU VA `B`, CPU VA free,
+one coherent object — verified rather than inferred from source.
+
+**If both pass**, the implementation is: guest module stops forwarding the UVM
+`mmap` for managed allocations and instead requests the synthesis; QEMU allocates
+the RM object via the isolate, publishes it at the guest's `G`, and CPU-maps it
+wherever it likes for the memslot. **U-6 needs no change** — cmd 73 is already
+`NVKVM_UVM_VA_CREATE`. Validation: `validate.sh` (30 cases) including
+`cuda_managed_alloc` / `cuda_managed_coherence`, `cuda_micro` 5 and 6,
+`u3_u6_gate_test` still `PASS (0 accepted)`, and the forced-collision
+two-process test — which should now be uninteresting, since QEMU's address space
+is no longer involved in a managed allocation at all.
+
+**The trade to decide before building it**, because no measurement settles it:
+`cudaMallocManaged` would become correct, coherent and non-migrating — the
+semantics of mapped pinned host memory. Oversubscription and VRAM residency go
+away, and a GPU-heavy kernel crosses PCIe on every access. For nvkvm's compute
+workloads that may be entirely acceptable; it should be an explicit choice, and
+`known-limitations.md` should say so plainly rather than letting users discover
+it as a performance mystery.
