@@ -205,6 +205,42 @@ struct uvm_unset_preferred_location_params {
 	__u32 reserved;
 };
 
+/*
+ * UVM_ENABLE_READ_DUPLICATION (44) / UVM_DISABLE_READ_DUPLICATION (45).
+ *
+ * Layout from open-gpu-kernel-modules 580.105.08,
+ * kernel-open/nvidia-uvm/uvm_ioctl.h:636-655 -- two NV_ALIGN_BYTES(8) NvU64s
+ * and an NV_STATUS, i.e. 20 bytes, padded to 24.  libcuda issues 45 on a
+ * freshly created managed range, so without these the guest's size table
+ * refused it ("unknown ioctl cmd=0x2d") and cuMemAllocManaged failed --
+ * the same shape of gap that UVM_UNMAP_EXTERNAL and
+ * UVM_MAP_DYNAMIC_PARALLELISM_REGION had before them.
+ */
+struct uvm_enable_read_duplication_params {
+	__u64 requested_base;
+	__u64 length;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
+struct uvm_disable_read_duplication_params {
+	__u64 requested_base;
+	__u64 length;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
+/*
+ * UVM_MIGRATE_RANGE_GROUP (53).  uvm_ioctl.h:787-793: an NvU64 range-group id,
+ * an NvProcessorUuid (16 bytes) and an NV_STATUS.
+ */
+struct uvm_migrate_range_group_params {
+	__u64 range_group_id;
+	struct uvm_uuid destination_uuid;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
 struct uvm_set_accessed_by_params {
 	__u64 base;
 	__u64 length;
