@@ -2,7 +2,7 @@
 
 ## Status at a glance
 
-Severities below are **as first assessed**. Five findings have since been fixed;
+Severities below are **as first assessed**. Nine findings have since been fixed;
 the rest are open. Read this table before the detail.
 
 | finding | severity as found | status |
@@ -11,9 +11,15 @@ the rest are open. Read this table before the detail.
 | U-2 | CRITICAL | **fixed** — rewrite sites fail closed (`nvkvm_stub.c`, `U-2` markers) |
 | U-3 | CRITICAL | **fixed** — default-deny gate on `NVOS32.function`, only `ALLOC_SIZE` allowed |
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
-| U-5 | HIGH | open |
+| U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_stub_ptr_sanitize.c` |
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
-| U-7 … U-13 | HIGH → UNKNOWN | open |
+| U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally on both paths (`nvkvm_frontend.c`, `zero_nvos64_rights` in `nvkvm_stub.c`) |
+| U-8 | MEDIUM | **open** — blocked on the ogkm struct layout, see the note in its section |
+| U-9 | MEDIUM | open |
+| U-10 | MEDIUM | **fixed** — offset 16 decided from the cmd, offset 32 zeroed (`nvkvm_stub.c`) |
+| U-11 | MEDIUM | open |
+| U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
+| U-13 | UNKNOWN | open |
 | U-14 | by design | documented for completeness |
 
 A separate defect found while fixing U-6 — the host driver writing past a
@@ -442,7 +448,7 @@ subset the ring accepts.
 
 ---
 
-### U-5 — OPEN — HIGH — `paramsSize` / `allocParmsSize` are never bounded against `aux_size`
+### U-5 — FIXED 2026-08-23 — HIGH — `paramsSize` / `allocParmsSize` are never bounded against `aux_size`
 
 **Fields:** `NVOS54.paramsSize@24`; `NVOS64.allocParmsSize@32`.
 
@@ -460,6 +466,42 @@ and it is why per-ioctl hand-marshalling is the wrong shape.
 
 In gVisor's nvproxy the two are the same variable by construction; here they were decoupled when the
 buffer moved into the aux slot, and nothing re-tied them.
+
+**Correction, 2026-08-23 — this was understated when written.** The finding
+describes the socket path only (`blob_alloc`, so a heap over-read/over-write).
+The **ring path has the same hole and is worse**: `ring_exec` copies the record
+into fixed stack buffers (`uint8_t aux[NVKVM_RING_MAX_AUX]`), rewrites
+`param + 16` to point at them, and forwards `paramsSize` from the guest
+untouched — so the same record runs off the **reader thread's own stack**, not
+the heap. `ring_ctrl_must_punt()` bounds `param_size`/`aux_size` against
+`NVKVM_RING_MAX_*`, but never relates either to the declared size.
+
+**FIXED 2026-08-23.** `clamp_inner_params_size()` in `src/stub/nvkvm_stub.c`
+clamps the declared size down to `aux_size` at both rewrite sites — the worker
+path (after the U-2 pointer rewrite) and the ring path. The rule is the U-2 rule
+applied to the size field: *the stub owns the pointer, so it owns the size that
+describes it; never leave the guest's bytes in a field that describes our
+memory.*
+
+Clamp-down only, deliberately. A **smaller** declared size is the caller's
+business, and for a probe-guessed alloc window the guest is intentionally
+forwarding the caller's own `0` (`nvkvm_alloc_parms_probe_len()`). On the
+ordinary path the two already agree exactly — the guest sets
+`aux_size = ctrl->params_size` for RM_CONTROL (`nvkvm_main.c:1534`) and syncs
+`alloc->alloc_parms_size = ap_size` for RM_ALLOC (`nvkvm_main.c:2068`) — so the
+clamp is a no-op on every legitimate record and a hard bound on the rest. That
+is also why it clamps rather than rejecting: fail-closed would turn any future
+legitimate size disagreement into a broken workload, where clamping can only
+ever shrink a copy to the buffer that actually exists.
+
+`NVOS21` (the 32-byte `RM_ALLOC` variant) carries no size field at all — its
+size comes from `hClass` via the alloc-param table — hence the `param_size >= 36`
+discriminator that selects `NVOS64` only.
+
+Pinned by `tests/unit/test_stub_ptr_sanitize.c` (12 cases, including the exploit
+record itself and the four layouts that must be left untouched). The function is
+**extracted from the stub source at build time** rather than copied into the
+test, so the suite cannot drift from the code it pins.
 
 ---
 
@@ -498,7 +540,7 @@ verified layout" justification for skipping the size floor is stale.
 
 ---
 
-### U-7 — OPEN — HIGH — `NVOS64.pRightsRequested` is never overwritten by anything
+### U-7 — FIXED 2026-08-23 — HIGH — `NVOS64.pRightsRequested` is never overwritten by anything
 
 **Field:** `NVOS64_PARAMETERS.pRightsRequested`, offset 24 (`src/abi/nvgpu.h:184`).
 **Driver dereferences it:** yes. `src/nvidia/src/kernel/rmapi/alloc_free.c:155-180`:
@@ -514,6 +556,34 @@ returned to the guest. So the direct impact is an address-probing oracle: `copy_
 surfaces as a distinguishable `nvstatus`, letting a guest map out the stub's address space and
 defeat its ASLR from inside the isolate. That is a stepping stone for U-1/U-2/U-4, not an end in
 itself.
+
+**Correction, 2026-08-23.** The claim above — *"No host-side site writes offset
+24 of an `RM_ALLOC` param buffer"* — is true exactly as scoped (`nvkvm_stub.c`,
+`nvkvm_isolate_handlers.c`) but misses a third path. `nvkvm_frontend.c`'s
+`nvkvm_handle_rm_alloc()` **did** write the field — but only under
+`if (h_class == NV01_ROOT_CLIENT)`, as an unrelated privilege check. For every
+other class it saved the guest's value, forwarded it verbatim to `host_ioctl`,
+and restored it afterwards. So the finding held on that path too; it was one
+`if` away from being invisible.
+
+**FIXED 2026-08-23** on both paths:
+
+- `nvkvm_frontend.c` — the zeroing is now unconditional rather than gated on
+  `NV01_ROOT_CLIENT`. The save/restore around the ioctl is unchanged, so the
+  guest still sees its own bytes come back.
+- `nvkvm_stub.c` — `zero_nvos64_rights()` zeroes offset 24 for `RM_ALLOC`
+  alongside the U-5 clamp. `NVOS21` is exactly 32 bytes and its offset 24 is
+  `{ status, pad }` — real data, not a pointer — so the discriminator is
+  `param_size > 32` (`>= 36` in the code, matching the U-5 clamp's).
+
+No-op on the live path: the guest already zeroes the field
+(`src/guest/nvkvm_ioctl.c:371`) and restores the caller's original VA on the way
+back (`nvkvm_main.c:2290`), so nothing legitimate ever depended on the host
+forwarding it. Guest code is not a security control, which is the whole reason
+this had to be done host-side as well.
+
+Pinned by `tests/unit/test_stub_ptr_sanitize.c` (5 U-7 cases, including the two
+layouts that must be left untouched).
 
 ---
 
@@ -534,6 +604,23 @@ This is the cleanest write primitive in the report: no guard to bypass, no bug t
 simply not handled. Ranked below U-1..U-4 only because the written content is P2P peer-ID data
 rather than attacker-chosen bytes, and because reaching it requires the socket path (the ring
 accepts it, but `must_punt` does not exclude it either — see U-1).
+
+**Still open 2026-08-23, deliberately — blocked on a struct layout we do not
+have locally.** Clearing these two fields needs the byte offsets of `busPeerIds`
+and `busEgmPeerIds` inside `NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS`. That struct
+is not in `src/abi/nvgpu.h`, and the ogkm checkout on this machine holds only a
+handful of headers, not `embedded_param_copy.c`.
+
+Hand-transcribing the offsets from the audit's prose would be exactly the
+fragility this project has already ruled out: offsets that are typed rather than
+derived can shift between driver branches and fail silently on the ones nobody
+tested. The fix wants the layout taken from ogkm source for every supported ABI
+profile, the same way the other struct sizes are, and then the same
+`aux_clear_ptr` treatment as U-12.
+
+Note also that `gpuCount` is guest-supplied and the write is `gpuCount² × 4`
+bytes per pointer, so clearing the pointers is necessary but a bound on
+`gpuCount` is worth adding in the same pass.
 
 ---
 
@@ -564,7 +651,7 @@ class, and it is listed so it is not lost. It is also partly by design: the `OS_
 
 ---
 
-### U-10 — OPEN — MEDIUM — DRM `PRIME_FENCE_CONTEXT_CREATE` (nr 0x45) has two pointers; neither is handled
+### U-10 — FIXED 2026-08-23 — MEDIUM — DRM `PRIME_FENCE_CONTEXT_CREATE` (nr 0x45) has two pointers; neither is handled
 
 **Fields:** `import_mem_nvkms_params_ptr` (offset 16) and `event_nvkms_params_ptr` (offset 32) in
 `drm_nvidia_prime_fence_context_create_params` (ogkm `kernel-open/nvidia-drm/nvidia-drm-ioctl.h:199-213`).
@@ -576,6 +663,17 @@ covering offset 32. `event_nvkms_params_ptr` is forwarded verbatim in every case
 
 Reachable only when `nv->graphics` is set (`nvkvm_isolate_handlers.c:1557-1564`); compute-only VMs
 are unaffected.
+
+**FIXED 2026-08-23.** Both pointers are now handled in `nvkvm_stub.c`:
+
+- **Offset 16** gets its own branch in the `ptr_off` decision, keyed on
+  `job_type == 'd' && job_nr == 0x45`, so it is written unconditionally — the
+  aux pointer, or an explicit 0. Previously it fell to the generic branch, which
+  only fires when `aux_size > 0`, so an `aux_size == 0` record left the guest's
+  own bytes in a pointer field: the same fail-open shape as U-2.
+- **Offset 32** is zeroed outright. Only one aux blob exists per job, so there is
+  nothing to retarget the second pointer at; the driver null-checks it and the
+  event params are not on any path nvkvm serves.
 
 ---
 
@@ -598,13 +696,21 @@ guarantees that, not because a walk is demonstrated.
 
 ---
 
-### U-12 — OPEN — MEDIUM — `NV0000_CTRL_CMD_GPU_GET_ID_INFO` (0x202) `szName`
+### U-12 — FIXED 2026-08-23 — MEDIUM — `NV0000_CTRL_CMD_GPU_GET_ID_INFO` (0x202) `szName`
 
 **Field:** `NV0000_CTRL_GPU_GET_ID_INFO_PARAMS.szName` (`NvP64`).
 
 Output-only: the driver writes the GPU name string to it. Allowlisted; the guest zeroes it rather
 than marshalling (per `ARCHITECTURE.md`, `src/guest/nvkvm_main.c:1628-1639`); the host does nothing.
 A short, low-entropy, attacker-positioned write inside the isolate.
+
+**FIXED 2026-08-23.** `aux_clear_ptr(job.aux_buf, job.aux_size, 16)` on
+`inner_cmd == 0x202`, alongside the existing inner-pointer handling for `0x101`,
+`0x3d05`, `0x3d06`/`0x3d08` and `0x80170d`. The name is optional — `cuInit` does
+not need it and `nvidia-smi` gets the model elsewhere — and the driver
+null-checks `szName`, so clearing it host-side costs nothing and matches what the
+guest was already trying to do. The point is that the guest was the *only* thing
+doing it, and guest code is not a security control.
 
 ---
 
@@ -719,9 +825,13 @@ Concretely, in priority order:
    a schema row fails safe rather than fails open. This is what gVisor's nvproxy does and what the
    nestrilabs rewrite table does; `ARCHITECTURE.md:373-377` currently frames "nvkvm does something
    different" as a virtue, and the difference is precisely the coverage gap this report enumerates.
-4. **Add the size-consistency check** (U-5): reject any `RM_CONTROL` where
+4. ~~**Add the size-consistency check** (U-5): reject any `RM_CONTROL` where
    `paramsSize != aux_size`, and any `nvos64 RM_ALLOC` where `allocParmsSize > aux_size`. One
-   comparison each, in QEMU, where the values are already in hand.
+   comparison each, in QEMU, where the values are already in hand.~~ **DONE 2026-08-23**, with two
+   departures from this recommendation, both deliberate: it clamps rather than rejecting (a reject
+   on `!=` would break the legitimate `aux_size > paramsSize` extension records that U-4's writeback
+   creates), and it lives in the **stub** rather than QEMU — QEMU never sees the ring path, which is
+   the site where an over-read runs off the reader thread's stack. See U-5.
 5. **Gate `NVOS32.function`** to the set actually needed (U-3), matching nvproxy. If
    `ALLOC_OS_DESCRIPTOR` is genuinely required, it needs the same memfd-aliasing treatment as the
    `NVOS02` path, not opaque forwarding.

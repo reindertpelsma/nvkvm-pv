@@ -36,7 +36,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -73,6 +73,18 @@ test_ctrl_gate: $(CTRL_GATE_SRCS)
 test_nvkms_allowlist: test_nvkms_allowlist.c ../../src/qemu/nvkvm_nvkms_allowlist.h
 	$(CC) $(CFLAGS) -o $@ test_nvkms_allowlist.c
 
+# U-5 / U-7.  The stub is freestanding (-nostdlib -ffreestanding) and carries its own
+# entry point, so it cannot be linked into a hosted test binary.  Extract the one
+# function under test straight out of the stub source instead of copying it here,
+# so this suite pins the REAL code and cannot drift away from it.  If the
+# extraction ever comes back empty the compile fails on an undefined symbol,
+# which is the failure mode we want.
+stub_sanitize.inc: ../../src/stub/nvkvm_stub.c
+	awk '/^static void (clamp_inner_params_size|zero_nvos64_rights)/,/^}$$/' $< > $@
+
+test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
+	$(CC) $(CFLAGS) -I. -o $@ test_stub_ptr_sanitize.c
+
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
 # runtime until 2026-08-21, and the note that used to sit here blamed "isolate
@@ -82,7 +94,7 @@ test_nvkms_allowlist: test_nvkms_allowlist.c ../../src/qemu/nvkvm_nvkms_allowlis
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
 	./test_dispatch
 	./test_frontend
 	./test_handle
@@ -91,6 +103,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_open_scm
 	./test_ctrl_gate
 	./test_nvkms_allowlist
+	./test_stub_ptr_sanitize
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -103,4 +116,4 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc

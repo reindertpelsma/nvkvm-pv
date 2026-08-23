@@ -861,6 +861,90 @@ static void aux_clear_ptr(void *aux_buf, uint32_t aux_size, uint32_t off)
 	__builtin_memcpy((char *)aux_buf + off, &zero, n);
 }
 
+/*
+ * U-7 (docs/internal/audit-guest-pointers.md) — never forward NVOS64's second
+ * pointer field.
+ *
+ * NVOS64_PARAMETERS carries TWO pointers: pAllocParms at offset 16, which the
+ * U-2 rewrite above replaces with our aux blob, and pRightsRequested at offset
+ * 24, which nothing host-side ever touched.  alloc_free.c:155-180 dereferences
+ * it when non-NULL — rmapiParamsCopyIn("RightsRequested", ...,
+ * sizeof(RS_ACCESS_MASK)) is a 16-byte copy_from_user at a guest-named address
+ * inside the isolate.  The copied value never comes back to the guest, so the
+ * direct impact is an address-probing oracle rather than a read: a
+ * copy_from_user failure surfaces as a distinguishable nvstatus, which is
+ * enough to map the isolate's address space and defeat its ASLR from inside —
+ * a stepping stone for U-1/U-2/U-4.
+ *
+ * No-op on the live path (the guest zeroes the field itself, see
+ * src/guest/nvkvm_ioctl.c:371, and restores the caller's original VA on the way
+ * back in nvkvm_main.c:2290), but guest code is not a security control.
+ *
+ * NVOS21 is exactly 32 bytes and its offset 24 is { status, pad } — real data,
+ * not a pointer — so the discriminator is param_size > 32.  NVOS64 is 48.
+ */
+static void zero_nvos64_rights(unsigned job_type, unsigned job_nr,
+			       void *param_buf, uint32_t param_size)
+{
+	static const uint64_t zero;
+
+	if (job_type != 'F' || job_nr != 0x2b || !param_buf || param_size < 36)
+		return;
+
+	__builtin_memcpy((char *)param_buf + 24, &zero, sizeof(zero));
+}
+
+/*
+ * U-5 (docs/internal/audit-guest-pointers.md) — make the declared inner-params
+ * size describe the buffer we actually allocated.
+ *
+ * The pointer field at offset 16 is rewritten (U-2) to point at our aux blob,
+ * but the SIZE field that tells RM how much to copy through that pointer was
+ * forwarded from the guest untouched.  rmapiParamsCopyIn/Out copy that many
+ * bytes out of — and back into — the address we just supplied, so a record
+ * carrying aux_size = 8 with paramsSize = 0x100000 is a ~1 MiB over-read AND
+ * over-write past the end of the blob: the stub heap on the socket path
+ * (blob_alloc), the reader thread's own stack on the ring path (a fixed
+ * uint8_t aux[NVKVM_RING_MAX_AUX]).  No pointer field is needed to reach it.
+ *
+ * We own the pointer, so we own the size that describes it — the same rule as
+ * U-2: never leave the guest's bytes in a field that describes our memory.
+ *
+ * Clamp DOWN only.  A smaller declared size is the caller's business, and for
+ * a probe-guessed alloc window the caller's own 0 is the value the guest is
+ * deliberately forwarding (see nvkvm_alloc_parms_probe_len() guest-side).  On
+ * the ordinary path the two already agree exactly — the guest sets
+ * aux_size = ctrl->params_size for RM_CONTROL and syncs
+ * alloc->alloc_parms_size = ap_size for RM_ALLOC — so this is a no-op on
+ * every legitimate record and a hard bound on the rest.
+ *
+ *   RM_CONTROL ('F' nr 0x2a)  NVOS54.paramsSize     @24  (struct is 32 bytes)
+ *   RM_ALLOC   ('F' nr 0x2b)  NVOS64.allocParmsSize @32  (struct is 48 bytes)
+ *                             NVOS21 is 32 bytes and carries no size field,
+ *                             hence the param_size >= 36 discriminator.
+ */
+static void clamp_inner_params_size(unsigned job_type, unsigned job_nr,
+				    void *param_buf, uint32_t param_size,
+				    uint32_t aux_size)
+{
+	unsigned off;
+	uint32_t declared;
+
+	if (job_type != 'F' || !param_buf)
+		return;
+	if (job_nr == 0x2a && param_size >= 28)
+		off = 24;
+	else if (job_nr == 0x2b && param_size >= 36)
+		off = 32;
+	else
+		return;
+
+	__builtin_memcpy(&declared, (char *)param_buf + off, sizeof(declared));
+	if (declared > aux_size)
+		__builtin_memcpy((char *)param_buf + off, &aux_size,
+				 sizeof(aux_size));
+}
+
 static void worker_thread(void *arg)
 {
 	/* arg = (void *)(uintptr_t)(slot_id + 1) — non-zero so we can
@@ -940,6 +1024,22 @@ static void worker_thread(void *arg)
 		} else if (job_type == 'F' && (job_nr == 0x2a || job_nr == 0x2b) &&
 			   job.param_size >= 24) {
 			ptr_off = 16;
+		} else if (job_type == 'd' && job_nr == 0x45 &&
+			   job.param_size >= 24) {
+			/*
+			 * U-10 — DRM PRIME_FENCE_CONTEXT_CREATE.  Two pointers:
+			 * import_mem_nvkms_params_ptr@16 and
+			 * event_nvkms_params_ptr@32 (ogkm
+			 * kernel-open/nvidia-drm/nvidia-drm-ioctl.h:199-213).
+			 * This used to fall to the generic branch below, which
+			 * covers offset 16 only when aux_size > 0 — so an
+			 * aux_size == 0 record left the guest's own bytes in a
+			 * pointer field, the same fail-open shape as U-2.  Decide
+			 * it from the cmd instead, so offset 16 is always written
+			 * (aux pointer, or an explicit 0).  Offset 32 is cleared
+			 * below; nothing here can target it.
+			 */
+			ptr_off = 16;
 		} else if (job.aux_size > 0 && job.param_size >= 24) {
 			/* Unchanged legacy generic case: some other cmd that
 			 * shipped an aux blob.  Only ever reached with
@@ -951,6 +1051,31 @@ static void worker_thread(void *arg)
 				? (uint64_t)(uintptr_t)job.aux_buf : 0;
 			__builtin_memcpy((char *)job.param_buf + ptr_off,
 					 &ptr_val, sizeof(uint64_t));
+		}
+
+		/* U-5: bound the declared inner-params size by the blob we
+		 * actually allocated, now that the pointer names it. */
+		clamp_inner_params_size(job_type, job_nr, job.param_buf,
+					job.param_size, job.aux_size);
+
+		/* U-7: NVOS64 carries a second pointer at offset 24 that no
+		 * rewrite above reaches.  Never forward the guest's bytes. */
+		zero_nvos64_rights(job_type, job_nr, job.param_buf,
+				   job.param_size);
+
+		/*
+		 * U-10 — the SECOND pointer of DRM PRIME_FENCE_CONTEXT_CREATE.
+		 * event_nvkms_params_ptr@32 was forwarded verbatim in every
+		 * case: only one aux blob exists per job, so there is nothing to
+		 * retarget it at.  Zero it — the driver null-checks, and the
+		 * event params are not on any path nvkvm serves.  Reachable only
+		 * when nv->graphics is set, so compute-only VMs never saw this.
+		 */
+		if (job_type == 'd' && job_nr == 0x45 && job.param_buf &&
+		    job.param_size >= 40) {
+			uint64_t zero = 0;
+			__builtin_memcpy((char *)job.param_buf + 32, &zero,
+					 sizeof(zero));
 		}
 
 		/*
@@ -1186,6 +1311,25 @@ static void worker_thread(void *arg)
 					aux_clear_ptr(job.aux_buf, job.aux_size, 16);
 				}
 			}
+			/*
+			 * U-12 — NV0000_CTRL_CMD_GPU_GET_ID_INFO (0x202).
+			 *
+			 * szName@16 inside the params blob is an OUTPUT pointer:
+			 * the driver writes the GPU name through it.  Only the
+			 * GUEST zeroed it (src/guest/nvkvm_main.c:1761), and guest
+			 * code is not a security control — a malicious guest simply
+			 * does not, and the stub forwards the value verbatim,
+			 * giving the driver a guest-named address to write to
+			 * inside the isolate.
+			 *
+			 * The name is optional (cuInit does not need it and
+			 * nvidia-smi gets the model elsewhere) and the driver
+			 * null-checks szName, so clearing it host-side costs
+			 * nothing and matches what the guest already intends.
+			 */
+			if (inner_cmd == 0x00000202U)
+				aux_clear_ptr(job.aux_buf, job.aux_size, 16);
+
 			if (inner_cmd == 0x00000101U) {    /* GET_BUILD_VERSION */
 				/*
 				 * nv0000_ctrl_system_get_build_version_params is
@@ -2487,6 +2631,10 @@ static void ring_exec_one(const uint8_t *pay, uint32_t len)
 			? (uint64_t)(uintptr_t)aux : 0;
 		__builtin_memcpy(param + 16, &ptr_val, sizeof(ptr_val));
 	}
+
+	/* U-5: same bound on the ring path, where an over-read would run off
+	 * the reader thread's stack rather than the heap. */
+	clamp_inner_params_size('F', 0x2a, param, rq.param_size, rq.aux_size);
 
 	clear_fault_addr();
 	long ret = stub_ioctl(fd, rq.cmd, param);

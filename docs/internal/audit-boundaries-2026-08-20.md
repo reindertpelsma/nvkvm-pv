@@ -36,8 +36,8 @@ guest kernel → guest process, VMM → anything.
 | A-5 | **high** | missing-validation | guest process → isolate | **fixed** — the ioctl size table is type-gated, matching the sanitizer |
 | A-6 | **high** | cross-isolate | guest process → isolate | **fixed** — isolate/session ownership checked on mmap, munmap and present |
 | A-7 | **high** | lost-wakeup | guest process → VMM | **fixed** — ENTER_LOOP moved to its own slot; a real one-at-a-time gate on the rest |
-| A-8 | **high** | blocking-under-lock | guest process → VMM | **partial** — deadlined, but the lock is still held across the trip; residual risk in-line |
-| A-9 | **high** | lifetime-race | guest process → guest kernel | **open** — mitigated indirectly: the VMM now kills a wedged stub, releasing the pump |
+| A-8 | ~~high~~ **medium** | blocking-under-lock | guest process → VMM | **partial** — deadlined; re-rated 2026-08-23, see §9 |
+| A-9 | ~~high~~ **medium** | lifetime-race | guest process → guest kernel | **open** — mitigated indirectly; re-rated 2026-08-23, see §9 |
 | A-10 | medium | cache-confusion | isolate → isolate (display) | **fixed** — cache key carries the owning isolate; invalidated on isolate death |
 | A-11 | medium | fd-confusion | guest → isolate | **fixed** — the command was `0x3d06`; `53dc238` punts it (and `0x3d08`) off the ring and translates the fd. See §8 |
 | A-12 | medium | oob-map | guest kernel → VMM | **fixed** — handles record their size; offset+length checked overflow-safe |
@@ -468,3 +468,53 @@ recorded there as deliberately unfixed, with the reason.
 - **A-9.** Indirectly mitigated, and the direct fix is the same threading
   surgery.
 - Everything in §6 and §7.
+
+---
+
+## 9. Re-rating and two later findings, 2026-08-23
+
+### A-8 and A-9 were rated against code that has since changed
+
+Both were **high** when written, and correctly so: the round-trip wait was an
+*untimed* `pthread_cond_wait`, so an unprivileged guest process could park the
+VMM forever. Three things have changed since, and together they make **medium**
+the honest rating:
+
+1. **The wait is deadlined** (`NVKVM_ISO_SYNC_TIMEOUT_MS`), so "forever" became
+   a bounded stall ending in the isolate being killed.
+2. **The ioctl hot path is not affected at all.** `NVKVM_REQ_IOCTL_ON_ISOLATE`
+   is offloaded via `thread_pool_submit_aio` and the TX handler returns
+   immediately — its own comment says running it inline "would block the single
+   virtio TX thread, so a second concurrent guest process ... is starved". What
+   remains inline under the BQL is the per-frame **display** round-trip
+   (`NVKVM_REQ_PRESENT`, `NVKVM_REQ_XISO_IMPORT`), whose stub side is a single
+   `DRM_IOCTL_PRIME_HANDLE_TO_FD` that does not wait on GPU work.
+3. **Reaching it now requires guest `CAP_SYS_ADMIN`.** Present is driven by a
+   flip on the virtual head, and the primary DRM node is gated (#124), so an
+   unprivileged guest process cannot drive the path at all.
+
+Reaching the deadline therefore needs a stub that has stopped answering — which
+guest userspace cannot cause, since ioctls run on the stub's worker pool and a
+faulting worker is caught. That is a broken or compromised stub, not an attack
+primitive. Worst case is a bounded VM freeze followed by the isolate being
+killed: availability only, no corruption, no escape.
+
+What genuinely remains is the **throughput** ceiling the code already names:
+`ISOLATE_REQ` calls the handler inline, and its comment reads *"TODO(perf):
+offload to the thread pool like NVKVM_REQ_IOCTL_ON_ISOLATE if per-frame TX stall
+matters for a high-fps desktop."* That is a performance item, not a security
+one, and it should not be carried in this document at high severity.
+
+### A-20 — `virtio_nvgpu_device_unrealize` has no cancel/drain (OPEN)
+
+`src/qemu/virtio_nvgpu.c` submits work at two `thread_pool_submit_aio` sites
+(the `IOCTL_ON_ISOLATE` offload and the ENTER_LOOP worker). `unrealize` does not
+cancel or drain either, so device teardown with work in flight can complete
+while a worker still holds `nv`, `vq` and the `VirtQueueElement` it was handed
+ownership of. Use-after-free on teardown. Found by reading, not yet reproduced;
+recorded here because it was previously written down nowhere at all.
+
+### A-21 — `nvkvm_kvm_slot_release()` does not validate the slot (OPEN)
+
+It does not check that the slot being released was ever allocated. Same
+provenance as A-20: found by reading, recorded so it is not lost.
