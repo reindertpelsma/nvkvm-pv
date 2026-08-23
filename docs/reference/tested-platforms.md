@@ -368,6 +368,35 @@ region is a property of the window layout, and the guest's UVM size table is a
 `switch` on a command number. **Read every `28/28` row in the table above as
 "28/28, unified memory not exercised".**
 
+### The fix, on the same three boxes
+
+Same boxes, same guests, one QEMU rebuild and a guest-module rebuild apart:
+
+| GPU | architecture | `main` @ `10a0a03` | with the fix |
+|---|---|---|---|
+| RTX 5090 | Blackwell GB202 | `cuda_managed_alloc` **FAIL** — 28 PASS / 1 FAIL / 1 SKIP | **30 PASS / 0 FAIL / 0 SKIP** |
+| RTX 3080 | Ampere GA102 | `cuda_managed_alloc` **FAIL** — 28 PASS / 1 FAIL / 1 SKIP | **30 PASS / 0 FAIL / 0 SKIP** |
+| RTX 4070 | Ada AD104 | `cuda_managed_alloc` **FAIL** | both managed checks **PASS**, no UVM `DENY` \* |
+
+\* That guest has no Vulkan loader or EGL installed, so the graphics half of
+the suite skips and the run reads INCOMPLETE rather than PASS. The CUDA half is
+complete: 20 PASS / 0 FAIL.
+
+On the RTX 5090, beyond the suite:
+
+- `tests/integration/cuda_micro.c` case 5 (`uvm_alloc`, 50 managed alloc+touch)
+  and case 6 (`uvm_migrate`, 20 GPU↔CPU migration cycles over 4 MiB) both run.
+  Case 5 previously printed `cuMemAllocManaged FAILED (err=1) — skipping UVM`
+  and case 6 could not start.
+- Two concurrent CUDA processes both get working managed memory — the case the
+  QEMU-side UVM mapping was removed for, when a collision was fatal
+  (`cuCtxCreate` 304) rather than a fallback.
+- Over a full run: 153 real UVM mappings, 142 stale-mapping reclaims, 1 announced
+  fallback, and **zero** `DENY UVM` from legitimate traffic. The only eight
+  `DENY UVM` lines in the log are the four adversarial probes in
+  `tests/security/u3_u6_gate_test.c`, twice — which still reports
+  `GATE_TEST PASS (0 accepted)`.
+
 ### When it broke
 
 Not on 2026-08-21, and not in any commit that can be bisected. The UVM branch of
