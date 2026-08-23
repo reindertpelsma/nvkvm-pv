@@ -251,10 +251,27 @@ exercises different code:
 | RTX 4070 (Ada AD104) | 595.84 | GNOME/Wayland, real monitor | **readback**, then **native** | Mint desktop; Minecraft at max settings, 60 fps, chunk generation smooth, 35% GPU util; `nvtop` (NVML); GL zero-copy A/B against readback |
 | RTX 3050 (Ampere GA107) | 595.84 | GNOME/Wayland, real monitor | **native** | Mint desktop; pointer lock; keyboard grab (Super to guest); configurable head verified at 1600x900; OpenGL 4.6 reported by the guest |
 | 6x Tesla T4 (Turing TU104, datacenter) | 580.178.04 | **none — headless bare metal** | **headless** | Ubuntu guest: XFCE on the virtual head, weston+Xwayland, NVENC H.265 to a browser over an SSH tunnel; Minecraft 54 fps in-guest, 48 fps delivered, 25 ms end-to-end. CentOS Stream 9 guest: Xorg + openbox on the same head. |
+| RTX 3050 **Laptop** (Ampere GA107, mobile) | 580.173.02 | **Xvfb + llvmpipe, inside a Docker container** | **readback** | Ubuntu guest: weston on the virtual head → readback into `Xvfb :99` → x11vnc → noVNC → browser. 52-61 fps sustained, `present_mean` 1.0-1.4 ms, 12,303 frames, `failed=0`. Verified by pixel, not by counter: the guest's exported dma-buf reads `nonzero_px=2073512/2621440`, and the Xvfb root window holds 8,916 unique colours with no black frame. |
 
-Both physical rows are on driver **595.84** and were verified by watching the
-screen, not by reading a log. Two GPU generations (Ada and Ampere) and two CPU
-vendors (Ryzen 9 7900 and Core i5-4460).
+The two real-monitor rows are on driver **595.84** and were verified by watching
+the screen, not by reading a log. Two GPU generations (Ada and Ampere) and two
+CPU vendors (Ryzen 9 7900 and Core i5-4460).
+
+The **RTX 3050 Laptop** row is the software-host case: no NVIDIA-rendered host
+UI anywhere, so the window is Mesa/llvmpipe on `Xvfb` and readback is the only
+correct path. It is also the row that needed two fixes before it worked at all,
+and each failed in a way worth knowing about:
+
+- without the threaded present path, `egl_init()` cannot get a context on that
+  host (the UI already holds one on the main loop) and nvkvm displays **nothing
+  at all** while reporting a healthy 54.8 fps;
+- without `patches/0010`, weston on the virtual head kills the guest within
+  10-60 s with `kvm run failed Bad address` -- the NVIDIA fault handler answers
+  "come back later" while it reinstates a revoked GPU mapping, and KVM turns
+  that into a fatal EFAULT. It clears after ~1.5 s if you let it.
+
+Both are mobile-GPU-friendly in the sense that matters for r/VFIO: this is the
+consumer-laptop shape, and it is the only row where either bug reproduces.
 
 The T4 row is the headless case in its strongest form: that card has **no
 display outputs at all**, so there is no host display server, no monitor, and

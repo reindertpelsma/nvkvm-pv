@@ -310,6 +310,38 @@ proof it is fixed — the earlier reproductions were on different hardware (RTX
 3050 laptop), and several unrelated fixes have landed since. Treat it as open
 and unreproduced rather than closed.
 
+#### (2) DIAGNOSED AND FIXED 2026-08-23 (RTX 3050 **laptop**, driver 580.173.02)
+
+It was never a narrow-MAXPHYADDR bug, a hole in the sparse window, a memslot
+collision, or an allocator race — all four were instrumented and cleared. Nor
+was it specific to the display path in principle; it just needs the GPU to go
+idle, which only a desktop session does.
+
+An NVIDIA GPU mapping is `VM_IO|VM_PFNMAP`, and `nv_fault()`
+(`kernel-open/nvidia/nv-mmap.c`) has two paths that return `VM_FAULT_NOPAGE`
+**without installing a PTE** while the driver reinstates a revoked mapping:
+
+```c
+if (!down_read_trylock(&nv_system_pm_lock))   return VM_FAULT_NOPAGE;
+if (!nvl->safe_to_mmap) { rm_schedule_gpu_wakeup(...); return VM_FAULT_NOPAGE; }
+```
+
+Both mean "retry, it is coming". Userspace honours that by re-faulting. KVM
+calls `fixup_user_fault()` once, `follow_pte()` still finds nothing, and it
+returns `-EFAULT`, which QEMU has always treated as fatal — so the guest dies
+on a mapping that was about to be reinstated.
+
+Fixed by `patches/0010-kvm-retry-a-bare-KVM_RUN-EFAULT.patch`: `RIP` has not
+advanced, so re-entering the guest re-executes the same access. **The fault
+clears after ~1465 ms.** That number is why it looked permanent: an earlier
+attempt retried 64 times at 200 us, covered ~13 ms, and concluded it never
+clears.
+
+Why the 4070/T4 never saw it: `validate.sh` passes 28/28 either way because
+compute never lets the GPU idle, and neither box has aggressive mobile RTD3
+(`DynamicPowerManagement: 2`, `runtime_status=suspended` for 6.7 h on the
+laptop). `nvidia-smi -pm 1` alone does **not** prevent it.
+
 **Two more traps found on the way in, both of which looked like "graphics does
 not work" and were neither:**
 
