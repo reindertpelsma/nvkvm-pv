@@ -333,6 +333,41 @@ range up with `uvm_va_range_find()` and checks only that the bounds match
 exactly — **it does not check the range type** (`uvm_va_range.c:762-777`). An
 external range at `G` satisfies it.
 
+### The concrete sequence, and where the decoupling actually happens
+
+Stated as a division of labour, which is the clearest form:
+
+1. **The isolate allocates a regular RM memory object** (sysmem `hMemory`) on its
+   own client.
+2. **It is named to QEMU by handle, not by address.**
+   `UVM_MAP_EXTERNAL_ALLOCATION_PARAMS` carries
+   `{rmCtrlFd, hClient, hMemory}` (`uvm_ioctl.h:491-503`) — the same
+   cross-process naming as `UVM_REGISTER_GPU_VASPACE` (§2c-bis), and a field
+   nvkvm already translates (`uvm_map_ext_fd_off` in the ABI profile).
+3. **QEMU publishes it to the GPU at the guest's VA `G`:**
+   `UVM_CREATE_EXTERNAL_RANGE(base=G, length)` then
+   `UVM_MAP_EXTERNAL_ALLOCATION(base=G, hMemory)`. The mapping lands in
+   `uvm_gpu_va_space_get(va_space, mapping_gpu)->page_tables` at
+   `ext_gpu_map->node.start = base` (`uvm_map_external.c:1098-1144`) — that is
+   **the isolate's registered RM VA space**, precisely where the guest's kernels
+   dereference.
+4. **QEMU CPU-maps the same `hMemory` at any VMM VA `H`** — an ordinary
+   `/dev/nvidia0` mapping through the existing sparse window — and installs the
+   memslot so the guest CPU reaches it at `G` in the guest.
+
+**That is the decoupling the original proposal wanted.** The GPU VA is an
+*ioctl argument*, so it is set to `G` and matches the guest. The VMM's CPU
+address `H` is unconstrained, because an external range creates **no** CPU
+mapping — so there is no guest-chosen host address, no layout oracle, and no
+cross-process collision in QEMU's single address space.
+
+**One correction to the shape**, and it is the same trap as the original brief:
+step 3 must register at **`G`, the guest's pointer — not at the VMM's pointer
+`H`.** Registering at `H` puts the GPU mapping where the guest never looks, and
+the guest's kernels fault exactly as in §2b. The two addresses are decoupled
+precisely *because* only one of them has to match anything: `G` is forced by the
+guest, `H` is free.
+
 ### What it costs: this is not unified memory
 
 The ioctls libcuda drives a managed allocation with split cleanly:
