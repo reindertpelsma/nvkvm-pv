@@ -845,6 +845,54 @@ Do not put untrusted tenants behind this.
 
 ## Functional gaps worth knowing
 
+### Managed memory falls back when the guest's UVM VA is already taken in QEMU — OPEN, degrades cleanly
+
+UVM pins a mapping to its own offset — `uvm_mmap()` requires
+`vm_start == (vm_pgoff << PAGE_SHIFT)` (ogkm
+`kernel-open/nvidia-uvm/uvm.c:791-795`) — so the range libcuda picks in the
+**guest** is the only address QEMU can put that mapping at, in QEMU's own
+address space. QEMU is a large process, guest libcuda allocates from the same
+top-down band of the 47-bit user VA space that QEMU's own mappings live in, and
+several guest processes pick the *same* UVM VA as each other. Collisions are
+therefore expected, not exotic.
+
+The mapping is made `MAP_FIXED_NOREPLACE`, so a collision fails rather than
+overwriting whatever QEMU had there. On a collision the range falls back to the
+anonymous window backing that every UVM mapping used before 2026-08-23:
+`cuCtxCreate` and the rest of the UVM surface keep working, and **only managed
+memory is lost, for that one range**. It is announced, once per range:
+
+```
+nvkvm: UVM mapping at guest VA 0x... +0x... could not be placed in QEMU
+       (handle=N, mmap: File exists) -- falling back to anonymous window
+       backing; managed memory is unavailable for this range
+```
+
+Two mitigations are already in: QEMU reclaims its own abandoned mapping when the
+guest re-maps the same VA (the common case, since libcuda reuses one address for
+a `cuMemAllocManaged`/`cuMemFree` loop — without it, 1 mapping was followed by 23
+fallbacks at one address), and the ownership record is keyed on the UVM handle so
+one process can never reclaim another's live mapping.
+
+What is **not** solved: two guest processes that genuinely want the same VA at
+the same time. The second takes the fallback. Measured on 1x RTX 5090: two
+concurrent CUDA processes both got working managed memory, with one unrelated
+fallback logged — but that is a property of where their allocators happened to
+land, not a guarantee. Fixing it properly needs the guest's UVM VAs steered into
+a region QEMU has reserved, which libcuda's own address selection does not
+currently allow.
+
+### Reserving the UVM sub-window costs the sparse window 16 GiB
+
+The per-mmap UVM memslots need GPAs the big sparse memslot does not cover, so
+`nvkvm_sparse_init()` carves `min(NVKVM_MMAP_WIN_SIZE, win/8)` off the top —
+16 GiB of 128 on a normal host. The advertised window and the VMM buffer are
+unchanged; what shrinks is the bump allocator behind every bulk BAR/sysmem
+mmap, from 128 GiB to 112. No workload measured here has come close to either
+figure, and the window has a free-list, but it is a real reduction and it is
+where to look first if `sparse window full` ever appears.
+
+
 ### A100 (Ampere GA100): `cuCtxCreate` fails with 999 — OPEN, first datacenter-Ampere test
 
 Measured 2026-08-20 on an **A100 80GB PCIe**, host driver **580.126.09**, ABI

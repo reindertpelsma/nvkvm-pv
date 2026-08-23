@@ -91,6 +91,12 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return sizeof(struct uvm_set_preferred_location_params);
 	case UVM_UNSET_PREFERRED_LOCATION:
 		return sizeof(struct uvm_unset_preferred_location_params);
+	case UVM_ENABLE_READ_DUPLICATION:
+		return sizeof(struct uvm_enable_read_duplication_params);
+	case UVM_DISABLE_READ_DUPLICATION:
+		return sizeof(struct uvm_disable_read_duplication_params);
+	case UVM_MIGRATE_RANGE_GROUP:
+		return sizeof(struct uvm_migrate_range_group_params);
 	case UVM_SET_ACCESSED_BY:
 		return sizeof(struct uvm_set_accessed_by_params);
 	case UVM_UNSET_ACCESSED_BY:
