@@ -297,6 +297,75 @@ pages at all, and it goes on reading the sparse window's anonymous pages while
 the GPU reads UVM's. Silent incoherence, which is worse than the loud failure on
 `main`.
 
+## 2e. External range over an RM sysmem buffer — the one design that does decouple
+
+Worth taking seriously, because unlike everything above it **works**, and it
+dissolves the address problem rather than fighting it.
+
+The shape: don't create a managed range at all. Instead allocate an ordinary RM
+sysmem object (`hMemory`), map it to the guest through the existing sparse-window
+path, and publish it to the GPU with
+`UVM_CREATE_EXTERNAL_RANGE(base=G, length)` +
+`UVM_MAP_EXTERNAL_ALLOCATION(hMemory, base=G)` into the host `uvm_va_space`.
+
+Why it escapes §2a-§2d — every objection above turns on the managed range's
+address being the `mmap` address. An external range's address is an **ioctl
+argument**, so nvkvm names `G` explicitly:
+
+- **No `/dev/nvidia-uvm` mmap in QEMU at all.** No guest-chosen host address, so
+  no U-15 layout oracle, and nothing of QEMU's address space is involved.
+- **No cross-process collision.** `G` is a GPU VA in the isolate's RM VA space
+  plus a guest CPU VA; QEMU's single address space never enters.
+- **The CPU side is coherent**, and by the mechanism nvkvm already uses
+  everywhere else: one RM object, mapped guest-side via GPA→window→memslot and
+  GPU-side by the external mapping. Same physical pages, PCIe-snooped — this is
+  the `hMemory` sharing of §2c-bis, which genuinely does cross processes.
+- **U-6 needs no change.** `UVM_CREATE_EXTERNAL_RANGE` (73) is already
+  `NVKVM_UVM_VA_CREATE` in the schema (`nvkvm_isolate_handlers.c:660-682`), so
+  the ownership table records the range exactly as designed. The special case
+  `c8ea92d` had to add for managed ranges disappears.
+- Sysmem is explicitly supported as external-range backing —
+  `set_ext_gpu_map_location()` branches on `mem_info->sysmem`
+  (`uvm_map_external.c:628-681`).
+
+And the current failure symptom is cured: `uvm_api_validate_va_range()` looks the
+range up with `uvm_va_range_find()` and checks only that the bounds match
+exactly — **it does not check the range type** (`uvm_va_range.c:762-777`). An
+external range at `G` satisfies it.
+
+### What it costs: this is not unified memory
+
+The ioctls libcuda drives a managed allocation with split cleanly:
+
+| ioctl | on an external range |
+|---|---|
+| `UVM_VALIDATE_VA_RANGE` (72) | **works** — no type check (`uvm_va_range.c:762-777`) |
+| `UVM_FREE` (34) | **works** — explicit `case UVM_VA_RANGE_TYPE_EXTERNAL` (`uvm_va_range.c:687-688`) |
+| `UVM_MIGRATE` (51) | **fails** `NV_ERR_INVALID_ADDRESS` — requires `uvm_va_space_iter_managed_first()` (`uvm_migrate.c:1159-1163`) |
+| `SET_PREFERRED_LOCATION` (42) / `SET_ACCESSED_BY` (46) / read-duplication (44/45) | **fail** — all iterate `uvm_va_space_iter_managed_*` (`uvm_policy.c:429`) |
+
+So what you get is pinned host memory mapped into the GPU: the semantics of
+`cudaHostAlloc` + `cudaHostGetDevicePointer`, not of `cudaMallocManaged`. No
+fault-driven migration, no VRAM residency, no oversubscription,
+`cudaMemPrefetchAsync` and `cudaMemAdvise` fail. For a GPU-heavy kernel that is
+every access crossing PCIe instead of hitting VRAM.
+
+### The structural catch: nvkvm would have to emulate UVM, not forward it
+
+The larger problem is not the driver, it is who decides. **libcuda in the guest
+issues the `mmap` on `/dev/nvidia-uvm`** — it is not asking nvkvm's opinion. To
+substitute this scheme the guest module would have to *not* forward that mmap,
+synthesize an RM allocation plus an external range behind libcuda's back, and
+then keep libcuda believing it holds a managed range while it issues
+managed-only ioctls at it — several of which now fail per the table above.
+
+That is a different project from forwarding: it is *emulating* UVM's managed
+allocator. Every divergence surfaces as a silently wrong or failed CUDA call, in
+a subsystem where the guest's own bookkeeping and the host's have to stay in
+agreement with no way to reconcile them. It is the first proposal in this
+document that is not blocked by the driver — the blocker is scope and fidelity,
+which is a judgement, not a measurement.
+
 ## 3. A claim in this tree that the measurements falsify
 
 `ARCHITECTURE.md:265-268`, and the revert commit that quotes it, both rest on:
@@ -384,7 +453,14 @@ The three properties cannot currently be had together:
   anonymous pages while the GPU reads UVM's. That is silent incoherence, which
   is worse than a loud failure.
 
-An honest fourth option is to keep `main`'s loud failure and record why.
+- **External range over RM sysmem** (§2e): gets (2) and (3) outright, and (1) in
+  the sense that CPU and GPU see the same coherent pages — at the cost of the
+  memory no longer being *managed* (no migration, no oversubscription,
+  `UVM_MIGRATE` and the policy ioctls fail), and of nvkvm having to emulate
+  libcuda's managed allocator instead of forwarding it. The only option here not
+  blocked by the driver.
+
+An honest fifth option is to keep `main`'s loud failure and record why.
 
 Whether the layout oracle is an acceptable price for working managed memory is a
 judgement about this project's threat model, not something a measurement
