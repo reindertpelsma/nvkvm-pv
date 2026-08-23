@@ -56,6 +56,32 @@ outcome gave a guest an address probe, and whose severity rested on being a
 stepping stone to U-1/U-2/U-4. This one is cheaper and more reliable: the signal
 is a logged, unambiguous per-range outcome rather than a status code.
 
+**Sharpening of U-6 found while checking this.** The U-6 write-up above describes
+the pageable fallthrough as UVM migrating *"the CALLER'S OWN anonymous pages"*.
+The driver's actual test is broader. `uvm_api_range_type_check()`
+(`uvm_policy.c:59-106`) takes the pageable branch whenever **no** UVM range
+covers the interval, gated on `uvm_is_valid_vma_range(mm, base, length)` — and
+that helper (`uvm_policy.c:39-57`) just walks the caller's mm with
+`find_vma_intersection()` and returns true if the interval is spanned by any run
+of VMAs. **It tests no property of the VMA at all**: the sparse window, an RM
+sysmem mapping, a memslot's backing and a mapped library all qualify equally.
+The qualifying condition is *any mapping in QEMU*, not *anonymous memory*, and
+the non-anonymous targets are the more interesting ones. U-6's containment check
+blocks all of it, so nothing is open — but the control has to stay
+unconditional, and the reason is broader than the original wording implies.
+
+Two properties in the same function are worth recording because they corroborate
+U-6's design rather than merely coexisting with it:
+
+- **Full containment is the driver's own rule too.** A partially covered
+  interval returns `UVM_API_RANGE_TYPE_INVALID`
+  (`managed_range_last->va_range.node.end < last_address`), matching
+  `uvm_va_covers()`'s deliberate refusal to stitch adjacent entries together.
+- **A non-managed range is protective.** Any covering range makes
+  `uvm_va_space_range_empty()` false, so the pageable branch is never reached;
+  an external range over an address removes it from the "treat as the caller's
+  CPU memory" path entirely.
+
 **Status: closed.** `2406a3c` reverted the mapping, so `main` makes no UVM device
 mmap and there is no guest-influenced host address left to probe. It is recorded
 here rather than dropped because the functional gap that motivated it — managed

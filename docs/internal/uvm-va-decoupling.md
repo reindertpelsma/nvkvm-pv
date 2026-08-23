@@ -366,6 +366,65 @@ agreement with no way to reconcile them. It is the first proposal in this
 document that is not blocked by the driver — the blocker is scope and fidelity,
 which is a judgement, not a measurement.
 
+## 2f. What the driver does with an address that is a plain RM buffer, or overlaps an external range
+
+The dispatcher that decides this is `uvm_api_range_type_check()`
+(`uvm_policy.c:59-106`), and reading it answers both halves — with one result
+that sharpens U-6 and one that is a genuine, non-obvious safety property.
+
+```c
+if (uvm_va_space_range_empty(va_space, base, last_address)) {          // no UVM range here
+    potential_ats_range = g_uvm_global.ats.enabled && … && uvm_is_valid_vma_range(mm, base, length);
+    if (potential_ats_range && …)                    return UVM_API_RANGE_TYPE_ATS;
+    else if (uvm_hmm_is_enabled(va_space) && mm && uvm_is_valid_vma_range(mm, base, length))
+                                                     return UVM_API_RANGE_TYPE_HMM;
+    else                                             return UVM_API_RANGE_TYPE_INVALID;
+}
+uvm_for_each_va_range_managed_in_contig(managed_range, va_space, base, last_address)
+    managed_range_last = managed_range;
+if (!managed_range_last || managed_range_last->va_range.node.end < last_address)
+                                                     return UVM_API_RANGE_TYPE_INVALID;
+return UVM_API_RANGE_TYPE_MANAGED;
+```
+
+**A plain RM buffer mapping, with no UVM range at that address — this is worse
+than U-6 documents.** The range is empty in the va_space, so the driver falls to
+the pageable branch and asks `uvm_is_valid_vma_range(mm, base, length)`. That
+helper (`uvm_policy.c:39-57`) walks the caller's mm with
+`find_vma_intersection()` and returns true if the interval is covered by any
+contiguous run of VMAs — **it checks no VMA property whatsoever**. Not
+anonymous-only, not private, not "not a device mapping". QEMU's sparse window,
+an RM sysmem mapping, a memslot's backing, a mapped library: every one of them
+satisfies it.
+
+So with HMM (or ATS) enabled, a guest naming such an address gets the operation
+classified as pageable memory and applied to **QEMU's live RM buffer pages**.
+`audit-guest-pointers.md` frames the U-6 hazard as UVM *"migrat[ing] the
+CALLER'S OWN anonymous pages (i.e. QEMU's heap, the 128 GiB sparse window …)"* —
+correct, but the "anonymous" framing understates it. The qualifying condition is
+*any VMA*, and the most interesting targets are precisely the non-anonymous
+ones. U-6's containment check still blocks all of it (an address nvkvm never
+recorded is refused before the driver sees it), so this is not a live hole — but
+it is a reason the check must stay unconditional, and worth stating in the terms
+the driver actually uses.
+
+**Overlapping an external range is, by contrast, safe — and is itself a guard.**
+If any range covers part of the interval, `uvm_va_space_range_empty()` is false
+and the **pageable branch is never reached at all**. The managed iteration then
+finds nothing (an external range is not managed), `managed_range_last` stays
+NULL, and the call returns `UVM_API_RANGE_TYPE_INVALID`.
+
+That is a genuinely useful property: creating an external range over an address
+*removes* it from the "empty → treat as the caller's CPU memory" path. An
+external range is not merely inert here, it is protective.
+
+**Partial overlap with a managed range is also refused**:
+`managed_range_last->va_range.node.end < last_address` → `INVALID`. The interval
+must be *fully* covered by managed ranges. This is exactly the rule U-6's
+`uvm_va_covers()` enforces — full containment in one recorded range, deliberately
+not a union — so nvkvm's check and the driver's own semantics agree, which is
+the reassuring outcome for a control that was designed independently.
+
 ## 3. A claim in this tree that the measurements falsify
 
 `ARCHITECTURE.md:265-268`, and the revert commit that quotes it, both rest on:
