@@ -348,6 +348,42 @@ This is the failure mode the suite's own design rules exist to prevent, and it
 went unnoticed for the same reason every time: *the check did not exist*, so
 there was nothing to go yellow.
 
+### It was never Blackwell-specific
+
+The bug was first seen on 2x RTX 5090 and recorded as "scope beyond Blackwell
+not established". It is universal, and it was checked rather than argued:
+`main` @ `10a0a03`, the same guest image, the same host driver, three
+architectures, one command each.
+
+| GPU | architecture | `cuMemAllocManaged` on `main` | host log |
+|---|---|---|---|
+| RTX 5090 | Blackwell GB202 | `rc=1 CUDA_ERROR_INVALID_VALUE` | `DENY UVM cmd=0x48 ... (U-6)` |
+| RTX 4070 | Ada AD104 | `rc=1 CUDA_ERROR_INVALID_VALUE` | `DENY UVM cmd=0x48 ... (U-6)` |
+| RTX 3080 | Ampere GA102 | `rc=1 CUDA_ERROR_INVALID_VALUE` | `DENY UVM cmd=0x48 ... (U-6)` |
+
+Which is what the code said it would be: nothing on the path reads a GPU model,
+an architecture or a PCI ID. `nvkvm_req_mmap_on_isolate` branches on
+`h->dev_id != NVKVM_DEV_UVM` and nothing else, the orphaned `mmap_win` GPA
+region is a property of the window layout, and the guest's UVM size table is a
+`switch` on a command number. **Read every `28/28` row in the table above as
+"28/28, unified memory not exercised".**
+
+### When it broke
+
+Not on 2026-08-21, and not in any commit that can be bisected. The UVM branch of
+`nvkvm_req_mmap_on_isolate` already reads *"The old approach mmap'd the UVM fd
+MAP_FIXED at req->offset ... Instead allocate the GPA from the sparse window"*
+at `ebdfb30`, the first commit in this history, and the only commit to touch
+that function since (`e5e6dc3`) does not go near the UVM branch. The three
+2026-08-21 UVM commits are not candidates either: `a276035` hardens
+`REALIZE_UVM_MAPPING`, which the guest never reaches
+(`src/guest/nvkvm_mmap.c:295` disables it outright), and `74769e8` / `ff98af9`
+only *widen* the guest's size table.
+
+So the comment is the only surviving record that an earlier design did make this
+mapping, and it predates the published history. On `main` as published, unified
+memory has never worked.
+
 Two checks now cover it, and the suite is **30** rather than 28:
 
 | check | what it proves |
