@@ -235,8 +235,12 @@ guest's frame reaches a human* varies more than the GPU does, and each route
 exercises different code:
 
 - **native** — the host desktop is rendered by the *same* NVIDIA GPU, so QEMU
-  imports the guest's dma-buf straight into its window. Zero copies.
-  `NVKVM_PRESENT_MODE=gl`, and the log says `window mode=GL-zerocopy`.
+  imports the guest's dma-buf straight into its window. Zero copies. **Detected
+  automatically** since the present path probes the host UI's own GL renderer;
+  the log says `display mode = GL zero-copy (host UI renders on NVIDIA: native
+  import)` and names the renderer. `NVKVM_PRESENT_MODE=gl|readback` still forces
+  it either way. (Before that probe existed the mode was hardcoded to readback
+  and `=gl` had to be set by hand, which is what older logs and notes show.)
 - **readback** — the host's window cannot import an NVIDIA dma-buf (a hybrid
   laptop where the display is on the iGPU, an Xvfb or software X server, a
   non-NVIDIA compositor). QEMU reads the pixels back to a CPU surface and

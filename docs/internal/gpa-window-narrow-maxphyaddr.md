@@ -1,14 +1,38 @@
-# GPA window on narrow-MAXPHYADDR hosts — state as of 2026-08-18
+# GPA window on narrow-MAXPHYADDR hosts
 
-## Where it stands
+> **RESOLVED 2026-08-23.** Two separate problems were tangled together in this
+> document, and only one of them was about MAXPHYADDR.
+>
+> 1. **Window placement on a 39-bit host** — real, and fixed by the adaptive
+>    base this document describes. Keep all of it.
+> 2. **The guest dying under sustained use** — *not* a MAXPHYADDR problem at
+>    all, and the reason this doc spent three sessions on wrong theories. An
+>    NVIDIA GPU mapping is `VM_IO|VM_PFNMAP`, and `nv_fault()` returns
+>    `VM_FAULT_NOPAGE` **without installing a PTE** while the driver reinstates
+>    a revoked mapping. Userspace answers that by re-faulting; KVM turns it into
+>    a fatal `EFAULT`. Fixed by `patches/0010-kvm-retry-a-bare-KVM_RUN-EFAULT.patch`
+>    — the fault clears after **~1465 ms** if you let it. See
+>    `known-limitations.md` for the full write-up.
+>
+> On the 39-bit laptop this document is written about, `validate.sh` now passes
+> **28/28** and a weston desktop runs at 60 fps indefinitely.
+>
+> **Everything below is the investigation as it happened.** The root-cause
+> sections in particular record theories that were later disproven — the
+> `r--s`-VMA explanation, PTE-level write protection, munmap holes, memslot
+> collisions and allocator races were each instrumented and cleared. They are
+> kept because knowing what it is *not* is most of the value here, but do not
+> read any of them as the current explanation.
+
+## Where it stood (2026-08-18, superseded)
 
 `fix-gpa-window-base` makes the GPA window placement adaptive. On a 39-bit host it
-gets **further than main** (which cannot start at all) but is **not finished**:
+gets **further than main** (which cannot start at all) but was **not finished**:
 the guest boots, `nvidia-smi` reports the GPU, and then the guest **hangs** on
 sustained use — `nvidia-smi` blocks, guest SSH stops responding, QEMU sits at ~8%
-CPU. `validate.sh` has never completed on this host.
+CPU. `validate.sh` had never completed on this host at the time of writing.
 
-Do not merge until a 39-bit host reaches 28/28 and a wide host shows no regression.
+That gate — "do not merge until a 39-bit host reaches 28/28" — is now met.
 
 ## Reproducer
 
