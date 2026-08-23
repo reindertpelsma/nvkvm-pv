@@ -2,7 +2,7 @@
 
 ## Status at a glance
 
-Severities below are **as first assessed**. Five findings have since been fixed;
+Severities below are **as first assessed**. Six findings have since been fixed;
 the rest are open. Read this table before the detail.
 
 | finding | severity as found | status |
@@ -11,7 +11,7 @@ the rest are open. Read this table before the detail.
 | U-2 | CRITICAL | **fixed** — rewrite sites fail closed (`nvkvm_stub.c`, `U-2` markers) |
 | U-3 | CRITICAL | **fixed** — default-deny gate on `NVOS32.function`, only `ALLOC_SIZE` allowed |
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
-| U-5 | HIGH | open |
+| U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_u5_params_size.c` |
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
 | U-7 … U-13 | HIGH → UNKNOWN | open |
 | U-14 | by design | documented for completeness |
@@ -442,7 +442,7 @@ subset the ring accepts.
 
 ---
 
-### U-5 — OPEN — HIGH — `paramsSize` / `allocParmsSize` are never bounded against `aux_size`
+### U-5 — FIXED 2026-08-23 — HIGH — `paramsSize` / `allocParmsSize` are never bounded against `aux_size`
 
 **Fields:** `NVOS54.paramsSize@24`; `NVOS64.allocParmsSize@32`.
 
@@ -460,6 +460,42 @@ and it is why per-ioctl hand-marshalling is the wrong shape.
 
 In gVisor's nvproxy the two are the same variable by construction; here they were decoupled when the
 buffer moved into the aux slot, and nothing re-tied them.
+
+**Correction, 2026-08-23 — this was understated when written.** The finding
+describes the socket path only (`blob_alloc`, so a heap over-read/over-write).
+The **ring path has the same hole and is worse**: `ring_exec` copies the record
+into fixed stack buffers (`uint8_t aux[NVKVM_RING_MAX_AUX]`), rewrites
+`param + 16` to point at them, and forwards `paramsSize` from the guest
+untouched — so the same record runs off the **reader thread's own stack**, not
+the heap. `ring_ctrl_must_punt()` bounds `param_size`/`aux_size` against
+`NVKVM_RING_MAX_*`, but never relates either to the declared size.
+
+**FIXED 2026-08-23.** `clamp_inner_params_size()` in `src/stub/nvkvm_stub.c`
+clamps the declared size down to `aux_size` at both rewrite sites — the worker
+path (after the U-2 pointer rewrite) and the ring path. The rule is the U-2 rule
+applied to the size field: *the stub owns the pointer, so it owns the size that
+describes it; never leave the guest's bytes in a field that describes our
+memory.*
+
+Clamp-down only, deliberately. A **smaller** declared size is the caller's
+business, and for a probe-guessed alloc window the guest is intentionally
+forwarding the caller's own `0` (`nvkvm_alloc_parms_probe_len()`). On the
+ordinary path the two already agree exactly — the guest sets
+`aux_size = ctrl->params_size` for RM_CONTROL (`nvkvm_main.c:1534`) and syncs
+`alloc->alloc_parms_size = ap_size` for RM_ALLOC (`nvkvm_main.c:2068`) — so the
+clamp is a no-op on every legitimate record and a hard bound on the rest. That
+is also why it clamps rather than rejecting: fail-closed would turn any future
+legitimate size disagreement into a broken workload, where clamping can only
+ever shrink a copy to the buffer that actually exists.
+
+`NVOS21` (the 32-byte `RM_ALLOC` variant) carries no size field at all — its
+size comes from `hClass` via the alloc-param table — hence the `param_size >= 36`
+discriminator that selects `NVOS64` only.
+
+Pinned by `tests/unit/test_u5_params_size.c` (12 cases, including the exploit
+record itself and the four layouts that must be left untouched). The function is
+**extracted from the stub source at build time** rather than copied into the
+test, so the suite cannot drift from the code it pins.
 
 ---
 
@@ -719,9 +755,13 @@ Concretely, in priority order:
    a schema row fails safe rather than fails open. This is what gVisor's nvproxy does and what the
    nestrilabs rewrite table does; `ARCHITECTURE.md:373-377` currently frames "nvkvm does something
    different" as a virtue, and the difference is precisely the coverage gap this report enumerates.
-4. **Add the size-consistency check** (U-5): reject any `RM_CONTROL` where
+4. ~~**Add the size-consistency check** (U-5): reject any `RM_CONTROL` where
    `paramsSize != aux_size`, and any `nvos64 RM_ALLOC` where `allocParmsSize > aux_size`. One
-   comparison each, in QEMU, where the values are already in hand.
+   comparison each, in QEMU, where the values are already in hand.~~ **DONE 2026-08-23**, with two
+   departures from this recommendation, both deliberate: it clamps rather than rejecting (a reject
+   on `!=` would break the legitimate `aux_size > paramsSize` extension records that U-4's writeback
+   creates), and it lives in the **stub** rather than QEMU — QEMU never sees the ring path, which is
+   the site where an over-read runs off the reader thread's stack. See U-5.
 5. **Gate `NVOS32.function`** to the set actually needed (U-3), matching nvproxy. If
    `ALLOC_OS_DESCRIPTOR` is genuinely required, it needs the same memfd-aliasing treatment as the
    `NVOS02` path, not opaque forwarding.

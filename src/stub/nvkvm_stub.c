@@ -861,6 +861,57 @@ static void aux_clear_ptr(void *aux_buf, uint32_t aux_size, uint32_t off)
 	__builtin_memcpy((char *)aux_buf + off, &zero, n);
 }
 
+/*
+ * U-5 (docs/internal/audit-guest-pointers.md) — make the declared inner-params
+ * size describe the buffer we actually allocated.
+ *
+ * The pointer field at offset 16 is rewritten (U-2) to point at our aux blob,
+ * but the SIZE field that tells RM how much to copy through that pointer was
+ * forwarded from the guest untouched.  rmapiParamsCopyIn/Out copy that many
+ * bytes out of — and back into — the address we just supplied, so a record
+ * carrying aux_size = 8 with paramsSize = 0x100000 is a ~1 MiB over-read AND
+ * over-write past the end of the blob: the stub heap on the socket path
+ * (blob_alloc), the reader thread's own stack on the ring path (a fixed
+ * uint8_t aux[NVKVM_RING_MAX_AUX]).  No pointer field is needed to reach it.
+ *
+ * We own the pointer, so we own the size that describes it — the same rule as
+ * U-2: never leave the guest's bytes in a field that describes our memory.
+ *
+ * Clamp DOWN only.  A smaller declared size is the caller's business, and for
+ * a probe-guessed alloc window the caller's own 0 is the value the guest is
+ * deliberately forwarding (see nvkvm_alloc_parms_probe_len() guest-side).  On
+ * the ordinary path the two already agree exactly — the guest sets
+ * aux_size = ctrl->params_size for RM_CONTROL and syncs
+ * alloc->alloc_parms_size = ap_size for RM_ALLOC — so this is a no-op on
+ * every legitimate record and a hard bound on the rest.
+ *
+ *   RM_CONTROL ('F' nr 0x2a)  NVOS54.paramsSize     @24  (struct is 32 bytes)
+ *   RM_ALLOC   ('F' nr 0x2b)  NVOS64.allocParmsSize @32  (struct is 48 bytes)
+ *                             NVOS21 is 32 bytes and carries no size field,
+ *                             hence the param_size >= 36 discriminator.
+ */
+static void clamp_inner_params_size(unsigned job_type, unsigned job_nr,
+				    void *param_buf, uint32_t param_size,
+				    uint32_t aux_size)
+{
+	unsigned off;
+	uint32_t declared;
+
+	if (job_type != 'F' || !param_buf)
+		return;
+	if (job_nr == 0x2a && param_size >= 28)
+		off = 24;
+	else if (job_nr == 0x2b && param_size >= 36)
+		off = 32;
+	else
+		return;
+
+	__builtin_memcpy(&declared, (char *)param_buf + off, sizeof(declared));
+	if (declared > aux_size)
+		__builtin_memcpy((char *)param_buf + off, &aux_size,
+				 sizeof(aux_size));
+}
+
 static void worker_thread(void *arg)
 {
 	/* arg = (void *)(uintptr_t)(slot_id + 1) — non-zero so we can
@@ -952,6 +1003,11 @@ static void worker_thread(void *arg)
 			__builtin_memcpy((char *)job.param_buf + ptr_off,
 					 &ptr_val, sizeof(uint64_t));
 		}
+
+		/* U-5: bound the declared inner-params size by the blob we
+		 * actually allocated, now that the pointer names it. */
+		clamp_inner_params_size(job_type, job_nr, job.param_buf,
+					job.param_size, job.aux_size);
 
 		/*
 		 * NVKMS REGISTER_SURFACE (sub-cmd 17): the inner params carry up
@@ -2487,6 +2543,10 @@ static void ring_exec_one(const uint8_t *pay, uint32_t len)
 			? (uint64_t)(uintptr_t)aux : 0;
 		__builtin_memcpy(param + 16, &ptr_val, sizeof(ptr_val));
 	}
+
+	/* U-5: same bound on the ring path, where an over-read would run off
+	 * the reader thread's stack rather than the heap. */
+	clamp_inner_params_size('F', 0x2a, param, rq.param_size, rq.aux_size);
 
 	clear_fault_addr();
 	long ret = stub_ioctl(fd, rq.cmd, param);
