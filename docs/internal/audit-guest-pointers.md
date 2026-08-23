@@ -21,10 +21,48 @@ the rest are open. Read this table before the detail.
 | U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
 | U-13 | UNKNOWN | open |
 | U-14 | by design | documented for completeness |
+| U-15 | HIGH | **closed by revert** — QEMU-side UVM `mmap()` at a guest-chosen host address; layout oracle. Existed only between `c8ea92d` and `2406a3c`. See below. |
 
 A separate defect found while fixing U-6 — the host driver writing past a
 `g_malloc` on every `REGISTER_CHANNEL` — is in the addendum at the end, and is
 also fixed.
+
+### U-15 — the guest chose a host mmap address (introduced and reverted the same night)
+
+`c8ea92d` made QEMU map `/dev/nvidia-uvm` at an address the guest supplied
+(`nvkvm_isolate_handlers.c:3427,3447` on that commit):
+
+```c
+void *want = (void *)(uintptr_t)req->offset;   /* GUEST-SUPPLIED */
+real = mmap(want, len, PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_FIXED_NOREPLACE, h->fd, (off_t)req->offset);
+```
+
+`req->offset` is `vma->vm_pgoff << PAGE_SHIFT` forwarded verbatim from the guest
+(`src/guest/nvkvm_mmap.c:150`), so a malicious guest names any address it likes
+by mmap'ing the device with an arbitrary `pgoff`. That is a guest pointer used
+host-side, against the invariant this audit is scoped against.
+
+**Correctly prevented: overwrite.** `MAP_FIXED_NOREPLACE` returns `EEXIST`
+rather than replacing, and the `real != want` guard catches kernels that ignore
+the flag and relocate. A guest could not land a mapping over QEMU's heap, a
+memslot, the KVM fd or an isolate socket.
+
+**Not prevented: probing.** Request an address, observe whether the range got a
+real UVM mapping or the announced anonymous-window fallback, repeat. That is an
+address-space layout oracle over the privileged QEMU process — the same
+primitive class as U-7, which was rated HIGH precisely because a distinguishable
+outcome gave a guest an address probe, and whose severity rested on being a
+stepping stone to U-1/U-2/U-4. This one is cheaper and more reliable: the signal
+is a logged, unambiguous per-range outcome rather than a status code.
+
+**Status: closed.** `2406a3c` reverted the mapping, so `main` makes no UVM device
+mmap and there is no guest-influenced host address left to probe. It is recorded
+here rather than dropped because the functional gap that motivated it — managed
+memory does not work without that mapping — is still open, and any future attempt
+to close it must not reintroduce this. The measured reasons a VMM-chosen address
+is *not* the way out are in
+[UVM VA decoupling](uvm-va-decoupling.md).
 
 **This document names locations, not techniques.** It deliberately contains no
 working bypass procedure for anything still open. The source is public, so it

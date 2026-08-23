@@ -257,15 +257,34 @@ its QEMU-listener-managed memslot collided with the raw one and broke `cuInit`
 (`src/qemu/virtio_nvgpu_pci.c:30-34`).
 
 `/dev/nvidia-uvm` is the exception. Its kernel `mmap` handler requires
-`vm_start == (vm_pgoff << PAGE_SHIFT)`, so it cannot be `MAP_FIXED` anywhere
-QEMU chooses. It gets a GPA from the window riding the window's anonymous
-backing, with no QEMU-side device mmap at all — the stub owns the real UVM
-mapping in its own address space and the GPU reaches the memory by DMA
-(`src/qemu/nvkvm_isolate_handlers.c:2354-2385`). The earlier design that
+`vm_start == (vm_pgoff << PAGE_SHIFT)`, so it cannot be `MAP_FIXED` at an
+address that differs from the offset. It gets a GPA from the window riding the
+window's anonymous backing, with no QEMU-side device mmap at all
+(`src/qemu/nvkvm_isolate_handlers.c:3249-3279`). The earlier design that
 `MAP_FIXED`'d UVM at `req->offset` in QEMU's address space collided across
-concurrent processes — `libcuda` picks the same UVM VA in every process, and
-QEMU has one address space — so the second process hit `EEXIST` and
-`cuCtxCreate` failed with 304.
+concurrent processes, so the second process hit `EEXIST` and `cuCtxCreate`
+failed with 304.
+
+Three corrections to that paragraph, all measured on an RTX 5090 / 580.95.05 on
+2026-08-24 — see [UVM VA decoupling](docs/internal/uvm-va-decoupling.md):
+
+- ~~*the stub owns the real UVM mapping in its own address space and the GPU
+  reaches the memory by DMA*~~ — **it does not.** `mmap_on_isolate` skips the
+  stub mirror for UVM (`do_stub_mirror = hd->dev_id != NVKVM_DEV_UVM`), so
+  since `b46e9c0` (28 May 2026) *nobody* maps `/dev/nvidia-uvm`. This sentence
+  documents the regression as though it were the design, which is why managed
+  memory was broken for three months with no test able to see it.
+- ~~*`libcuda` picks the same UVM VA in every process*~~ — **it does not.**
+  libcuda reserves the range with an anonymous `PROT_NONE` `mmap(NULL, …)`, so
+  the address is ASLR'd. Twelve concurrent processes produced twelve distinct
+  addresses. The collision is a rare birthday collision, not a certainty.
+- *"cannot be `MAP_FIXED` anywhere QEMU chooses"* is too strong as a statement
+  about the **pin** — QEMU controls both address and offset. But QEMU still
+  cannot choose the address, for a different and stronger reason: the GPU VA of
+  a managed range **is** the CPU VA of the VMA that created it (measured:
+  `cuPointerGetAttribute` returns the host pointer unchanged), and the guest's
+  kernels dereference the guest's pointer. A VMM-chosen address produces a
+  mapping the guest cannot address.
 
 ### Cacheability is not a detail
 

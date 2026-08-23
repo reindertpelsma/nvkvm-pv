@@ -845,42 +845,47 @@ Do not put untrusted tenants behind this.
 
 ## Functional gaps worth knowing
 
-### Managed memory falls back when the guest's UVM VA is already taken in QEMU — OPEN, degrades cleanly
+### Managed memory (`cuMemAllocManaged`) does not work — OPEN, fails loudly
 
-UVM pins a mapping to its own offset — `uvm_mmap()` requires
-`vm_start == (vm_pgoff << PAGE_SHIFT)` (ogkm
-`kernel-open/nvidia-uvm/uvm.c:791-795`) — so the range libcuda picks in the
-**guest** is the only address QEMU can put that mapping at, in QEMU's own
-address space. QEMU is a large process, guest libcuda allocates from the same
-top-down band of the 47-bit user VA space that QEMU's own mappings live in, and
-several guest processes pick the *same* UVM VA as each other. Collisions are
-therefore expected, not exotic.
+**State on `main` (`2406a3c`).** Nothing maps `/dev/nvidia-uvm` on the host.
+`uvm_mmap()` → `uvm_va_range_create_mmap()` is the *only* thing that puts a
+managed range into a `uvm_va_space` (ogkm `kernel-open/nvidia-uvm/uvm.c:759-858`),
+so no range exists — not for the U-6 ownership table to record, not for
+`uvm_api_validate_va_range()` to find. `cuMemAllocManaged` returns
+`CUDA_ERROR_INVALID_VALUE`. `cuCtxCreate` and the rest of the UVM surface work;
+only managed memory is missing.
 
-The mapping is made `MAP_FIXED_NOREPLACE`, so a collision fails rather than
-overwriting whatever QEMU had there. On a collision the range falls back to the
-anonymous window backing that every UVM mapping used before 2026-08-23:
-`cuCtxCreate` and the rest of the UVM surface keep working, and **only managed
-memory is lost, for that one range**. It is announced, once per range:
+This is universal, not architecture-specific: reproduced on Blackwell GB202, Ada
+AD104 and Ampere GA102. `validate.sh`'s `cuda_managed_alloc` and
+`cuda_managed_coherence` exist to report it, and they are the first tests in this
+project that could see it — the gap dates to `b46e9c0` (28 May 2026) and went
+three months unnoticed because nothing called `cuMemAllocManaged`.
 
-```
-nvkvm: UVM mapping at guest VA 0x... +0x... could not be placed in QEMU
-       (handle=N, mmap: File exists) -- falling back to anonymous window
-       backing; managed memory is unavailable for this range
-```
+**Why it is not a one-line fix.** The mapping has to be at the *guest's* VA, and
+QEMU has one address space:
 
-Two mitigations are already in: QEMU reclaims its own abandoned mapping when the
-guest re-maps the same VA (the common case, since libcuda reuses one address for
-a `cuMemAllocManaged`/`cuMemFree` loop — without it, 1 mapping was followed by 23
-fallbacks at one address), and the ownership record is keyed on the UVM handle so
-one process can never reclaim another's live mapping.
+- The managed pointer is the CPU VA of the `/dev/nvidia-uvm` VMA, and the GPU VA
+  is that same number — measured, `cuPointerGetAttribute` returns the host
+  pointer unchanged. So a VMM-chosen host address produces a mapping the guest's
+  kernels cannot address, and no ioctl translation can help: the pointer reaches
+  the GPU inside kernel launch parameters, not inside an ioctl.
+- The guest's VA cannot be steered either. libcuda reserves the range with an
+  anonymous `PROT_NONE` `mmap(NULL, …)` and then `MAP_FIXED`s the UVM fd inside
+  it, so the address is settled by the guest kernel's ASLR before any device we
+  own is touched.
+- Mapping at the guest VA in QEMU (what `c8ea92d` did) makes managed memory work,
+  but hands the guest an address-space layout oracle over the QEMU process —
+  recorded as U-15 in
+  [audit-guest-pointers.md](audit-guest-pointers.md).
 
-What is **not** solved: two guest processes that genuinely want the same VA at
-the same time. The second takes the fallback. Measured on 1x RTX 5090: two
-concurrent CUDA processes both got working managed memory, with one unrelated
-fallback logged — but that is a property of where their allocators happened to
-land, not a guarantee. Fixing it properly needs the guest's UVM VAs steered into
-a region QEMU has reserved, which libcuda's own address selection does not
-currently allow.
+Corrections to the earlier write-up of this section, which described the
+`c8ea92d` state: guest UVM VAs are **ASLR'd**, not identical across processes
+(twelve concurrent processes, twelve distinct addresses), so cross-process
+collisions are rare rather than expected — the earlier "that is a property of
+where their allocators happened to land" caveat was right, and the revert
+commit's claim that it was wrong is itself wrong. Full measurements and the
+option analysis are in
+[UVM VA decoupling](uvm-va-decoupling.md).
 
 ### Reserving the UVM sub-window costs the sparse window 16 GiB
 
