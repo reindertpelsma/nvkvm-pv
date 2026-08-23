@@ -179,6 +179,10 @@ PROTECTED="${NVKVM_SWEEP_PROTECT:-$PROTECTED_DEFAULT}"
 # Adding either produces an install failure that reads like a driver finding
 # and is nothing of the kind.
 # ---------------------------------------------------------------------------
+# VERIFIED DOWNLOADABLE 2026-08-23: every primary below, and every alternate,
+# returned HTTP 200 from one of the two paths in driver_urls().  Re-check with
+# a ranged HEAD before blaming a box when an install starts 404ing -- NVIDIA
+# unpublishes versions, which is why DRIVER_ALTS exists at all.
 DRIVER_PRESET_BOUNDARY="\
 565.57.01	565.77	below the 570 seam: the top of the 550 profile range
 570.124.06	570.133.07,570.86.15	the 570 profile proper (== 575 layouts)

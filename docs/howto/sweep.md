@@ -164,6 +164,11 @@ the seams.
 Blackwell's architecture floor is 570, so `565.57.01` drops out and Blackwell
 still gets five rows. Every other architecture gets six.
 
+All six, and every same-profile alternate, were confirmed downloadable from
+NVIDIA on 2026-08-23 (HTTP 200 at one of the two paths `sweep_matrix.py`
+tries). Re-check with a `curl -I` before blaming a box if an install starts
+404ing — NVIDIA does unpublish versions, which is why the alternates exist.
+
 The expected profile in that table is **not** hardcoded anywhere. `sweep.sh`
 compiles `src/common/nvkvm_abi.h` and calls `nvkvm_abi_id_for_version()`, so the
 expectation is by construction whatever the shipped selector says. The
