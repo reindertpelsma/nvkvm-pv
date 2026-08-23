@@ -211,8 +211,15 @@ int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
      * is generally NOT the thread egl_init made the context current on.  EGL
      * contexts are per-thread, so we must bind qemu_egl_rn_ctx on THIS thread
      * (else glGenTextures silently returns 0).  Released at exit so the next
-     * present's (possibly different) thread can claim it.  Presents are
-     * throttled/serialized, so no two threads contend here in practice. */
+     * present's (possibly different) thread can claim it.
+     *
+     * STALE INVARIANT, 2026-08-23.  This used to end "presents are
+     * throttled/serialized, so no two threads contend here in practice".  That
+     * stopped being true when nvkvm_present_thread_fn() was added: it binds the
+     * SAME context and holds it for the life of the VM.  An EGL context can be
+     * current on only one thread at a time, so whichever of the two binds
+     * second now fails -- observed as a black window on an SDL host.  Do not
+     * rely on the old assumption; the two paths need to agree on an owner. */
     if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         qemu_egl_rn_ctx)) {
         fprintf(stderr,
@@ -1003,11 +1010,38 @@ static void *nvkvm_present_thread_fn(void *opaque)
      * UI backend also reads, so it must not race the main loop.  All that is
      * left here is to BIND that context to this thread, once, forever.
      */
+    /*
+     * Diagnose BEFORE calling: a bare eglGetError() here is not trustworthy.
+     * Measured on an SDL host (2026-08-23): this path reported a bind failure
+     * with eglGetError() == 0x3000, which is EGL_SUCCESS -- so the error code
+     * pointed at nothing and the operator was left with a black window and no
+     * usable message.  eglGetError() is per-thread and is cleared by a
+     * preceding successful call, so it can legitimately read SUCCESS after a
+     * false return.  Check the preconditions explicitly instead.
+     */
+    if (qemu_egl_display == EGL_NO_DISPLAY || qemu_egl_rn_ctx == EGL_NO_CONTEXT) {
+        fprintf(stderr, "nvkvm present: no render-node EGL context to bind "
+                        "(display=%p ctx=%p) -- egl_init() did not run or did "
+                        "not complete; nothing will be displayed\n",
+                        (void *)qemu_egl_display, (void *)qemu_egl_rn_ctx);
+        qatomic_set(&p->thread_failed, true);
+        return NULL;
+    }
     if (!eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         qemu_egl_rn_ctx)) {
+        EGLint err = eglGetError();
         fprintf(stderr, "nvkvm present: could not bind the render-node context "
-                        "to the present thread (eglGetError=0x%04x); nothing "
-                        "will be displayed\n", (unsigned)eglGetError());
+                        "to the present thread (eglGetError=0x%04x%s); nothing "
+                        "will be displayed\n", (unsigned)err,
+                        err == EGL_BAD_ACCESS
+                            ? " EGL_BAD_ACCESS -- the context is already current"
+                              " on another thread; see nvkvm_present_capture()"
+                            : err == EGL_SUCCESS
+                            ? " EGL_SUCCESS -- the driver returned failure"
+                              " without setting an error, so this code is not"
+                              " the real cause; check whether another thread"
+                              " holds the context"
+                            : "");
         qatomic_set(&p->thread_failed, true);
         return NULL;
     }
