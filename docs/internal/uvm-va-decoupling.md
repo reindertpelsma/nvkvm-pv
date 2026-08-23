@@ -99,6 +99,46 @@ device node we own before the address is already decided, so a guest-side
 `get_unmapped_area` hook has nothing to hook: by the time `/dev/nvidia-uvm` is
 mmap'd, `MAP_FIXED` has already fixed the answer.
 
+## 2c-bis. Cross-process sharing works. It is the number that must match, not the mm.
+
+It is easy to over-read §2b as "the mapping and the GPU work must be in the same
+process". **They must not, and nvkvm depends on their not being.** Stating it
+carefully, because the distinction is the whole subject:
+
+- **The RM VA space crosses processes, by design.**
+  `UVM_REGISTER_GPU_VASPACE` takes `{rmCtrlFd, hClient, hVaSpace}`
+  (`uvm_gpu.c:3831-3840`) and UVM *dupes* that RM object out of the naming
+  process:
+  `nvUvmInterfaceDupAddressSpace(uvm_gpu_device_handle(gpu), user_client, user_object, &gpu_va_space->duped_gpu_va_space)`
+  (`uvm_va_space.c:1531-1534`). So the isolate owns the RM VA space and the
+  channels; QEMU's UVM fd registers them; and the page tables UVM writes into
+  (`gpu_va_space->page_tables`, `uvm_va_block.c:7730`) are **the isolate's**.
+  `UVM_REGISTER_CHANNEL` bridges the same way.
+- **The UVM `va_space` crosses processes too** — it is per *struct file*, so an
+  fd passed by `SCM_RIGHTS` is the same `va_space` on both sides.
+
+So a managed range created by a `mmap` in QEMU is absolutely reachable by
+channels the isolate created. That is not a bug, it is the mechanism, and it is
+why UVM worked at all before `b46e9c0`.
+
+**What crosses is the handle. What does not cross is the CPU mapping — and what
+reaches the GPU is a number.** UVM programs the PTEs at
+`va_block->start`, i.e. at the `vm_start` of whichever process's VMA created the
+range (§2b). The GPU has no idea, and no way to care, which mm that VMA lived
+in; it only ever sees the address. Hence:
+
+- QEMU maps at the guest's VA `G` → PTEs at `G` in the isolate's RM VA space →
+  the guest's kernels dereference `G` → **works**. This is exactly the
+  pre-`b46e9c0` design, and why it worked.
+- QEMU maps at a VMM-chosen `H` → PTEs at `H` in that same isolate RM VA space →
+  the guest's kernels still dereference `G` → **fatal fault**.
+
+The failure in the second case is not "wrong address space" and it is not a
+check nvkvm performs. Nothing rejects it: the mapping succeeds, the registration
+succeeds, every ioctl returns `NV_OK`, and the GPU then faults on an address
+nobody mapped. That is the whole difficulty — it is a numeric mismatch that no
+layer is in a position to notice.
+
 ## 2d. "Can't the isolate create it and the VMM map the same object elsewhere?"
 
 The natural next idea, and the one that would rescue the isolate-owned option in
@@ -236,8 +276,10 @@ The three properties cannot currently be had together:
 - **Map at a VMM-chosen VA in QEMU**: would get (2) and (3) — but not (1), for
   the reason in §2b. It does not work at all.
 - **Map in the isolate** (per-guest-process mm): gets (2) and (3), and the GPU
-  side of (1) — GPU VA would equal the guest VA in a private address space, with
-  no collisions and no QEMU layout to probe. It loses the **CPU** side of (1):
+  side of (1) — the isolate would map at the guest VA in a private mm, so the
+  PTEs land at `G` in its own RM VA space, with no collisions and no QEMU layout
+  to probe. (Note this works for the reason in §2c-bis, not against it: the mm
+  is irrelevant, the number is what matters.) It loses the **CPU** side of (1):
   a KVM memslot's `userspace_addr` is resolved in the VM-owning process's mm
   (QEMU's), so the guest CPU would still be reading the sparse window's
   anonymous pages while the GPU reads UVM's. That is silent incoherence, which
