@@ -90,8 +90,15 @@ framebuffer), none of which are the configuration this project targets.
 We audit our own boundary and publish the results, fixed or not:
 
 - [Pre-release audit, 2026-08-21](docs/internal/audit-prerelease-2026-08-21.md) —
-  12 findings plus the suspected and ruled-out lists. The most serious was in
-  code one day old and is fixed.
+  **15 findings** (P-1 to P-12, plus P-13 to P-15 found the same evening by
+  *running* the tests rather than reading them) plus the suspected and ruled-out
+  lists. Both criticals are fixed: P-1 was in code one day old, and P-2 —
+  `NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2`, an unbounded kernel-side write
+  loop reachable by any client — is excluded from the control allowlist, with
+  the reasoning and the correct re-admission test recorded at the top of
+  `src/qemu/nvkvm_ctrl_allowlist.h`. Still open: P-5 and P-14 (both assessed as
+  wrong comments rather than wrong behaviour, see below), P-7 (dev harness
+  only), and P-8 partly.
 - [Boundary audit, 2026-08-20](docs/internal/audit-boundaries-2026-08-20.md) —
   19 findings across all three in-scope boundaries. 16 fixed, 1 partial (A-8,
   by decision), 1 open (A-9), and the low-severity set A-16 four-sixths done.
@@ -101,7 +108,13 @@ We audit our own boundary and publish the results, fixed or not:
   follow-up round is §8 of that document; it is build-verified only and has not
   been run against a GPU.
 - [Guest pointer audit](docs/internal/audit-guest-pointers.md) — 14 unenforced
-  paths against one invariant, 5 since fixed.
+  paths against one invariant, **9 since fixed**. The four that remain (U-8,
+  U-9, U-11, U-13) are all **medium or unknown severity, and all contained by
+  the isolate** — none of them escapes it. **Nothing rated HIGH is open.** U-8
+  is open for a stated reason rather than an oversight: clearing it needs struct
+  offsets that should be derived from NVIDIA's source per ABI profile, and
+  hand-transcribing them is the kind of fragility this project deliberately
+  avoids.
 
 Both documents name locations, not techniques: they contain no working bypass
 procedure. The source is public, so they give an attacker nothing the code does
@@ -116,6 +129,26 @@ exists to provide. The most serious practical exposure is **liveness**: an
 unprivileged guest process could hang the entire VMM without corrupting
 anything. Those two are fixed; the remaining open items are listed by name in
 the audit rather than quietly dropped, each with the reason it is still there.
+
+Two severities in the boundary audit were rated before their mitigations landed
+and read worse than the code now is. **A-8 and A-9 were rated HIGH when the
+round-trip wait was untimed**, i.e. when an unprivileged guest process could
+park the VMM forever. Both are now deadlined, and the reachable path is the
+per-frame *display* round-trip only — the ioctl hot path
+(`NVKVM_REQ_IOCTL_ON_ISOLATE`) is offloaded to a thread pool and never holds the
+BQL. Reaching the deadline additionally requires guest `CAP_SYS_ADMIN` (the
+display node is gated) and a stub that has stopped answering, which guest
+userspace cannot cause — ioctls run on worker threads. Both are **medium** on
+the code as it stands.
+
+Two more read as open but are assessments, not defects. **P-5**: the isolate
+comment claims uid separation that does not exist on the default namespace rung
+— but per-isolate PID and mount namespaces mean peers cannot name or enumerate
+each other, so the comment is wrong rather than the boundary. **P-14**: a
+ring-setup timeout kills the isolate instead of falling back to the socket path,
+contrary to its comment — but a stub that has stopped answering is broken or
+compromised, and dropping its handles is the correct response. Both need the
+comment corrected, not the code.
 
 ## Can a container read the host's screen?
 
