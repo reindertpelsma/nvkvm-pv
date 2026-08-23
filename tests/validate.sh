@@ -336,7 +336,8 @@ section "2. CUDA (driver API, compute)"
 
 CUDA_CHECKS="cuda_libcuda cuda_init cuda_driver_version cuda_device_count \
 cuda_device_name cuda_compute_cap cuda_ctx_create cuda_htod_dtoh_8mib \
-cuda_memset_d8 cuda_ptx_jit cuda_kernel_launch cuda_matmul"
+cuda_memset_d8 cuda_ptx_jit cuda_kernel_launch cuda_matmul \
+cuda_managed_alloc cuda_managed_coherence"
 
 cat > "$WORK/cuda_probe.c" <<'NVKVM_CUDA_EOF'
 /*
@@ -375,7 +376,8 @@ static const char *ALL_CHECKS[] = {
     "cuda_libcuda", "cuda_init", "cuda_driver_version", "cuda_device_count",
     "cuda_device_name", "cuda_compute_cap", "cuda_ctx_create",
     "cuda_htod_dtoh_8mib", "cuda_memset_d8", "cuda_ptx_jit",
-    "cuda_kernel_launch", "cuda_matmul", NULL
+    "cuda_kernel_launch", "cuda_matmul",
+    "cuda_managed_alloc", "cuda_managed_coherence", NULL
 };
 static int reported[64];
 
@@ -415,6 +417,7 @@ static CUresult (*p_cuLaunchKernel)(CUfunction, unsigned, unsigned, unsigned,
                                     CUstream, void **, void **);
 static CUresult (*p_cuCtxSynchronize)(void);
 static CUresult (*p_cuGetErrorName)(CUresult, const char **);
+static CUresult (*p_cuMemAllocManaged)(CUdeviceptr *, size_t, unsigned int);
 
 static void *H;
 /* libcuda exports the _v2 ABI under a suffixed name; prefer it, fall back. */
@@ -431,6 +434,7 @@ static const char *errname(CUresult r) {
     return "?";
 }
 
+#define CU_MEM_ATTACH_GLOBAL 0x1u
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR 75
 #define CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR 76
 
@@ -575,6 +579,11 @@ static int probe_main(void) {
     p_cuModuleGetFunction  = dlsym(H, "cuModuleGetFunction");
     p_cuLaunchKernel       = dlsym(H, "cuLaunchKernel");
     p_cuCtxSynchronize     = dlsym(H, "cuCtxSynchronize");
+    /* No _v2 for this one -- and sym2() would be actively wrong here, the way
+     * it is for cuCtxSynchronize: libcuda 13 exports a _v2 with different
+     * semantics for several entry points, so only the ones that really are
+     * _v2-versioned above go through sym2(). */
+    p_cuMemAllocManaged    = dlsym(H, "cuMemAllocManaged");
 
     if (!p_cuInit || !p_cuDeviceGetCount || !p_cuCtxCreate || !p_cuMemAlloc) {
         emit("cuda_libcuda", "FAIL", "libcuda loaded but core symbols missing");
@@ -870,6 +879,159 @@ static int probe_main(void) {
                 free(A); free(B); free(C); free(R);
             }
         }
+    }
+
+    /* ---- 13/14. unified (managed) memory --------------------------------
+     *
+     * This is the check whose absence let "cuMemAllocManaged fails in the
+     * guest" sit undetected on every platform this suite has ever passed on.
+     * The old UVM coverage was `/dev/nvidia-uvm` appearing in the device-node
+     * list -- a node existing says nothing about managed memory working, and
+     * managed memory is what most ML frameworks allocate through.
+     *
+     * Managed memory is a different code path from every check above, not a
+     * variation on one: the range is created by mmap() on /dev/nvidia-uvm
+     * rather than by an ioctl, the pages are migrated on fault rather than
+     * copied by cuMemcpy, and the CPU dereferences the device pointer
+     * directly.  So it is checked the only way that proves it: write the
+     * inputs from the CPU THROUGH the managed pointer (no cuMemcpy anywhere),
+     * run a real kernel over them, and read every output element back through
+     * the same pointer.  Both directions of coherence, verified by value.
+     */
+    if (!p_cuMemAllocManaged) {
+        emit("cuda_managed_alloc", "SKIP", "cuMemAllocManaged not exported by libcuda");
+    } else {
+        /* 83 = CU_DEVICE_ATTRIBUTE_MANAGED_MEMORY */
+        int managed_cap = 1;
+        if (p_cuDeviceGetAttribute &&
+            p_cuDeviceGetAttribute(&managed_cap, 83, dev) != 0)
+            managed_cap = 1;   /* attribute unreadable -- try anyway */
+
+        const int N = 1 << 20;                        /* 1,048,576 elements */
+        size_t bytes = (size_t)N * sizeof(int);
+        CUdeviceptr ma = 0, mb = 0, mc = 0;
+        CUresult ra = p_cuMemAllocManaged(&ma, bytes, CU_MEM_ATTACH_GLOBAL);
+        CUresult rb = ra ? ra : p_cuMemAllocManaged(&mb, bytes, CU_MEM_ATTACH_GLOBAL);
+        CUresult rc2 = rb ? rb : p_cuMemAllocManaged(&mc, bytes, CU_MEM_ATTACH_GLOBAL);
+
+        if (ra || rb || rc2) {
+            CUresult bad = ra ? ra : (rb ? rb : rc2);
+            if (!managed_cap)
+                emit("cuda_managed_alloc", "SKIP",
+                     "device reports MANAGED_MEMORY=0 and cuMemAllocManaged rc=%d (%s)",
+                     bad, errname(bad));
+            else
+                emit("cuda_managed_alloc", "FAIL",
+                     "cuMemAllocManaged(%zu) rc=%d (%s) on a device that reports "
+                     "MANAGED_MEMORY=1 -- unified memory is unavailable in this guest",
+                     bytes, bad, errname(bad));
+        } else if (!ma || !mb || !mc) {
+            emit("cuda_managed_alloc", "FAIL",
+                 "cuMemAllocManaged rc=0 but returned a null pointer (a=0x%llx b=0x%llx c=0x%llx)",
+                 (unsigned long long)ma, (unsigned long long)mb,
+                 (unsigned long long)mc);
+        } else {
+            emit("cuda_managed_alloc", "PASS",
+                 "3 x %zu bytes, MANAGED_MEMORY=%d (a=0x%llx b=0x%llx c=0x%llx)",
+                 bytes, managed_cap, (unsigned long long)ma,
+                 (unsigned long long)mb, (unsigned long long)mc);
+
+            /* ---- 14. host<->device coherence over the managed pages ------ */
+            CUfunction mf = NULL;
+            CUresult rf = p_cuModuleGetFunction(&mf, mod, "vec_add");
+            if (rf != 0 || !mf) {
+                emit("cuda_managed_coherence", "SKIP",
+                     "cuModuleGetFunction(vec_add) rc=%d (%s)", rf, errname(rf));
+            } else {
+                /* CPU writes the inputs directly through the managed pointers. */
+                int *pa = (int *)ma, *pb = (int *)mb, *pc = (int *)mc;
+                int i;
+                for (i = 0; i < N; i++) { pa[i] = i; pb[i] = 2 * i; pc[i] = -1; }
+
+                int n = N;
+                void *args[] = { &ma, &mb, &mc, &n };
+                int threads = 256, blocks = (N + threads - 1) / threads;
+                CUresult rl = p_cuLaunchKernel(mf, blocks, 1, 1, threads, 1, 1,
+                                               0, NULL, args, NULL);
+                CUresult rs = p_cuCtxSynchronize ? p_cuCtxSynchronize() : 0;
+                if (rl || rs) {
+                    emit("cuda_managed_coherence", "FAIL",
+                         "vec_add over managed memory: launch rc=%d (%s) sync rc=%d (%s)",
+                         rl, errname(rl), rs, errname(rs));
+                } else {
+                    /* CPU reads every output element back through the pointer. */
+                    long bad = 0;
+                    int firsti = -1, firstgot = 0, firstwant = 0, firstcycle = 0;
+                    for (i = 0; i < N; i++) {
+                        if (pc[i] != 3 * i) {
+                            bad++;
+                            if (firsti < 0) {
+                                firsti = i; firstgot = pc[i];
+                                firstwant = 3 * i; firstcycle = 0;
+                            }
+                        }
+                    }
+                    /*
+                     * Second and third cycles: the pages have now been pulled
+                     * to the CPU by the read above, so re-running the kernel
+                     * migrates them back to the GPU and the next CPU read
+                     * pulls them across again.  One cycle can pass on a system
+                     * where migration is subtly broken -- e.g. where the first
+                     * fault happens to be serviced but a later invalidation is
+                     * not -- so thrash it and re-verify by value each time,
+                     * with different inputs so a stale page cannot compare
+                     * equal.  Same shape as tests/integration/cuda_micro.c
+                     * case 6 (uvm_migrate), but checked rather than timed.
+                     */
+                    int cycle;
+                    for (cycle = 1; cycle <= 2 && !bad; cycle++) {
+                        for (i = 0; i < N; i++) {
+                            pa[i] = i + cycle;      /* CPU writes -> pages to CPU */
+                            pb[i] = 2 * i + cycle;
+                            pc[i] = -1;
+                        }
+                        rl = p_cuLaunchKernel(mf, blocks, 1, 1, threads, 1, 1,
+                                              0, NULL, args, NULL);
+                        rs = p_cuCtxSynchronize ? p_cuCtxSynchronize() : 0;
+                        if (rl || rs) {
+                            emit("cuda_managed_coherence", "FAIL",
+                                 "migration cycle %d: launch rc=%d (%s) sync rc=%d (%s)",
+                                 cycle, rl, errname(rl), rs, errname(rs));
+                            bad = -1;
+                            break;
+                        }
+                        for (i = 0; i < N; i++) {   /* CPU reads -> pages back */
+                            if (pc[i] != 3 * i + 2 * cycle) {
+                                bad++;
+                                if (firsti < 0) {
+                                    firsti = i; firstgot = pc[i];
+                                    firstwant = 3 * i + 2 * cycle;
+                                    firstcycle = cycle;
+                                }
+                            }
+                        }
+                    }
+
+                    if (bad < 0) {
+                        /* already reported */
+                    } else if (bad)
+                        emit("cuda_managed_coherence", "FAIL",
+                             "%ld/%d managed elements wrong on migration cycle %d, "
+                             "first i=%d expected %d got %d",
+                             bad, N, firstcycle, firsti, firstwant, firstgot);
+                    else
+                        emit("cuda_managed_coherence", "PASS",
+                             "host wrote %d elements through the managed pointer, "
+                             "vec_add<<<%d,%d>>> ran on them, host read all %d back; "
+                             "3 CPU<->GPU migration cycles, every element verified "
+                             "(e.g. c[%d]=%d)",
+                             N, blocks, threads, N, N - 1, pc[N - 1]);
+                }
+            }
+        }
+        if (ma) p_cuMemFree(ma);
+        if (mb) p_cuMemFree(mb);
+        if (mc) p_cuMemFree(mc);
     }
 
     finish("not reached");

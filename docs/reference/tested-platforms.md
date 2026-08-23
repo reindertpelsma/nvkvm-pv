@@ -44,10 +44,13 @@ that it failed; those are early rows that predate the suite.
 >   the plural sibling of the `0x3d08` that caused the previous NCCL bug. `3d0b` is
 >   absent from the entire tree. Seen on 590.48.01, 610.57.04 and 580.105.08, across
 >   two Blackwell SKUs. Correlation plus a source argument, **not proven cause**.
-> - **`cuMemAllocManaged` fails `err=1`** via `DENY UVM cmd=0x48`
->   (`UVM_VALIDATE_VA_RANGE`, refused by the U-6 VA-ownership gate). The host does
->   the same op in 177–190 µs. Unified memory therefore does not work in the guest.
->   Found 2026-08-23 on 2x RTX 5090; **scope beyond Blackwell not established.**
+> - **`cuMemAllocManaged` failed `err=1`** via `DENY UVM cmd=0x48`
+>   (`UVM_VALIDATE_VA_RANGE`, refused by the U-6 VA-ownership gate). **Fixed
+>   2026-08-23** — see [Unified memory](#unified-memory-was-broken-everywhere-and-nothing-noticed)
+>   below. It was **not** Blackwell-specific and not really a U-6 bug: QEMU never
+>   made the `/dev/nvidia-uvm` mapping that creates a managed range, so no range
+>   existed for U-6 to have recorded or for the driver to have found. Every
+>   architecture was affected.
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
 | H100 PCIe | **Hopper GH100** | 550.54.14 | 550 | 28/28 |
@@ -331,3 +334,43 @@ relative events. The **SDL** backend asks properly
 (`SDL_SetRelativeMouseMode()`, which on Wayland is `zwp_pointer_constraints_v1`
 plus `zwp_relative_pointer_v1`), and that is the configuration both rows above
 used for grab mode.
+
+## Unified memory was broken everywhere, and nothing noticed
+
+Every `28/28` in the table above was **silent on unified memory**. `validate.sh`
+mentioned UVM in exactly one place — `/dev/nvidia-uvm` in the device-node list
+(`tests/validate.sh:219`) — and a node existing says nothing about managed
+memory working. No check ever called `cuMemAllocManaged`. So on every GPU ever
+tested here, `cuMemAllocManaged` returned `CUDA_ERROR_INVALID_VALUE` in the
+guest and the suite reported a clean sweep.
+
+This is the failure mode the suite's own design rules exist to prevent, and it
+went unnoticed for the same reason every time: *the check did not exist*, so
+there was nothing to go yellow.
+
+Two checks now cover it, and the suite is **30** rather than 28:
+
+| check | what it proves |
+|---|---|
+| `cuda_managed_alloc` | `cuMemAllocManaged` succeeds and returns a usable pointer on a device reporting `MANAGED_MEMORY=1` |
+| `cuda_managed_coherence` | the CPU writes the inputs **through the managed pointer** (no `cuMemcpy` anywhere), a real kernel runs over them, and the CPU reads every output element back — repeated over three CPU↔GPU migration cycles with different inputs each time |
+
+The second one is the point. Managed memory is a different code path from
+everything else in the suite, not a variation on one: the range is created by
+`mmap()` on `/dev/nvidia-uvm` rather than by an ioctl, the pages migrate on
+fault rather than being copied, and the CPU dereferences the device pointer
+directly. Only a value check across both directions can tell "it works" from
+"the allocation returned a pointer".
+
+Measured on the same box, same guest, same driver, one QEMU rebuild apart:
+
+```
+main @ 10a0a03   TOTAL 30   PASS 28   FAIL 1   SKIP 1
+                 FAIL cuda_managed_alloc  cuMemAllocManaged(4194304) rc=1
+                      (CUDA_ERROR_INVALID_VALUE) on a device that reports
+                      MANAGED_MEMORY=1 -- unified memory is unavailable in this guest
+with the fix     TOTAL 30   PASS 30   FAIL 0   SKIP 0
+```
+
+That `PASS 28` is the historic result, reproduced exactly. The suite was not
+wrong before; it was not looking.
