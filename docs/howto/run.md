@@ -195,20 +195,42 @@ monitor isolates it — firmware-range RIP means wedged, kernel-range means boot
 So it is `virtio-nvgpu`'s window that OVMF cannot accommodate; the identity
 `nvkvm-gpu` device is not involved.
 
-### Debugging note: nvkvm's scanout is console 0
+### Debugging note: `screendump` may not capture the console you mean
 
-With nvkvm attached, its scanout registers as QEMU **console 0**. A bare
-`screendump file.ppm` therefore captures nvkvm's placeholder —
+QEMU numbers consoles in **device registration order**, so which one is console
+0 depends on your command line, not on which device is "the display". With
+`-device VGA` listed before `virtio-nvgpu` — the ordering `run_test_vm.sh` uses —
+**the emulated VGA is console 0** and nvkvm's scanout is console 1. Reverse the
+device order and the numbering reverses with it.
+
+That matters because a bare `screendump file.ppm` always grabs console 0. Point
+it at the wrong one and you get either nvkvm's placeholder —
 
 ```
 Guest has not initialized the display (yet).
 ```
 
-— which is what nvkvm shows until the guest compositor renders through it. A
-guest that is booting perfectly well on the emulated VGA looks dead this way, and
-that is a costly wrong turn. `screendump <file> <device-id>` does not reliably
-select the other console either, and `screendump -d <id>` is rejected outright
-("unsupported option -d").
+— which is what nvkvm shows until the guest compositor renders through it, or a
+blank VGA framebuffer. **Either way a guest that is booting perfectly well looks
+dead**, and that is a costly wrong turn. `screendump <file> <device-id>` does not
+reliably select a specific console either, and `screendump -d <id>` is rejected
+outright ("unsupported option -d").
+
+Reliable ways to tell what you are actually looking at, in decreasing order of
+certainty:
+
+- **`-vga none`.** Remove the emulated VGA entirely. Then nothing but nvkvm can
+  be producing the picture, and `info pci` should list `10de:xxxx` as the only
+  VGA-class device. This is how the "SteamOS renders through nvkvm" claim was
+  established rather than inferred.
+- **Resolution.** The two heads usually differ — a 1920x1080 capture is not the
+  1280x800 bochs framebuffer.
+- **In the guest**, `/sys/class/drm/card*/device/driver` by **name**, not by
+  number. Node numbering is not guaranteed; `card0` is whichever registered
+  first.
+- **Guest RIP** from the monitor is the reliable *liveness* check when the
+  picture is ambiguous: a kernel-space RIP means the guest is running regardless
+  of what any console shows.
 
 **Use guest RIP as the liveness check instead:**
 
