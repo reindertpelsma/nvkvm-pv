@@ -877,6 +877,11 @@ QEMU has one address space:
   but hands the guest an address-space layout oracle over the QEMU process —
   recorded as U-15 in
   [audit-guest-pointers.md](audit-guest-pointers.md).
+- Letting the **isolate** own the mapping and having QEMU map the same UVM
+  object elsewhere does not work either: a managed range holds exactly one
+  `vma_wrapper`, so it has exactly one VMA, and mmap'ing the fd at a second
+  address creates a second independent range rather than aliasing the first
+  (`uvm_va_range.h:288`, `uvm.c:743-757`).
 
 Corrections to the earlier write-up of this section, which described the
 `c8ea92d` state: guest UVM VAs are **ASLR'd**, not identical across processes

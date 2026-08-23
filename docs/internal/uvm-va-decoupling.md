@@ -99,6 +99,65 @@ device node we own before the address is already decided, so a guest-side
 `get_unmapped_area` hook has nothing to hook: by the time `/dev/nvidia-uvm` is
 mmap'd, `MAP_FIXED` has already fixed the answer.
 
+## 2d. "Can't the isolate create it and the VMM map the same object elsewhere?"
+
+The natural next idea, and the one that would rescue the isolate-owned option in
+§6: let the **isolate** create the managed range at the guest VA (GPU VA then
+equals the guest VA, per-process, nothing of QEMU's to probe), and have QEMU map
+*the same UVM object* at some other address purely to have a host VA to hand
+KVM as a memslot.
+
+That is exactly how the rest of nvkvm works, and it is correct **for RM memory
+objects** — an `hMemory` is a shareable object, mappable in several processes at
+different VAs, with a GPU VA that RM assigns independently. It does not carry
+over to UVM managed ranges, because **a managed range is not an object that has
+a mapping; the mapping *is* the range**:
+
+- `uvm_va_range_managed_t` holds exactly one `uvm_vma_wrapper_t *vma_wrapper`
+  (`uvm_va_range.h:288`), and a wrapper holds exactly one
+  `struct vm_area_struct *vma` (`uvm_va_range.h:117-125`). One managed range can
+  structurally only ever have one VMA.
+- Enforced at runtime, not just by convention: `uvm_va_range_vma()` asserts
+  `vma->vm_private_data == managed_range->vma_wrapper` (`uvm_va_range.h:929`).
+- There is no "map this existing range" API for managed memory.
+  `va_range_type_expects_mmap()` returns true only for `SEMAPHORE_POOL` and
+  `DEVICE_P2P`; the comment in the `default:` arm is explicit — *"Although
+  UVM_VA_RANGE_TYPE_MANAGED does support mmap, it doesn't expect mmap to be
+  called on a pre-existing range. mmap itself creates the managed va range"*
+  (`uvm.c:743-757`).
+- And even for the two types that *do* support it, the re-mmap path requires
+  `existing_range->node.start == vma->vm_start` (`uvm.c:863-867`) — the **same**
+  address. UVM never lets any range be mapped at a second address.
+
+So `mmap`ing the same UVM fd at a different VA does not alias the range. It runs
+`uvm_va_range_create_mmap()` with the new `vm_start` and produces a **second,
+independent, empty** managed range at that address.
+
+Two further places the driver says the same thing, both worth knowing because
+they are the cases that look like counter-examples:
+
+- **fork** is the one situation where a managed range's pages exist in two mms.
+  UVM declares it undefined and disables the child: *"Parent vma is dup'd (fork).
+  This is undefined behavior in the UVM Programming Model … the child is not
+  guaranteed access to the range"* (`uvm.c:396-401`), with
+  `uvm_vm_open_failure()` calling `uvm_disable_vma()` on both.
+- **`UVM_INIT_FLAGS_MULTI_PROCESS_SHARING_MODE`** sounds like the feature being
+  asked for and is not. It only drops the va_space↔mm binding
+  (`uvm_va_space_mm.c:176`), so several processes can create *their own* ranges
+  in one shared va_space. When the process that created a range exits while
+  others still hold the fd, the range becomes a **zombie with
+  `vma_wrapper == NULL`** (`uvm_va_range.h:284-288`) — it is not re-homed onto a
+  surviving process's VMA, because there is nothing to re-home it to.
+
+The last step is the one that closes the option: a KVM memslot's
+`userspace_addr` is resolved in the mm of the process that owns the VM
+(`kvm->mm`, QEMU's — the vCPU threads are QEMU threads). A mapping that
+deliberately *doesn't* belong to the VMM process therefore cannot back a
+memslot. If the isolate owns the only VMA, the guest CPU has no path to those
+pages at all, and it goes on reading the sparse window's anonymous pages while
+the GPU reads UVM's. Silent incoherence, which is worse than the loud failure on
+`main`.
+
 ## 3. A claim in this tree that the measurements falsify
 
 `ARCHITECTURE.md:265-268`, and the revert commit that quotes it, both rest on:
