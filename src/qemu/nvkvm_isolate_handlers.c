@@ -3069,7 +3069,23 @@ static void nvkvm_uvm_reclaim_stale(VirtIONvgpu *nv, uint32_t handle_id,
 			    (uint64_t)(uintptr_t)iso_mmap_tbl[i].qva != va)
 				continue;
 			e = iso_mmap_tbl[i];
-			iso_mmap_tbl[i].used = false;
+			/*
+			 * Keep the slot USED but empty rather than freeing it.
+			 * The guest still holds this token -- nvkvm_vma_close()
+			 * does not send MUNMAP_ON_ISOLATE, so the munmap only
+			 * arrives at fd close -- and iso_mmap_alloc() hands
+			 * tokens out by index, so releasing it here would let a
+			 * later mapping take the same token and the guest's
+			 * stale munmap tear down a live one.  Emptied, the
+			 * eventual munmap finds the entry, tears down nothing,
+			 * and releases the slot on the normal path.
+			 */
+			iso_mmap_tbl[i].qva      = NULL;
+			iso_mmap_tbl[i].gpa      = 0;
+			iso_mmap_tbl[i].len      = 0;
+			iso_mmap_tbl[i].kvm_slot = -1;
+			iso_mmap_tbl[i].uvm_va_owned  = false;
+			iso_mmap_tbl[i].stub_mirrored = false;
 			found = true;
 			break;
 		}
@@ -3410,9 +3426,18 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		 */
 		void      *want    = (void *)(uintptr_t)req->offset;
 		void      *real    = MAP_FAILED;
+		/*
+		 * nv->sparse_gpa_base is set at the same moment mmap_win is
+		 * rebased onto the UVM reserve, i.e. once the window's real base
+		 * is known.  Before that we have no GPA the guest would accept,
+		 * and handing it one it rejects fails the mmap outright instead
+		 * of degrading -- so take the fallback until the window resolves.
+		 */
 		const bool mappable = req->offset != 0 &&
 				      (req->offset & 4095ULL) == 0 &&
-				      req->offset + len > req->offset;
+				      req->offset + len > req->offset &&
+				      nv->sparse_gpa_base != 0 &&
+				      nv->sparse_uvm_size != 0;
 
 		int mmap_errno = 0;
 		if (mappable)
@@ -3492,6 +3517,11 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 					  (unsigned long)len,
 					  (unsigned long long)gpa, slot);
 			} else {
+				/* Give the extent back -- mmap_win is a bump
+				 * allocator with a small free-list, and a leak
+				 * here is permanent for the life of the VM. */
+				if (gpa)
+					nvkvm_mmap_win_free(nv, gpa, (size_t)len);
 				munmap(real, len);
 				real = MAP_FAILED;
 				gpa  = 0;
