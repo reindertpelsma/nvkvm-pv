@@ -2,7 +2,7 @@
 
 ## Status at a glance
 
-Severities below are **as first assessed**. Seven findings have since been fixed;
+Severities below are **as first assessed**. Nine findings have since been fixed;
 the rest are open. Read this table before the detail.
 
 | finding | severity as found | status |
@@ -14,7 +14,12 @@ the rest are open. Read this table before the detail.
 | U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_stub_ptr_sanitize.c` |
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
 | U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally on both paths (`nvkvm_frontend.c`, `zero_nvos64_rights` in `nvkvm_stub.c`) |
-| U-8 … U-13 | MEDIUM → UNKNOWN | open |
+| U-8 | MEDIUM | **open** — blocked on the ogkm struct layout, see the note in its section |
+| U-9 | MEDIUM | open |
+| U-10 | MEDIUM | **fixed** — offset 16 decided from the cmd, offset 32 zeroed (`nvkvm_stub.c`) |
+| U-11 | MEDIUM | open |
+| U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
+| U-13 | UNKNOWN | open |
 | U-14 | by design | documented for completeness |
 
 A separate defect found while fixing U-6 — the host driver writing past a
@@ -600,6 +605,23 @@ simply not handled. Ranked below U-1..U-4 only because the written content is P2
 rather than attacker-chosen bytes, and because reaching it requires the socket path (the ring
 accepts it, but `must_punt` does not exclude it either — see U-1).
 
+**Still open 2026-08-23, deliberately — blocked on a struct layout we do not
+have locally.** Clearing these two fields needs the byte offsets of `busPeerIds`
+and `busEgmPeerIds` inside `NV0000_CTRL_SYSTEM_GET_P2P_CAPS_PARAMS`. That struct
+is not in `src/abi/nvgpu.h`, and the ogkm checkout on this machine holds only a
+handful of headers, not `embedded_param_copy.c`.
+
+Hand-transcribing the offsets from the audit's prose would be exactly the
+fragility this project has already ruled out: offsets that are typed rather than
+derived can shift between driver branches and fail silently on the ones nobody
+tested. The fix wants the layout taken from ogkm source for every supported ABI
+profile, the same way the other struct sizes are, and then the same
+`aux_clear_ptr` treatment as U-12.
+
+Note also that `gpuCount` is guest-supplied and the write is `gpuCount² × 4`
+bytes per pointer, so clearing the pointers is necessary but a bound on
+`gpuCount` is worth adding in the same pass.
+
 ---
 
 ### U-9 — OPEN — MEDIUM — `ISOLATE_CMD_MMAP` / `ISOLATE_CMD_MUNMAP` take a raw guest VA
@@ -629,7 +651,7 @@ class, and it is listed so it is not lost. It is also partly by design: the `OS_
 
 ---
 
-### U-10 — OPEN — MEDIUM — DRM `PRIME_FENCE_CONTEXT_CREATE` (nr 0x45) has two pointers; neither is handled
+### U-10 — FIXED 2026-08-23 — MEDIUM — DRM `PRIME_FENCE_CONTEXT_CREATE` (nr 0x45) has two pointers; neither is handled
 
 **Fields:** `import_mem_nvkms_params_ptr` (offset 16) and `event_nvkms_params_ptr` (offset 32) in
 `drm_nvidia_prime_fence_context_create_params` (ogkm `kernel-open/nvidia-drm/nvidia-drm-ioctl.h:199-213`).
@@ -641,6 +663,17 @@ covering offset 32. `event_nvkms_params_ptr` is forwarded verbatim in every case
 
 Reachable only when `nv->graphics` is set (`nvkvm_isolate_handlers.c:1557-1564`); compute-only VMs
 are unaffected.
+
+**FIXED 2026-08-23.** Both pointers are now handled in `nvkvm_stub.c`:
+
+- **Offset 16** gets its own branch in the `ptr_off` decision, keyed on
+  `job_type == 'd' && job_nr == 0x45`, so it is written unconditionally — the
+  aux pointer, or an explicit 0. Previously it fell to the generic branch, which
+  only fires when `aux_size > 0`, so an `aux_size == 0` record left the guest's
+  own bytes in a pointer field: the same fail-open shape as U-2.
+- **Offset 32** is zeroed outright. Only one aux blob exists per job, so there is
+  nothing to retarget the second pointer at; the driver null-checks it and the
+  event params are not on any path nvkvm serves.
 
 ---
 
@@ -663,13 +696,21 @@ guarantees that, not because a walk is demonstrated.
 
 ---
 
-### U-12 — OPEN — MEDIUM — `NV0000_CTRL_CMD_GPU_GET_ID_INFO` (0x202) `szName`
+### U-12 — FIXED 2026-08-23 — MEDIUM — `NV0000_CTRL_CMD_GPU_GET_ID_INFO` (0x202) `szName`
 
 **Field:** `NV0000_CTRL_GPU_GET_ID_INFO_PARAMS.szName` (`NvP64`).
 
 Output-only: the driver writes the GPU name string to it. Allowlisted; the guest zeroes it rather
 than marshalling (per `ARCHITECTURE.md`, `src/guest/nvkvm_main.c:1628-1639`); the host does nothing.
 A short, low-entropy, attacker-positioned write inside the isolate.
+
+**FIXED 2026-08-23.** `aux_clear_ptr(job.aux_buf, job.aux_size, 16)` on
+`inner_cmd == 0x202`, alongside the existing inner-pointer handling for `0x101`,
+`0x3d05`, `0x3d06`/`0x3d08` and `0x80170d`. The name is optional — `cuInit` does
+not need it and `nvidia-smi` gets the model elsewhere — and the driver
+null-checks `szName`, so clearing it host-side costs nothing and matches what the
+guest was already trying to do. The point is that the guest was the *only* thing
+doing it, and guest code is not a security control.
 
 ---
 

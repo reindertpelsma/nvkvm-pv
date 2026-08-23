@@ -1024,6 +1024,22 @@ static void worker_thread(void *arg)
 		} else if (job_type == 'F' && (job_nr == 0x2a || job_nr == 0x2b) &&
 			   job.param_size >= 24) {
 			ptr_off = 16;
+		} else if (job_type == 'd' && job_nr == 0x45 &&
+			   job.param_size >= 24) {
+			/*
+			 * U-10 — DRM PRIME_FENCE_CONTEXT_CREATE.  Two pointers:
+			 * import_mem_nvkms_params_ptr@16 and
+			 * event_nvkms_params_ptr@32 (ogkm
+			 * kernel-open/nvidia-drm/nvidia-drm-ioctl.h:199-213).
+			 * This used to fall to the generic branch below, which
+			 * covers offset 16 only when aux_size > 0 — so an
+			 * aux_size == 0 record left the guest's own bytes in a
+			 * pointer field, the same fail-open shape as U-2.  Decide
+			 * it from the cmd instead, so offset 16 is always written
+			 * (aux pointer, or an explicit 0).  Offset 32 is cleared
+			 * below; nothing here can target it.
+			 */
+			ptr_off = 16;
 		} else if (job.aux_size > 0 && job.param_size >= 24) {
 			/* Unchanged legacy generic case: some other cmd that
 			 * shipped an aux blob.  Only ever reached with
@@ -1046,6 +1062,21 @@ static void worker_thread(void *arg)
 		 * rewrite above reaches.  Never forward the guest's bytes. */
 		zero_nvos64_rights(job_type, job_nr, job.param_buf,
 				   job.param_size);
+
+		/*
+		 * U-10 — the SECOND pointer of DRM PRIME_FENCE_CONTEXT_CREATE.
+		 * event_nvkms_params_ptr@32 was forwarded verbatim in every
+		 * case: only one aux blob exists per job, so there is nothing to
+		 * retarget it at.  Zero it — the driver null-checks, and the
+		 * event params are not on any path nvkvm serves.  Reachable only
+		 * when nv->graphics is set, so compute-only VMs never saw this.
+		 */
+		if (job_type == 'd' && job_nr == 0x45 && job.param_buf &&
+		    job.param_size >= 40) {
+			uint64_t zero = 0;
+			__builtin_memcpy((char *)job.param_buf + 32, &zero,
+					 sizeof(zero));
+		}
 
 		/*
 		 * NVKMS REGISTER_SURFACE (sub-cmd 17): the inner params carry up
@@ -1280,6 +1311,25 @@ static void worker_thread(void *arg)
 					aux_clear_ptr(job.aux_buf, job.aux_size, 16);
 				}
 			}
+			/*
+			 * U-12 — NV0000_CTRL_CMD_GPU_GET_ID_INFO (0x202).
+			 *
+			 * szName@16 inside the params blob is an OUTPUT pointer:
+			 * the driver writes the GPU name through it.  Only the
+			 * GUEST zeroed it (src/guest/nvkvm_main.c:1761), and guest
+			 * code is not a security control — a malicious guest simply
+			 * does not, and the stub forwards the value verbatim,
+			 * giving the driver a guest-named address to write to
+			 * inside the isolate.
+			 *
+			 * The name is optional (cuInit does not need it and
+			 * nvidia-smi gets the model elsewhere) and the driver
+			 * null-checks szName, so clearing it host-side costs
+			 * nothing and matches what the guest already intends.
+			 */
+			if (inner_cmd == 0x00000202U)
+				aux_clear_ptr(job.aux_buf, job.aux_size, 16);
+
 			if (inner_cmd == 0x00000101U) {    /* GET_BUILD_VERSION */
 				/*
 				 * nv0000_ctrl_system_get_build_version_params is
