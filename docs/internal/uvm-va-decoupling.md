@@ -25,7 +25,8 @@ the cross-process collision and the layout oracle in one change.
 The pin is not the obstacle. `uvm_mmap()` requires
 `vma->vm_start == (vma->vm_pgoff << PAGE_SHIFT)`
 (ogkm `kernel-open/nvidia-uvm/uvm.c:791-795`), and a VMM that picks both
-satisfies it trivially.
+satisfies it trivially. Nor can the `offset` argument be used to point the range
+somewhere other than the mapping — see §2a-bis.
 
 The obstacle is that **the GPU VA of a managed range is the CPU VA of the VMA
 that created it**, and the guest's kernels dereference the *guest's* pointer.
@@ -98,6 +99,49 @@ UVM fd inside it with `offset == addr`. Nothing in that sequence touches a
 device node we own before the address is already decided, so a guest-side
 `get_unmapped_area` hook has nothing to hook: by the time `/dev/nvidia-uvm` is
 mmap'd, `MAP_FIXED` has already fixed the answer.
+
+## 2a-bis. Does `mmap`'s `offset` argument not decouple this?
+
+`mmap` does take an `offset`, and the obvious move is
+`mmap(H, len, …, uvm_fd, G)` — place the CPU mapping at a VMM-chosen `H` while
+declaring offset `G`, hoping UVM creates the range at `G`. That is the last
+variant of the proposal, and it is worth killing explicitly.
+
+**The argument is honoured, but only as a constraint.** `vm_pgoff` appears in
+exactly three places in the whole UVM driver:
+
+| site | use |
+|---|---|
+| `uvm.c:793-794` | the equality check `vma->vm_start != (vma->vm_pgoff << PAGE_SHIFT)` → `-EINVAL`, plus its debug print |
+| `uvm.c:358-361` | `unmap_mapping_range(vma->vm_file->f_mapping, vma->vm_pgoff << PAGE_SHIFT, …)` on the disable-vma path |
+| `uvm_test_file.c:99` | the `UVM_FD_TEST` device — not managed memory |
+
+**It is never used to place the range.** `uvm_va_range_create_mmap()` reads
+`vma->vm_start` and nothing else:
+`uvm_va_range_alloc_managed(va_space, vma->vm_start, vma->vm_end - 1)`
+(`uvm_va_range.c:224`). So `mmap(H, …, fd, G)` fails the check outright, and if
+the check were patched out the range would still be created at `H` — the offset
+has no path to the range's address.
+
+This is unlike a normal file mapping, where the offset selects *which part of a
+backing object* you see. A managed range has no backing object to offset into:
+its pages are allocated and migrated per `uvm_va_block`, created by the mapping
+itself.
+
+The driver's own comment says why the equality is required, and the second use
+above is half the reason:
+
+> *"UVM mappings are required to set offset == VA. This simplifies things since
+> we don't have to worry about address aliasing (except for fork, handled
+> separately) and it makes `unmap_mapping_range` simpler."*
+
+`unmap_mapping_range()` works on **file offsets**, and `f_mapping` is per
+`struct file` — so it reaches every VMA of that fd at that offset, in every
+process holding it. Pinning offset to VA is what stops two mappings of one
+shared UVM fd from aliasing in `f_mapping` and tearing each other down. Note
+what that implies for a design that maps one shared UVM fd twice: it would not
+merely be useless (§2d), it would be actively hazardous, because an unmap on one
+side unmaps the other by offset.
 
 ## 2c-bis. Cross-process sharing works. It is the number that must match, not the mm.
 
