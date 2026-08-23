@@ -209,9 +209,33 @@ Verified with the node chowned to the caller and `chmod 0666`:
 | `privileged_modeset=N` | master seized, `ADDFB` OK -- the old behaviour |
 
 The permission bits are irrelevant to the outcome, which is the point: the
-boundary is the capability. `privileged_modeset=N` restores upstream behaviour
-for anyone who needs an unprivileged compositor driving the head directly; it
-re-opens the hole above, so treat it as a debugging knob.
+boundary is the capability.
+
+### When to turn it off
+
+`privileged_modeset=N` is a **deployment choice, not a debugging knob**.
+
+Turning it off does not put you below upstream: you land exactly on the
+ordinary Linux posture -- unix permissions on the node, plus drm core's own
+`SET_MASTER` and `GETFB` checks. Neither drm core nor `nvidia-drm` gates the
+*first* opener of a primary node, so `Y` is nvkvm being **stricter than the
+driver it emulates**, and that has a cost: a session whose compositor opens the
+primary node itself gets `EACCES` and a black screen with no obvious cause.
+Measured: SteamOS's `sddm` -> `kwin_wayland` does exactly that -- it opens the
+node directly, with no logind fd-passing step -- and the desktop does not start
+until the gate is off.
+
+Leave it **on** where a process that is unprivileged *to the guest* should still
+not be able to drive or capture the guest's screen: multi-user guests, and above
+all guests running containers, where root-inside-a-container with `card*` mapped
+is precisely the case the gate answers.
+
+Turning it **off** is reasonable for a single-user appliance image where the
+desktop user already holds full privilege over the VM anyway. On SteamOS `deck`
+has passwordless sudo, so gating `card0` against `deck` protects nothing it
+could not simply take, and CUDA containers are not a scenario there. nvkvm's
+shipped default stays `Y`; an image that has made that judgement sets
+`options nvkvm_guest privileged_modeset=0` in `/etc/modprobe.d/` and says why.
 
 Render clients are untouched, so CUDA and Vulkan are unaffected, and weston
 still drives the head normally (it is started by root, and under logind the
