@@ -874,6 +874,23 @@ a `cuMemAllocManaged`/`cuMemFree` loop — without it, 1 mapping was followed by
 fallbacks at one address), and the ownership record is keyed on the UVM handle so
 one process can never reclaim another's live mapping.
 
+> **Correction, 2026-08-24.** The revert commit `2406a3c` states that "libcuda
+> picks the same UVM VA in every process, so the collision is deterministic". That
+> is **false**, and so is the `ARCHITECTURE.md` sentence it was taken from.
+> Measured on RTX 5090 / 580.95.05-open: **12 concurrent processes produced 12
+> distinct addresses.** libcuda reserves via an anonymous `PROT_NONE mmap(NULL,…)`
+> — guest-kernel ASLR picks the address — then `MAP_FIXED`s the UVM fd inside it.
+> The collision is a birthday collision at 2 MiB granularity over ~14 TiB: rare,
+> not certain. `known-limitations.md`'s original "where their allocators happened
+> to land" was right; the revert's repudiation of it was wrong.
+>
+> This also means the guest VA **cannot be steered** — it is settled before any
+> device we own is touched.
+>
+> The revert itself stands: it closes U-15 (the layout oracle). Only its reasoning
+> about collision frequency was wrong, and that changes the trade-off, not the
+> conclusion. See `docs/internal/uvm-va-decoupling.md`.
+
 What is **not** solved: two guest processes that genuinely want the same VA at
 the same time. The second takes the fallback. Measured on 1x RTX 5090: two
 concurrent CUDA processes both got working managed memory, with one unrelated
