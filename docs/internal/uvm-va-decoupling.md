@@ -100,6 +100,61 @@ device node we own before the address is already decided, so a guest-side
 `get_unmapped_area` hook has nothing to hook: by the time `/dev/nvidia-uvm` is
 mmap'd, `MAP_FIXED` has already fixed the answer.
 
+## 2a-ter. "But you can't just open `/dev/nvidia-uvm` and mmap it" — right, and that is the point
+
+True, and the initialisation sequence is worth spelling out, because the thing it
+allocates is *not* the thing that would need to be allocated for the address to
+be choosable.
+
+```
+open("/dev/nvidia-uvm")              -> fd A, private_data = UVM_FD_UNINITIALIZED
+open("/dev/nvidia-uvm")              -> fd B          (yes, twice)
+ioctl(A, UVM_INITIALIZE)             -> allocates the uvm_va_space,
+                                        uvm_fd_type_set(A, UVM_FD_VA_SPACE)   uvm.c:959
+ioctl(B, UVM_MM_INITIALIZE, {A})     -> fget(A), require UVM_FD_VA_SPACE,
+                                        uvm_fd_type_set(B, UVM_FD_MM, A)      uvm.c:67-126
+                                        binds the va_space to current->mm
+mmap(G, len, ..., A, G)              -> creates the managed range
+```
+
+The double open is real — the `strace` in §2c shows libcuda doing exactly this
+(`openat("/dev/nvidia-uvm") = 9`, `= 10`). Before `UVM_INITIALIZE`, `uvm_mmap()`'s
+switch on `uvm_fd_type()` falls to `default: return -EBADFD` (`uvm.c:769-780`) —
+which is precisely the `EBADFD` nvkvm's skipped stub-mirror comment records, and
+it means "this fd has no va_space yet", not "this process may not map it".
+
+**What that sequence allocates is the `va_space`.** What it does *not* allocate
+is the range. There is no RM object behind a managed range, no `hMemory`, no
+handle, no allocation ioctl — nothing to name, dup, or hand to a second mapper.
+
+The contrast inside UVM itself is the clearest way to see it. UVM has exactly two
+kinds of range that *are* allocated first and mapped second, and for both **the
+VA is an argument to the allocating ioctl**:
+
+| range kind | created by | who names the VA |
+|---|---|---|
+| `SEMAPHORE_POOL` | `UVM_ALLOC_SEMAPHORE_POOL` (68) | the ioctl; `mmap` afterwards must use that same VA |
+| external | `UVM_CREATE_EXTERNAL_RANGE` (73) + `UVM_MAP_EXTERNAL_ALLOCATION` (33) | the ioctl; backed by an RM `hMemory`, GPU VA independent of any CPU mapping |
+| **managed** | **`mmap` itself** | **the `mmap` address — there is no ioctl** |
+
+`va_range_type_expects_mmap()` returns true for exactly the first two
+(`uvm.c:743-757`); the `default:` arm carries the comment *"Although
+UVM_VA_RANGE_TYPE_MANAGED does support mmap, it doesn't expect mmap to be called
+on a pre-existing range. mmap itself creates the managed va range."*
+
+This is also, precisely, why U-6 needed a special case. The ownership table
+records a range when a range-**creating** ioctl is accepted by the driver —
+`NVKVM_UVM_VA_CREATE` on 27 / 65 / 68 / 73 (`nvkvm_isolate_handlers.c:660-682`).
+Managed ranges are the one kind with no such ioctl to hook, which is why the
+table never learned about them and refused every later use, and why `c8ea92d`
+had to add the `uvm_va_add()` call on the mmap path instead.
+
+So the intuition "it must be allocated, therefore its address must be nameable"
+is exactly right as a rule — and managed memory is the case where the rule does
+not apply. Everything in UVM whose VA you can choose, you choose in an ioctl.
+Managed memory has no such ioctl, which is the same sentence as "its address is
+the `mmap` address", which is the same sentence as §2b.
+
 ## 2a-bis. Does `mmap`'s `offset` argument not decouple this?
 
 `mmap` does take an `offset`, and the obvious move is
