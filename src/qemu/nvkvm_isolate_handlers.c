@@ -17,6 +17,11 @@
 #include <errno.h>
 #include <stdio.h>
 #include <sys/mman.h>
+/* Older glibc headers predate this; the flag is a kernel ABI constant and an
+ * unsupported kernel just ignores it (we re-check the returned address). */
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
 #include <sys/ioctl.h>
 
 #include "virtio_nvgpu.h"
@@ -47,6 +52,13 @@ struct nvkvm_iso_mmap_entry {
 	uint64_t gpa;
 	uint32_t handle_id;  /* frontend handle the mapping was made from, so a
 			      * close can tear the window extent down; 0 = none */
+	bool     uvm_va_owned; /* this mmap is what put the range into the U-6
+				* ownership table, so this mmap's teardown is
+				* what must take it out again.  False when an
+				* ioctl (ALLOC_SEMAPHORE_POOL, CREATE_EXTERNAL_
+				* RANGE, ...) recorded the range first: that
+				* range outlives the mapping and its UVM_FREE
+				* still has to be admitted. */
 };
 
 static struct nvkvm_iso_mmap_entry iso_mmap_tbl[NVKVM_ISO_MMAP_MAX];
@@ -55,7 +67,8 @@ static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 				size_t len, int kvm_slot, uint64_t gpa,
-				bool stub_mirrored, uint32_t handle_id)
+				bool stub_mirrored, uint32_t handle_id,
+				bool uvm_va_owned)
 {
 	pthread_mutex_lock(&iso_mmap_lock);
 	for (uint32_t i = 0; i < NVKVM_ISO_MMAP_MAX - 1; i++) {
@@ -71,6 +84,7 @@ static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 			iso_mmap_tbl[tok].kvm_slot      = kvm_slot;
 			iso_mmap_tbl[tok].gpa           = gpa;
 			iso_mmap_tbl[tok].handle_id     = handle_id;
+			iso_mmap_tbl[tok].uvm_va_owned  = uvm_va_owned;
 			pthread_mutex_unlock(&iso_mmap_lock);
 			return tok;
 		}
@@ -3018,6 +3032,113 @@ struct nvkvm_kvm_mem_region {
 #define NVKVM_IN_WINDOW_SLOT  (-2)
 
 /*
+ * Reclaim a stale /dev/nvidia-uvm mapping this handle already holds at exactly
+ * this VA.
+ *
+ * The guest does NOT tell us when a UVM VMA goes away: nvkvm_vma_close()
+ * (src/guest/nvkvm_mmap.c:123-132) only clears region->vma and defers the host
+ * munmap to fd close, "consistent with how the NVIDIA driver expects mappings
+ * to outlive individual VMAs".  That was harmless while QEMU never mapped
+ * /dev/nvidia-uvm at the guest VA.  Now that it does, it is the difference
+ * between managed memory working once and working: libcuda reuses the SAME VA
+ * for the next cuMemAllocManaged, our MAP_FIXED_NOREPLACE finds our own
+ * abandoned mapping still there, and every allocation after the first falls
+ * back to the un-managed path.  Measured: 1 UVMMAP followed by 23 UVMFALLBACK
+ * at one address, then a U-6 DENY on the 24th.
+ *
+ * A request to map the same UVM fd at the same VA is proof the previous
+ * mapping there is dead -- one address in one address space cannot be two live
+ * UVM ranges.  Keyed on handle_id, so this only ever reclaims a mapping made
+ * from the SAME UVM fd, i.e. the same guest process's va_space; a different
+ * process asking for the same VA still takes the fallback rather than stealing
+ * a neighbour's live mapping.
+ */
+static void nvkvm_uvm_reclaim_stale(VirtIONvgpu *nv, uint32_t handle_id,
+				    uint64_t va)
+{
+	if (!handle_id || !va)
+		return;
+	for (;;) {
+		struct nvkvm_iso_mmap_entry e;
+		bool found = false;
+		pthread_mutex_lock(&iso_mmap_lock);
+		for (uint32_t i = 1; i < NVKVM_ISO_MMAP_MAX; i++) {
+			if (!iso_mmap_tbl[i].used ||
+			    iso_mmap_tbl[i].handle_id != handle_id ||
+			    iso_mmap_tbl[i].kvm_slot == NVKVM_IN_WINDOW_SLOT ||
+			    (uint64_t)(uintptr_t)iso_mmap_tbl[i].qva != va)
+				continue;
+			e = iso_mmap_tbl[i];
+			iso_mmap_tbl[i].used = false;
+			found = true;
+			break;
+		}
+		pthread_mutex_unlock(&iso_mmap_lock);
+		if (!found)
+			return;
+
+		NVKVM_DBG("nvkvm: UVMRECLAIM handle=%u va=0x%llx len=%lu "
+			  "gpa=0x%llx slot=%d (new mapping requested at the "
+			  "same VA)\n",
+			  handle_id, (unsigned long long)va,
+			  (unsigned long)e.len, (unsigned long long)e.gpa,
+			  e.kvm_slot);
+
+		if (e.kvm_slot >= 0 && nvkvm_kvm_vm_fd >= 0) {
+			struct nvkvm_kvm_mem_region mr = {
+				.slot        = (uint32_t)e.kvm_slot,
+				.memory_size = 0,
+			};
+			ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
+			nvkvm_kvm_slot_release(e.kvm_slot);
+		}
+		if (e.uvm_va_owned)
+			uvm_va_drop(e.handle_id, va, (uint64_t)e.len);
+		if (e.qva)
+			munmap(e.qva, e.len);
+		if (e.gpa)
+			nvkvm_mmap_win_free(nv, e.gpa, (size_t)e.len);
+	}
+}
+
+/*
+ * Install one per-mmap KVM memslot for a /dev/nvidia-uvm mapping.
+ *
+ * UVM mappings are the one kind that cannot live in the sparse window (the
+ * driver pins them to vm_start == pgoff<<PAGE_SHIFT, so QEMU cannot MAP_FIXED
+ * them into the window buffer), so they keep the legacy per-mmap memslot out
+ * of mmap_win.  Returns the slot, or -1 with nothing installed and the slot
+ * returned to the pool.
+ */
+static int nvkvm_uvm_install_memslot(uint64_t gpa, void *hva, size_t len)
+{
+	if (nvkvm_kvm_vm_fd < 0)
+		return -1;
+	int slot = nvkvm_kvm_slot_alloc();
+	if (slot < 0) {
+		fprintf(stderr, "nvkvm: uvm mmap: KVM slot pool exhausted\n");
+		return -1;
+	}
+	struct nvkvm_kvm_mem_region mr = {
+		.slot            = (uint32_t)slot,
+		.flags           = 0,
+		.guest_phys_addr = gpa,
+		.memory_size     = (uint64_t)len,
+		.userspace_addr  = (uint64_t)(uintptr_t)hva,
+	};
+	if (ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
+		fprintf(stderr,
+			"nvkvm: uvm mmap: KVM_SET_USER_MEMORY_REGION slot=%d "
+			"gpa=0x%llx len=%lu: %s\n",
+			slot, (unsigned long long)gpa, (unsigned long)len,
+			strerror(errno));
+		nvkvm_kvm_slot_release(slot);
+		return -1;
+	}
+	return slot;
+}
+
+/*
  * KVM slot allocator is centralised in nvkvm_mmap_host.c via the
  * nvkvm_kvm_slot_alloc/release prototypes in virtio_nvgpu.h, shared with
  * nvkvm_mmap_create().  The stale `iso_kvm_slot_counter` monotonic
@@ -3145,6 +3266,9 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	uint64_t gpa       = 0;
 	int      kvm_slot  = -1;
 	bool     in_window = (h->dev_id != NVKVM_DEV_UVM);
+	/* Set only when the UVM branch below is what put this range into the
+	 * U-6 ownership table; see the field comment on nvkvm_iso_mmap_entry. */
+	bool     uvm_va_owned = false;
 
 	if (in_window) {
 		gpa = nvkvm_sparse_gpa_alloc(nv, len);
@@ -3248,34 +3372,182 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		kvm_slot = NVKVM_IN_WINDOW_SLOT;
 	} else {
 		/*
-		 * /dev/nvidia-uvm.  The old approach mmap'd the UVM fd MAP_FIXED at
-		 * req->offset in QEMU's address space and installed a per-mmap
-		 * memslot.  That collides across concurrent processes: libcuda
-		 * picks the same UVM VA in every process, and QEMU's single address
-		 * space can only hold one mapping there, so the second process hits
-		 * MAP_FIXED_NOREPLACE → EEXIST → cuCtxCreate fails (304).  (UVM also
-		 * cannot be MAP_FIXED into the sparse window: its kernel mmap
-		 * requires vm_start == (vm_pgoff<<PAGE_SHIFT).)
+		 * /dev/nvidia-uvm.
 		 *
-		 * Instead allocate the GPA from the sparse window and let it ride
-		 * the window's anonymous backing — no QEMU-side device mmap, no
-		 * per-mmap memslot, no cross-process VA collision (same model as the
-		 * realize path).  The stub owns the real UVM mapping in its own
-		 * per-process address space; the GPU reaches the memory via DMA, not
-		 * a QEMU CPU memslot.
+		 * The mmap IS the range-creating call.  UVM has no "create a
+		 * managed range" ioctl: uvm_mmap() calls uvm_va_range_create_mmap()
+		 * and that is the only thing that puts a managed uvm_va_range into
+		 * the va_space (ogkm kernel-open/nvidia-uvm/uvm.c:759-858).  The
+		 * same function requires
+		 *     vma->vm_start == (vma->vm_pgoff << PAGE_SHIFT)
+		 * (uvm.c:791-795) — the offset IS the address — so the mapping can
+		 * only be placed at req->offset, which is the VA libcuda reserved.
+		 *
+		 * It has to be made HERE, in QEMU's mm, because that is the mm
+		 * every UVM ioctl runs in (nvkvm_req_ioctl_on_isolate ioctl()s the
+		 * handle's fd directly).  Skipping it is not a small loss of
+		 * fidelity: with no range in the va_space,
+		 * uvm_api_validate_va_range() cannot find one
+		 * (uvm_va_range.c:762-777), UVM_VALIDATE_VA_RANGE fails, and
+		 * cuMemAllocManaged returns CUDA_ERROR_INVALID_VALUE — unified
+		 * memory does not work at all.  Measured on 2x RTX 5090.
+		 *
+		 * MAP_FIXED_NOREPLACE, never MAP_FIXED, for two reasons:
+		 *
+		 *  - Safety.  req->offset is a GUEST-chosen address being mapped
+		 *    into the privileged QEMU process.  NOREPLACE means we can only
+		 *    ever land on a hole, so a guest cannot name the KVM fd's
+		 *    mappings, a memslot, an isolate socket or QEMU's heap and have
+		 *    the UVM driver write there.  MAP_FIXED would hand it exactly
+		 *    that.
+		 *  - Collisions are expected and are not failures.  libcuda picks
+		 *    the same UVM VA in every process, and QEMU has one address
+		 *    space, so the second guest process asking for the same VA gets
+		 *    EEXIST.  This used to be fatal (cuCtxCreate 304), which is why
+		 *    the mapping was dropped altogether.  Fall back to the
+		 *    anonymous window backing instead: that process loses managed
+		 *    memory, it does not lose the GPU.
 		 */
-		gpa = nvkvm_sparse_gpa_alloc(nv, len);
-		void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
-		if (!target) {
-			NVKVM_DBG(
-				"nvkvm: mmap_on_isolate(uvm): sparse window full "
-				"(handle=%u len=%lu)\n",
-				req->handle_id, (unsigned long)len);
-			resp->status = ENOMEM;
-			return 0;
+		void      *want    = (void *)(uintptr_t)req->offset;
+		void      *real    = MAP_FAILED;
+		const bool mappable = req->offset != 0 &&
+				      (req->offset & 4095ULL) == 0 &&
+				      req->offset + len > req->offset;
+
+		int mmap_errno = 0;
+		if (mappable)
+			nvkvm_uvm_reclaim_stale(nv, req->handle_id,
+						req->offset);
+		if (mappable) {
+			real = mmap(want, len, PROT_READ | PROT_WRITE,
+				    MAP_SHARED | MAP_FIXED_NOREPLACE,
+				    h->fd, (off_t)req->offset);
+			if (real == MAP_FAILED)
+				mmap_errno = errno;
 		}
-		qva      = target;             /* sparse-window VA (anon-backed) */
-		kvm_slot = NVKVM_IN_WINDOW_SLOT;
+		if (real != MAP_FAILED && real != want) {
+			/* Kernel too old for NOREPLACE and it relocated us: a
+			 * UVM mapping anywhere but req->offset is useless (the
+			 * driver refuses it, and the VA would not match the
+			 * range the guest goes on to name).  Drop it. */
+			munmap(real, len);
+			real = MAP_FAILED;
+		}
+
+		if (real != MAP_FAILED) {
+			/*
+			 * A real UVM mapping cannot ride the sparse window's
+			 * single memslot (that memslot points at the window
+			 * buffer, and we could not MAP_FIXED the UVM fd into
+			 * it).  Give it a per-mmap memslot out of mmap_win —
+			 * which exists for exactly this and had been left
+			 * unused, see the window comment in
+			 * virtio_nvgpu.c:realize.
+			 */
+			nvkvm_mmap_win_alloc(nv, len, &gpa);
+			int slot = gpa ? nvkvm_uvm_install_memslot(gpa, real, len)
+				       : -1;
+			if (slot >= 0) {
+				qva      = real;
+				kvm_slot = slot;
+				/*
+				 * U-6 — record the range the DRIVER just
+				 * accepted.  This is the "earlier call that
+				 * establishes the range" the ownership table
+				 * was missing: every OTHER range-creating UVM
+				 * operation is an ioctl and was already
+				 * recorded from its rmStatus, but a managed
+				 * range is created by this mmap and by nothing
+				 * else, so the table never learned about it and
+				 * refused every later use of it.
+				 *
+				 * This does not widen U-6.  The entry is added
+				 * only after mmap() returned success, i.e.
+				 * after the UVM driver itself created the
+				 * range, so the table stays a narrowing of
+				 * driver state.  And because the mapping is
+				 * MAP_FIXED_NOREPLACE, the VA recorded is one
+				 * that was a hole in QEMU's address space —
+				 * never an address the guest could have aimed
+				 * at something of QEMU's.
+				 */
+				const bool pre =
+					uvm_va_covers(req->handle_id,
+						      req->offset, (uint64_t)len);
+				if (!uvm_va_add(req->handle_id,
+						req->offset, (uint64_t)len))
+					fprintf(stderr,
+						"nvkvm: WARN UVM VA table full — "
+						"handle %u managed range "
+						"0x%llx+0x%lx untracked (U-6)\n",
+						req->handle_id,
+						(unsigned long long)req->offset,
+						(unsigned long)len);
+				else
+					uvm_va_owned = !pre;
+				NVKVM_DBG("nvkvm: UVMMAP handle=%u va=0x%llx "
+					  "len=%lu gpa=0x%llx slot=%d\n",
+					  req->handle_id,
+					  (unsigned long long)req->offset,
+					  (unsigned long)len,
+					  (unsigned long long)gpa, slot);
+			} else {
+				munmap(real, len);
+				real = MAP_FAILED;
+				gpa  = 0;
+			}
+		}
+
+		if (real == MAP_FAILED) {
+			/*
+			 * Fallback (VA already taken in QEMU, or no memslot):
+			 * allocate the GPA from the sparse window and let it
+			 * ride the window's anonymous backing.  No QEMU-side
+			 * device mmap, no per-mmap memslot, no cross-process VA
+			 * collision.  Managed memory does not work through this
+			 * path — nothing recorded in the U-6 table, so
+			 * UVM_VALIDATE_VA_RANGE is refused exactly as before —
+			 * but cuCtxCreate and the rest of the UVM surface do.
+			 */
+			/*
+			 * Say so.  A fallback is a silent loss of managed
+			 * memory for this range, which is exactly the kind of
+			 * degradation that should never be invisible -- but
+			 * libcuda retries the same address, so print only when
+			 * the (handle, va, len) actually changes rather than
+			 * once per retry.
+			 */
+			static uint32_t last_h;
+			static uint64_t last_va, last_len;
+			if (req->handle_id != last_h ||
+			    req->offset != last_va || (uint64_t)len != last_len) {
+				last_h   = req->handle_id;
+				last_va  = req->offset;
+				last_len = (uint64_t)len;
+				fprintf(stderr,
+					"nvkvm: UVM mapping at guest VA 0x%llx+0x%lx "
+					"could not be placed in QEMU (handle=%u, "
+					"mmap: %s) -- falling back to anonymous "
+					"window backing; managed memory is "
+					"unavailable for this range\n",
+					(unsigned long long)req->offset,
+					(unsigned long)len, req->handle_id,
+					mmap_errno ? strerror(mmap_errno)
+						   : "not attempted (unaligned or zero VA)");
+			}
+			gpa = nvkvm_sparse_gpa_alloc(nv, len);
+			void *target = gpa ? nvkvm_gpa_to_vmm_va(nv, gpa, len) : NULL;
+			if (!target) {
+				NVKVM_DBG(
+					"nvkvm: mmap_on_isolate(uvm): sparse window full "
+					"(handle=%u len=%lu)\n",
+					req->handle_id, (unsigned long)len);
+				resp->status = ENOMEM;
+				return 0;
+			}
+			qva      = target;         /* sparse-window VA (anon-backed) */
+			kvm_slot = NVKVM_IN_WINDOW_SLOT;
+		}
 	}
 
 	/* Step 3: optionally mirror the mapping into the isolate's mm.
@@ -3318,7 +3590,17 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 				ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
 				nvkvm_kvm_slot_release(kvm_slot);
 			}
+			if (uvm_va_owned)
+				uvm_va_drop(req->handle_id,
+					    (uint64_t)(uintptr_t)qva,
+					    (uint64_t)len);
 			munmap(qva, len);
+		}
+		if (gpa) {
+			if (kvm_slot == NVKVM_IN_WINDOW_SLOT)
+				nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
+			else
+				nvkvm_mmap_win_free(nv, gpa, (size_t)len);
 		}
 		resp->status = (uint32_t)-ret;
 		return 0;
@@ -3327,7 +3609,8 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	/* Record for future MUNMAP_ON_ISOLATE */
 	uint32_t token = iso_mmap_alloc(req->isolate_id, req->gva, qva,
 					len, kvm_slot, gpa,
-					do_stub_mirror, req->handle_id);
+					do_stub_mirror, req->handle_id,
+					uvm_va_owned);
 	if (token == 0) {
 		/*
 		 * Table full: we cannot track this mapping for later teardown, so
@@ -3352,11 +3635,20 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 				      KVM_SET_USER_MEMORY_REGION, &mr);
 				nvkvm_kvm_slot_release(kvm_slot);
 			}
-			if (qva != MAP_FAILED && qva)
+			if (qva != MAP_FAILED && qva) {
+				if (uvm_va_owned)
+					uvm_va_drop(req->handle_id,
+						    (uint64_t)(uintptr_t)qva,
+						    (uint64_t)len);
 				munmap(qva, len);
+			}
 		}
-		if (gpa)
-			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
+		if (gpa) {
+			if (kvm_slot == NVKVM_IN_WINDOW_SLOT)
+				nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
+			else
+				nvkvm_mmap_win_free(nv, gpa, (size_t)len);
+		}
 		resp->status = ENOMEM;
 		return 0;
 	}
@@ -3440,17 +3732,32 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 			ioctl(nvkvm_kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
 			nvkvm_kvm_slot_release(e.kvm_slot);
 		}
-		if (e.qva)
+		if (e.qva) {
+			/* U-6: if this mapping is what created the range, the
+			 * range dies with it -- drop the ownership entry too, so
+			 * the table cannot outlive the VA and go on admitting an
+			 * address QEMU has handed back to the allocator. */
+			if (e.uvm_va_owned)
+				uvm_va_drop(e.handle_id,
+					    (uint64_t)(uintptr_t)e.qva,
+					    (uint64_t)e.len);
 			munmap(e.qva, e.len);
+		}
 	}
 
 	/* #80/H-1: return the GPA extent to the window free-list so a
-	 * mmap/munmap loop recycles window space instead of leaking it. */
+	 * mmap/munmap loop recycles window space instead of leaking it.
+	 * Which window depends on which branch made it: the sparse window for
+	 * in-window mappings, mmap_win for the per-memslot UVM ones. */
 	NVKVM_DBG("nvkvm: WINUNMAP token=%u gpa=0x%llx len=%lu slot=%d\n",
 		  req->mmap_token, (unsigned long long)e.gpa,
 		  (unsigned long)e.len, e.kvm_slot);
-	if (e.gpa)
-		nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+	if (e.gpa) {
+		if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT)
+			nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+		else
+			nvkvm_mmap_win_free(nv, e.gpa, (size_t)e.len);
+	}
 
 	resp->status = 0;
 	return 0;
@@ -3500,11 +3807,21 @@ static int nvkvm_iso_mmap_reap_handle(VirtIONvgpu *nv, uint32_t isolate_id,
 				      KVM_SET_USER_MEMORY_REGION, &mr);
 				nvkvm_kvm_slot_release(e.kvm_slot);
 			}
-			if (e.qva)
+			if (e.qva) {
+				/* U-6: see the munmap handler. */
+				if (e.uvm_va_owned)
+					uvm_va_drop(e.handle_id,
+						    (uint64_t)(uintptr_t)e.qva,
+						    (uint64_t)e.len);
 				munmap(e.qva, e.len);
+			}
 		}
-		if (e.gpa)
-			nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+		if (e.gpa) {
+			if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT)
+				nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+			else
+				nvkvm_mmap_win_free(nv, e.gpa, (size_t)e.len);
+		}
 		reaped++;
 		pthread_mutex_lock(&iso_mmap_lock);
 	}
@@ -3545,11 +3862,21 @@ static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
 				      KVM_SET_USER_MEMORY_REGION, &mr);
 				nvkvm_kvm_slot_release(e.kvm_slot);
 			}
-			if (e.qva)
+			if (e.qva) {
+				/* U-6: see the munmap handler. */
+				if (e.uvm_va_owned)
+					uvm_va_drop(e.handle_id,
+						    (uint64_t)(uintptr_t)e.qva,
+						    (uint64_t)e.len);
 				munmap(e.qva, e.len);
+			}
 		}
-		if (e.gpa)
-			nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+		if (e.gpa) {
+			if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT)
+				nvkvm_sparse_gpa_free(nv, e.gpa, (size_t)e.len);
+			else
+				nvkvm_mmap_win_free(nv, e.gpa, (size_t)e.len);
+		}
 		reaped++;
 		pthread_mutex_lock(&iso_mmap_lock);
 	}
@@ -4031,7 +4358,7 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 					     /*qva=*/NULL, (size_t)len,
 					     NVKVM_IN_WINDOW_SLOT, gpa,
 					     /*stub_mirrored=*/false,
-					     /*handle_id=*/0);
+					     /*handle_id=*/0, /*uvm_va_owned=*/false);
 	if (mmap_token == 0) {
 		/*
 		 * Table full.  This return was discarded with a (void) cast,
