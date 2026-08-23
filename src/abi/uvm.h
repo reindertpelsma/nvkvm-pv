@@ -257,6 +257,42 @@ struct uvm_map_dynamic_parallelism_region_params {
 	__u32 reserved;
 };
 
+/*
+ * UVM_UNMAP_EXTERNAL (66).
+ *
+ * The same shape of gap as UVM_MAP_DYNAMIC_PARALLELISM_REGION (65) above, one
+ * NR over, and the tree was already ASYMMETRIC about it: QEMU carries the
+ * host-side entry (src/qemu/nvkvm_isolate_handlers.c, NR 66,
+ * NVKVM_UVM_VA_USE) and the guest treats it as a VALIDATE-cache invalidator
+ * (src/guest/nvkvm_main.c, "Any UVM range teardown invalidates the VALIDATE
+ * cache" (#94)) -- but nvkvm_ioctl_param_size() had no case for it, so the
+ * size table was the one site that did not know the ioctl existed.
+ *
+ * How it presented: OBSERVED on an RTX PRO 6000 Blackwell (GB202, sm_120) on
+ * 2026-08-23, as
+ *     nvkvm: AUDIT unknown ioctl cmd=0x42 type=0x0 nr=0x42 iocsz=0
+ * in the guest log, four times per run, on every driver tested (580.95.05,
+ * 590.48.01, 610.57.04).  It FAILED SAFE rather than misrouting: with no size
+ * entry the call reaches the sanitizer's _IOC_TYPE != 'F' gate and is refused,
+ * which is exactly the outcome that gate was added for after the 65 bug.  So
+ * nothing was corrupted (28/28 throughout) -- the UVM unmap simply never
+ * reached the host.
+ *
+ * MEASURED, not derived: sizeof(UVM_UNMAP_EXTERNAL_PARAMS) == 40 with
+ * base=0, length=8, gpuUuid=16, rmStatus=32, from a compiled offsetof probe
+ * against open-gpu-kernel-modules at BOTH tag 580.95.05 and tag 610.57.04
+ * (kernel-open/nvidia-uvm/uvm_ioctl.h:935-942 in each).  The two are
+ * byte-identical, so this layout spans the 580 and 610 ABI profiles and does
+ * not need a per-profile value.
+ */
+struct uvm_unmap_external_params {
+	__u64 base;
+	__u64 length;
+	struct uvm_uuid gpu_uuid;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
 struct uvm_create_external_range_params {
 	__u64 base;
 	__u64 length;

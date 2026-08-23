@@ -176,6 +176,23 @@ different vCPU counts (25 vs 4 here) it is not a clean GPU-encode parity number.
   thread sits in a healthy `epoll_wait` under `wl_display_run` with no
   nvidia-egl-gbm in the stack, and `weston-screenshooter` captured a populated
   1920x1080 desktop — textured wallpaper, top panel, live clock.
+> **STALE (superseded 2026-08-19).** The next bullet's *symptom* was real and
+> its differential method is still the right one, but its CONCLUSION — "PRIME/
+> dma-buf export of a rendered EGL surface is not forwarded", i.e. a gap decided
+> outside nvkvm — is wrong. Two guest-side bugs were found and fixed on
+> 2026-08-19 (`GET_DEV_INFO` leaking the HOST's `primary_index` into the guest,
+> and `nvkvm_drm_ioctls[]` having no `[0x01] GEM_IMPORT_NVKMS_MEMORY`, so the
+> DRM *core* returned `-EINVAL` before nvkvm's dispatch ever ran — which is why
+> nothing was DENYed and it looked like NVIDIA's userspace refusing). After
+> them, `egl_dmabuf_export_probe` in the guest reports `PASS dma-buf export
+> works` and `WAYLAND_DEBUG` shows a healthy triple-buffered
+> `create`/`attach`/`damage`/`commit` loop. Full evidence, including the
+> host/guest `strace` A/B that localised it to one ioctl:
+> [`docs/internal/known-limitations.md`](../../docs/internal/known-limitations.md)
+> ("GL clients under Wayland presented nothing — TWO ROOT CAUSES FIXED
+> 2026-08-19"). The measurements below are kept as the record of the
+> 2026-08-17 state; do not read the last paragraph as current.
+
 - **GL *clients*: now reach the GPU, but present NOTHING.  Root-caused to
   dma-buf export (2026-08-17).**  The earlier "clients land on llvmpipe" result
   was a *staging* failure and is fixed: with the EGL external platform staged

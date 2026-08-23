@@ -244,64 +244,21 @@ cat > /home/$GUEST_USER/start-cinnamon-x11.sh <<'CX'
 # it.  Invoked by run-session.sh; safe to run by hand too.
 exec > ~/cinnamon-x11.log 2>&1
 set -x
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+export XDG_RUNTIME_DIR="\${XDG_RUNTIME_DIR:-/run/user/\$(id -u)}"
+export WAYLAND_DISPLAY="\${WAYLAND_DISPLAY:-wayland-1}"
 
 pkill -f "Xwayland :2" 2>/dev/null
 sleep 1
 
-# Follow the HEAD's mode rather than asserting one.  kms_width/kms_height are
-# module parameters now, so 1920x1080 is a default, not a fact -- hardcoding it
-# here would render the desktop larger than the scanout on any guest that set
-# them.  Ask the connector nvkvm actually drives; fall back only if that fails.
-NVKVM_MODE=$(for c in /sys/class/drm/card*/card*-*/; do
-        drv=$(basename "$(readlink -f "$c/../device/driver" 2>/dev/null)" 2>/dev/null)
-        [ "$drv" = nvkvm-guest ] && head -1 "$c/modes" 2>/dev/null && break
-    done)
-[ -n "$NVKVM_MODE" ] || NVKVM_MODE=1920x1080
-echo "nvkvm head mode: $NVKVM_MODE"
-
-Xwayland :2 -fullscreen -geometry "$NVKVM_MODE" &
-for _ in $(seq 1 60); do
+Xwayland :2 -fullscreen -geometry 1920x1080 &
+for _ in \$(seq 1 60); do
     [ -S /tmp/.X11-unix/X2 ] && break
     sleep 0.5
 done
 [ -S /tmp/.X11-unix/X2 ] || { echo "Xwayland :2 never came up"; exit 1; }
 
-export PATH="$HOME/bin:$PATH"     # for the cinnamon --x11 shim, see ~/bin/cinnamon
+export PATH="\$HOME/bin:\$PATH"     # for the cinnamon --x11 shim, see ~/bin/cinnamon
 export DISPLAY=:2
-
-# Pin the mode.  Xwayland is started with -geometry 1920x1080 above, but
-# -fullscreen makes it adopt the output's PREFERRED mode instead, and the head
-# advertises 5120x2880.  The X screen then comes up at 5K while nvkvm scans out
-# 1920x1080: the desktop is rendered at a size the scanout cannot show, so
-# everything is oversized and the pointer lands in the wrong place.  Measured on
-# the physical test box -- XWAYLAND0 at 5120x2880 against a 1920x1080 scanout.
-#
-# Re-assert it here, after the server is up and before any client connects.
-# Doing it from a terminal with xrandr fixes the running session but does NOT
-# survive a restart, because 5120x2880 is still the preferred mode and comes
-# back every time Xwayland starts.  This is the part that persists.
-for _ in $(seq 1 20); do
-    xrandr --output XWAYLAND0 --mode "$NVKVM_MODE" 2>/dev/null && break
-    sleep 0.5
-done
-
-# ...and again, in the background, for a while.  Setting it once here is not
-# enough: cinnamon-settings-daemon's xrandr plugin applies its OWN saved display
-# configuration when the session comes up, a few seconds after this point, and
-# it picks the preferred mode -- 5120x2880 -- straight back.  Measured: the
-# session log shows this script setting 1920x1080 successfully, and xrandr
-# reporting 5120x2880 minutes later.  Re-asserting past the point where csd
-# settles means we apply last.  Cheap, idempotent, and it stops on its own.
-(
-    for _ in $(seq 1 30); do
-        sleep 2
-        xrandr 2>/dev/null | grep -q "current ${NVKVM_MODE%x*} x ${NVKVM_MODE#*x}" ||
-            xrandr --output XWAYLAND0 --mode "$NVKVM_MODE" 2>/dev/null
-    done
-) &
-xrandr 2>/dev/null | grep -E "^(Screen |XWAYLAND0 )"   # leave the proof in the log
 export XDG_SESSION_TYPE=x11
 export XDG_CURRENT_DESKTOP=X-Cinnamon
 export XDG_SESSION_DESKTOP=cinnamon
@@ -332,7 +289,7 @@ CX
 mkdir -p /home/$GUEST_USER/bin
 cat > /home/$GUEST_USER/bin/cinnamon <<'SHIM'
 #!/bin/sh
-exec /usr/bin/cinnamon --x11 "$@"
+exec /usr/bin/cinnamon --x11 "\$@"
 SHIM
 chmod +x /home/$GUEST_USER/bin/cinnamon
 chmod +x /home/$GUEST_USER/run-session.sh /home/$GUEST_USER/start-cinnamon-x11.sh
@@ -340,7 +297,7 @@ echo cinnamon-x11 > /home/$GUEST_USER/session-choice
 
 # The guard is NOT optional.  /usr/bin/cinnamon-session is a shell wrapper that,
 # for a wayland session, re-execs itself through a LOGIN shell:
-#     exec bash -c "exec -l '$SHELL' -c '$0 -l $*'"
+#     exec bash -c "exec -l '\$SHELL' -c '\$0 -l \$*'"
 # so the session inherits the user's login environment.  That login shell
 # re-reads .bash_profile -- which would start the session again.  Without the
 # guard that is an infinite exec chain: it spins at 100% CPU, never spawns a
@@ -348,7 +305,7 @@ echo cinnamon-x11 > /home/$GUEST_USER/session-choice
 # The guard survives because exec preserves the environment.
 cat > /home/$GUEST_USER/.bash_profile <<'BP'
 [ -f ~/.bashrc ] && . ~/.bashrc
-if [ -z "$NVKVM_SESSION_LAUNCHED" ] && [ -z "$WAYLAND_DISPLAY" ] && [ "$XDG_VTNR" = 1 ]; then
+if [ -z "\$NVKVM_SESSION_LAUNCHED" ] && [ -z "\$WAYLAND_DISPLAY" ] && [ "\$XDG_VTNR" = 1 ]; then
   export NVKVM_SESSION_LAUNCHED=1
   exec ~/run-session.sh
 fi
@@ -358,7 +315,7 @@ chown -R $GUEST_USER:$GUEST_USER /home/$GUEST_USER/run-session.sh \
       /home/$GUEST_USER/session-choice /home/$GUEST_USER/.bash_profile
 
 # Build and load the guest module at boot.  RequiresMountsFor is load-bearing:
-# the 9p fstab entries are `nofail`, which removes them from local-fs.target's
+# the 9p fstab entries are \`nofail\`, which removes them from local-fs.target's
 # dependency set, so ordering After=local-fs.target guarantees nothing and the
 # unit loses the race on reboot -- leaving the guest with no DRM node and no
 # GPU.  Same bug, same fix as candidate 67a18e3 on the Ubuntu guest.
@@ -372,7 +329,7 @@ Before=getty@tty1.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest && exit 0; modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko'
+ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest && exit 0; modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/\$(uname -r)/build && insmod ./nvkvm-guest.ko'
 # Nodes created by a late insmod are root:root 0600 with no by-path links --
 # they miss the boot-time uevent flow.  Without this trigger no unprivileged
 # compositor can open the card.
