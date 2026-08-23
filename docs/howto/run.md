@@ -156,6 +156,68 @@ Set `NVKVM_DEBUG=1` in QEMU's environment for verbose per-operation tracing
 (`src/qemu/virtio_nvgpu.c:1102`). Errors and security `DENY` lines are printed
 unconditionally either way.
 
+## UEFI guests: OVMF needs a bigger 64-bit PCI window
+
+`run_test_vm.sh` boots SeaBIOS, where this does not arise. If you boot a guest
+under **OVMF/UEFI** — which some distro images require, SteamOS among them — add:
+
+```
+-fw_cfg opt/ovmf/X-PciMmio64Mb,string=262144
+```
+
+Without it the guest **hangs in firmware before the bootloader, with no error
+message on any console**. It is not a crash and not a boot-device problem: OVMF
+simply stops.
+
+Why: nvkvm reserves a large 64-bit GPA window for guest-physical forwarding, and
+says so at startup —
+
+```
+nvkvm: GPA windows: guest RAM top ~0x400000000 (16 GiB), floor 0x4000000000
+       -> block base 0xdfdbc0000000 size 145 GiB
+```
+
+OVMF's default 64-bit PCI MMIO aperture is far smaller than that window, and it
+wedges rather than failing loudly. `X-PciMmio64Mb` is OVMF's own knob for the
+aperture size; 262144 (256 GiB) comfortably covers the window above.
+
+Measured on an RTX 3090 host, driver 580.105.08, booting SteamOS
+(`steamdeck-oobe-repair-20260707.10`) with OVMF 4M. Guest RIP read from the QEMU
+monitor isolates it — firmware-range RIP means wedged, kernel-range means booted:
+
+| devices attached | guest RIP | result |
+|---|---|---|
+| `nvkvm-gpu` only | `ffffffffa58d7aef` | boots |
+| `virtio-nvgpu` only | `000000007f46a561` | **wedged in firmware** |
+| neither (control) | `ffffffff928d7aef` | boots |
+| both, `+X-PciMmio64Mb=262144` | `ffffffffa92d7aef` | boots |
+
+So it is `virtio-nvgpu`'s window that OVMF cannot accommodate; the identity
+`nvkvm-gpu` device is not involved.
+
+### Debugging note: nvkvm's scanout is console 0
+
+With nvkvm attached, its scanout registers as QEMU **console 0**. A bare
+`screendump file.ppm` therefore captures nvkvm's placeholder —
+
+```
+Guest has not initialized the display (yet).
+```
+
+— which is what nvkvm shows until the guest compositor renders through it. A
+guest that is booting perfectly well on the emulated VGA looks dead this way, and
+that is a costly wrong turn. `screendump <file> <device-id>` does not reliably
+select the other console either, and `screendump -d <id>` is rejected outright
+("unsupported option -d").
+
+**Use guest RIP as the liveness check instead:**
+
+```
+(qemu) info registers
+RIP=ffffffff.......   # kernel space -> the guest is running
+RIP=000000007f......  # firmware range -> still in OVMF
+```
+
 ## 4. Stage the NVIDIA userspace
 
 ```bash
