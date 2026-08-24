@@ -289,12 +289,67 @@ static InputButton relay_btn(unsigned code)
 static void relay_set_relative(bool relative)
 {
     MouseInfoList *mice = qmp_query_mice(NULL), *e;
+    MouseInfo *pick = NULL;
+    bool found = false;
 
+    /*
+     * PICK DETERMINISTICALLY, AND PREFER VIRTIO.
+     *
+     * Taking the first device with the right absolute-ness is not stable:
+     * qemu_mouse_set() moves the chosen handler to the head of the list
+     * (ui/input.c), so the NEXT query sees a different order and the next
+     * grab picks a different device.  A guest with virtio-tablet,
+     * virtio-mouse, an emulated PS/2 mouse and vmmouse has two candidates in
+     * each direction, and the grab lands on a different one each time.
+     *
+     * Observed on hardware 2026-08-24: grab worked roughly every other
+     * attempt, the failures being the ones that selected "QEMU PS/2 Mouse" or
+     * "vmmouse" -- devices the guest's desktop is not reading -- so the
+     * pointer simply froze until the user ungrabbed and tried again.  It read
+     * as a flaky grab and was really a coin flip over four devices.
+     *
+     * The virtio devices are the ones the guest driver actually uses, and
+     * they are the ones this harness attaches on purpose, so prefer them by
+     * name and fall back to the first match only if there is no virtio
+     * candidate at all.
+     */
     for (e = mice; e; e = e->next) {
-        if (e->value->absolute != relative) {
-            qemu_mouse_set((int)e->value->index, NULL);
+        if (e->value->absolute == relative) {
+            continue;                   /* wrong kind */
+        }
+        if (!pick) {
+            pick = e->value;            /* fallback: first of the right kind */
+        }
+        if (e->value->name && strstr(e->value->name, "Virtio")) {
+            pick = e->value;
             break;
         }
+    }
+    if (pick) {
+        qemu_mouse_set((int)pick->index, NULL);
+        RELAY_LOG("pointing device -> #%d %s (%s)",
+                  (int)pick->index, pick->name,
+                  relative ? "relative" : "absolute");
+        found = true;
+    }
+    /*
+     * SAY SO when there is nothing to switch to.  A guest configured with only
+     * virtio-tablet (the default: see VM_RELATIVE_MOUSE in
+     * scripts/run_test_vm.sh) has no relative device at all, so a grab
+     * suppresses absolute motion in the broker and the relative motion it
+     * sends instead lands on nothing -- the pointer simply stops until the
+     * user ungrabs.  Observed on hardware 2026-08-24.  It looks like a broken
+     * grab and is really a missing device, and the difference was invisible
+     * because this function failed silently.
+     */
+    if (!found) {
+        RELAY_LOG("NO %s pointing device exists -- the guest was started "
+                  "without one, so %s.  Add -device virtio-mouse-pci "
+                  "(VM_RELATIVE_MOUSE=1 in scripts/run_test_vm.sh) if you "
+                  "want mouse-look under grab.",
+                  relative ? "relative" : "absolute",
+                  relative ? "pointer motion goes nowhere while grabbed"
+                           : "the pointer cannot be put back on ungrab");
     }
     qapi_free_MouseInfoList(mice);
 }
