@@ -45,6 +45,7 @@ tests/unit/test_isolate
 tests/unit/test_tables
 tests/unit/test_open_scm
 tests/unit/test_ctrl_gate
+tests/unit/test_uvm_va_gate
 tests/unit/mock_stub
 tests/unit/test_nvkms_allowlist
 tests/unit/test_stub_ptr_sanitize

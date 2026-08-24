@@ -900,9 +900,36 @@ space. U-15 (the layout oracle) stays closed, and `u3_u6_gate_test` still report
 | `cudaMemPrefetchAsync` (`UVM_MIGRATE`, 51) | fails `NV_ERR_INVALID_ADDRESS` |
 | `cudaMemAdvise` preferred-location / accessed-by (42/43/46/47) | fail `NV_ERR_INVALID_ADDRESS` |
 | read duplication (44) | fails `NV_ERR_INVALID_ADDRESS` |
+| `UVM_VALIDATE_VA_RANGE` (72) **on an extent nvkvm never recorded** | refused by the U-6 gate with `NV_ERR_INVALID_ADDRESS` — the same answer the driver gives, and libcuda treats it as one |
 | **oversubscription** | refused: `cuMemAllocManaged` past host RAM returns an error and a NULL pointer |
 
-All of those are managed-only policy paths that iterate
+Cmd 72 is the odd one out on that list, and worth reading carefully because it
+was mistaken for a bug. It is a **question**, not an operation:
+`uvm_api_validate_va_range()` answers `NV_OK` only when ONE `va_range` matches
+the requested extent **exactly** (`uvm_va_range.c:762-777` — `node.start ==
+base && node.end + 1 == base + length`), so a sub-extent, a span across two
+ranges, or an address with no range at all is `NV_ERR_INVALID_ADDRESS` on bare
+metal too. U-6's own check is *containment*, which is strictly weaker than that
+exact match, and every `va_range` a guest can now have comes from a
+range-creating ioctl the table records with the identical base/length (73/68/65/27
+— managed allocations included, since the fallback downgrades them to external
+ranges). **So U-6 cannot refuse a 72 the driver would have accepted**: an extent
+the table does not cover is an extent the driver does not have.
+
+That is why the refusal is correct and is *not* being allowlisted. What was wrong
+was the channel it was logged on: until 2026-08-24 every refused 72 printed
+`DENY UVM cmd=0x48 ... not owned by handle N (U-6)`, which is the early-warning
+line an operator reads to spot guest-originated probes. Filling it with the
+routine negative answer to a query trains its readers to ignore it. Cmd 72 is now
+classified `NVKVM_UVM_VA_QUERY` (`src/qemu/nvkvm_uvm_va.h`): the ownership check
+and the refusal are byte-identical, and only the log line changes — a
+rate-limited `nvkvm: UVM query cmd=0x48 ... is not a range of handle N` on the
+diagnostic channel. `51/42/43/46/47/44` keep their `DENY` lines, because refusing
+those blocks an operation the guest asked for. Pinned by
+`tests/unit/test_uvm_va_gate.c`, which asserts the ownership decisions themselves
+rather than any log text.
+
+All of the *other* rows are managed-only policy paths that iterate
 `uvm_va_space_iter_managed_*` (`uvm_policy.c:429`, `uvm_migrate.c:1159-1163`), and
 an external range is not managed. Measured (M1, `uvm-va-decoupling.md` §6b):
 libcuda **tolerates** every one of them failing — an application that ignores the
@@ -935,22 +962,43 @@ response would be a trusted component inventing kernel results.
 #### Costs and limits
 
 - **One RM sysmem object, one `/dev/nvidiactl` handle and one host fd per live
-  managed allocation.** The per-allocation handle is forced by the driver: RM arms
+  UVM *mapping*** — which is **not** the same as per allocation, see the
+  headroom bullet below: libcuda mmaps `/dev/nvidia-uvm` in 2 MiB units and
+  suballocates within them, and the fallback fires once per mmap. Measured:
+  20,000 live 64 KiB managed allocations cost 625 of each, and `RLIMIT_NOFILE`
+  was never approached. The per-mapping handle is forced by the driver: RM arms
   its mmap context on the `struct file` named by `NVOS33.fd` and **never clears
   it** (`nv-usermap.c:52-56` arms; only `nv_free_file_private()` releases), so a
   second `NV_ESC_RM_MAP_MEMORY` against a file that already carries one returns
   `NV_ERR_STATE_IN_USE` (0x63). Measured both ways by
   `tools/uvm_sysmem_probe.c`.
-- **`NVKVM_UVM_VA_MAX` headroom.** Each live managed allocation occupies exactly
-  one entry of the 16384-entry U-6 ownership table, which is VM-global and shared
-  with every other external range in the VM (`cudaMalloc` already creates ~24 per
-  context). The entry is added on `UVM_CREATE_EXTERNAL_RANGE` and dropped on
-  `UVM_FREE`, so the cost is proportional to *concurrently live* allocations, not
-  to allocation churn — 1,000 sequential managed alloc/free cycles (4 GiB of
-  cumulative demand) left both the table and host RAM flat
-  (`tests/integration/managed_leak.c`). A workload holding more than ~16k live
-  managed allocations across the whole VM would exhaust it, and the table fails
-  closed (`DENY … VA ownership table full`).
+- **`NVKVM_UVM_VA_MAX` headroom — one entry per 2 MiB of live managed VA, i.e.
+  ~32 GiB VM-global.** *Corrected 2026-08-24; this bullet previously said "one
+  entry per live managed allocation, out of 16384", which is wrong and
+  pessimistic by up to 32x.* An entry is charged per `/dev/nvidia-uvm` **mapping**
+  (one `UVM_CREATE_EXTERNAL_RANGE` per mmap), and libcuda mmaps in 2 MiB units
+  and suballocates inside them. Measured by counting `/dev/nvidia-uvm` VMAs while
+  holding the allocations live (`tests/uvm_multiarch/managed_headroom.c`),
+  identically on Ampere and Ada:
+
+  | allocation size | table entries each | 20,000 live cost |
+  |---|---|---|
+  | 64 KiB | **0.0312** (32 allocations share one 2 MiB range) | 625 entries |
+  | 2 MiB  | **1.0000** | 20,000 entries |
+
+  So the governing unit is *live managed virtual address space*, not allocation
+  count: 16384 entries x 2 MiB ≈ **32 GiB of concurrently live managed VA**,
+  VM-global and shared with every other external range in the VM (`cudaMalloc`
+  already creates ~24 per context). 20,000 live allocations succeeded on every
+  architecture tested with a healthy context and a full release afterwards;
+  neither the table nor `RLIMIT_NOFILE` was reached. The entry is added on
+  `UVM_CREATE_EXTERNAL_RANGE` and dropped on `UVM_FREE`, so the cost tracks
+  *concurrently live* mappings, not churn — 1,000 sequential managed alloc/free
+  cycles (4 GiB of cumulative demand) left both the table and host RAM flat
+  (`tests/integration/managed_leak.c`). Past the bound the table fails closed
+  (`DENY … VA ownership table full`). The 2026-08-24 U-6 query reclassification
+  does not move this number: cmd 72 never added or dropped an entry — only
+  73/68/65/27 (add) and 34 (drop) do.
 - **`mmap` ceiling.** A single managed allocation is bounded by the pre-existing
   forwarded-mmap guard `vma_len > SZ_1G` (`nvkvm_mmap.c`), i.e. 1 GiB. A ladder
   from 4 MiB to 1 GiB inclusive is verified end to end
@@ -985,6 +1033,16 @@ than renamed, so the numbers are not read as evidence about migration:
 - **`validate.sh`'s `cuda_managed_coherence`** reports "3 CPU<->GPU migration
   cycles". It genuinely verifies coherence in both directions by value, which is
   the property that matters; the word "migration" is wrong for this backing.
+- **NVIDIA's `UnifiedMemoryPerf` sample does NOT complete** — it was recorded as
+  "correct but unusably slow", which is a different fact and leads a reader to a
+  different decision. Measured under the fallback: **28:39 on Turing and 22:43 on
+  Ampere produced 61 bytes of output and a single progress dot**, i.e. it never
+  reached a result to be correct or slow *about*. Read it as non-terminating on
+  this backing, not as a slow pass. (The "very slow" wording also sits in
+  `tests/uvm_multiarch/build_apps.sh` and `battery.sh` on the
+  `uvm-multiarch-sweep` branch and needs the same correction there.) The sample
+  is a migration benchmark, and there is no migration here, so this is the
+  expected shape of the answer — but the honest phrasing is "does not finish".
 
 #### Cross-process collision: no longer a thing
 

@@ -427,6 +427,7 @@ Eight binaries, all of which build (`tests/unit/Makefile:39`):
 | `test_frontend` | 8/8 |
 | `test_open_scm` | prints `ALL OPEN_SCM TESTS PASSED` |
 | `test_ctrl_gate` | prints `test_ctrl_gate: PASS` |
+| `test_uvm_va_gate` | 11/11 — the U-6 UVM VA-ownership gate (`src/qemu/nvkvm_uvm_va.h`) |
 | `test_isolate` | 7 cases run, exactly 5 known-failing |
 | `mock_stub` | not a suite — the fake isolate `test_isolate` spawns |
 

@@ -597,6 +597,19 @@ still (a) an intra-QEMU cross-range confusion surface with no host-side ownershi
 in this report that the isolate does not contain**: the target process is QEMU, which holds the KVM
 fd, the memslots, every isolate's socket, and the per-VM handle table.
 
+**Where the code lives now (2026-08-24).** The schema and the ownership table moved out of
+`nvkvm_isolate_handlers.c` into `src/qemu/nvkvm_uvm_va.h`, unchanged, so the gate's decisions can be
+asserted by `tests/unit/test_uvm_va_gate.c` without QEMU's headers (line numbers quoted above are
+pre-move). One classification changed with the move: `72 VALIDATE_VA_RANGE` is `NVKVM_UVM_VA_QUERY`
+rather than `..._USE`. It is still ownership-checked and still refused with `NV_ERR_INVALID_ADDRESS`
+— the change is that its refusal no longer prints on the `DENY` channel, because cmd 72 asks a
+question and "no" is the answer the driver itself gives (`uvm_va_range.c:762-777` requires ONE
+`va_range` matching the extent exactly, so U-6's containment test is strictly weaker and can never
+refuse a 72 the driver would have accepted). Normal managed-memory traffic was writing those lines
+on all four architectures, which is a monitoring regression in the one log an operator reads for
+guest probes. Refusals of `51/42/43/46/47/44/34` — where a refusal blocks a real operation — keep
+their `DENY` lines.
+
 Secondary note on the same table: its comment at `:546-556` states that rows 44/45/53/65/66 are
 "NOT in our ABI" and therefore carry `min_size 0` (accept any size). Four of those five
 (44/45/65/66) do have `UVM_*_PARAMS` structs in ogkm 575.51.03 with `base`/`length`, so the "no

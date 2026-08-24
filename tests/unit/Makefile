@@ -34,9 +34,11 @@ OPEN_SCM_SRCS = test_open_scm.c
 
 CTRL_GATE_SRCS = test_ctrl_gate.c
 
+UVM_VA_GATE_SRCS = test_uvm_va_gate.c
+
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_uvm_va_gate test_nvkms_allowlist test_stub_ptr_sanitize
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -66,6 +68,13 @@ test_open_scm: $(OPEN_SCM_SRCS)
 test_ctrl_gate: $(CTRL_GATE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(CTRL_GATE_SRCS)
 
+# U-6.  Header-only too: nvkvm_uvm_va.h carries the UVM command schema and the
+# VA-ownership table, so the gate's decisions are asserted without linking the
+# handlers (which need QEMU's headers).  The table is file-scope static there,
+# which is exactly what makes it testable in isolation here.
+test_uvm_va_gate: $(UVM_VA_GATE_SRCS) ../../src/qemu/nvkvm_uvm_va.h
+	$(CC) $(CFLAGS) -o $@ $(UVM_VA_GATE_SRCS) $(LDFLAGS)
+
 # Header-only gate, so this needs no sources beyond the test itself.  It pins
 # the NVKMS command numbering at every vendor tag nvkvm supports -- see the
 # table in the test; the gate is version-keyed precisely because those numbers
@@ -94,7 +103,7 @@ test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_uvm_va_gate test_nvkms_allowlist test_stub_ptr_sanitize
 	./test_dispatch
 	./test_frontend
 	./test_handle
@@ -102,6 +111,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_tables
 	./test_open_scm
 	./test_ctrl_gate
+	./test_uvm_va_gate
 	./test_nvkms_allowlist
 	./test_stub_ptr_sanitize
 
@@ -116,4 +126,4 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_uvm_va_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc
