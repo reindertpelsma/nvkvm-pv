@@ -52,7 +52,7 @@ wait_for_vm() {
 
 case "$cmd" in
     restart)
-        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR'"'
+        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR' RW='$RW'"'
                    kill -9 $(pgrep qemu-system) $(pgrep nvkvm_stub) 2>/dev/null; sleep 3
                    rm -f /tmp/qemu.log
                    NVKVM_DEV_HARNESS_INSECURE_RW=$RW nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!'
@@ -66,7 +66,7 @@ case "$cmd" in
         rsync -avz -e "${NVKVM_RSYNC_SSH:-ssh}" --exclude '.git' --exclude 'host-libs' \
             "$LOCAL_DIR"/ "$RSYNC_TARGET" > /dev/null
         echo "Rebuilding QEMU + stub..."
-        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR'"'
+        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR' RW='$RW'"'
             cp $REMOTE_DIR/src/qemu/*.c $REMOTE_DIR/src/qemu/*.h /opt/qemu-src/hw/misc/ 2>/dev/null
             cd /opt/qemu-src/build && ninja qemu-system-x86_64 2>&1 | tail -3
             # Canonical stub is freestanding (no libc); build via its Makefile so
