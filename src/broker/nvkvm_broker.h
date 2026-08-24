@@ -185,6 +185,15 @@ struct nb_session_ops {
     int  (*commit)(struct nb_session *s, struct nb_sink *sink);
     /* Ask for a window of this size.  Advisory; may be ignored. */
     int  (*resize)(struct nb_session *s, unsigned w, unsigned h);
+
+    /*
+     * Show the "no VM attached" placeholder.  Called once before the first
+     * client can connect and again whenever one goes away, so that an idle
+     * broker is visibly idle rather than an unmapped window.  Optional: a
+     * backend that leaves this NULL simply shows nothing until a real frame
+     * arrives, which is what every backend did before.
+     */
+    int  (*show_idle)(struct nb_session *s);
 };
 
 struct nb_session {
@@ -240,5 +249,13 @@ struct nb_formats {
 void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier);
 bool nb_formats_has(const struct nb_formats *f, uint32_t fourcc, uint64_t mod);
 void nb_formats_log(const struct nb_formats *f, const char *what);
+
+/*
+ * Paint the idle placeholder into a 32-bit XRGB/ARGB buffer (nb_placeholder.c).
+ * `stride_px` is in pixels.  CPU only — no GL, no dma-buf, deliberately.
+ */
+void nb_placeholder_paint(uint32_t *px, unsigned w, unsigned h,
+                          unsigned stride_px, const char *line1,
+                          const char *line2);
 
 #endif /* NVKVM_BROKER_H */

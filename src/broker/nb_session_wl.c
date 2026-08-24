@@ -40,6 +40,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include "nvkvm_broker.h"
@@ -93,6 +94,15 @@ struct nb_wl {
     struct xdg_toplevel  *toplevel;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     uint32_t              dmabuf_ver;
+    /* Only ever used for the idle placeholder.  The guest path never touches
+     * shm — its frames are dma-bufs and are never copied. */
+    struct wl_shm        *shm;
+    struct wl_buffer     *idle_buf;
+    void                 *idle_px;
+    size_t                idle_sz;
+    int                   idle_w, idle_h;
+    bool                  idle_wanted;   /* show it as soon as configured */
+    bool                  idle_shown;
 
     struct zwp_keyboard_shortcuts_inhibit_manager_v1 *inhibit_mgr;
     struct zwp_keyboard_shortcuts_inhibitor_v1       *inhibitor;
@@ -286,6 +296,12 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         return -ENOENT;
     }
 
+    /* A real frame supersedes the placeholder; drop its mapping rather than
+     * hold a megabyte of shm for the life of the VM. */
+    if (w->idle_wanted) {
+        w->idle_wanted = false;
+        w->idle_shown = false;
+    }
     wl_surface_attach(w->surf, sl->buf, 0, 0);
     wl_surface_damage_buffer(w->surf, 0, 0, (int32_t)sl->w, (int32_t)sl->h);
     /*
@@ -323,6 +339,124 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         w->surf_w = (int)sl->w;
         w->surf_h = (int)sl->h;
         nb_sink_surface(sink, sl->w, sl->h);
+    }
+    return 0;
+}
+
+/* ── the idle placeholder ────────────────────────────────────────────────── */
+/*
+ * The surface has no content until the client's first ATTACH+COMMIT, so an
+ * idle broker is an unmapped window: it sits in the dock and shows nothing
+ * when clicked.  "Waiting for a VM" and "crashed" then look identical, which
+ * is the first thing a user meets.  We paint our own frame instead.
+ *
+ * shm, not dma-buf, on purpose: this is the one thing the broker draws itself,
+ * it must work before any GPU buffer exists, and wl_shm is the only allocator
+ * every compositor is required to have.  It costs one page-aligned mapping
+ * that is freed the moment a guest frame replaces it.
+ */
+static void wl_idle_drop(struct nb_wl *w)
+{
+    if (w->idle_buf) {
+        wl_buffer_destroy(w->idle_buf);
+        w->idle_buf = NULL;
+    }
+    if (w->idle_px) {
+        munmap(w->idle_px, w->idle_sz);
+        w->idle_px = NULL;
+        w->idle_sz = 0;
+    }
+    w->idle_w = w->idle_h = 0;
+}
+
+static int wl_idle_make(struct nb_wl *w, int wd, int ht)
+{
+    struct wl_shm_pool *pool;
+    size_t stride = (size_t)wd * 4;
+    size_t sz = stride * (size_t)ht;
+    void *px;
+    int fd;
+
+    if (!w->shm || wd <= 0 || ht <= 0) {
+        return -ENOTSUP;
+    }
+    fd = memfd_create("nvkvm-broker-idle", MFD_CLOEXEC);
+    if (fd < 0) {
+        return -errno;
+    }
+    if (ftruncate(fd, (off_t)sz) < 0) {
+        close(fd);
+        return -errno;
+    }
+    px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) {
+        close(fd);
+        return -errno;
+    }
+    pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+    close(fd);
+    if (!pool) {
+        munmap(px, sz);
+        return -EIO;
+    }
+    /*
+     * Destroy the previous buffer only AFTER the new one exists, and rely on
+     * request ordering for the swap: the compositor processes attach+commit
+     * before it sees the destroy, so the old buffer is never yanked out from
+     * under a frame it is still scanning out.
+     */
+    wl_idle_drop(w);
+    w->idle_buf = wl_shm_pool_create_buffer(pool, 0, wd, ht, (int32_t)stride,
+                                            WL_SHM_FORMAT_XRGB8888);
+    wl_shm_pool_destroy(pool);
+    if (!w->idle_buf) {
+        munmap(px, sz);
+        return -EIO;
+    }
+    w->idle_px = px;
+    w->idle_sz = sz;
+    w->idle_w  = wd;
+    w->idle_h  = ht;
+    nb_placeholder_paint(px, (unsigned)wd, (unsigned)ht, (unsigned)wd,
+                         "NVKVM DISPLAY BROKER", "WAITING FOR A VM");
+    return 0;
+}
+
+static int wl_show_idle(struct nb_session *s)
+{
+    struct nb_wl *w = s->priv;
+    int wd = w->surf_w > 0 ? w->surf_w : 1280;
+    int ht = w->surf_h > 0 ? w->surf_h : 800;
+    int r;
+
+    w->idle_wanted = true;
+    if (!w->shm) {
+        /* Said once: a compositor with no wl_shm is legal but startling. */
+        if (!w->idle_shown) {
+            w->idle_shown = true;
+            nb_log("no wl_shm: the window stays blank until the VM's first "
+                   "frame");
+        }
+        return -ENOTSUP;
+    }
+    if (!w->configured) {
+        return 0;               /* xdg_configure will call us back */
+    }
+    if (!w->idle_buf || w->idle_w != wd || w->idle_h != ht) {
+        r = wl_idle_make(w, wd, ht);
+        if (r < 0) {
+            nb_err("could not make the placeholder buffer: %s", strerror(-r));
+            return r;
+        }
+    }
+    wl_surface_attach(w->surf, w->idle_buf, 0, 0);
+    wl_surface_damage_buffer(w->surf, 0, 0, wd, ht);
+    wl_surface_commit(w->surf);
+    wl_display_flush(w->dpy);
+    w->current = -1;
+    if (!w->idle_shown) {
+        nb_log("no client yet: showing the placeholder (%dx%d)", wd, ht);
+        w->idle_shown = true;
     }
     return 0;
 }
@@ -539,7 +673,9 @@ static void xdg_configure(void *d, struct xdg_surface *s, uint32_t serial)
     /* Do NOT commit a buffer here: the first real content arrives as an
      * ATTACH+COMMIT from the client.  An empty commit is enough to make the
      * surface exist. */
-    if (w->current < 0) {
+    if (w->idle_wanted && w->current < 0) {
+        wl_show_idle(w->sess);
+    } else if (w->current < 0) {
         wl_surface_commit(w->surf);
     }
 }
@@ -579,6 +715,8 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
     } else if (!strcmp(iface, wl_seat_interface.name) && !w->seat) {
         w->seat = BIND(wl_seat_interface, 5);
         wl_seat_add_listener(w->seat, &seat_listener, w);
+    } else if (!strcmp(iface, wl_shm_interface.name) && !w->shm) {
+        w->shm = BIND(wl_shm_interface, 1);
     } else if (!strcmp(iface, xdg_wm_base_interface.name)) {
         w->wm_base = BIND(xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(w->wm_base, &wm_listener, w);
@@ -755,6 +893,7 @@ static void wl_close_session(struct nb_session *s)
     for (i = 0; i < NB_MAX_BUFS; i++) {
         wl_buf_destroy(w, i);
     }
+    wl_idle_drop(w);
     if (w->dpy) {
         wl_display_flush(w->dpy);
         wl_display_disconnect(w->dpy);
@@ -897,6 +1036,7 @@ static const struct nb_session_ops wl_ops = {
     .attach = wl_attach,
     .commit = wl_commit,
     .resize = wl_resize,
+    .show_idle = wl_show_idle,
 };
 
 struct nb_session *nb_session_wayland(const struct nb_config *cfg)

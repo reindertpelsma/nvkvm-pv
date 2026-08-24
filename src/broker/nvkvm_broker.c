@@ -1204,6 +1204,7 @@ int main(int argc, char **argv)
      * keyboard grab, so it is spelled out rather than left as "2 +". */
     struct pollfd pfd[3 + NB_MAX_SESSION_FDS];
     int listen_fd, sigfd, i, rc = 1;
+    bool had_client = false;
     sigset_t mask;
 
     memset(&cfg, 0, sizeof(cfg));
@@ -1298,6 +1299,13 @@ int main(int argc, char **argv)
 
     nb_sink_init(&sink, sess);
 
+    /* Put something on the screen NOW.  Until a client attaches the surface
+     * has no content, and a contentless window is indistinguishable from a
+     * dead broker — which is the first thing a user meets. */
+    if (sess->ops->show_idle) {
+        sess->ops->show_idle(sess);
+    }
+
     for (;;) {
         int n = 0, nsess, r;
 
@@ -1386,6 +1394,15 @@ int main(int argc, char **argv)
         if (sink.client_fd >= 0 && nb_sink_flush(&sink) < 0) {
             nb_sink_detach(&sink, "write failed");
         }
+
+        /* The VM is gone: say so, rather than leaving its last frame frozen
+         * on screen looking like a hung guest. */
+        if (had_client && sink.client_fd < 0) {
+            if (sess->ops->show_idle) {
+                sess->ops->show_idle(sess);
+            }
+        }
+        had_client = (sink.client_fd >= 0);
     }
 
     if (sink.client_fd >= 0) {

@@ -34,8 +34,8 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -I. -I../common
 LDFLAGS += -Wl,-z,relro,-z,now
 
-OBJS = nvkvm_broker.o nb_common.o nb_session_x11.o nb_session_wl.o \
-       nb_session_test.o
+OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_session_x11.o \
+       nb_session_wl.o nb_session_test.o
 
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
 # DRI3 is what lets a dma-buf become an X pixmap without a GL context, and
