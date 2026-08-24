@@ -128,6 +128,7 @@ typedef struct NvkvmRelay {
      */
     QemuClipboardPeer clip_peer;
     bool        clip_registered;
+    bool        clip_agent_seen;   /* another peer has published a clipboard */
     char        clip_in[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
     unsigned    clip_in_len;
     unsigned    clip_in_chunks;
@@ -835,7 +836,15 @@ static void relay_send_caps(NvkvmRelay *r)
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.type  = NVKVM_BROKER_CMD_CAPS;
-    cmd.width = r->clip_registered ? NVKVM_BROKER_CLIENT_CLIPBOARD : 0;
+    /*
+     * The bit means A GUEST AGENT EXISTS, not "we registered a peer" -- we
+     * always register one, so reporting that would make the flag always true
+     * and destroy the distinction it exists for ("clipboard is off" vs "there
+     * is no vdagent").  It is only set once another peer has actually
+     * published a clipboard, which is the first moment vdagent proves it is
+     * there; CAPS is re-sent at that point.
+     */
+    cmd.width = r->clip_agent_seen ? NVKVM_BROKER_CLIENT_CLIPBOARD : 0;
     (void)relay_send(r, &cmd, -1);
 }
 
@@ -892,6 +901,16 @@ static void relay_clip_notify(Notifier *notifier, void *data)
     info = notify->info;
     if (!info || info->owner == &r->clip_peer) {
         return;                 /* our own update coming back around */
+    }
+    /*
+     * Another peer published something, so a guest agent demonstrably exists.
+     * Tell the broker once, so it can stop blaming the mode.
+     */
+    if (!r->clip_agent_seen) {
+        r->clip_agent_seen = true;
+        qemu_mutex_lock(&r->lock);
+        relay_send_caps(r);
+        qemu_mutex_unlock(&r->lock);
     }
     if (info->selection != QEMU_CLIPBOARD_SELECTION_CLIPBOARD) {
         return;                 /* PRIMARY is not what a paste key means */

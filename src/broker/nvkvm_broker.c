@@ -1300,8 +1300,10 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         s->caps_seen = c->width;
         nb_log("the VM reports: clipboard agent %s",
-               (c->width & NVKVM_BROKER_CLIENT_CLIPBOARD) ? "present"
-                                                          : "absent");
+               (c->width & NVKVM_BROKER_CLIENT_CLIPBOARD)
+                   ? "present"
+                   : "not seen yet (it is announced the first time the guest "
+                     "copies something)");
         return;
 
     case NVKVM_BROKER_CMD_WINDOW:
