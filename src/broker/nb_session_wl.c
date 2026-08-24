@@ -441,7 +441,19 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
 static void wl_viewport_apply(struct nb_wl *w, int bw, int bh,
                               int *out_w, int *out_h)
 {
-    bool want = w->scale_mode == 1 || (w->scale_mode == 2 && w->fullscreen);
+    /*
+     * AUTO NOW MEANS "FIT THE WINDOW", not "only when fullscreen".
+     *
+     * The old auto rule existed because the guest could not re-mode, so
+     * scaling a window meant a permanently blurry resample and snapping back
+     * to the guest's resolution was the lesser evil.  The guest CAN re-mode
+     * now (ui_info -> nvkvm_kms_set_host_size), so the window size reaches it
+     * and the buffer converges on the window -- at which point "fit" is
+     * exactly 1:1 and the viewport unsets itself.  Fitting is therefore the
+     * transient, not the destination, and it is what lets the window be
+     * resized at all in the meantime.
+     */
+    bool want = w->scale_mode != 0;
     int dw, dh;
 
     if (bw <= 0 || bh <= 0) {
@@ -451,14 +463,16 @@ static void wl_viewport_apply(struct nb_wl *w, int bw, int bh,
 
     if (!want) {
         /*
-         * 1:1, pixel-exact.  The window takes the guest's own resolution and a
-         * drag on the edge snaps back to it -- sharp, and honest about the
-         * fact that the guest owns its resolution.  Snapping win_* here is
-         * what makes set_window_geometry (in tb_update) agree with the surface
-         * we are about to commit.
+         * --no-scale: the surface IS the buffer, whatever the window is.  The
+         * window is still the user's -- we do not force it to the buffer size.
+         *
+         * THIS USED TO SNAP w->win_w/win_h BACK TO THE BUFFER, and that is
+         * what made dragging a window smaller do nothing: the compositor
+         * configured the smaller size, we immediately clamped it back to the
+         * guest's resolution, and the next configure undid the drag.  The
+         * resize request and its serial were never the problem.  A window's
+         * size is the user's decision; what the guest renders is the guest's.
          */
-        w->win_w = bw;
-        w->win_h = bh;
         dw = bw;
         dh = bh;
     } else if (w->win_w > 0 && w->win_h > 0) {
@@ -1161,6 +1175,12 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
     w->last_serial = serial;
     if (w->bd_hot >= 0) {
         if (state && w->toplevel && w->seat) {
+            /* Logged with the serial because a compositor SILENTLY IGNORES a
+             * resize carrying a stale one -- no error, no event, nothing.
+             * Without this line "I never asked" and "I asked and was ignored"
+             * look identical from out here. */
+            nb_log("resize: edge %d requested with serial %u (window %dx%d)",
+                   nb_bd_edge[w->bd_hot], serial, w->win_w, w->win_h);
             xdg_toplevel_resize(w->toplevel, w->seat, serial,
                                 nb_bd_edge[w->bd_hot]);
             wl_display_flush(w->dpy);
