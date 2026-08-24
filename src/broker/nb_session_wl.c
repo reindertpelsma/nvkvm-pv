@@ -66,6 +66,7 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 #include "relative-pointer-unstable-v1-client-protocol.h"
 #include "presentation-time-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
 #include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
@@ -192,6 +193,24 @@ struct nb_wl {
     struct wp_presentation *presentation;
     int                     last_scanout;   /* -1 unknown, 0 copy, 1 zero-copy */
 
+    /*
+     * THE OUTPUT'S SCALE, IN 120THS -- and it is not cosmetic.
+     *
+     * A Wayland surface is measured in LOGICAL pixels.  On this GNOME the
+     * output is 3840x2160 at scale 1.5, so a fullscreen surface measures
+     * 2560x1440 -- and telling the guest to render 2560x1440 would produce a
+     * buffer that does NOT cover the 3840x2160 output, which is exactly the
+     * condition the compositor requires before it will scan it out directly.
+     * The guest must be told the PHYSICAL size.
+     *
+     * 120 is the protocol's fixed-point base, and 120 (i.e. 1.0) is the right
+     * default: a compositor that does not offer wp_fractional_scale_v1 is
+     * telling us logical and physical are the same thing.
+     */
+    struct wp_fractional_scale_manager_v1 *frac_mgr;
+    struct wp_fractional_scale_v1         *frac;
+    uint32_t                               scale_120;
+
     /* Client-side title bar.  A SUBSURFACE ABOVE the content, at negative y,
      * so it never overlaps the guest's picture -- an occluded surface is not a
      * scanout candidate, and the whole point of this backend is that it can
@@ -244,6 +263,24 @@ struct nb_wl {
      * present only to take a pointer and turn a drag into
      * xdg_toplevel_resize().
      */
+    /*
+     * LETTERBOX BACKGROUND.  In aspect mode the viewport destination is
+     * smaller than the window in one dimension, and Wayland has no background
+     * colour -- something has to actually occupy the remainder or the desktop
+     * shows through.  This is one opaque black pixel stretched by its own
+     * viewport, placed BELOW the parent surface (the protocol allows the
+     * parent as place_below's sibling), so the guest's frame stays exactly
+     * where it was: on w->surf, attached directly, still a direct-scanout
+     * candidate.  Mapped ONLY when there are bars to draw.
+     */
+    struct wl_surface    *bg_surf;
+    struct wl_subsurface *bg_sub;
+    struct wp_viewport   *bg_vp;
+    struct wl_buffer     *bg_buf;
+    void                 *bg_px;
+    bool                  bg_mapped;
+    int                   off_x, off_y;   /* content offset inside the window */
+
     struct wl_surface    *bd_surf[8];
     struct wl_subsurface *bd_sub[8];
     struct wp_viewport   *bd_vp[8];
@@ -300,6 +337,11 @@ static void tb_update(struct nb_wl *w, int width);
 static void cur_build(struct nb_wl *w);
 /* Forward: the invisible resize borders, laid out on every size change. */
 static void bd_build(struct nb_wl *w);
+/* Forward: the letterbox bars, sized from the content rect wl_viewport_apply
+ * just computed.  Defined next to the rest of the shm chrome. */
+static void bg_layout(struct nb_wl *w, int dw, int dh);
+/* Forward: EV_SURFACE reports PHYSICAL pixels; defined with the scale code. */
+static void wl_report_surface(struct nb_wl *w, int lw, int lh);
 static void bd_layout(struct nb_wl *w);
 static int  bd_index(const struct nb_wl *w, const struct wl_surface *s);
 /* Forward: presentation feedback is requested by wl_commit, defined below. */
@@ -479,18 +521,13 @@ static void wl_viewport_apply(struct nb_wl *w, int bw, int bh,
                               int *out_w, int *out_h)
 {
     /*
-     * AUTO NOW MEANS "FIT THE WINDOW", not "only when fullscreen".
-     *
-     * The old auto rule existed because the guest could not re-mode, so
-     * scaling a window meant a permanently blurry resample and snapping back
-     * to the guest's resolution was the lesser evil.  The guest CAN re-mode
-     * now (ui_info -> nvkvm_kms_set_host_size), so the window size reaches it
-     * and the buffer converges on the window -- at which point "fit" is
-     * exactly 1:1 and the viewport unsets itself.  Fitting is therefore the
-     * transient, not the destination, and it is what lets the window be
-     * resized at all in the meantime.
+     * A RESIZE NEVER REACHES THE GUEST.  All three modes are a viewport
+     * destination and an offset: no buffer is reallocated, no round trip is
+     * made, and the guest goes on believing it is the size it chose -- so
+     * nothing inside it reflows because someone dragged a window edge.  The
+     * one case where the guest IS told is fullscreen, and that is decided in
+     * the relay off NVKVM_BROKER_F_FULLSCREEN, not here.
      */
-    bool want = w->scale_mode != 0;
     int dw, dh;
 
     if (bw <= 0 || bh <= 0) {
@@ -498,34 +535,51 @@ static void wl_viewport_apply(struct nb_wl *w, int bw, int bh,
         bh = w->win_h > 0 ? w->win_h : 1;
     }
 
-    if (!want) {
+    if (w->scale_mode == NB_SCALE_NONE || w->win_w <= 0 || w->win_h <= 0) {
         /*
-         * --no-scale: the surface IS the buffer, whatever the window is.  The
-         * window is still the user's -- we do not force it to the buffer size.
+         * 1:1.  The surface IS the buffer, whatever the window is.  The window
+         * is still the user's -- we do not force it to the buffer size.
          *
-         * THIS USED TO SNAP w->win_w/win_h BACK TO THE BUFFER, and that is
-         * what made dragging a window smaller do nothing: the compositor
-         * configured the smaller size, we immediately clamped it back to the
-         * guest's resolution, and the next configure undid the drag.  The
-         * resize request and its serial were never the problem.  A window's
-         * size is the user's decision; what the guest renders is the guest's.
+         * THIS USED TO SNAP w->win_w/win_h BACK TO THE BUFFER, which is what
+         * made dragging a window smaller do nothing: the compositor granted
+         * the smaller size and we immediately restored the guest's resolution.
+         * The resize request and its serial were never the problem.
          */
         dw = bw;
         dh = bh;
-    } else if (w->win_w > 0 && w->win_h > 0) {
-        /* Fit to the window, aspect preserved. */
-        long fw = (long)w->win_w * bh / bw;
-
-        if (fw <= w->win_h) {           /* fit by height */
-            dw = (int)((long)w->win_h * bw / bh);
-            dh = w->win_h;
-        } else {                        /* fit by width */
-            dw = w->win_w;
-            dh = (int)fw;
-        }
+    } else if (w->scale_mode == NB_SCALE_STRETCH) {
+        /* Fill it, aspect be damned.  No bars, ever. */
+        dw = w->win_w;
+        dh = w->win_h;
     } else {
-        dw = bw;
-        dh = bh;
+        /*
+         * ASPECT.  As large as fits, aspect kept, remainder blank.
+         *
+         * Both branches are computed from the SAME rounding so a window one
+         * pixel off does not produce a bar on one side only, and -- the case
+         * that decides direct scanout -- a window whose aspect MATCHES the
+         * buffer's must come out exactly equal to the window, with no bars at
+         * all.  Otherwise the surface fails to cover the output and the
+         * compositor quietly declines to promote it, and fullscreen stays COPY
+         * for a reason nothing logs.
+         */
+        long by_h = (long)w->win_h * bw / bh;   /* width if we fit by height */
+
+        if (by_h <= (long)w->win_w) {
+            dw = (int)by_h;
+            dh = w->win_h;
+        } else {
+            dw = w->win_w;
+            dh = (int)((long)w->win_w * bh / bw);
+        }
+        /* Snap away a rounding remainder of one: an exact-aspect window must
+         * produce an exact cover, not a 1px bar that costs direct scanout. */
+        if (dw > w->win_w - 2 && dw < w->win_w + 2) {
+            dw = w->win_w;
+        }
+        if (dh > w->win_h - 2 && dh < w->win_h + 2) {
+            dh = w->win_h;
+        }
     }
     if (dw <= 0 || dh <= 0) {
         dw = bw;
@@ -541,6 +595,7 @@ static void wl_viewport_apply(struct nb_wl *w, int bw, int bh,
             wp_viewport_set_destination(w->viewport, dw, dh);
         }
     }
+    bg_layout(w, dw, dh);
     *out_w = dw;
     *out_h = dh;
 }
@@ -690,7 +745,7 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     if (new_w != w->surf_w || new_h != w->surf_h) {
         w->surf_w = new_w;
         w->surf_h = new_h;
-        nb_sink_surface(sink, (unsigned)new_w, (unsigned)new_h);
+        wl_report_surface(w, new_w, new_h);
     }
     return 0;
 }
@@ -860,7 +915,8 @@ static void tb_update(struct nb_wl *w, int width)
         if (w->tb_mapped) {
             wl_surface_attach(w->tb_surf, NULL, 0, 0);
             wl_surface_commit(w->tb_surf);
-            xdg_surface_set_window_geometry(w->xdg_surf, 0, 0,
+            xdg_surface_set_window_geometry(w->xdg_surf,
+                                            -w->off_x, -w->off_y,
                                             w->win_w > 0 ? w->win_w : width,
                                             w->win_h > 0 ? w->win_h : NB_TB_H);
             wl_surface_commit(w->surf);
@@ -913,15 +969,159 @@ static void tb_update(struct nb_wl *w, int width)
                w->tb_w, NB_TB_H);
     }
     w->tb_mapped = true;
+    /* Sit at the WINDOW's top-left, which is off_* up-left of the content
+     * when aspect mode is drawing bars. */
+    if (w->tb_sub) {
+        wl_subsurface_set_position(w->tb_sub, -w->off_x,
+                                   -w->off_y - NB_TB_H);
+    }
     wl_surface_attach(w->tb_surf, w->tb_buf, 0, 0);
     wl_surface_damage_buffer(w->tb_surf, 0, 0, w->tb_w, NB_TB_H);
     wl_surface_commit(w->tb_surf);
-    /* The window is the content PLUS the bar sitting above it. */
-    xdg_surface_set_window_geometry(w->xdg_surf, 0, -NB_TB_H, w->tb_w,
+    /* The window is the content PLUS the bar sitting above it, and PLUS any
+     * letterbox bars around it. */
+    xdg_surface_set_window_geometry(w->xdg_surf, -w->off_x,
+                                    -w->off_y - NB_TB_H, w->tb_w,
                                     (w->win_h > 0 ? w->win_h : NB_TB_H)
                                     + NB_TB_H);
     wl_surface_commit(w->surf);
     wl_display_flush(w->dpy);
+}
+
+/* ── the output's fractional scale ───────────────────────────────────────── */
+/*
+ * EV_SURFACE carries what the GUEST should render, which is physical pixels --
+ * see the scale_120 comment.  Everything else in this file works in logical
+ * pixels, so the conversion lives here and nowhere else.
+ */
+static void wl_report_surface(struct nb_wl *w, int lw, int lh)
+{
+    unsigned s = w->scale_120 ? w->scale_120 : 120;
+
+    if (!w->sink || lw <= 0 || lh <= 0) {
+        return;
+    }
+    /*
+     * Sync the fullscreen flag HERE, on the packet the client actually keys
+     * its mode switch off, rather than only on the transition.  Fullscreen can
+     * be true before any transition is observed -- `--fullscreen` sets it at
+     * startup, so top_configure's was_fs check never fires and the flag stayed
+     * false forever, which silently disabled the whole ui_info path.  The
+     * setter is idempotent, so calling it on every report costs a compare.
+     */
+    nb_sink_set_fullscreen(w->sink, w->fullscreen);
+    nb_sink_surface(w->sink, (unsigned)((long)lw * s / 120),
+                    (unsigned)((long)lh * s / 120));
+}
+
+
+static void frac_scale(void *d, struct wp_fractional_scale_v1 *f,
+                       uint32_t scale)
+{
+    struct nb_wl *w = d;
+
+    (void)f;
+    if (scale == 0 || scale == w->scale_120) {
+        return;
+    }
+    w->scale_120 = scale;
+    nb_log("output scale is %u.%03u — the guest is told PHYSICAL pixels, so a "
+           "fullscreen guest buffer can cover the output",
+           scale / 120, (scale % 120) * 1000 / 120);
+    /* Re-report the surface at the new scale; the size in logical pixels has
+     * not changed, but what the guest should render has. */
+    wl_report_surface(w, w->surf_w, w->surf_h);
+}
+static const struct wp_fractional_scale_v1_listener frac_listener = {
+    .preferred_scale = frac_scale,
+};
+
+/* ── the letterbox background ────────────────────────────────────────────── */
+static void bg_build(struct nb_wl *w)
+{
+    struct wl_shm_pool *pool;
+    uint32_t *px;
+    int fd;
+
+    if (w->bg_surf || !w->shm || !w->subcomp || !w->comp || !w->viewporter) {
+        return;
+    }
+    fd = memfd_create("nvkvm-broker-bg", MFD_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    if (ftruncate(fd, 4) < 0) {
+        close(fd);
+        return;
+    }
+    px = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    *px = 0xff000000u;          /* opaque black: the conventional bar colour */
+    w->bg_px = px;
+    pool = wl_shm_create_pool(w->shm, fd, 4);
+    if (pool) {
+        w->bg_buf = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4,
+                                              WL_SHM_FORMAT_ARGB8888);
+        wl_shm_pool_destroy(pool);
+    }
+    close(fd);
+    if (!w->bg_buf) {
+        return;
+    }
+    w->bg_surf = wl_compositor_create_surface(w->comp);
+    if (!w->bg_surf) {
+        return;
+    }
+    w->bg_sub = wl_subcompositor_get_subsurface(w->subcomp, w->bg_surf,
+                                                w->surf);
+    if (!w->bg_sub) {
+        return;
+    }
+    /* Below the parent, so the guest's frame stays the topmost thing. */
+    wl_subsurface_place_below(w->bg_sub, w->surf);
+    wl_subsurface_set_desync(w->bg_sub);
+    w->bg_vp = wp_viewporter_get_viewport(w->viewporter, w->bg_surf);
+}
+
+/*
+ * Show or hide the bars.  `dw`/`dh` is the content rectangle just computed;
+ * anything the window has left over is bar.  Called from the same place the
+ * viewport destination is set, so the two can never disagree.
+ */
+static void bg_layout(struct nb_wl *w, int dw, int dh)
+{
+    bool want = w->win_w > dw || w->win_h > dh;
+
+    w->off_x = want && w->win_w > dw ? (w->win_w - dw) / 2 : 0;
+    w->off_y = want && w->win_h > dh ? (w->win_h - dh) / 2 : 0;
+
+    if (want) {
+        bg_build(w);
+    }
+    if (!w->bg_surf || !w->bg_vp) {
+        w->off_x = w->off_y = 0;
+        return;
+    }
+    if (!want) {
+        if (w->bg_mapped) {
+            wl_surface_attach(w->bg_surf, NULL, 0, 0);
+            wl_surface_commit(w->bg_surf);
+            w->bg_mapped = false;
+        }
+        return;
+    }
+    /* The background sits at the window origin; the content (the parent
+     * surface) is inset by off_*, so the background starts that far up-left
+     * of it. */
+    wl_subsurface_set_position(w->bg_sub, -w->off_x, -w->off_y);
+    wp_viewport_set_destination(w->bg_vp, w->win_w, w->win_h);
+    wl_surface_attach(w->bg_surf, w->bg_buf, 0, 0);
+    wl_surface_damage_buffer(w->bg_surf, 0, 0, 1, 1);
+    wl_surface_commit(w->bg_surf);
+    w->bg_mapped = true;
 }
 
 /* ── the close confirmation ──────────────────────────────────────────────── */
@@ -1712,6 +1912,11 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
     if (was_fs != w->fullscreen) {
         nb_log("window is %s", w->fullscreen ? "FULLSCREEN (chrome hidden)"
                                              : "windowed");
+        /* Report what actually happened, not what we asked for: the client
+         * keys a guest mode switch off this flag. */
+        if (w->sink) {
+            nb_sink_set_fullscreen(w->sink, w->fullscreen);
+        }
         tb_update(w, w->win_w > 0 ? w->win_w : w->surf_w);
     }
     if (wd <= 0 || ht <= 0) {
@@ -1783,7 +1988,7 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
         w->surf_w = wd;
         w->surf_h = ht;
         if (w->sink) {
-            nb_sink_surface(w->sink, (unsigned)wd, (unsigned)ht);
+            wl_report_surface(w, wd, ht);
         }
     }
 }
@@ -2166,6 +2371,8 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         w->subcomp = BIND(wl_subcompositor_interface, 1);
     } else if (!strcmp(iface, wp_presentation_interface.name)) {
         w->presentation = BIND(wp_presentation_interface, 1);
+    } else if (!strcmp(iface, wp_fractional_scale_manager_v1_interface.name)) {
+        w->frac_mgr = BIND(wp_fractional_scale_manager_v1_interface, 1);
     } else if (!strcmp(iface, wp_viewporter_interface.name)) {
         w->viewporter = BIND(wp_viewporter_interface, 1);
     } else if (!strcmp(iface, wl_shm_interface.name) && !w->shm) {
@@ -2537,7 +2744,15 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     }
 
     /* The window. */
+    w->scale_120 = 120;         /* until the compositor says otherwise */
     w->surf = wl_compositor_create_surface(w->comp);
+    if (w->surf && w->frac_mgr) {
+        w->frac = wp_fractional_scale_manager_v1_get_fractional_scale(
+                      w->frac_mgr, w->surf);
+        if (w->frac) {
+            wp_fractional_scale_v1_add_listener(w->frac, &frac_listener, w);
+        }
+    }
     w->xdg_surf = xdg_wm_base_get_xdg_surface(w->wm_base, w->surf);
     xdg_surface_add_listener(w->xdg_surf, &xdg_listener, w);
     w->toplevel = xdg_surface_get_toplevel(w->xdg_surf);

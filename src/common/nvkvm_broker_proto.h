@@ -153,6 +153,24 @@ struct nvkvm_broker_pkt {
  * about grab state, whatever it did with the GRAB event. */
 #define NVKVM_BROKER_F_GRABBED  (1u << 0)
 #define NVKVM_BROKER_F_FOCUSED  (1u << 1)
+/*
+ * The window is fullscreen.  Mirrored like the others, and load-bearing on
+ * EV_SURFACE: it is what separates the two kinds of size change.
+ *
+ *   windowed resize  -> the host scales the buffer it already has.  The guest
+ *                       is NOT told and MUST NOT re-mode: applications inside
+ *                       would reflow, games would reinitialise swapchains, and
+ *                       X clients would get a ConfigureNotify storm, all
+ *                       because someone dragged a window edge.
+ *   fullscreen       -> the size IS propagated, so the guest re-modes to the
+ *                       output's resolution.  That is when you want it: 1:1
+ *                       pixels, no scaling, and a surface that covers the
+ *                       output, which is the compositor's condition for
+ *                       promoting it to direct scanout.  It is also a
+ *                       deliberate user action where a brief re-mode is
+ *                       expected -- games do this routinely.
+ */
+#define NVKVM_BROKER_F_FULLSCREEN (1u << 2)
 
 /* ── VMM → broker: commands ──────────────────────────────────────────────── */
 

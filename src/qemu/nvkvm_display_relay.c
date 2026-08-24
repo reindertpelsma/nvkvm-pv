@@ -448,16 +448,22 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
     case NVKVM_BROKER_EV_SURFACE:
         RELAY_LOG("broker window is now %dx%d", p->x, p->y);
         /*
-         * Forward it to the guest.  This is the whole point of the event: the
-         * guest head can then offer a mode that MATCHES the host output, which
-         * is what a compositor requires before it will scan the guest's buffer
-         * out directly instead of compositing a copy of it.
+         * FULLSCREEN ONLY, and that is a design rule rather than an
+         * optimisation.  A windowed resize must not reach the guest at all --
+         * the host scales the buffer it already has, and the guest goes on
+         * believing it is the same size, so nothing inside it reflows because
+         * someone dragged a window edge.  Fullscreen is the opposite case:
+         * propagating the size is exactly what makes the guest render at the
+         * output's resolution, which is 1:1 pixels and the precondition for
+         * the compositor scanning its buffer out directly.
          *
-         * `delay` is true: a resize drag produces a stream of these and only
-         * the last one is worth a guest mode switch.  QEMU's own timer
-         * coalescing is exactly the right tool and is already there.
+         * `delay` is true: entering fullscreen can produce more than one
+         * configure and only the last is worth a guest mode switch.  QEMU's
+         * own timer coalescing is the right tool and is already there.
          */
-        if (con && p->x > 0 && p->y > 0 && dpy_ui_info_supported(con)) {
+        if (con && p->x > 0 && p->y > 0 &&
+            (p->flags & NVKVM_BROKER_F_FULLSCREEN) &&
+            dpy_ui_info_supported(con)) {
             QemuUIInfo info = *dpy_get_ui_info(con);
 
             info.width  = (uint32_t)p->x;

@@ -71,7 +71,8 @@ WL_XML = \
   $(WL_PROTO_DIR)/unstable/relative-pointer/relative-pointer-unstable-v1.xml \
   $(WL_PROTO_DIR)/stable/presentation-time/presentation-time.xml \
   $(WL_PROTO_DIR)/stable/viewporter/viewporter.xml \
-  $(WL_PROTO_DIR)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml
+  $(WL_PROTO_DIR)/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml \
+  $(WL_PROTO_DIR)/staging/fractional-scale/fractional-scale-v1.xml
 
 WL_HDRS = $(notdir $(WL_XML:.xml=-client-protocol.h))
 WL_SRCS = $(notdir $(WL_XML:.xml=-protocol.c))

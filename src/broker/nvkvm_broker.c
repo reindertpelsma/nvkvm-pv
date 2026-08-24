@@ -249,7 +249,8 @@ static void nb_emit(struct nb_sink *s, int type, int x, int y,
     s->tx[s->tx_head] = (struct nvkvm_broker_pkt){
         .type  = (uint16_t)type,
         .flags = (uint16_t)((s->grabbed ? NVKVM_BROKER_F_GRABBED : 0) |
-                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0)),
+                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0) |
+                            (s->fullscreen ? NVKVM_BROKER_F_FULLSCREEN : 0)),
         .seq   = s->seq++,
         .x = x, .y = y, .w0 = w0, .w1 = w1,
     };
@@ -317,7 +318,8 @@ static struct nvkvm_broker_pkt nb_pkt(struct nb_sink *s, int type,
     struct nvkvm_broker_pkt p = {
         .type  = (uint16_t)type,
         .flags = (uint16_t)((s->grabbed ? NVKVM_BROKER_F_GRABBED : 0) |
-                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0)),
+                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0) |
+                            (s->fullscreen ? NVKVM_BROKER_F_FULLSCREEN : 0)),
         .seq   = s->seq++,
         .x = x, .y = y, .w0 = w0, .w1 = w1,
     };
@@ -611,6 +613,14 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
 {
     nb_emit(s, NVKVM_BROKER_EV_RELEASE, 0, 0,
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
+}
+
+void nb_sink_set_fullscreen(struct nb_sink *s, bool on)
+{
+    if (!s || s->fullscreen == on) {
+        return;
+    }
+    s->fullscreen = on;
 }
 
 bool nb_sink_close_request(struct nb_sink *s, int action)
@@ -1224,7 +1234,7 @@ int main(int argc, char **argv)
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.backend = "auto";
-    cfg.scale_mode = 2;   /* 1:1 windowed, fit in fullscreen */
+    cfg.scale_mode = NB_SCALE_ASPECT;   /* preserve aspect, black bars */
     cfg.title = "nvkvm";
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -1262,8 +1272,16 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
         else if (!strcmp(a, "--persist"))    { cfg.persist = true; }
-        else if (!strcmp(a, "--scale")) { cfg.scale_mode = 1; }
-        else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = 0; }
+        else if (!strcmp(a, "--scale")) { NEEDVAL();
+            if (!strcmp(v, "stretch"))     { cfg.scale_mode = NB_SCALE_STRETCH; }
+            else if (!strcmp(v, "aspect")) { cfg.scale_mode = NB_SCALE_ASPECT; }
+            else if (!strcmp(v, "none"))   { cfg.scale_mode = NB_SCALE_NONE; }
+            else {
+                nb_err("--scale must be stretch, aspect or none (not '%s')", v);
+                return 2;
+            } }
+        /* The old boolean pair, kept working because it is in scripts. */
+        else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = NB_SCALE_NONE; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
