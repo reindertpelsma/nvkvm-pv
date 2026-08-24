@@ -282,7 +282,16 @@ def installed_driver_version(S):
     """The running kernel module's version, or '' if none is loaded."""
     got, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=60)
     import re as _re
-    m = _re.search(r"Kernel Module\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)", got)
+    # BOTH banner forms.  Proprietary:
+    #     NVRM version: NVIDIA UNIX x86_64 Kernel Module  575.51.03  Wed Apr 16 ...
+    # Open (-m=kernel-open, mandatory on Blackwell and datacenter Hopper):
+    #     NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.95.05  Release Build ...
+    # The optional "for <arch>" is the whole difference, and without it this
+    # returns "" for every open-module box -- which makes install_driver() report
+    # a perfectly good install as a failure and FAILS the box, on exactly the
+    # architectures that require the open module.  Measured on an RTX 5060,
+    # 580.95.05 open, 2026-08-24.
+    m = _re.search(r"Kernel Module(?:\s+for\s+\S+)?\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)", got)
     return m.group(1) if m else ""
 
 
