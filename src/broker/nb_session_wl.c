@@ -37,6 +37,8 @@
  * unescapable grab is a keylogger.
  */
 #include <errno.h>
+#include <fcntl.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -302,6 +304,27 @@ struct nb_wl {
     char                     title[128];
     bool                     quit;
 
+    /*
+     * CLIPBOARD.  wl_data_device is core Wayland, so no extra protocol XML.
+     *
+     * The compositor only delivers a selection offer to the FOCUSED client,
+     * which is not a limitation to work around -- it is the same rule the
+     * clipboard policy states, enforced a layer down.  wlr-data-control would
+     * read the selection while unfocused; GNOME does not offer it, and wanting
+     * it would mean the design had drifted.
+     */
+    struct wl_data_device_manager *ddm;
+    struct wl_data_device         *ddev;
+    struct wl_data_offer          *offer;      /* current selection, if text */
+    bool                           offer_text; /* it advertised our mime     */
+    struct wl_data_source         *source;     /* ours, when we own it       */
+    char                          *src_text;   /* what we would send         */
+    size_t                         src_len;
+    int                            fetch_fd;   /* pipe being read, or -1     */
+    uint64_t                       clip_notice_until;  /* title-bar notice   */
+    char                           fetch_buf[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    size_t                         fetch_len;
+
     struct nb_formats formats;
 
     /* The sink is not reachable from Wayland callbacks otherwise.  NULL until
@@ -344,6 +367,8 @@ static void tb_update(struct nb_wl *w, int width);
 static void cur_build(struct nb_wl *w);
 /* Forward: hide or show the host cursor over the content, per what is on it. */
 static void cur_apply(struct nb_wl *w, uint32_t serial);
+/* Forward: the clipboard notice needs a clock and lives with the clipboard. */
+static uint64_t nb_now_ms_wl(void);
 /* Forward: the invisible resize borders, laid out on every size change. */
 static void bd_build(struct nb_wl *w);
 /* Forward: the letterbox bars, sized from the content rect wl_viewport_apply
@@ -834,7 +859,12 @@ static void tb_paint(struct nb_wl *w, int width)
      * release gesture by design -- every other key is going to the guest -- so
      * the bar says so, in the accent colour, for as long as the grab is held.
      */
-    txt = w->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE" : w->title;
+    if (w->clip_notice_until && nb_now_ms_wl() < w->clip_notice_until) {
+        txt = "THE VM CHANGED YOUR CLIPBOARD";
+    } else {
+        w->clip_notice_until = 0;
+        txt = w->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE" : w->title;
+    }
     tw = nb_placeholder_text_w(txt, scale);
     while (scale > 1 && tw > (unsigned)(width - 3 * NB_TB_BTN - 16)) {
         scale--;
@@ -1001,6 +1031,228 @@ static void tb_update(struct nb_wl *w, int width)
                                     + NB_TB_H);
     wl_surface_commit(w->surf);
     wl_display_flush(w->dpy);
+}
+
+/* ── clipboard ───────────────────────────────────────────────────────────── */
+
+#define NB_CLIP_MIME "text/plain;charset=utf-8"
+
+static uint64_t nb_now_ms_wl(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+static void doffer_offer(void *d, struct wl_data_offer *o, const char *mime)
+{
+    struct nb_wl *w = d;
+
+    if (w->offer == o && !strcmp(mime, NB_CLIP_MIME)) {
+        w->offer_text = true;
+    }
+}
+static void doffer_source_actions(void *d, struct wl_data_offer *o, uint32_t a) {}
+static void doffer_action(void *d, struct wl_data_offer *o, uint32_t a) {}
+static const struct wl_data_offer_listener doffer_listener = {
+    .offer = doffer_offer,
+    .source_actions = doffer_source_actions,
+    .action = doffer_action,
+};
+
+static void ddev_data_offer(void *d, struct wl_data_device *dev,
+                            struct wl_data_offer *o)
+{
+    struct nb_wl *w = d;
+
+    /* A new offer supersedes any we were tracking; the compositor destroys the
+     * old one for us only when it sends selection(NULL). */
+    w->offer = o;
+    w->offer_text = false;
+    wl_data_offer_add_listener(o, &doffer_listener, w);
+}
+static void ddev_selection(void *d, struct wl_data_device *dev,
+                           struct wl_data_offer *o)
+{
+    struct nb_wl *w = d;
+
+    if (!o) {
+        w->offer = NULL;
+        w->offer_text = false;
+        return;
+    }
+    /* The offer we were told about in data_offer is now THE selection. */
+    if (w->offer != o) {
+        w->offer = o;
+        w->offer_text = false;
+    }
+}
+static void ddev_enter(void *d, struct wl_data_device *v, uint32_t s,
+                       struct wl_surface *su, wl_fixed_t x, wl_fixed_t y,
+                       struct wl_data_offer *o) {}
+static void ddev_leave(void *d, struct wl_data_device *v) {}
+static void ddev_motion(void *d, struct wl_data_device *v, uint32_t t,
+                        wl_fixed_t x, wl_fixed_t y) {}
+static void ddev_drop(void *d, struct wl_data_device *v) {}
+static const struct wl_data_device_listener ddev_listener = {
+    .data_offer = ddev_data_offer,
+    .enter = ddev_enter,
+    .leave = ddev_leave,
+    .motion = ddev_motion,
+    .drop = ddev_drop,
+    .selection = ddev_selection,
+};
+
+/* ── guest -> host: we become the selection owner ────────────────────────── */
+
+static void dsrc_send(void *d, struct wl_data_source *src, const char *mime,
+                      int fd)
+{
+    struct nb_wl *w = d;
+    size_t off = 0;
+
+    if (!w->src_text || strcmp(mime, NB_CLIP_MIME)) {
+        close(fd);
+        return;
+    }
+    /* Blocking write to a pipe the requester owns.  Bounded by the clipboard
+     * cap, and a reader that goes away gives EPIPE rather than a stall --
+     * SIGPIPE is ignored process-wide. */
+    while (off < w->src_len) {
+        ssize_t n = write(fd, w->src_text + off, w->src_len - off);
+
+        if (n <= 0) {
+            break;
+        }
+        off += (size_t)n;
+    }
+    close(fd);
+}
+static void dsrc_cancelled(void *d, struct wl_data_source *src)
+{
+    struct nb_wl *w = d;
+
+    /* Someone else took the selection.  Ours is dead; drop it so we do not
+     * keep the guest's text alive longer than it is on the clipboard. */
+    if (w->source == src) {
+        wl_data_source_destroy(src);
+        w->source = NULL;
+        free(w->src_text);
+        w->src_text = NULL;
+        w->src_len = 0;
+    }
+}
+static void dsrc_target(void *d, struct wl_data_source *s, const char *m) {}
+static void dsrc_dnd_drop(void *d, struct wl_data_source *s) {}
+static void dsrc_dnd_finished(void *d, struct wl_data_source *s) {}
+static void dsrc_action(void *d, struct wl_data_source *s, uint32_t a) {}
+static const struct wl_data_source_listener dsrc_listener = {
+    .target = dsrc_target,
+    .send = dsrc_send,
+    .cancelled = dsrc_cancelled,
+    .dnd_drop_performed = dsrc_dnd_drop,
+    .dnd_finished = dsrc_dnd_finished,
+    .action = dsrc_action,
+};
+
+static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
+{
+    struct nb_wl *w = s->priv;
+    char *copy;
+
+    if (!w->ddm || !w->ddev || !w->seat) {
+        return -ENOTSUP;
+    }
+    copy = malloc(len + 1);
+    if (!copy) {
+        return -ENOMEM;
+    }
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+
+    if (w->source) {
+        wl_data_source_destroy(w->source);
+        w->source = NULL;
+    }
+    free(w->src_text);
+    w->src_text = copy;
+    w->src_len = len;
+
+    w->source = wl_data_device_manager_create_data_source(w->ddm);
+    if (!w->source) {
+        return -EIO;
+    }
+    wl_data_source_add_listener(w->source, &dsrc_listener, w);
+    wl_data_source_offer(w->source, NB_CLIP_MIME);
+    /* The serial must be one from a real input event; the compositor rejects
+     * a fabricated one, which is the protocol enforcing "only a focused client
+     * that has seen input may take the selection". */
+    wl_data_device_set_selection(w->ddev, w->source, w->last_serial);
+    wl_display_flush(w->dpy);
+    return 0;
+}
+
+/* ── host -> guest: read the selection, asynchronously ───────────────────── */
+
+static int wl_fetch_clipboard(struct nb_session *s)
+{
+    struct nb_wl *w = s->priv;
+    int fds[2];
+
+    if (w->fetch_fd >= 0) {
+        return -EBUSY;              /* one at a time */
+    }
+    if (!w->offer || !w->offer_text) {
+        return -ENOENT;             /* nothing, or nothing we accept */
+    }
+    if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) < 0) {
+        return -errno;
+    }
+    wl_data_offer_receive(w->offer, NB_CLIP_MIME, fds[1]);
+    close(fds[1]);                  /* the compositor owns its end now */
+    wl_display_flush(w->dpy);
+    w->fetch_fd = fds[0];
+    w->fetch_len = 0;
+    return 0;
+}
+
+/*
+ * Drain the selection pipe.  Returns true when the transfer is finished (for
+ * any reason), so the caller can release the held paste keystroke exactly once.
+ */
+static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
+{
+    for (;;) {
+        ssize_t n = read(w->fetch_fd, w->fetch_buf + w->fetch_len,
+                         sizeof(w->fetch_buf) - 1 - w->fetch_len);
+
+        if (n > 0) {
+            w->fetch_len += (size_t)n;
+            if (w->fetch_len >= sizeof(w->fetch_buf) - 1) {
+                nb_log("clipboard: host selection is larger than the %u-byte "
+                       "cap; not pasting it",
+                       NVKVM_BROKER_CLIP_MAX_BYTES);
+                break;
+            }
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return false;           /* more later */
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        /* n == 0: EOF, the whole selection is here. */
+        if (n == 0 && w->fetch_len > 0) {
+            nb_sink_send_clipboard(sink, w->fetch_buf, w->fetch_len);
+        }
+        break;
+    }
+    close(w->fetch_fd);
+    w->fetch_fd = -1;
+    w->fetch_len = 0;
+    return true;
 }
 
 /* ── the output's fractional scale ───────────────────────────────────────── */
@@ -1493,6 +1745,23 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
 }
 
 /* ops->dismiss_dialog: the broker took a state that contradicts the dialog. */
+/*
+ * ops->notify_clipboard: the guest just replaced the host clipboard.
+ *
+ * VISIBILITY IS THE CONTROL for this direction.  A guest that can silently
+ * swap what you are about to paste into a host terminal is the actual attack;
+ * a log line is good for forensics but nobody is reading stderr, so it also
+ * goes where the user is already looking.
+ */
+static void wl_notify_clipboard(struct nb_session *s)
+{
+    struct nb_wl *w = s->priv;
+
+    w->clip_notice_until = nb_now_ms_wl() + 4000u;
+    tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
+    wl_display_flush(w->dpy);
+}
+
 static void wl_dismiss_dialog(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
@@ -2480,6 +2749,8 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         w->presentation = BIND(wp_presentation_interface, 1);
     } else if (!strcmp(iface, wp_fractional_scale_manager_v1_interface.name)) {
         w->frac_mgr = BIND(wp_fractional_scale_manager_v1_interface, 1);
+    } else if (!strcmp(iface, wl_data_device_manager_interface.name)) {
+        w->ddm = BIND(wl_data_device_manager_interface, 3);
     } else if (!strcmp(iface, wp_viewporter_interface.name)) {
         w->viewporter = BIND(wp_viewporter_interface, 1);
     } else if (!strcmp(iface, wl_shm_interface.name) && !w->shm) {
@@ -2541,6 +2812,15 @@ static int wl_pollfds(struct nb_session *s, struct pollfd *out, int max)
     out[0].events = POLLIN | (w->flush_blocked ? POLLOUT : 0);
     out[0].revents = 0;
     w->pfd = out;
+    if (w->fetch_fd >= 0 && max >= 2) {
+        /* The selection pipe.  Polled rather than read inline: the transfer is
+         * the compositor's to pace, and blocking on it here would stall input
+         * for as long as the other client takes to write. */
+        out[1].fd = w->fetch_fd;
+        out[1].events = POLLIN;
+        out[1].revents = 0;
+        return 2;
+    }
     return 1;
 }
 
@@ -2557,6 +2837,30 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
     bool readable = w->pfd && (w->pfd->revents & (POLLIN | POLLHUP | POLLERR));
 
     w->sink = sink;
+
+    /*
+     * CLIPBOARD, both halves, before the Wayland dispatch below -- the pipe is
+     * a separate fd and its readiness has nothing to do with the compositor's.
+     */
+    if (w->fetch_fd >= 0 && w->pfd && (w->pfd[1].revents & (POLLIN | POLLHUP))) {
+        if (wl_fetch_pump(w, sink)) {
+            /* Finished, however it ended.  Release the held paste key on EVERY
+             * path or the keystroke is swallowed and paste appears broken. */
+            nb_sink_clip_release(sink);
+        }
+    }
+    if (sink->clip_want_paste && w->fetch_fd < 0) {
+        int r = wl_fetch_clipboard(s);
+
+        sink->clip_want_paste = false;
+        if (r != 0) {
+            if (r == -ENOENT) {
+                nb_log("clipboard: the host selection is empty or is not "
+                       "text, so this paste sent nothing");
+            }
+            nb_sink_clip_release(sink);
+        }
+    }
 
     if (w->pfd && (w->pfd->revents & POLLOUT)) {
         wl_display_flush(w->dpy);
@@ -2814,6 +3118,21 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     wl_registry_add_listener(w->reg, &reg_listener, w);
     wl_display_roundtrip(w->dpy);   /* globals */
     wl_display_roundtrip(w->dpy);   /* the dmabuf format/modifier burst */
+    /*
+     * The data device needs BOTH the seat and the manager, and registry order
+     * is not guaranteed -- so it is created here, after the globals are in,
+     * rather than in whichever handler happened to run second.
+     */
+    if (w->ddm && w->seat) {
+        w->ddev = wl_data_device_manager_get_data_device(w->ddm, w->seat);
+        if (w->ddev) {
+            wl_data_device_add_listener(w->ddev, &ddev_listener, w);
+        }
+    }
+    if (!w->ddev) {
+        nb_log("no wl_data_device: clipboard is unavailable on this "
+               "compositor, whatever --clipboard says");
+    }
 
     if (!w->comp || !w->wm_base) {
         nb_err("the compositor is missing %s%s— there is no window to make",
@@ -2852,6 +3171,7 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
 
     /* The window. */
     w->scale_120 = 120;         /* until the compositor says otherwise */
+    w->fetch_fd = -1;
     w->surf = wl_compositor_create_surface(w->comp);
     if (w->surf && w->frac_mgr) {
         w->frac = wp_fractional_scale_manager_v1_get_fractional_scale(
@@ -3025,6 +3345,9 @@ static const struct nb_session_ops wl_ops = {
     .resize = wl_resize,
     .show_idle = wl_show_idle,
     .dismiss_dialog = wl_dismiss_dialog,
+    .set_clipboard = wl_set_clipboard,
+    .notify_clipboard = wl_notify_clipboard,
+    .fetch_clipboard = wl_fetch_clipboard,
 };
 
 struct nb_session *nb_session_wayland(const struct nb_config *cfg)
