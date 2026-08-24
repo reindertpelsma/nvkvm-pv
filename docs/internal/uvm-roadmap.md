@@ -42,8 +42,14 @@ flaky**. Accepting a slow path beats accepting an unreliable one.
 "Why upstream will not happen" below.
 
 QEMU reserves a fixed region `R`, one KVM memslot, sized around GPU VRAM
-rather than larger (ASLR is a security policy worth keeping), holds sparse
-`PROT_NONE` over everything outside it, and **publishes only R's bounds**.
+rather than larger (ASLR is a security policy worth keeping), and **publishes
+only R's bounds**.
+
+The reservation is `R` itself: QEMU `mmap`s the whole region `PROT_NONE`,
+`MAP_NORESERVE` at startup, so **QEMU's own allocator can never hand any of it
+out** for something else. UVM mappings are then `MAP_FIXED`'d into that
+reservation. Nothing outside `R` is touched — R is a hole QEMU holds open, not
+a fence around the rest of the address space.
 
 The guest module hooks `open("/dev/nvidia-uvm")` and from then on steers that
 process's anonymous mappings into `R` (overriding `get_unmapped_area` for that
