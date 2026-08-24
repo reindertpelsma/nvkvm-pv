@@ -935,6 +935,17 @@ the differences are user-visible:
   gets correct data. Visible beats silent, but code that checks these calls will
   see them fail.
 - **`cudaMemPrefetchAsync`** returns success and does nothing.
+- **Per-stream attach fails, and a real application dies on it.**
+  `cudaStreamAttachMemAsync(..., cudaMemAttachSingle)` returns
+  `cudaErrorInvalidValue`. It is backed by `UVM_SET_RANGE_GROUP`, which iterates
+  `uvm_va_range_managed_t` and so cannot see an external range
+  (`uvm_range_group.c:300-330`). Measured: NVIDIA's own
+  `cuda-samples/Samples/0_Introduction/UnifiedMemoryStreams` prints the error
+  twice and **dumps core**. This is the sharpest edge in the fallback — unlike
+  `cudaMemAdvise`, whose failure an application can ignore and still get correct
+  results, an application built around per-stream attachment does not survive.
+  If a managed-memory workload crashes here rather than merely running slowly,
+  this is the first thing to check.
 - **The pages are pinned, and it gets worse with size.** The guest module holds
   them with `alloc_pages()` and the host pins the matching HVA range via the RM
   OS-descriptor (`pin_user_pages()`). A 1 GiB managed allocation therefore
@@ -962,7 +973,17 @@ the differences are user-visible:
 
 `cuda_micro` case 6 is named `uvm_migrate` and measures a GPU↔CPU cycle. It
 still passes, but under the fallback there is no migration happening, so the
-number it reports stops meaning what its name says.
+number it reports stops meaning what its name says. Measured on an RTX 3060 Ti:
+566 us/cycle for 4 MiB each way, and case 5 (`managed+touch`) 1842 us/op — the
+latter includes a BACK + MAP + UNBACK round trip per allocation, so managed
+allocation is markedly more expensive here than on bare metal.
+
+**What has been seen to work**, same box: the size ladder from 4 MiB to 2 GiB
+(all CPU-verified), 3 GiB / 768 chunks and 4 GiB / 1024 chunks, `validate.sh`
+30/30 including `cuda_managed_coherence`, `cuda_micro` 5 and 6, and NVIDIA's
+`conjugateGradientUM` — a cuBLAS/cuSPARSE iterative solver running entirely on
+`cudaMallocManaged` — converging to residual 1.6e-06 with `Error amount =
+0.000000`.
 
 ### Reserving the UVM sub-window costs the sparse window 16 GiB
 
