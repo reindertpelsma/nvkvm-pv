@@ -25,6 +25,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_atomic.h>
 #include <drm/drm_edid.h>      /* drm_add_modes_noedid */
+#include <drm/drm_modes.h>     /* drm_cvt_mode, drm_mode_probed_add */
 #include <drm/drm_crtc.h>
 #include <drm/drm_framebuffer.h>  /* #102 present path: fb geometry/format */
 #include <linux/hrtimer.h>
@@ -52,6 +53,35 @@
 #define NVKVM_KMS_H_DEFAULT   1080
 #define NVKVM_KMS_HZ_DEFAULT  60
 
+/*
+ * THE CEILING, WHICH IS NOT THE MODE.
+ *
+ * These were the same number, and that is what capped the head.  The mode list
+ * was built with drm_add_modes_noedid(conn, kms_w, kms_h) and
+ * mode_config.max_width/max_height were set to kms_w/kms_h as well -- so the
+ * largest mode a compositor could be offered, and the largest framebuffer it
+ * could create, were both exactly the resolution the head happened to boot at.
+ * A head like that can never be asked to grow, whatever tells it to.
+ *
+ * That is the whole reason the host compositor could never promote the guest's
+ * buffer to a hardware plane: Mutter only scans out a surface that COVERS the
+ * output, the output is 3840x2160, and a 1600x900 head cannot produce a
+ * 3840x2160 buffer at any window size.  See src/broker/README.md.
+ *
+ * So: the ceiling is what the head COULD do, the mode is what it is doing now.
+ * The ceiling bounds framebuffer allocation and the extent of the mode list;
+ * it creates no modes by itself and costs nothing until something asks for a
+ * bigger one.  The current mode still starts at kms_width/kms_height and is
+ * then driven by the host through ui_info (nvkvm_kms_set_host_size).
+ *
+ * 4K by default because that is the largest display anyone is likely to put
+ * this window on today, not because 4K is special.  Raise it for an 8K panel:
+ *
+ *     options nvkvm-guest kms_max_width=7680 kms_max_height=4320
+ */
+#define NVKVM_KMS_MAX_W_DEFAULT   3840
+#define NVKVM_KMS_MAX_H_DEFAULT   2160
+
 /* Bounds are sanity, not policy: reject a value that would make the mode list
  * or the vblank timer nonsense, and fall back rather than refuse to load. */
 #define NVKVM_KMS_MIN         64u
@@ -62,6 +92,8 @@
 static unsigned int nvkvm_kms_w  = NVKVM_KMS_W_DEFAULT;
 static unsigned int nvkvm_kms_h  = NVKVM_KMS_H_DEFAULT;
 static unsigned int nvkvm_kms_hz = NVKVM_KMS_HZ_DEFAULT;
+static unsigned int nvkvm_kms_max_w = NVKVM_KMS_MAX_W_DEFAULT;
+static unsigned int nvkvm_kms_max_h = NVKVM_KMS_MAX_H_DEFAULT;
 
 module_param_named(kms_width, nvkvm_kms_w, uint, 0444);
 MODULE_PARM_DESC(kms_width, "virtual head width in pixels (default 1920)");
@@ -69,6 +101,25 @@ module_param_named(kms_height, nvkvm_kms_h, uint, 0444);
 MODULE_PARM_DESC(kms_height, "virtual head height in pixels (default 1080)");
 module_param_named(kms_hz, nvkvm_kms_hz, uint, 0444);
 MODULE_PARM_DESC(kms_hz, "virtual head refresh rate in Hz (default 60)");
+module_param_named(kms_max_width, nvkvm_kms_max_w, uint, 0444);
+MODULE_PARM_DESC(kms_max_width,
+		 "largest width the head can ever be asked for (default 3840)");
+module_param_named(kms_max_height, nvkvm_kms_max_h, uint, 0444);
+MODULE_PARM_DESC(kms_max_height,
+		 "largest height the head can ever be asked for (default 2160)");
+
+/*
+ * The mode the head is presenting RIGHT NOW.  Starts at kms_width/kms_height
+ * and is moved by the host telling us how big its window is -- unlike the
+ * module parameters, which are 0444 and fixed at insmod.
+ */
+static unsigned int nvkvm_kms_cur_w;
+static unsigned int nvkvm_kms_cur_h;
+
+/* The single virtual head.  One head by construction, so a pointer rather than
+ * a lookup; NULL until nvkvm_kms_init() has finished building it, which is why
+ * nvkvm_kms_set_host_size() must tolerate that. */
+static struct nvkvm_kms *nvkvm_kms_head;
 
 static void nvkvm_kms_clamp_mode(void)
 {
@@ -90,6 +141,29 @@ static void nvkvm_kms_clamp_mode(void)
 			NVKVM_KMS_HZ_DEFAULT);
 		nvkvm_kms_hz = NVKVM_KMS_HZ_DEFAULT;
 	}
+	if (nvkvm_kms_max_w < NVKVM_KMS_MIN || nvkvm_kms_max_w > NVKVM_KMS_MAX) {
+		pr_warn("nvkvm: kms_max_width=%u out of range [%u,%u], using %u\n",
+			nvkvm_kms_max_w, NVKVM_KMS_MIN, NVKVM_KMS_MAX,
+			NVKVM_KMS_MAX_W_DEFAULT);
+		nvkvm_kms_max_w = NVKVM_KMS_MAX_W_DEFAULT;
+	}
+	if (nvkvm_kms_max_h < NVKVM_KMS_MIN || nvkvm_kms_max_h > NVKVM_KMS_MAX) {
+		pr_warn("nvkvm: kms_max_height=%u out of range [%u,%u], using %u\n",
+			nvkvm_kms_max_h, NVKVM_KMS_MIN, NVKVM_KMS_MAX,
+			NVKVM_KMS_MAX_H_DEFAULT);
+		nvkvm_kms_max_h = NVKVM_KMS_MAX_H_DEFAULT;
+	}
+	/* The ceiling must contain the mode, or the head boots into a size it is
+	 * not allowed to allocate.  Raise the ceiling rather than shrink the
+	 * mode: the operator asked for the mode explicitly and only defaulted
+	 * into the ceiling. */
+	if (nvkvm_kms_max_w < nvkvm_kms_w)
+		nvkvm_kms_max_w = nvkvm_kms_w;
+	if (nvkvm_kms_max_h < nvkvm_kms_h)
+		nvkvm_kms_max_h = nvkvm_kms_h;
+
+	nvkvm_kms_cur_w = nvkvm_kms_w;
+	nvkvm_kms_cur_h = nvkvm_kms_h;
 }
 
 struct nvkvm_kms {
@@ -131,18 +205,114 @@ static enum hrtimer_restart nvkvm_vblank_fn(struct hrtimer *t)
 	return HRTIMER_RESTART;
 }
 
-/* ── Connector: a single fixed mode, no EDID ─────────────────────────────── */
+/* ── Connector: a mode list bounded by the ceiling, preferring the current
+ *    size ────────────────────────────────────────────────────────────────── */
+
+/* Is (w,h) already among the modes we have probed onto this connector? */
+static bool nvkvm_mode_listed(struct drm_connector *conn, unsigned int w,
+			      unsigned int h)
+{
+	struct drm_display_mode *m;
+
+	list_for_each_entry(m, &conn->probed_modes, head) {
+		if (m->hdisplay == (int)w && m->vdisplay == (int)h)
+			return true;
+	}
+	return false;
+}
+
 static int nvkvm_conn_get_modes(struct drm_connector *conn)
 {
+	unsigned int w = READ_ONCE(nvkvm_kms_cur_w);
+	unsigned int h = READ_ONCE(nvkvm_kms_cur_h);
+	struct drm_display_mode *mode;
 	int count;
 
-	/* drm_add_modes_noedid() adds the whole standard table up to this size
-	 * and marks NONE of it preferred, so a client picks by its own
-	 * heuristics -- Xorg chose 1400x1050 on a 1920x1080 panel.  Flag the
-	 * native mode, the way vkms/virtio-gpu do. */
-	count = drm_add_modes_noedid(conn, nvkvm_kms_w, nvkvm_kms_h);
-	drm_set_preferred_mode(conn, nvkvm_kms_w, nvkvm_kms_h);
+	/*
+	 * The standard table, up to the CEILING -- not up to the mode we happen
+	 * to be in.  A compositor can only ever choose a mode that was offered,
+	 * so a list that ends at the current size is a head that can never grow.
+	 */
+	count = drm_add_modes_noedid(conn, nvkvm_kms_max_w, nvkvm_kms_max_h);
+
+	/*
+	 * AND THE ONE THAT ACTUALLY MATTERS, WHICH THAT CALL CANNOT PRODUCE.
+	 *
+	 * drm_add_modes_noedid() offers the VESA DMT table, and DMT stops at
+	 * 2560x1600 -- there is no 3840x2160 in it.  Verified on hardware: with
+	 * kms_width=3840 kms_height=2160 the connector's mode list still topped
+	 * out at 2560x1600.  So raising the ceiling alone reaches nothing; the
+	 * mode has to be synthesised.
+	 *
+	 * The host's window size is not a standard mode either -- a dragged
+	 * window is 2560x1412, not 2560x1440 -- so the same synthesis serves
+	 * both.  CVT with reduced blanking, because this head has no real
+	 * timing: the numbers exist only so the mode is well-formed.
+	 *
+	 * Matching the host output EXACTLY is the point.  Mutter promotes a
+	 * surface to a hardware plane only when it covers the output, so
+	 * "close to 3840x2160" is worth exactly as much as 1600x900.
+	 */
+	if (w && h && !nvkvm_mode_listed(conn, w, h)) {
+		mode = drm_cvt_mode(conn->dev, w, h, nvkvm_kms_hz, true, false,
+				    false);
+		if (mode) {
+			mode->type |= DRM_MODE_TYPE_DRIVER;
+			drm_mode_probed_add(conn, mode);
+			count++;
+		}
+	}
+
+	/* drm_add_modes_noedid() marks NONE of its modes preferred, so a client
+	 * picks by its own heuristics -- Xorg chose 1400x1050 on a 1920x1080
+	 * panel.  Flag ours, the way vkms/virtio-gpu do. */
+	drm_set_preferred_mode(conn, w, h);
 	return count;
+}
+
+/*
+ * THE HOST'S WINDOW CHANGED SIZE.
+ *
+ * Called from the virtio event path when QEMU forwards ui_info -- which is
+ * itself the broker's EV_SURFACE, i.e. the size of the window a person just
+ * dragged.  Without this the guest never learns the window changed, and the
+ * host compositor is left resampling a fixed-size guest frame into a different
+ * sized window: the picture the user described as "only sharp at the initial
+ * window size or smaller".
+ *
+ * This does NOT set the mode.  It moves the head's idea of its native size and
+ * fires a hotplug, and the guest's own compositor then decides whether to take
+ * it -- which is the right split, because a mode switch is the guest's business
+ * and a window drag is the host's.
+ */
+void nvkvm_kms_set_host_size(unsigned int w, unsigned int h)
+{
+	struct nvkvm_kms *kms = READ_ONCE(nvkvm_kms_head);
+
+	if (!kms)
+		return;
+	/* Bound it before it reaches the mode list: this number comes from
+	 * outside the guest, and mode_config.max_* is what the rest of DRM will
+	 * enforce anyway.  Clamp rather than reject -- a window larger than the
+	 * ceiling is a reasonable thing for a user to make, and the head should
+	 * simply stop growing at that point. */
+	if (w < NVKVM_KMS_MIN || h < NVKVM_KMS_MIN)
+		return;
+	if (w > nvkvm_kms_max_w)
+		w = nvkvm_kms_max_w;
+	if (h > nvkvm_kms_max_h)
+		h = nvkvm_kms_max_h;
+	if (w == READ_ONCE(nvkvm_kms_cur_w) && h == READ_ONCE(nvkvm_kms_cur_h))
+		return;
+
+	WRITE_ONCE(nvkvm_kms_cur_w, w);
+	WRITE_ONCE(nvkvm_kms_cur_h, h);
+	pr_info("nvkvm: host window is %ux%u; offering it as the preferred mode\n",
+		w, h);
+
+	/* Makes userspace re-run get_modes() and see the new preferred mode.
+	 * A compositor that ignores it simply keeps the mode it has. */
+	drm_kms_helper_hotplug_event(kms->conn.dev);
 }
 
 /* A virtual panel is always present: report connected on every probe so the
@@ -541,8 +711,11 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	ddev->mode_config.min_width  = 0;
 	ddev->mode_config.min_height = 0;
 	nvkvm_kms_clamp_mode();
-	ddev->mode_config.max_width  = nvkvm_kms_w;
-	ddev->mode_config.max_height = nvkvm_kms_h;
+	/* The CEILING, not the mode -- see NVKVM_KMS_MAX_W_DEFAULT.  This bounds
+	 * framebuffer creation, so a head whose max_* equals its boot mode can
+	 * never scan out anything larger however the mode list is built. */
+	ddev->mode_config.max_width  = nvkvm_kms_max_w;
+	ddev->mode_config.max_height = nvkvm_kms_max_h;
 	/* Reported as DRM_CAP_DUMB_PREFERRED_DEPTH; left at 0 a client has to
 	 * guess, and Xorg's modesetting DDX guesses by probing a scanout fb. */
 	ddev->mode_config.preferred_depth = 24;
@@ -608,7 +781,18 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	}
 
 	drm_mode_config_reset(ddev);
-	pr_info("nvkvm: virtual KMS head ready (%dx%d, 1 connector/crtc)\n",
-		nvkvm_kms_w, nvkvm_kms_h);
+	/* Publish last: nvkvm_kms_set_host_size() may be called from the virtio
+	 * event path the moment the device goes live, and everything it touches
+	 * has to exist by then. */
+	WRITE_ONCE(nvkvm_kms_head, kms);
+	pr_info("nvkvm: virtual KMS head ready (%ux%u, up to %ux%u, 1 connector/crtc)\n",
+		nvkvm_kms_cur_w, nvkvm_kms_cur_h,
+		nvkvm_kms_max_w, nvkvm_kms_max_h);
 	return 0;
+}
+
+/* Torn down with the DRM device: stop the resize path finding a freed head. */
+void nvkvm_kms_fini(void)
+{
+	WRITE_ONCE(nvkvm_kms_head, NULL);
 }

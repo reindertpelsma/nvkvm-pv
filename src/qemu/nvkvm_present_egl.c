@@ -305,6 +305,7 @@ out:
 typedef struct NvkvmPresent {
     QemuConsole *con;
     DeviceState *dev;
+    struct VirtIONvgpu *nv;  /* for ui_info, which travels back to the guest */
 
     pthread_mutex_t lock;
     /* Pending frame from the guest; owns `fd`.  fd<0 ⇒ slot empty. */
@@ -1277,9 +1278,36 @@ static void nvkvm_present_invalidate(void *opaque)
     (void)opaque;            /* full redraw happens on the next flip */
 }
 
+/*
+ * GraphicHwOps.ui_info -- the host window's geometry, on its way to the guest.
+ *
+ * Its ABSENCE was the bug.  Without this callback dpy_ui_info_supported() is
+ * false and QEMU silently has no channel to tell the guest the window changed,
+ * so the guest goes on scanning out whatever size it booted at and the host
+ * resamples it into the window.  That is why enlarging the window made the
+ * picture softer instead of sharper, and it is half of why the guest's buffer
+ * can never cover the host output and so can never reach a hardware plane.
+ *
+ * Advisory in both directions: we forward the size and the guest's own
+ * compositor decides whether to re-mode.  A window is a host gesture; a mode
+ * is the guest's business.
+ */
+static void nvkvm_present_ui_info(void *opaque, uint32_t head,
+                                  QemuUIInfo *info)
+{
+    NvkvmPresent *p = opaque;
+
+    (void)head;                 /* one head */
+    if (!p || !info) {
+        return;
+    }
+    nvkvm_virtio_push_ui_info(p->nv, info->width, info->height);
+}
+
 static const GraphicHwOps nvkvm_present_hwops = {
     .invalidate  = nvkvm_present_invalidate,
     .gfx_update  = nvkvm_present_gfx_update,
+    .ui_info     = nvkvm_present_ui_info,
 };
 
 /* Bottom half: runs on the main loop, pokes the display to drain the slot
@@ -1297,6 +1325,7 @@ int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
     p->fd   = -1;
     p->mode = -1;
     p->dev  = dev;
+    p->nv   = nv;
     p->con  = graphic_console_init(dev, 0, &nvkvm_present_hwops, p);
     p->bh   = qemu_bh_new(nvkvm_present_bh, p);
     qemu_sem_init(&p->wake, 0);   /* #125: present thread starts on first use */

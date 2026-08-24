@@ -445,6 +445,23 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
         break;
     case NVKVM_BROKER_EV_SURFACE:
         RELAY_LOG("broker window is now %dx%d", p->x, p->y);
+        /*
+         * Forward it to the guest.  This is the whole point of the event: the
+         * guest head can then offer a mode that MATCHES the host output, which
+         * is what a compositor requires before it will scan the guest's buffer
+         * out directly instead of compositing a copy of it.
+         *
+         * `delay` is true: a resize drag produces a stream of these and only
+         * the last one is worth a guest mode switch.  QEMU's own timer
+         * coalescing is exactly the right tool and is already there.
+         */
+        if (con && p->x > 0 && p->y > 0 && dpy_ui_info_supported(con)) {
+            QemuUIInfo info = *dpy_get_ui_info(con);
+
+            info.width  = (uint32_t)p->x;
+            info.height = (uint32_t)p->y;
+            dpy_set_ui_info(con, &info, true);
+        }
         break;
     case NVKVM_BROKER_EV_FRAME:
     case NVKVM_BROKER_EV_RELEASE:

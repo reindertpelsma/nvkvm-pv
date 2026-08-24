@@ -519,13 +519,42 @@ struct nvkvm_resp_unpoll_on_isolate {
 	__le32 reserved;
 };
 
-/* ── Async poll event (VQ_EVT) ───────────────────────────────────────────── */
+/* ── Async events (VQ_EVT) ───────────────────────────────────────────────── */
+
+/*
+ * VQ_EVT carried exactly one kind of message and so had no type field.  It now
+ * carries two, and the discriminator is the LAST word -- what used to be
+ * `reserved`, which QEMU has always zero-filled.  So type 0 still means the
+ * poll event it always meant, an older guest that ignores the word keeps
+ * working against a newer QEMU, and a newer guest reading it against an older
+ * QEMU sees 0 and is right.  No version bump is needed for that to hold; it
+ * only holds because the field was genuinely always zero, so do not repurpose
+ * any other `reserved` in this header on the strength of this precedent
+ * without checking the same thing.
+ *
+ * Every event is the same 16 bytes, because the guest pre-posts fixed-size
+ * buffers on VQ_EVT and recycles them (nvkvm_evt_post_one).
+ */
+#define NVKVM_EVT_TYPE_POLL     0u
+#define NVKVM_EVT_TYPE_UI_INFO  1u
 
 struct nvkvm_evt_poll {
 	__le32 isolate_id;
 	__le32 handle_id;
 	__le32 events;
+	__le32 type;            /* NVKVM_EVT_TYPE_POLL (0); was `reserved` */
+};
+
+/*
+ * The host's window is now width x height -- QEMU's GraphicHwOps.ui_info,
+ * which in broker mode is the broker's EV_SURFACE.  Advisory: the guest offers
+ * it as the head's preferred mode and its own compositor decides.
+ */
+struct nvkvm_evt_ui_info {
+	__le32 width;
+	__le32 height;
 	__le32 reserved;
+	__le32 type;            /* NVKVM_EVT_TYPE_UI_INFO (1) */
 };
 
 /* ── WRITE_MEMORY_HANDLE ─────────────────────────────────────────────────── */

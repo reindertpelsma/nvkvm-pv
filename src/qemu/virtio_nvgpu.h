@@ -444,6 +444,10 @@ void virtio_nvgpu_fini(VirtIONvgpu *nv);
  * Safe to call from any thread; hops onto the device AioContext internally. */
 void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
 			   uint32_t handle_id, uint32_t revents);
+/* The host window changed size: forward it to the guest's KMS head over
+ * VQ_EVT.  Advisory and latest-wins -- see nvkvm_virtio_push_ui_info(). */
+void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
+			       uint32_t height);
 
 /*
  * DEAD-1, 2026-08-24: the nvkvm_dispatch.c and nvkvm_frontend.c declarations
