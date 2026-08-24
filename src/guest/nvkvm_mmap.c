@@ -66,8 +66,8 @@ bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
  * range was freshly mapped, after a zap in the migrate path), before userspace
  * can have touched — and thus TLB-cached — them.  Callers must hold mmap lock.
  */
-static void nvkvm_force_range_wb(struct mm_struct *mm,
-				 unsigned long start, unsigned long end)
+void nvkvm_force_range_wb(struct mm_struct *mm,
+			  unsigned long start, unsigned long end)
 {
 	unsigned long a;
 
@@ -125,6 +125,38 @@ static void nvkvm_vma_close(struct vm_area_struct *vma)
 	struct nvkvm_mmap_region *region = vma->vm_private_data;
 	if (!region)
 		return;
+
+	/*
+	 * A fallback-backed managed range is released HERE.
+	 *
+	 * vma_close and mmap_release_fd can both reach a region — on process
+	 * exit the kernel tears VMAs down and then closes files.  Exactly one of
+	 * them must do the teardown; the claim decides which, under the same
+	 * lock that guards the list.  See nvkvm_uvm_ext_release() for why this
+	 * cannot be deferred to fd close the way a forwarded mapping is.
+	 */
+	if (region->ext_backed) {
+		struct nvkvm_fd_ctx *ctx = region->ctx;
+		bool mine = false;
+
+		if (ctx) {
+			spin_lock(&ctx->mmap_lock);
+			if (!region->ext_claimed) {
+				region->ext_claimed = true;
+				list_del(&region->list);
+				mine = true;
+			}
+			spin_unlock(&ctx->mmap_lock);
+		}
+		vma->vm_private_data = NULL;
+		/* Losing the claim means the other side owns the region and may
+		 * already have freed it, so do not touch it again on the way
+		 * out — clearing vm_private_data above is all this side owes. */
+		if (!mine)
+			return;
+		nvkvm_uvm_ext_release(region);
+		return;
+	}
 
 	/* Mark VMA as gone; the actual host munmap is deferred to fd close
 	 * or explicit unmap, consistent with how the NVIDIA driver expects
@@ -272,6 +304,38 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
 					  struct vm_area_struct *vma);
 
+/*
+ * Does a recorded UVM intent cover exactly this mapping?
+ *
+ * UVM_ALLOC_SEMAPHORE_POOL names its VA in the ioctl and is mmap'd afterwards
+ * at that same VA — va_range_type_expects_mmap() is true for SEMAPHORE_POOL and
+ * DEVICE_P2P and false for MANAGED (uvm.c:743-757).  Those mappings must keep
+ * going down the forwarding path.
+ *
+ * A managed range has no such ioctl: mmap itself creates it.  So "no matching
+ * intent" is precisely "this is a managed allocation", which is the one case
+ * the fallback handles.
+ */
+static bool nvkvm_uvm_mmap_has_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
+				      unsigned long len)
+{
+	struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+	struct nvkvm_uvm_mapping_intent *m;
+	bool found = false;
+
+	if (!st)
+		return false;
+	mutex_lock(&st->lock);
+	list_for_each_entry(m, &st->intents, list) {
+		if (m->base == gva && m->length == len) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&st->lock);
+	return found;
+}
+
 int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 {
 	unsigned long vma_len = vma->vm_end - vma->vm_start;
@@ -293,6 +357,17 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * realize-on-existing-fd refactor lands (the current fresh-fd
 	 * design loses the RM↔UVM bindings the original fd built up). */
 	(void)nvkvm_mmap_request_uvm_realize;
+
+	/*
+	 * A UVM mmap with no matching intent is libcuda creating a MANAGED
+	 * range — the one thing forwarding cannot do correctly (§2b of
+	 * docs/internal/uvm-va-decoupling.md).  Everything else on this fd
+	 * (semaphore pools, device-P2P) named its VA in an ioctl first, so it
+	 * already exists in the host va_space and keeps the forwarding path.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state &&
+	    !nvkvm_uvm_mmap_has_intent(ctx, vma->vm_start, vma_len))
+		return nvkvm_uvm_ext_mmap(ctx, vma);
 
 	return nvkvm_mmap_request_isolate(ctx, vma);
 }
@@ -1141,6 +1216,15 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
 
 	spin_lock(&ctx->mmap_lock);
+	{
+		struct nvkvm_mmap_region *r;
+		/* Claim every fallback region while still holding the lock, so a
+		 * concurrent vma_close sees ext_claimed and steps aside rather
+		 * than tearing down a region this loop is about to free. */
+		list_for_each_entry(r, &ctx->mmap_regions, list)
+			if (r->ext_backed)
+				r->ext_claimed = true;
+	}
 	list_splice_init(&ctx->mmap_regions, &to_free);
 	spin_unlock(&ctx->mmap_lock);
 
@@ -1155,6 +1239,15 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 	 * simple_req uses).
 	 */
 	list_for_each_entry_safe(region, tmp, &to_free, list) {
+		if (region->ext_backed) {
+			/* Same teardown as vma_close: the GPU mapping goes
+			 * first, then the CPU mapping, then the RM object. */
+			list_del(&region->list);
+			if (region->vma)
+				region->vma->vm_private_data = NULL;
+			nvkvm_uvm_ext_release(region);
+			continue;
+		}
 		if (region->handle_id && isolate_id) {
 			struct {
 				struct nvkvm_hdr                   hdr;

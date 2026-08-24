@@ -1209,12 +1209,14 @@ int nvkvm_virtio_interrupt_isolate(__u32 isolate_id, __u32 target_txn)
  * third shm slot.  On -EFAULT, *fault_addr_out is set to the faulting GVA so
  * the caller can map the region and retry.
  */
-long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
-				   unsigned int cmd,
-				   void *params_buf, size_t param_size,
-				   void *aux_buf, size_t aux_size,
-				   __u32 flags,
-				   __u64 *fault_addr_out)
+static long ioctl_on_isolate_common(__u32 isolate_id, __u32 handle_id,
+				    __u32 session_id,
+				    unsigned int cmd,
+				    void *params_buf, size_t param_size,
+				    void *aux_buf, size_t aux_size,
+				    __u32 flags,
+				    __u64 *fault_addr_out,
+				    bool want_vma_whitelist)
 {
 	struct {
 		struct nvkvm_hdr                 hdr;
@@ -1241,7 +1243,7 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	}
 	/* Mark this wait interruptible: on a guest signal, send_sync will ask
 	 * this isolate to interrupt the in-flight host ioctl. */
-	inf->isolate_id = ctx->session->isolate_id;
+	inf->isolate_id = isolate_id;
 
 	/*
 	 * FF-2 backstop (security_audit_2026_06_01): the RM_CONTROL aux-extend
@@ -1294,8 +1296,9 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	 * path without an mm (GEM_CLOSE) carry no embedded user pointers anyway, so
 	 * skipping the whitelist (vma_count stays 0) is correct, not a workaround.
 	 */
-	vma_buf = current->mm ? kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES,
-					GFP_KERNEL) : NULL;
+	vma_buf = (want_vma_whitelist && current->mm)
+		? kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES, GFP_KERNEL)
+		: NULL;
 	if (vma_buf) {
 		struct mm_struct *mm = current->mm;
 		struct vm_area_struct *vma;
@@ -1340,8 +1343,8 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 
 	msg->hdr.type   = cpu_to_le32(NVKVM_REQ_IOCTL_ON_ISOLATE);
 	msg->hdr.txn_id = cpu_to_le32(txn_id);
-	msg->req.isolate_id              = cpu_to_le32(ctx->session->isolate_id);
-	msg->req.handle_id               = cpu_to_le32(ctx->handle_id);
+	msg->req.isolate_id              = cpu_to_le32(isolate_id);
+	msg->req.handle_id               = cpu_to_le32(handle_id);
 	msg->req.cmd                     = cpu_to_le32(cmd);
 	msg->req.param_size              = cpu_to_le32((__u32)param_size);
 	msg->req.shm_slot                = cpu_to_le32((__u32)(shm_slot >= 0 ? shm_slot : 0));
@@ -1350,7 +1353,7 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 	msg->req.vma_whitelist_nentries  = cpu_to_le32((__u32)vma_count);
 	msg->req.vma_whitelist_slot      = cpu_to_le32((__u32)(shm_vma_slot >= 0 ? shm_vma_slot : 0));
 	msg->req.flags                   = cpu_to_le32(flags);
-	msg->req.session_id              = cpu_to_le32((__u32)ctx->session->id);
+	msg->req.session_id              = cpu_to_le32(session_id);
 
 	ret = nvkvm_send_sync(&nvkvm, msg, sizeof(*msg), inf);
 	if (ret < 0)
@@ -1390,6 +1393,45 @@ out:
 	inflight_free(&nvkvm, inf);
 	kfree(msg);
 	return ret;
+}
+
+long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
+				   unsigned int cmd,
+				   void *params_buf, size_t param_size,
+				   void *aux_buf, size_t aux_size,
+				   __u32 flags,
+				   __u64 *fault_addr_out)
+{
+	return ioctl_on_isolate_common(ctx->session->isolate_id, ctx->handle_id,
+				       (__u32)ctx->session->id,
+				       cmd, params_buf, param_size,
+				       aux_buf, aux_size, flags,
+				       fault_addr_out, true);
+}
+
+/*
+ * Same forward, minus the VMA whitelist.
+ *
+ * The whitelist exists so the stub can validate a guest pointer that an ioctl
+ * embeds; building it takes mmap_read_lock(current->mm).  The managed-memory
+ * fallback issues its RM and UVM ioctls from inside ->mmap() and ->close() on a
+ * VMA, i.e. with mmap_write_lock ALREADY HELD — taking the read side there is a
+ * self-deadlock on a non-recursive rwsem, not a lock-order nicety.
+ *
+ * Dropping it is also correct rather than merely necessary: every ioctl on that
+ * path is composed by this module out of handles and lengths and embeds no user
+ * pointer at all (the alloc-params blob travels in the aux slot, which the stub
+ * re-points at its own copy).  vma_count == 0 is already an ordinary case for
+ * the stub — GEM_CLOSE forwarded at process exit takes it.
+ */
+long nvkvm_virtio_ioctl_on_isolate_nomm(__u32 isolate_id, __u32 handle_id,
+					__u32 session_id, unsigned int cmd,
+					void *params_buf, size_t param_size,
+					void *aux_buf, size_t aux_size)
+{
+	return ioctl_on_isolate_common(isolate_id, handle_id, session_id,
+				       cmd, params_buf, param_size,
+				       aux_buf, aux_size, 0, NULL, false);
 }
 
 int nvkvm_virtio_munmap_on_isolate(__u32 isolate_id, __u32 mmap_token)

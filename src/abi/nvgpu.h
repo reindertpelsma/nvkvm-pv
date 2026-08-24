@@ -772,6 +772,21 @@ struct nv_memory_allocation_params_v545 {
 	__u32 _pad1;
 };
 
+/*
+ * NVOS32 attribute bitfields — the `attr` word of NV_MEMORY_ALLOCATION_PARAMS.
+ * Only the one field the managed-memory fallback sets is spelled out; RM fills
+ * the rest in and reports them back in the same word.
+ *
+ *   NVOS32_ATTR_LOCATION   26:25   _VIDMEM 0, _PCI 1 (system memory), _ANY 3
+ *
+ * MEASURED, not transcribed: tools/uvm_sysmem_probe.c sweeps candidate `attr`
+ * words against a real driver.  On 575.51.03 / RTX 3060, `attr = 0` is refused
+ * (status 0x39) and `attr = 1 << 25` is accepted, RM echoing 0x0a800000 — i.e.
+ * it filled in PHYSICALITY_NONCONTIGUOUS and a page size of its choosing on top
+ * of the location we asked for.
+ */
+#define NVOS32_ATTR_LOCATION_PCI            (1U << 25)
+
 /* ── NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION (0x101) ────────────────────── */
 
 #define NV0000_CTRL_CMD_SYSTEM_GET_BUILD_VERSION 0x00000101U
