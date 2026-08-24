@@ -180,15 +180,26 @@ docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 \
 | `go test -count=1` | a wrong ABI row does not fail loudly — it forwards a mis-sized parameter block and the guest gets a plausible wrong answer (`5036b0f`) |
 | shellcheck **v0.10.0**, pinned | `scripts/` is how everything gets built and shipped to rented boxes; a quoting bug there fails at hour three of a paid sweep (`ci.yml:20-22`) |
 
-**Use `run_tests.sh`, never `make run`.** `make run` exits non-zero *by design*:
-`test_isolate` fails 5 of its 7 cases at runtime on pre-existing API drift
-between the test and the isolate table (`tests/unit/Makefile:65-69`). A suite
-that is red by default is a suite nobody reads. `run_tests.sh` names those five
-explicitly and goes **red** if a sixth fails, if one of the five starts passing
-(the drift got fixed — update the file), if any suite regresses, if anything
-fails to build, **or if a suite quietly loses assertions** (the counts are
-pinned: `test_dispatch` 39, `test_tables` 17, `test_handle` 9, `test_frontend`
-8). Do not "fix" the five by deleting the test.
+**Use `run_tests.sh`, never `make run`.** `make run` runs the suites raw and is not
+a pass/fail signal. `run_tests.sh` goes **red** if any case fails, if any suite
+regresses, if anything fails to build, **or if a suite quietly loses assertions** —
+the counts are pinned per suite in `tests/unit/run_tests.sh:41-52` and `:99`:
+`test_dispatch` 39, `test_frontend` 8, `test_handle` 11, `test_isolate` 9,
+`test_tables` 17, `test_nvkms_allowlist` 618, `test_stub_ptr_sanitize` 17,
+`test_kvm_slot` 12, `test_stub_window` 27, `test_drm_devinfo` 67 — **ten suites,
+825 cases, zero failures**, plus the two marker suites `test_open_scm` and
+`test_ctrl_gate`. Bump the pin in `run_tests.sh` when you add cases; that one-line
+diff is the point.
+
+**`test_isolate` has no known-failing cases any more, and this section used to say
+it had five.** For months the file carried "5 of 7 fail on pre-existing API drift
+between the test and the isolate table". That was a *confident wrong explanation*,
+and it is exactly what kept anyone from looking. Under strace it turned out to be
+four independent faults stacked — **two of them production bugs**: the isolate
+closed its own fd 0 before `fexecve`, and `nvkvm_isolate_table_init()` left
+`sync_open_fd` at 0 so claiming a slot closed fd 0 again. All four are fixed and
+`ISOLATE_KNOWN_FAIL` is empty (`tests/unit/run_tests.sh:60-99`). Never silence a
+case you have not explained.
 
 **`-count=1` on the Go tests is mandatory.** Go's build cache does track the
 cgo-included header, but the *test-result* cache is keyed on the test binary, so

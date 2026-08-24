@@ -410,12 +410,8 @@ against stub headers in `tests/unit/stubs/`:
 bash tests/unit/run_tests.sh        # or: make -C tests/unit check
 ```
 
-**Use `run_tests.sh`, not `make run`.** `tests/unit/Makefile:70-77` runs the
-suites raw and exits non-zero *by design*: `test_isolate` fails 5 of its 7 cases
-at runtime — pre-existing API drift between the test and the isolate table,
-documented at `tests/unit/Makefile:65-69` — which makes `make run` useless as a
-pass/fail signal. `run_tests.sh` names those five explicitly and is green when
-exactly those fail.
+**Use `run_tests.sh`, not `make run`.** `make run` runs the suites raw and is not
+a pass/fail signal; `run_tests.sh` is the one that knows what "green" means.
 
 It is also stricter than `make` in the way that matters. `make` aborts on the
 first error, so on 2026-08-20 a `test_isolate` link failure meant `test_tables`
@@ -424,23 +420,40 @@ stopped running**, with nothing saying so. `run_tests.sh` builds with `make -k`,
 then requires every expected binary to exist and every suite to report its
 pinned assertion count (`tests/unit/run_tests.sh:1-33`).
 
-Eight binaries, all of which build (`tests/unit/Makefile:39`):
+Thirteen binaries, all of which build. **Ten case-counted suites, 825 cases, zero
+failures** — nine pinned in `TALLY_SUITES` (`tests/unit/run_tests.sh:41-52`) plus
+`test_isolate`, which is counted separately via `ISOLATE_TOTAL` (`:99`). The runner's
+own closing line says *"all 9 suites"* because it counts only the nine tally suites;
+`test_isolate` is the tenth. `run_tests.sh` is the source of truth — this table
+follows it.
 
 | suite | pinned expectation |
 |---|---|
 | `test_dispatch` | 39/39 |
-| `test_tables` | 17/17 |
-| `test_handle` | 9/9 |
 | `test_frontend` | 8/8 |
+| `test_handle` | 11/11 |
+| `test_isolate` | 9/9 — **`ISOLATE_KNOWN_FAIL` is empty and must stay empty** |
+| `test_tables` | 17/17 |
+| `test_nvkms_allowlist` | 618/618 |
+| `test_stub_ptr_sanitize` | 17/17 |
+| `test_kvm_slot` | 12/12 |
+| `test_stub_window` | 27/27 |
+| `test_drm_devinfo` | 67/67 |
 | `test_open_scm` | prints `ALL OPEN_SCM TESTS PASSED` |
 | `test_ctrl_gate` | prints `test_ctrl_gate: PASS` |
-| `test_isolate` | 7 cases run, exactly 5 known-failing |
 | `mock_stub` | not a suite — the fake isolate `test_isolate` spawns |
 
 If you add cases, bump the count in `run_tests.sh`; that one-line diff is the
-point of pinning them. If one of the five known-failing isolate cases starts
-passing, the suite also goes red — that means the drift got fixed and the file
-needs updating, not that the test is wrong.
+point of pinning them.
+
+**`test_isolate` no longer has known-failing cases**, and this table used to say it
+did. It failed 4 of 9 (earlier written up as 5 of 7) behind a comment blaming "API
+drift between the test and the isolate table". That explanation was wrong, and being
+confidently wrong is what stopped anyone looking: `run_tests.sh:60-98` records the
+four independent faults that were actually stacked there, **two of them production
+bugs** (the isolate closing its own fd 0, and `nvkvm_isolate_table_init()` leaving
+`sync_open_fd` at 0). All four are fixed. `ISOLATE_KNOWN_FAIL` is now empty; a case
+that starts failing again is a regression, not drift.
 
 `test_dispatch` targets `src/qemu/nvkvm_dispatch.c`, which is dead code (see
 [the pointer audit](../internal/audit-guest-pointers.md), section 2).

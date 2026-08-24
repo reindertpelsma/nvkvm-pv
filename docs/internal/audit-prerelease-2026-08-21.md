@@ -21,16 +21,16 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 |---|---|---|---|---|
 | P-1 | **critical** | fail-open validation | guest process → another guest process | **fixed** — `71a490f` |
 | P-2 | **critical** | allowlist too permissive | guest process → host kernel | **fixed** — row dropped; see the EXCLUSIONS block in `nvkvm_ctrl_allowlist.h` |
-| P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (writable alias) + the stub is now a real static PIE; see below |
-| P-4 | high | missing ownership check | guest kernel → VMM | see below |
+| P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (writable alias; the entry had gone stale) + the stub is now a real static PIE; see below |
+| P-4 | high | missing ownership check | guest kernel → VMM | **partial** — `realize_uvm_mapping` fixed; `munmap_on_isolate` open, needs a protocol field — reconciled 2026-08-24 |
 | P-5 | ~~high~~ **by design** | design vs documentation | isolate → isolate | **decided** — uid separation is not required; see below |
 | P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
-| P-7 | high | dev harness | guest → host root | **gated** — opt-in behind `NVKVM_DEV_HARNESS_INSECURE_RW`; see below |
-| P-8 | high | process | — | **partly fixed** — see "the revert" |
-| P-9 | medium | shell quoting | — | build correctness |
-| P-10 | medium–high | liveness ×3 | isolate → VMM | see below |
-| P-11 | medium | struct size disagreement | guest → host | silent wrong answer |
-| P-12 | medium | state reuse | guest process → VM-wide DoS | see below |
+| P-7 | high | dev harness | guest → host root | **gated** — opt-in behind `NVKVM_DEV_HARNESS_INSECURE_RW`; narrowed, not removed; see below |
+| P-8 | high | process | — | **fixed** — all five items and the `abi-parity` job restored; reconciled 2026-08-24 |
+| P-9 | medium | shell quoting | — | **fixed** — `929f467`, all six heredocs; reconciled 2026-08-24 |
+| P-10 | medium–high | liveness ×3 | isolate → VMM | **partial** — fd leak fixed (`6087e1b`); prefault SIGBUS open; `loop_lock` open by design — reconciled 2026-08-24 |
+| P-11 | medium | struct size disagreement | guest → host | **fixed** — `NVOS57` is 24 B, `status@20`, the gate now fires; reconciled 2026-08-24 |
+| P-12 | medium | state reuse | guest process → VM-wide DoS | **fixed** — reset in `alloc_isolate_slot()`; reconciled 2026-08-24 |
 | P-13 | medium | descriptor handling | — (availability) | **fixed** — see addendum |
 | P-14 | medium | design vs documentation | isolate → VMM | **open** — see addendum |
 | P-15 | medium–high | descriptor handling | VMM → VMM's own fds | **fixed** — see addendum |
@@ -79,6 +79,23 @@ pairings are verified"*. That was true of the only broker that existed on
 pairing at all beyond "different isolate". The dma-buf broker
 `nvkvm_req_xiso_import` remains correctly gated and is the model to follow.
 
+**RECONCILED 2026-08-24 — the fd-guessing hole is FIXED; the relay's missing pairing
+check is NOT, and the table row should not be read as covering it.** All five sites
+fail closed on `guest_fd_to_handle_id() < 0` (`src/guest/nvkvm_main.c:1507-1512`,
+`:1541-1560`, `:1580-1600`; `src/guest/nvkvm_drm.c:779-789`, `:857-867`), matching
+the seven siblings. But `nvkvm_xrm_materialise`
+(`src/qemu/nvkvm_isolate_handlers.c:1694-1723`) still derives
+`owner_iso = session_first_isolate(nv, h->session_id)` and then checks
+`session_has_isolate(nv, h->session_id, owner_iso)` — tautological, as the code's own
+comment concedes (*"confinement in depth rather than the only check"*) — and never
+validates the **importer** `iso_id` against any session. There is still no
+`nv->graphics` gate. Both isolates are confined to this VM (`nv->isolates` is
+per-`VirtIONvgpu`), so the residue is the intra-VM boundary that
+`audit-guest-pointers.md`'s A-2 argues is out of scope — but the relay still does not
+do what `nvkvm_req_xiso_import` does, and that asymmetry is the thing this finding
+told the next reader to look at.
+
+
 ---
 
 ## P-2 — FIXED — `0x20800513` in the ctrl allowlist
@@ -121,11 +138,16 @@ Fix is one line — `close(3)` in the stub, or seal before exec.
 
 ### The writable alias — **FIXED, `073ece8`**, and this entry had gone stale
 
+**This half was already fixed when the 2026-08-24 reconciliation sweep reached it**
+— the entry above still read as open only because nobody had come back to it. Recorded
+here because a stale "open" on a fixed critical is exactly the failure mode this
+document set exists to catch.
+
 `073ece8` ("isolate: seal the stub memfd so the stub can't rewrite its own
 text") took the seal option, which is strictly stronger than `close(3)`: the
 seal binds **every** holder of the fd, so it survives a stub that forgets to
 close, a `dup`, and an fd inherited by anything the stub later spawns.
-`src/qemu/nvkvm_isolate.c`, in the embedded-stub spawn path, now:
+`src/qemu/nvkvm_isolate.c:1720-1765`, in the embedded-stub spawn path, now:
 
 - creates the memfd with `MFD_CLOEXEC | MFD_ALLOW_SEALING`;
 - `write(2)`s the image (never `mmap`s it, which is what lets `F_SEAL_WRITE`
@@ -142,8 +164,8 @@ holder, forever, and `F_SEAL_SEAL` stops the set being reopened. Neither
 unchanged.
 
 The **on-disk** spawn path (`NVKVM_STUB_PATH`) was never affected: it
-`open(stub_path, O_RDONLY | O_CLOEXEC)`s the binary, so there is no writable
-descriptor to seal.
+`open(stub_path, O_RDONLY | O_CLOEXEC)`s the binary (`:1902`), so there is no
+writable descriptor to seal.
 
 Verified in this tree: the seal is applied at `nvkvm_isolate.c` before the
 `nvkvm_isolate_spawn(mode)` call, and reproduced end to end against the real
@@ -256,6 +278,13 @@ the text base and applies relocations before `main` does anything — and the
 stub survives spawn, seccomp and its socket wait, but a GPU run is the gate
 that has not been through.
 
+*Reconciliation note, 2026-08-24.* The sweep in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md) read this half as
+still open, because at the time the `static-pie` conversion (`91d49d0`) was sitting
+unmerged on `sec-easy-batch`. It has since landed: `src/stub/Makefile:32,38` carry
+`-DNVKVM_STUB_SELF_RELOC` and `-static-pie`, and the `verify-pie` target (`:55-61`)
+runs after every link. Both halves of P-3 are closed.
+
 ---
 
 ## P-4 — two handlers accept the caller's self-declared identity
@@ -272,6 +301,24 @@ Of the five handlers taking an `isolate_id`, three cross-check it with
 
 Reachability: `isolate_id` is set by the guest module, so this needs a malicious
 guest *kernel*, not an unprivileged guest process. That boundary is in scope.
+
+**RECONCILED 2026-08-24 — PARTIAL.** *(Line references below re-checked against
+`65aa69f`.)*
+
+- **`nvkvm_req_realize_uvm_mapping` — FIXED.** It now performs the same two
+  assertions its sibling `MMAP_ON_ISOLATE` makes, in the same order:
+  `fh->session_id != req->session_id || !session_has_isolate(nv, req->session_id,
+  req->isolate_id)` → `-EPERM` (`src/qemu/nvkvm_isolate_handlers.c:4496-4505`, in
+  the handler at `:4472`). `fd_handle_id` is read at `:4496`, so this finding's
+  *"`grep -rn "fd_handle_id" src/qemu/` returns nothing"* no longer holds.
+- **`nvkvm_req_munmap_on_isolate` — STILL OPEN, and this finding was right about
+  why.** `struct nvkvm_req_munmap_on_isolate` is still `{ isolate_id, mmap_token }`
+  (`src/common/nvkvm_proto.h:484-487`), so there is nothing to check against. A
+  partial mitigation did land — `iso_mmap_free(req->mmap_token, req->isolate_id, &e)`
+  refuses a token the *named* isolate does not own (`:4000`) — under an explicit
+  "KNOWN GAP, do not read this as a closed boundary" comment (`:3979`): a caller
+  that names a neighbour's `isolate_id` together with that neighbour's token still
+  passes. Closing it needs the protocol field, exactly as written above.
 
 ---
 
@@ -336,6 +383,19 @@ document, which cites P-5 as the reason RM's own guard cannot be leaned on.
 Anything relying on RM to keep two isolates' client handles apart still needs
 its own check host-side; the decision above is that *nvkvm* need not add a uid
 layer, not that RM provides one.
+
+**RECONCILED 2026-08-24 — the comment half is done; the design decision is not made
+on `main`.** `d28201e` ("docs: correct three claims the code makes about boundaries
+it does not have") rewrote the false claim: `src/qemu/nvkvm_isolate_handlers.c:3266-3277`
+now states plainly that every isolate's in-namespace root maps to the same host uid,
+that namespaces plus seccomp are what separate them, and *"Do not reason about this
+layer as though a DAC check were backing it up."* The code is unchanged —
+`nvkvm_iso_auto_select` still returns `NS | SECCOMP` with no UID layer
+(`src/qemu/nvkvm_isolate_uid.h:537-548`). The unmerged `sec-easy-batch` records a
+decision (`2889c2e`) to treat this as by design; note that is a decision *not* to
+fix, and that P-5's second consequence — RM's `osValidateClientTokens` not separating
+isolates — is what bounds the severity of R-5 in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md).
 
 ---
 
@@ -471,6 +531,16 @@ Also the `abi-parity` CI job. (4) is restored by `c9e3875`, and while it was
 missing `docs/reference/tested-platforms.md` carried five H100 rows at 28/28
 that the tree could no longer produce.
 
+**RECONCILED 2026-08-24 — all five items and the CI job are restored; "partly
+fixed" is stale.** (1) `.gitignore:34-35` carries `__pycache__/` and `*.pyc`, and
+`git ls-files | grep __pycache__` is empty — `2d0a214`. (2) heredoc escaping —
+`2d0a214`, completed by `929f467` (see P-9). (3) the README trim is present at HEAD.
+(4) `nvkvm_alloc_parms_probe_len()` is back at `src/guest/nvkvm_main.c:1087`, used at
+`:1886` and `:2036` — `c9e3875`. (5) the `build_qemu.sh` patch series was restored by
+`4b9e7c9` ("build: restore the patch series, reverted by accident in a docs commit")
+and refined by `dcaff60`; `patches/` holds ten files. The `abi-parity` job is at
+`.github/workflows/ci.yml:151`.
+
 **The lesson, now in [`CLAUDE.md`](../../CLAUDE.md):** after merging or
 cherry-picking from a long-lived branch, diff against the base for files the
 change had no business touching. A clean auto-merge is not evidence.
@@ -502,6 +572,60 @@ change had no business touching. A clean auto-merge is not evidence.
   the dead one's relay list. 4096 short-lived processes permanently break
   cross-isolate sharing VM-wide.
 
+**RECONCILED 2026-08-24 — closing verdicts for all four.**
+
+- **P-9 — FIXED**, by `929f467`, one day after this document was written. The outer
+  `<<EOF` at `scripts/setup_mint_guest.sh:125` (unquoted, terminator `:376`) contains
+  **seven** nested heredocs, not six: `AL` (`:168`), `RS` (`:176`), `CX` (`:241`),
+  `SHIM` (`:290`), `BP` (`:306`), `NG` (`:322`), `NVK` (`:365`). All seven now escape
+  every `$` that is meant for the guest, including the "worst instance"
+  `\$(uname -r)` in the guest systemd unit (`:332`). Only host-generation-time
+  variables (`$GUEST_USER`, `$NBD`, `$IMG`, …) are left unescaped, which is intended.
+
+  **Two corrections to the original finding, both worth keeping.** First, the count:
+  the reconciliation sweep and the original entry both said six and both missed `AL`,
+  the `getty@tty1` autologin drop-in — which is also the one inner delimiter still
+  written unquoted (`<<AL`). Second, and more usefully: *quoting the inner delimiters
+  is cosmetic here*. Inside an unquoted outer `<<EOF` the outer heredoc has already
+  expanded every `$` before the inner delimiter is ever consulted, so **escaping is
+  the only thing doing any work**. `AL` being unquoted is therefore harmless, because
+  it escapes correctly (`\$TERM` at `:171`). Anyone "fixing" this by quoting the
+  remaining delimiter and unescaping the bodies would reintroduce the bug.
+- **P-10 — one of three fixed.**
+  - *fd leak* — **FIXED** by `6087e1b`. `reader_signal_sync_open`
+    (`src/qemu/nvkvm_isolate.c:894-904`) and `reader_signal_present` (`:908-918`)
+    now `close()` the previous fd before overwriting the slot.
+  - *prefault SIGBUS* — **OPEN.** The size check is gated
+    `if (h->type == NVKVM_HANDLE_TYPE_MEMORY)`, so `TYPE_NVIDIA` is exempt
+    (`nvkvm_isolate_handlers.c:3636-3650`, rationale at `:3633-3634` — `h->size` is 0
+    and means "unknown"); the prefault loop at `:3777-3781` is unguarded; and there is
+    **no SIGBUS handler anywhere in `src/qemu/`** — `sigaction` / `signal(SIG…)` /
+    `sigsetjmp` return no matches, only comments that name the hazard
+    (`:1902`, `:3630`, `:3772`, `nvkvm_handle.h:35`).
+  - *`loop_lock` across a deadline-less slot wait* — **OPEN, deliberately.**
+    `nvkvm_isolate.c:3088` (take `loop_lock`) → `:3103-3104`
+    (`nvkvm_iso_slot_wait(…, 0 /* no deadline */)`) → `:3114` (unlock), with a
+    design-rationale comment at `:3082-3086` that predates this document: the wait is
+    bounded by liveness rather than by a deadline, which is *"safe here precisely
+    because this caller does not hold the BQL"*. `timeout_ms == 0` semantics are at
+    `:718-724`. It is an accepted design, not an oversight — but it is not a fix
+    either, and the status should say so.
+- **P-11 — FIXED.** `struct nvos57_parameters` is 24 bytes with `status` at
+  offset 20 (`src/abi/nvgpu.h:273-283`; field offsets `h_client` 0, `h_object` 4,
+  `share_target` 8, `share_access_mask` 12, `share_type` 16, `share_action` 18,
+  `share_pad` 19, `status` 20 — no tail padding, independently recounted). The stub's
+  offset table carries `case 0x35: off = 20` (`src/stub/nvkvm_stub.c:1805`) and the
+  guard `(off + 4) <= job.param_size` is now `24 <= 24` → **true** (`:1822`). The
+  guest sizes its buffer from the same struct (`src/guest/nvkvm_ioctl.c:202-203`), so
+  `param_size` really is 24. The silent "every `RM_SHARE` reports `NV_OK` regardless
+  of RM's verdict" behaviour is gone.
+- **P-12 — FIXED.** `xrm_n` and `xrm_handles` are reset in `alloc_isolate_slot()`
+  (`:1482`) under `xrm_lock` (`src/qemu/nvkvm_isolate.c:1556-1558`, unlock `:1567`),
+  with a comment at `:1528-1555` explaining why slot-claim is the correct place rather
+  than `nvkvm_isolate_kill()`: it is the single `in_use = true` site in the file
+  (`:1494`, verified as the only one), so the reset is structurally guaranteed. The
+  same critical section also resets `xrm_accepting` and `nvkms_vblank` (`:1559-1566`).
+
 ---
 
 ## Suspected — plausible, not traced
@@ -518,12 +642,28 @@ change had no business touching. A clean auto-merge is not evidence.
   (`GT200_DEBUGGER`'s `hAppClient`, `0x2080110b`'s `hClientList[64]`,
   `0x20801208`'s `hClient`). RM guards these with `osValidateClientTokens`, which
   P-5 shows is a no-op between isolates.
-- **The ring path skips the `hClient` gate.** `ring_exec_one` applies the control
-  allowlist but never `nvkvm_client_allow_has()`, which `allowlists.md` §9 calls
-  authoritative. Residual risk low — RM's own validation is fd-scoped — but it is
-  a documented gate that is not there. Same function does **no aux translation at
-  all**, and `nvkvm_ctrl_cmd_allowed` wildcards `cmd & 0x8000` plus
+- **The ring path skips the `hClient` gate.** **CONFIRMED 2026-08-24 — no longer
+  merely suspected; recorded as R-8 in
+  [`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md).**
+  `ring_ctrl_must_punt()` (`src/stub/nvkvm_stub.c:2732`) now *does* apply the
+  control-**command** allowlist (`if (!nvkvm_ctrl_cmd_allowed(inner)) return 1;` at
+  `:2751`, U-1's fix) but never applies the **client** gate: `grep client_allow` over
+  the whole stub returns zero hits, so the fast ring path performs no `hClient`
+  ownership check at all. The slow path defines `nvkvm_client_allow_has()` at
+  `src/qemu/nvkvm_isolate_handlers.c:1286` and applies it at `:2977`, which
+  `allowlists.md` §9 calls authoritative. Residual risk low — RM's own validation is
+  fd-scoped — but it is a documented gate that is not there. Same function does **no
+  aux translation at all**, and `nvkvm_ctrl_cmd_allowed` wildcards `cmd & 0x8000` plus
   `(cmd>>16)==0x2081`: 167 explicit entries, and the wildcard admits 2³¹ values.
+
+  **Two refinements to the asymmetry as originally stated**, neither of which
+  softens it. The slow-path gate is *not* RM_CONTROL-only — it covers `ALLOC`,
+  `ALLOC_MEMORY`, `FREE`, `DUP_OBJECT`, `SHARE`, `MAP`/`UNMAP_MEMORY(_DMA)` and
+  `VID_HEAP_CONTROL` as well (NR list at `:2932-2939`, gated on
+  `_IOC_TYPE == 'F'` at `:2930`) — so the ring path skips a wider gate than "the
+  RM_CONTROL client check". And it is *not* unconditional: it is skipped entirely
+  when `nv->client_allow_n == 0`, so on a VM that never populated the client
+  allowlist the two paths agree by both checking nothing.
 
 ---
 
@@ -713,3 +853,37 @@ clock.
 `tests/unit/run_tests.sh` is empty. It is the only test in the tree that drives
 a real spawned isolate over the real socket protocol, so it is the only thing
 standing between this code and an untested live path.
+
+
+---
+
+## Reconciliation, 2026-08-24
+
+A full two-sweep reconciliation against `main` (`68a35c0`) is in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md). Every "see below"
+row in the table above now carries a closing verdict, recorded in this document at
+the finding itself:
+
+| # | was | now |
+|---|---|---|
+| P-3 | see below | writable alias **fixed** (`073ece8`); non-PIE **open** |
+| P-4 | see below | **partial** — `realize_uvm_mapping` fixed, `munmap_on_isolate` open |
+| P-8 | partly fixed | **fixed** — all five items and the CI job |
+| P-9 | build correctness | **fixed** (`929f467`) |
+| P-10 | see below | **partial** — fd leak fixed; SIGBUS open; `loop_lock` open by design |
+| P-11 | see below | **fixed** — `NVOS57` is 24 B, the status gate now fires |
+| P-12 | see below | **fixed** — reset in `alloc_isolate_slot()` |
+
+Also updated: **P-1** (the fd-guessing hole is fixed; the relay's missing pairing
+check is not, and the table row should not be read as covering it) and **P-5** (the
+false comment was corrected by `d28201e`; the code and the decision are unchanged on
+`main`).
+
+Two "Suspected" items were resolved by reading the code: the **ring path skipping
+the `hClient` gate** is confirmed and promoted to R-8; the **cross-VM `hClient` blind
+spot** turns out to have a sibling — the H-3 gate's NR list omits five allowlisted
+ioctls that carry an `hClient` at offset 0 (**R-5**).
+
+Findings on the unmerged `sec-easy-batch` branch (P-3, P-5, P-7, A-21, U-13) are
+characterised there; note that P-5 and U-13 are closed on that branch by *decision*
+and by *out-of-tree argument* respectively, not by code.
