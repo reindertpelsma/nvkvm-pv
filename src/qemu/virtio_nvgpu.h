@@ -630,6 +630,9 @@ void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
  */
 int  nvkvm_kvm_slot_alloc(void);
 void nvkvm_kvm_slot_release(int slot);
+/* A-21: how many slot alloc/release calls have been REFUSED for failing the
+ * range or ownership gate.  Non-zero means somebody is double-releasing. */
+uint64_t nvkvm_kvm_slot_rejects(void);
 void nvkvm_kvm_slot_stats(int *in_use, int *peak,
 			  uint64_t *allocs, uint64_t *frees);
 int  nvkvm_mmap_create(VirtIONvgpu *nv, struct nvkvm_host_fd *hfd,

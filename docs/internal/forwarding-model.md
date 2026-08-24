@@ -275,8 +275,9 @@ offset comes from the ABI profile (`:1488`).
 
 `NV_ESC_RM_ALLOC_MEMORY` with `hClass = 0x71` pins **the calling task's** pages
 — and the calling task is the stub. The guest migrates the range onto memfds the
-stub already maps at the same VA, so `pin_user_pages` finds tmpfs pages that
-alias `libcuda`'s guest userspace (`src/guest/nvkvm_ioctl.c:379-412`, full quote
+stub maps inside its guest-mapping window (U-9; it used to be at the guest's own
+VA), and QEMU rewrites `pMemory` to the window address so `pin_user_pages` finds
+tmpfs pages that alias `libcuda`'s guest userspace (`src/guest/nvkvm_ioctl.c:379-412`, full quote
 in [ARCHITECTURE.md](../../ARCHITECTURE.md#the-other-direction-os_descriptor)).
 Chunked at 2 MiB and migrated strictly per chunk — copy the chunk into its
 memfd, swap that chunk's PTEs, drop that chunk's pins, then move on — so the

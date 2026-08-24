@@ -9,6 +9,14 @@ test_open_scm
 test_ctrl_gate
 test_nvkms_allowlist
 test_stub_ptr_sanitize
+test_kvm_slot
 
 # Generated: the U-5 function extracted from src/stub/nvkvm_stub.c at build time.
 stub_sanitize.inc
+# Generated: the A-21 KVM slot pool extracted from src/qemu/nvkvm_mmap_host.c.
+kvm_slot_pool.inc
+
+# U-9: compiled suite + the two build-time extractions it pins.
+test_stub_window
+stub_window.inc
+win_alloc.inc

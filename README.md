@@ -217,6 +217,18 @@ against *your* guest's kernel. That is why `src/guest/` ships with the tarball:
 `scripts/run_test_vm.sh` exports the unpacked directory to the guest over 9p at
 `/mnt/nvkvm`, and cloud-init builds the module there on first boot.
 
+Building it there needs the export to be writable, and that is opt-in:
+
+```bash
+sudo NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
+```
+
+Read the banner it prints. A writable export gives guest root a path to host
+root, so the harness is for guests you trust completely — see
+[CONTRIBUTING.md, "The dev VM harness is not a sandbox"](CONTRIBUTING.md#the-dev-vm-harness-is-not-a-sandbox).
+Without the flag the VM still boots and the export is read-only; only the
+in-guest module build needs it.
+
 ### From source, if you want to hack on it
 
 ```bash

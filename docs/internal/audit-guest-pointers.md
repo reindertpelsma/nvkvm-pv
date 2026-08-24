@@ -15,12 +15,12 @@ the rest are open. Read this table before the detail.
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
 | U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally on both paths (`nvkvm_frontend.c`, `zero_nvos64_rights` in `nvkvm_stub.c`) |
 | U-8 | MEDIUM | **open** — blocked on the ogkm struct layout, see the note in its section |
-| U-9 | MEDIUM | open |
+| U-9 | MEDIUM | **fixed** — the isolate now reserves a `PROT_NONE` guest-mapping window before it maps anything else and refuses every mapping outside it (`stub_window_contains`); pinned by `tests/unit/test_stub_window.c` |
 | U-10 | MEDIUM | **fixed** — offset 16 decided from the cmd, offset 32 zeroed (`nvkvm_stub.c`) |
 | U-11 | MEDIUM | open |
 | U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
-| U-13 | UNKNOWN | open |
-| U-14 | by design | documented for completeness |
+| U-13 | ~~UNKNOWN~~ **not exploitable** | **closed** — RM refuses the whole control if the pointer is non-NULL and the client is not kernel-privileged. Traced 2026-08-24, evidence below |
+| U-14 | by design | **no longer an exception** — `NVOS02.pMemory` is rewritten host-side to the window address, so no guest pointer reaches the driver on this path either |
 | A-1 | **CRITICAL** | **fixed** — `NV_ESC_RM_ALLOC_MEMORY` + `hClass 0x71` pinned arbitrary stub memory; now gated on host-installed ranges |
 | A-2 | not a control | the missing session gate on `ioctl_on_isolate` — analysed below, deliberately not added |
 | U-15 | HIGH | **closed by revert** — QEMU-side UVM `mmap()` at a guest-chosen host address; layout oracle. Existed only between `c8ea92d` and `2406a3c`. See below. |
@@ -128,7 +128,15 @@ through the guest's page-migration path
 (`src/guest/nvkvm_ioctl.c:409-440`), which installs it via `mmap_on_isolate` —
 so QEMU already knows all of them, in `iso_mmap_tbl`, flagged `stub_mirrored`.
 `iso_mmap_covers()` requires full containment in **one** such entry, deliberately
-not a union (same reasoning as `uvm_va_covers()`). Anything else is refused
+not a union (same reasoning as `uvm_va_covers()`).
+
+**Updated by U-9 (2026-08-24).** The function is now `iso_mmap_translate()`: the chunks no longer
+live at the guest's addresses, so covering the guest range is not enough — it also carries the
+window-side end forward, refuses a step that is not window-adjacent to the previous one, and hands
+back the translated base, which the gate writes into `NVOS02.pMemory`. The ownership property is
+unchanged; what is added is that the answer is now an address rather than a yes/no, and that a
+range which is contiguous in the guest but scattered in the isolate is refused rather than pinned
+piecemeal. Anything else is refused
 before `nvkvm_isolate_ioctl()`, never clamped, and logged the way the U-3 gate
 logs.
 
@@ -326,11 +334,12 @@ The second path is the one that matters most and is discussed as **U-1**.
 | UVM schema rows | 31 | 16 | 0 | 15 | 0 |
 | DRM ioctls | 14 | 11 | 0 | 3 | 0 |
 | NVKMS inner cmdTypes | 7 | 6 | 0 | 0 (wrapper: 1) | 1 |
-| Isolate control commands | 15 | 14 | 0 | 1 | 0 |
+| Isolate control commands | 16 | 16 | 0 | 0 | 0 |
 
-The 15 isolate control commands are the `case ISOLATE_CMD_*` arms of `stub_dispatch_cmd`
-(`src/stub/nvkvm_stub.c:2502-2596`). `ISOLATE_CMD_IOCTL` is counted under the surfaces above, not
-here; the one `UNENFORCED` entry is `ISOLATE_CMD_MMAP`/`_MUNMAP` (U-9, counted once). The rest carry
+The 16 isolate control commands are the `case ISOLATE_CMD_*` arms of `stub_dispatch_cmd`.
+`ISOLATE_CMD_IOCTL` is counted under the surfaces above, not here; the entry that used to be
+`UNENFORCED` — `ISOLATE_CMD_MMAP`/`_MUNMAP` (U-9, counted once) — is now gated on the guest-mapping
+window, so there are no unenforced arms left. The rest carry
 only handle ids, uuids and scalars — including the `REALIZE_UVM_FD` state snapshot
 (`src/stub/nvkvm_stub.c:2043-2057`), which is handles and UUIDs throughout.
 
@@ -784,11 +793,11 @@ bytes per pointer, so clearing the pointers is necessary but a bound on
 
 ---
 
-### U-9 — OPEN — MEDIUM — `ISOLATE_CMD_MMAP` / `ISOLATE_CMD_MUNMAP` take a raw guest VA
+### U-9 — FIXED — MEDIUM — `ISOLATE_CMD_MMAP` / `ISOLATE_CMD_MUNMAP` took a raw guest VA
 
-**Field:** `isolate_cmd_mmap.gva`, `isolate_cmd_munmap.gva`.
+**Field:** `isolate_cmd_mmap.gva`, `isolate_cmd_munmap.gva` (both now `win_va`).
 
-`src/stub/nvkvm_stub.c:1971-1973`:
+What it was:
 
 ```c
 uint32_t flags = cmd->map_flags | MAP_FIXED;
@@ -796,18 +805,106 @@ void *addr = stub_mmap((void *)(uintptr_t)cmd->gva, (size_t)cmd->length,
                        (int)cmd->prot, (int)flags, fd, (off_t)cmd->offset);
 ```
 
-and `:1893`: `stub_munmap((void *)(uintptr_t)cmd->gva, (size_t)cmd->length)`.
+`gva` originated in `nvkvm_req_mmap_on_isolate.gva` off the virtqueue — the guest process's own
+`vma->vm_start` — and reached `nvkvm_isolate_mmap` untouched: stored and passed, never bounded.
+`length` and `prot` *were* bounded (audit M-1/N-2) and seccomp blocks `PROT_EXEC`, so it was a
+corruption/unmap primitive rather than a code-execution one.
 
-`gva` originates in `nvkvm_req_mmap_on_isolate.gva` off the virtqueue and reaches
-`nvkvm_isolate_mmap` (`nvkvm_isolate_handlers.c:2438-2444`) untouched — `grep -n gva
-nvkvm_isolate_handlers.c` shows it is stored and passed, never bounded. `length` and `prot` *are*
-bounded (`:1926-1942`, audit M-1/N-2), and seccomp blocks `PROT_EXEC` (`nvkvm_stub.c:2625-2626`),
-so this is a corruption/unmap primitive rather than a code-execution one.
+**Why a per-call check was the wrong fix.** The isolate's address space is *intentionally* shared
+with the guest in places — the memfd `MAP_FIXED` aliasing is what lets `pin_user_pages()` on the
+stub's task find pages that alias guest userspace (U-14). So a guest-directed mapping existing in
+the stub is not the bug. The bug was that **nothing distinguished the region the guest is supposed
+to reach from the isolate's own text, stack and allocations.** QEMU has had a sparse GPA window
+(`nvkvm_sparse_init`) for exactly this reason since long before this audit; the stub had no
+equivalent reservation at all.
 
-Strictly this is a guest pointer reaching the *host kernel's mmap*, not the NVIDIA driver, so it sits
-just outside the audited property's literal wording. It is the same trust boundary and the same bug
-class, and it is listed so it is not lost. It is also partly by design: the `OS_DESCRIPTOR` scheme
-(U-14) requires the stub to mirror guest VAs. The gap is that nothing restricts *which* VAs.
+**The fix: a reserved window.**
+
+- **The reservation.** `stub_window_init()` (`src/stub/nvkvm_stub.c`) takes one 1 TiB
+  `PROT_NONE | MAP_NORESERVE` region as the first act of `main()`, immediately after
+  `apply_relocations()` and before any other mapping this process makes. Freestanding
+  (`-nostdlib -ffreestanding`) is what makes "before anything else" exact: there is no malloc arena
+  and no C runtime constructors, so the only things already placed are what the ELF loader and
+  `fexecve` set up. From that point the kernel's mmap allocator routes every later stub allocation
+  (ring region, job blobs, worker stacks, the realize intent buffer) *around* the reservation,
+  because it is a live VMA. **Measured**, on the built stub with a command socket on fd 3:
+
+  ```
+  00400000-0044b000  ...          image + early anon
+  7dac77080000-7dac770a0000 rw-p  worker stack   <- placed BELOW the window
+  7dac771a0000-7dac771c0000 rw-p  worker stack
+  7dac772c0000-7dac772e0000 rw-p  worker stack
+  7dac773e0000-7dac77400000 rw-p  worker stack
+  7dac77400000-7eac77400000 ---p  the window, 0x100_0000_0000 = 1 TiB
+  ```
+
+  Failure is **fatal**: an isolate that cannot bound guest-directed mappings must not run.
+
+- **Placement is the kernel's, deliberately.** `addr = NULL`, so the window inherits the stub's own
+  mmap-region entropy rather than sitting at a constant. Hardcoding a base would have discarded
+  exactly the ASLR that making the stub a genuine static-PIE (`sec-easy-batch`) was for. QEMU
+  learns the base over the command socket (`ISOLATE_CMD_WINDOW_INFO`) and never returns a stub VA
+  to the guest — `nvkvm_resp_mmap_on_isolate` carries a token, a GPA and a length, and that is
+  deliberate.
+
+- **Size, and why it cannot be the binding constraint.** Live guest-directed bytes in one isolate
+  are capped by the VM-wide sparse GPA window (128 GiB) — nothing is mapped into an isolate without
+  a GPA extent behind it — plus up to `NVKVM_MIG_MAX_RANGE` (2 GiB) of reservation per in-flight
+  OS-descriptor registration. 1 TiB clears both, so "window full" can never be a denial the
+  existing 128 GiB ceiling does not already impose. Cost: one VMA, no memory, and 1 TiB out of the
+  128 TiB the stub's own allocator draws from — 0.011 bits of ASLR entropy.
+
+- **Who chooses the address.** No longer the guest. QEMU runs a per-isolate window allocator
+  (`win_place_locked`, `src/qemu/nvkvm_isolate_handlers.c`), bump pointer plus free list, the same
+  shape as `nvkvm_sparse_gpa_alloc`. `req->gva` survives only as the identity recorded in
+  `iso_mmap_tbl` and as the adjacency key that keeps a migration's 2 MiB chunks contiguous.
+
+- **Enforcement, reject-never-clamp.** `stub_window_contains()` gates `handle_mmap`,
+  `handle_munmap_cmd`, and the `host_va_hint` arm of `handle_realize_uvm_fd`, logging
+  `nvkvm: DENY ... (U-9)`. In `handle_mmap` the address check runs **before** the
+  handle lookup, deliberately: it does not depend on the fd, and a control sitting behind another
+  check is one a later edit to that other check can bypass — which is exactly A-1's shape.
+
+**Evidence.** Two suites, neither needing a GPU.
+
+- `tests/unit/test_stub_window.c` (27 cases) pins the predicate and the allocator, both extracted
+  from real source at build time. Verified to fail when reverted: a naive
+  `addr >= base && addr + len <= base + size` scores 23/27 (the u64-wrap and zero-length cases);
+  the gate removed outright scores 12/27; the run reservations removed score 26/27 — the
+  interleaved registration fails while the *non*-interleaved one still passes, which is the same
+  shape as the 2 MiB A-1 probe that sailed past its bug.
+- `tests/security/u9_window_gate_test.c` (12 probes) spawns the **real built stub** and sends real
+  `ISOLATE_CMD_MMAP` / `_MUNMAP` / `_WINDOW_INFO` messages over the real socket, because neither
+  unit suite can see whether the predicate is actually *wired into* the handlers — a stub with
+  `stub_window_contains()` defined and never called passes the whole unit suite. Against a
+  gate-removed build it scores 4/12, and the probe at `0x401000` makes that stub **unmap its own
+  text and die**, which is U-9 demonstrated rather than described.
+
+Two things that suite got wrong first, recorded because both are the shape of a green result that
+measures nothing. (1) A hardcoded "obviously outside" address of `0x7f1122200000` was *accepted*,
+and the gate was right — the window is 1 TiB and that run had placed it at `0x7e46fb400000`. Guest
+VAs and the window are drawn from the same band; every probe is now derived from the reported base.
+(2) The MMAP probe first asserted only `retval != 0` and got `-EBADF`, because the handle lookup ran
+first and the address was never examined — it would have passed with the gate deleted. That is what
+prompted the reordering above, and the probe now asserts the exact errno only the window produces.
+
+**What it does not cover.** `REALIZE_UVM_FD` with `host_va_hint == 0` — which is what QEMU passes
+today — maps at a **kernel-chosen** address, outside the window. That address is not
+guest-influenced, so it is not a U-9 exposure; but it means "every mapping the stub makes on the
+guest's behalf is in the window" is *not* a true statement, only "every mapping made at an address
+anything outside the stub supplied" is. Moving it inside would require MAP_FIXED at a window VA
+with the offset rewritten to match, because `uvm_mmap()` pins `vm_start == (vm_pgoff << PAGE_SHIFT)`
+(ogkm `kernel-open/nvidia-uvm/uvm.c:791-795`) — a driver-behaviour change with no test short of a
+GPU run, so it was not made.
+
+**Relationship to `iso_mmap_covers()` / `iso_mmap_translate()` — both are still needed.** The window
+answers *where a mapping may be*; the table answers *what was installed, for whom, and whether it is
+still live*. Inside the window a guest can still name another handle's extent, a freed extent, or a
+hole between two extents, and the window cannot see any of that. Conversely the table cannot be the
+window: it only knows what QEMU installed, so a stub-side path that maps without telling QEMU is
+invisible to it. The window is necessary, the table sufficient; what the window buys the A-1 class
+is that a *forgotten* check now fails inside guest-directed memory instead of on stub-private
+memory.
 
 ---
 
@@ -874,27 +971,116 @@ doing it, and guest code is not a security control.
 
 ---
 
-### U-13 — OPEN — UNKNOWN severity — `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` (0x2080110b) `pRunlistPreemptEvent`
+### U-13 — CLOSED 2026-08-24 — NOT EXPLOITABLE — `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` (0x2080110b) `pRunlistPreemptEvent`
 
 `NvP64`, documented in the header as "KEVENT handle for Async HW runlist preemption". It is not in
 `embedded_param_copy.c`, which suggests RM treats it as an opaque handle rather than a user pointer —
 but I could not follow it to a definite consume-or-ignore in the open tree. Allowlisted, unhandled
 host-side. Listing it as `UNENFORCED` with severity `UNKNOWN` rather than dropping it.
 
+**Traced. The severity is not UNKNOWN, it is none, and the reason is a check in the driver.**
+
+Reachability, in the order it has to be established:
+
+1. **Is the command allowlisted?** Yes — `src/qemu/nvkvm_ctrl_allowlist.h:132`, a bare
+   `0x2080110bu` with no justifying comment. Neither rule-based passthrough admits it
+   (`0x110b & 0x8000 == 0`, and `cmd >> 16` is `0x2080`, not `0x2081`), so the explicit row is the
+   only thing letting it through. So it does **not** close as unreachable here.
+
+2. **Does nvkvm's pointer rewrite reach the field's offset?** No. The generic rewrite (U-2) replaces
+   `NVOS54.params` at outer offset 16 with the address of the stub's aux blob; it does nothing to
+   fields *inside* that blob. Everything inside is per-command, and in `src/stub/nvkvm_stub.c` the
+   per-command list is exactly `0x101`, `0x202`, `0x3d05`, `0x3d06`/`0x3d08` and `0x80170d`, plus the
+   `nvkvm_ctrl_list_entry_size()` InfoList family. `0x2080110b` is in none of them, so the guest's
+   64 bits at aux offset 16 are forwarded to RM **verbatim**. (Offset confirmed by compiling the
+   struct: `pRunlistPreemptEvent@16`, `hClientList@24`, `hChannelList@280`, `sizeof == 536`.)
+
+3. **Does the driver dereference it?** **No — it refuses the entire control first.**
+   `subdeviceCtrlCmdFifoDisableChannels_IMPL`, `src/nvidia/src/kernel/gpu/fifo/kernel_fifo_ctrl.c`,
+   opens with:
+
+   ```c
+   // Validate use of pRunlistPreemptEvent to allow use by Kernel clients only
+   if ((pDisableChannelParams->pRunlistPreemptEvent != NULL) &&
+       (pCallContext->secInfo.privLevel < RS_PRIV_LEVEL_KERNEL))
+   {
+       return NV_ERR_INSUFFICIENT_PERMISSIONS;
+   }
+   ```
+
+   It is the first statement of the handler, before the `NV_RM_RPC_CONTROL` forward and before any
+   use of the field. And no ioctl client can satisfy it: the escape path sets
+   `secInfo.privLevel = osIsAdministrator() ? RS_PRIV_LEVEL_USER_ROOT : RS_PRIV_LEVEL_USER`
+   (`src/nvidia/arch/nvalloc/unix/src/escape.c:375`), and `RS_PRIV_LEVEL_KERNEL` is the **largest**
+   value of the enum (`src/common/sdk/nvidia/inc/nvsecurityinfo.h:36-38`, ordered `USER`,
+   `USER_ROOT`, `KERNEL`). `RS_PRIV_LEVEL_KERNEL` is set only for RM-internal contexts
+   (`rmapi/deprecated_context.c:184`), never for anything arriving through `/dev/nvidiactl`. The
+   stub is an ordinary userspace RM client, so a non-NULL value there is a guaranteed
+   `NV_ERR_INSUFFICIENT_PERMISSIONS`, not a dereference.
+
+   The `NV_RM_RPC_CONTROL` forward that follows copies `pParams` to GSP **as data**, so the pointer
+   value crosses as bytes and is not dereferenced there either.
+
+**Checked across the whole version span nvkvm supports**, because a guard that appeared late would
+close nothing on the older branches. Byte-identical at **515.105.01, 575.51.03, 580.95.05,
+580.159.04 and 610.43.02** — i.e. present since the first open-source release, comfortably before
+535, the oldest driver nvkvm supports.
+
+**No code change.** A defensive `aux_clear_ptr(job.aux_buf, job.aux_size, 16)` on `inner_cmd ==
+0x2080110b` was considered — it is the U-12 treatment and it would cost nothing on the live path,
+since a legitimate userspace caller must pass NULL anyway. It was **not** added, deliberately:
+clearing the field would convert a request RM *refuses* into one it *accepts*, silently changing the
+driver's verdict for a hostile caller. U-7's clear does not have that property (the field there is
+one the driver would otherwise happily dereference); this one does. Where the driver's own check is
+unconditional, first-statement, and present in every supported version, masking it is a downgrade,
+not hardening.
+
+**Not closed by this**, and it is a different field in the same struct: the *"Suspected — cross-VM
+`hClient` blind spot"* item in
+[`audit-prerelease-2026-08-21.md`](audit-prerelease-2026-08-21.md) cites `0x2080110b`'s
+`hClientList[64]` (offset 24, above) as a second client handle the per-VM gate does not see, because
+that gate reads param offset 0 only. That is a handle-scoping question, not a pointer-dereference
+one, and it stays open. U-13 was only ever about `pRunlistPreemptEvent`.
+
+**An UNKNOWN that turns out to be nothing is a result.** Recorded in full so the next reader does
+not re-derive it — the work here was three greps and a struct offset, and it had been sitting open
+for the want of them.
+
 ---
 
-### U-14 — BY DESIGN, documented for completeness — `NVOS02.pMemory` for `hClass == 0x71`
+### U-14 — WAS BY DESIGN, NO LONGER AN EXCEPTION — `NVOS02.pMemory` for `hClass == 0x71`
 
-`NV_ESC_RM_ALLOC_MEMORY` with `hClass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` **deliberately** forwards
-the guest VA: the guest migrates the range onto memfds and the stub `MAP_FIXED`s them at the same VA
-(`src/guest/nvkvm_ioctl.c:396-409`, `src/stub/nvkvm_stub.c:1357-1366`), so
-`RmAllocOsDescriptor` → `pin_user_pages` finds pages that alias guest userspace. This is the one
-place where a guest VA reaching the driver is the intended behaviour, and the invariant as stated in
-`ARCHITECTURE.md` does not admit it. It should be stated as an explicit exception rather than left
-as an unremarked contradiction. Note that `hClass` is **not** gated for nr 0x27 — the alloc-class
-allowlist applies only to nr 0x2b (`nvkvm_isolate_handlers.c:1736`) — and
-`nvkvm_fe_alloc_allowlist.h:13-16` states OS_DESCRIPTOR (0x71) is deliberately omitted from that
-allowlist, which is true and irrelevant on this path.
+`NV_ESC_RM_ALLOC_MEMORY` with `hClass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` **used to** forward the
+guest VA deliberately: the guest migrates the range onto memfds and the stub `MAP_FIXED`ed them at
+the same VA (`src/guest/nvkvm_ioctl.c:396-409`), so `RmAllocOsDescriptor` → `pin_user_pages` found
+pages aliasing guest userspace. That made this the one place where a guest pointer reaching the
+driver was intended, and `ARCHITECTURE.md`'s invariant had to be read with an asterisk.
+
+**U-9's window removes the asterisk.** The chunks now live at an address the *host* chose, so QEMU
+rewrites `NVOS02.pMemory` to the translated window base at the A-1 gate before forwarding. This is
+invisible to the guest — `pMemory` is IN-only for this class; the caller gets back an `hMemory`,
+never this field — and the physical aliasing the feature depends on is untouched: same memfds, same
+pages, only a different virtual address in a process the guest cannot observe. What made it
+possible is that "the stub maps at the guest's VA" was an *implementation* of the aliasing, never a
+requirement of it: RM only needs `pMemory` to be a valid user VA **in the calling task**, and the
+calling task is the stub.
+
+Two things had to hold for the rewrite to be safe, and `iso_mmap_translate()` establishes both:
+the guest range must be spanned by live mirrored entries **of this isolate** (the A-1 property,
+unchanged), and those entries must be **contiguous in the window**, because RM pins one range. The
+second is why the window allocator has run reservations at all — see the note on
+`win_place_locked`.
+
+Note that `hClass` is **not** gated for nr 0x27 — the alloc-class allowlist applies only to nr 0x2b
+(`nvkvm_isolate_handlers.c`) — and `nvkvm_fe_alloc_allowlist.h:13-16` states OS_DESCRIPTOR (0x71) is
+deliberately omitted from that allowlist, which is true and irrelevant on this path.
+
+**Unverified.** The rewrite has not been exercised on hardware. `tests/security/a1_span_test.c` is
+the test that would say so — its "inside passes the gate" case now additionally depends on the run
+reservation keeping a 16 MiB registration's eight chunks window-contiguous. The unit suite pins
+that property against the real allocator source
+(`tests/unit/test_stub_window.c`, "a 16 MiB registration lands contiguously" and the interleaved
+case), but the end-to-end `cudaHostRegister` path needs a GPU.
 
 ---
 
@@ -1020,7 +1206,9 @@ from a corrupted isolate is the whole point of the seccomp filter, which has not
 - **`pOsEvent` on classes 0x00f1 / 0x00fd, and `pOsPidInfo` on class 0x0000** (§5) — consuming code
   outside the sparse checkout, or apparently RM-internal.
 - **Whether `NVOS32.data.HwAlloc.bindResultFunc` is consumed** by the Linux RM path (U-3).
-- **`pRunlistPreemptEvent`** (U-13).
+- ~~**`pRunlistPreemptEvent`** (U-13).~~ **Settled 2026-08-24** — RM rejects the whole control with
+  `NV_ERR_INSUFFICIENT_PERMISSIONS` before touching the field, for every client that is not
+  kernel-privileged, in every driver version from 515 to 610. See U-13 above.
 - **The seccomp filter itself.** Assumed effective; not read line-by-line. Since it is what bounds
   every severity rating in this report, it should be the next thing audited.
   **Done 2026-08-20** — see [`audit-boundaries-2026-08-20.md`](audit-boundaries-2026-08-20.md) §6.

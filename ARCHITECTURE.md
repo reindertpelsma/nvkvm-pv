@@ -342,8 +342,16 @@ The fix runs in the guest sanitiser (`src/guest/nvkvm_ioctl.c:379-412`):
 > call finds tmpfs pages that alias libcuda's guest userspace — GPU DMA, libcuda
 > memcpy, and host kernel all touch the same physical pages.
 
-`p_memory` is deliberately left unchanged so the kernel sees the same VA the
-stub has mapped.
+`p_memory` is left unchanged **by the guest**, which is all the guest can
+usefully do — but it no longer reaches the driver. Since the U-9 guest-mapping
+window, the stub maps those memfds at an address the *host* chose inside its
+reservation, and QEMU rewrites `NVOS02.pMemory` to that address at the A-1 gate
+before forwarding (`iso_mmap_translate`, `src/qemu/nvkvm_isolate_handlers.c`).
+The physical aliasing is identical — same memfds, same pages — only the virtual
+address differs, in a process the guest cannot observe. This is what lets the
+"no guest pointer reaches the host NVIDIA driver" invariant be stated without
+the OS_DESCRIPTOR exception; see U-9 and U-14 in
+[`docs/internal/audit-guest-pointers.md`](docs/internal/audit-guest-pointers.md).
 
 `nvkvm_cpu_pages_migrate_range()` (`src/guest/nvkvm_mmap.c:823-1138`) does this
 in 2 MiB chunks — one memfd, one batched upload, one `mmap_on_isolate` and one

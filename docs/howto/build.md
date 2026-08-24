@@ -296,6 +296,13 @@ make KDIR=/lib/modules/$(uname -r)/build
 sudo insmod nvkvm-guest.ko
 ```
 
+`/mnt/nvkvm` is the host repo over 9p, and it is exported **read-only** unless
+the VM was started with `NVKVM_DEV_HARNESS_INSECURE_RW=1` (see
+[run.md, Launch](run.md#3-launch)). Building in place writes there, so on a
+default launch this `make` fails with a read-only filesystem error. That is
+deliberate: a writable export is a guest-root → host-root path, so it is opt-in
+and announced.
+
 `scripts/setup_guest.sh` arranges for cloud-init to do exactly this on first
 boot (`scripts/setup_guest.sh:86-89`), including installing
 `linux-headers-virtual` (`:80`).

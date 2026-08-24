@@ -9,8 +9,10 @@
 #
 # DEVELOPMENT HARNESS ONLY. `restart` below executes
 # `bash $REMOTE_DIR/scripts/run_test_vm.sh` on the HOST as root, and
-# $REMOTE_DIR is the same tree run_test_vm.sh exports to the guest over 9p
-# READ-WRITE. So guest root rewrites that script and the next `restart` runs it
+# $REMOTE_DIR is the same tree run_test_vm.sh exports to the guest over 9p.
+# That export is READ-ONLY unless NVKVM_DEV_HARNESS_INSECURE_RW=1 is set, which
+# this script forwards verbatim to the remote host -- see the banner in
+# run_test_vm.sh. With it set, guest root rewrites that script and `restart` runs it
 # with host root privileges. Never point this at a guest you do not fully
 # trust. See CONTRIBUTING.md, "The dev VM harness is not a sandbox".
 #
@@ -24,6 +26,12 @@
 set -e
 
 HOST_SSH="${NVKVM_REMOTE:?set NVKVM_REMOTE, e.g. 'ssh -p 22 root@gpu-host'}"
+
+# Forwarded verbatim to the remote run_test_vm.sh.  Defaults to 0, i.e. the
+# repo 9p export is read-only there too.  Setting it to 1 is what re-arms the
+# guest-root -> host-root path this script's `restart` completes; the banner
+# run_test_vm.sh prints on the remote side spells that out.
+RW="${NVKVM_DEV_HARNESS_INSECURE_RW:-0}"
 # Referenced inside the single-quoted remote command blocks below, which are
 # evaluated by the REMOTE shell -- so each of those blocks is prefixed with an
 # assignment that ships this value across.  Without that prefix $REMOTE_DIR
@@ -44,10 +52,10 @@ wait_for_vm() {
 
 case "$cmd" in
     restart)
-        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR'"'
+        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR' RW='$RW'"'
                    kill -9 $(pgrep qemu-system) $(pgrep nvkvm_stub) 2>/dev/null; sleep 3
                    rm -f /tmp/qemu.log
-                   nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!'
+                   NVKVM_DEV_HARNESS_INSECURE_RW=$RW nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!'
         echo "Waiting for VM..."
         wait_for_vm
         echo "VM ready."
@@ -58,7 +66,7 @@ case "$cmd" in
         rsync -avz -e "${NVKVM_RSYNC_SSH:-ssh}" --exclude '.git' --exclude 'host-libs' \
             "$LOCAL_DIR"/ "$RSYNC_TARGET" > /dev/null
         echo "Rebuilding QEMU + stub..."
-        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR'"'
+        $HOST_SSH "REMOTE_DIR='$REMOTE_DIR' RW='$RW'"'
             cp $REMOTE_DIR/src/qemu/*.c $REMOTE_DIR/src/qemu/*.h /opt/qemu-src/hw/misc/ 2>/dev/null
             cd /opt/qemu-src/build && ninja qemu-system-x86_64 2>&1 | tail -3
             # Canonical stub is freestanding (no libc); build via its Makefile so
@@ -70,7 +78,7 @@ case "$cmd" in
             cp /opt/qemu-src/build/qemu-system-x86_64 /opt/qemu-nvkvm/bin/qemu-system-x86_64
             [ -x $REMOTE_DIR/src/stub/nvkvm_stub ] && cp $REMOTE_DIR/src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
             rm -f /tmp/qemu.log
-            nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!
+            NVKVM_DEV_HARNESS_INSECURE_RW=$RW nohup bash $REMOTE_DIR/scripts/run_test_vm.sh > /tmp/qemu.log 2>&1 & echo PID=$!
         '
         echo "Waiting for VM..."
         wait_for_vm
