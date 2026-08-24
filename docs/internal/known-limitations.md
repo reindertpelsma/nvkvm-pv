@@ -959,7 +959,10 @@ the differences are user-visible:
   tension with **ballooning** and with **live migration**: those pages can be
   neither reclaimed nor moved. nvkvm does not support live migration anyway, but
   the balloon interaction is real.
-- **Chunked backing, and a 4 GiB ceiling.** Contiguity is required per
+- **Chunked backing, and a 4 GiB ceiling.** (An alternative built on U-14's
+  guest-issued OS-descriptor path would be capped at 2 GiB instead, because it
+  consumes one entry per 2 MiB in the VM-wide 8192-entry isolate mmap table —
+  see §10 of [UVM VA decoupling](uvm-va-decoupling.md).) Contiguity is required per
   *descriptor*, not per range: UVM finds an external range by any address inside
   it and keeps a per-GPU range tree of sub-mappings, so one range is covered by
   many allocations. The guest takes the backing largest-block-first with

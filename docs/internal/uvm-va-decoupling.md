@@ -1044,3 +1044,85 @@ eviction, and the bound needs documenting next to the existing reservation note.
 There is also a correctness obligation: a pooled entry must be dropped, not
 reused, if a later mmap at that VA has a different length or is not a fallback
 range, or a stale GPU mapping survives at an address the guest has repurposed.
+
+---
+
+## 10. Correction: a guest-issued OS descriptor is *not* U-3, and the fallback could have been built on it
+
+§6d said the fallback could not be guest-module-only because a guest-issued
+`ALLOC_OS_DESCRIPTOR` **is** U-3. **That was too broad, and the original premise
+was right on this point.** There are two OS-descriptor routes and only one is
+gated:
+
+| route | ioctl | gated? |
+|---|---|---|
+| NVOS32 function 27 | `NV_ESC_RM_VID_HEAP_CONTROL` (nr `0x4a`) | **denied** — this is U-3, and is what §6d analysed |
+| class `NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` (`0x71`) | `NV_ESC_RM_ALLOC_MEMORY` (nr `0x27`) | **allowed and live** — U-14's deliberate path |
+
+The U-3 gate's own comment says so (`nvkvm_isolate_handlers.c:2742-2746`:
+*"NOT affected: U-14's deliberate OS-descriptor path… Different ioctl, different
+struct, untouched by this gate"*), and the code confirms it: the alloc-class
+allowlist is applied under `if (nr == 0x2b)` only
+(`nvkvm_isolate_handlers.c:2778`), so nr `0x27` — which *is* in the frontend NR
+allowlist — carries no class check at all. The guest side is live at
+`src/guest/nvkvm_ioctl.c:409-440`.
+
+### Would `MAP_EXTERNAL_ALLOCATION` accept such an object? Yes.
+
+`dupMemory()` gates on the **address space of the memdesc, not the class**:
+
+```c
+if (memdescGetAddressSpace(pAdjustedMemDesc) != ADDR_FBMEM &&
+    memdescGetAddressSpace(pAdjustedMemDesc) != ADDR_SYSMEM &&
+    memdescGetAddressSpace(pAdjustedMemDesc) != ADDR_FABRIC_MC &&
+    memdescGetAddressSpace(pAdjustedMemDesc) != ADDR_FABRIC_V2)
+    status = NV_ERR_NOT_SUPPORTED;
+```
+
+(`src/nvidia/src/kernel/rmapi/nv_gpu_ops.c`, `dupMemory()`), and
+`osCreateMemFromOsDescriptor()` builds its memdesc with `ADDR_SYSMEM`
+(`arch/nvalloc/unix/src/osmemdesc.c:215-216`, `:502-503`, `:634-635`,
+`:798-799`). So an OS descriptor qualifies.
+
+It is also already proven empirically — by the *current* design. What QEMU
+allocates through NVOS32 fn 27 is the same kind of object, an OS descriptor with
+an `ADDR_SYSMEM` memdesc, and `MAP_EXTERNAL_ALLOCATION` duplicated and mapped it
+on real hardware. Both routes converge on the same `Memory` object; only the
+issuing ioctl and the owning client differ.
+
+**Same-client dup is the common case, not an edge.** libcuda does exactly it for
+every `cudaMalloc`: the M1 trace shows 24 `CREATE_EXTERNAL_RANGE` +
+`MAP_EXTERNAL_ALLOCATION` pairs using libcuda's own `hClient`.
+
+### So why keep the current design? Cost, and a shared resource — not U-3.
+
+**It copies every page, unconditionally.** The migration path
+(`nvkvm_mmap.c`, the bulk loop) does `kmap_local_page()` + `memcpy()` into a
+2 MiB shm slot and `write_memory_handle()` for **every page** of the range. For
+a *fresh* managed allocation every one of those bytes is provably zero — the
+guest module just allocated the pages — so the entire copy is wasted work, and
+nothing in the path knows to skip it. This tree's own DIAG output measures
+~20 ms per 2 MiB chunk (~100 MB/s), i.e. **~10 s per GiB**. The current design
+runs the whole 4 MiB→2 GiB ladder in 1.75 s *including* a full CPU touch and
+verify.
+
+**It is bounded at 2 GiB per registration, and the bound is a shared per-VM
+resource.** From the tree's own comment (`nvkvm_mmap.c:1631-1640`): *"every
+chunk takes one entry in QEMU's fixed `NVKVM_ISO_MMAP_MAX = 8192` mmap-token
+table … and that table is shared by every isolate in the VM. 2 GiB / 2 MiB =
+1024 tokens = 1/8 of it."* So one maximal managed allocation would consume an
+eighth of a VM-wide table. The current design's descriptors are per-range RM
+objects, not entries in that table, and reach 4 GiB.
+
+### What the alternative would genuinely have bought
+
+This is not a defence of what exists — the simplifications are real: no
+QEMU-side RM composition, no admin client, no GPA list and no GPA validation, no
+cross-client dup, and CPU/GPU page identity by *construction* (memfd aliasing)
+rather than by argument. If the copy could be skipped for freshly-allocated
+pages — a "these are new, map don't copy" flag on the migration path — the
+balance would likely tip the other way, at the cost of touching a path shared
+with the real OS-descriptor use case.
+
+**Standing conclusion:** the current design stays, on the grounds of copy cost
+and the shared-table bound. The U-3 argument in §6d was wrong and is withdrawn.
