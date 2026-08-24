@@ -56,6 +56,13 @@ There are four processes and one kernel module.
 - **`src/stub/`** (2.8 kLoC) — the isolate. A freestanding static binary
   (`-nostdlib -static -fPIE`) embedded in QEMU and launched from a memfd. One
   per guest process. It holds the real device fds and runs the real ioctls.
+- **`src/broker/`** (~3 kLoC) — the privileged display broker, and the only
+  component that is *not* part of the VMM. It owns the window, the compositor
+  connection and the input grab so QEMU can be sandboxed: QEMU relays the
+  guest's scanout dma-buf fd to it over a unix socket and the broker wraps that
+  same fd in a `wl_buffer` or a DRI3 pixmap. Optional — `-display gtk` still
+  works — but with it a QEMU built without OpenGL can still display. See
+  [`src/broker/README.md`](src/broker/README.md) for the threat model.
 - **`src/common/`, `src/abi/`** — wire protocol, ABI profile table, NVIDIA
   struct definitions.
 

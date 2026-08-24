@@ -1,13 +1,13 @@
 # QEMU patches
 
-Everything nvkvm changes in **upstream QEMU** is in this directory: ten patch
-files, 760 added lines and 29 removed, against the `v9.2.0` tag
+Everything nvkvm changes in **upstream QEMU** is in this directory: twelve
+patch files, against the `v9.2.0` tag
 (`ae35f033b874c627d81d51070187fbf55f0bf1a7`). Nothing else in the QEMU tree is
 edited.
 
 They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
-A reader deciding whether to trust this can read ten diffs; a maintainer
+A reader deciding whether to trust this can read twelve diffs; a maintainer
 bumping the QEMU version resolves conflicts with ordinary tools instead of
 rewriting editing logic; and "is it already applied?" is answered by
 `git apply --reverse --check` rather than by grepping the tree for a comment
@@ -25,6 +25,8 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
 | `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. Pointer lock was **reported working** on that box; the evtest that would prove it was never read — see its header |
 | `0010-kvm-retry-a-bare-KVM_RUN-EFAULT.patch` | `accel/kvm/kvm-all.c` | retries a bare `KVM_RUN` `EFAULT` for up to 3 s instead of killing the VM. An NVIDIA GPU mapping is `VM_IO\|VM_PFNMAP`, and `nv_fault()` returns `VM_FAULT_NOPAGE` **without installing a PTE** while the driver reinstates a revoked mapping; KVM turns that "come back later" into a fatal `EFAULT`. Measured clearing after **1465 ms** on the RTX 3050 laptop, which is why it looked permanent |
+| `0011-qapi-ui-add-the-nvkvm-broker-display-type.patch` | `qapi/ui.json` | adds `-display nvkvm-broker,socket=PATH`: the display, the input grab and the compositor connection move into a separate privileged process (`src/broker/`) and QEMU keeps one unix socket. Gated on `CONFIG_LINUX` |
+| `0012-hw-misc-build-the-nvkvm-broker-display-relay.patch` | `hw/misc/meson.build` | one line, adding `nvkvm_display_relay.c` to the list `0001` created. Note it is **not** gated on `CONFIG_OPENGL`: broker mode exists so a QEMU with no EGL can still display |
 
 Each patch's commit message says *why* it is there. Read those before changing
 one — several of them record a measurement (a driver version, an error code)
