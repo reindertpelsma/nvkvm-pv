@@ -408,10 +408,28 @@ static void nvkvm_evt_callback(struct virtqueue *vq)
 	bool posted = false;
 
 	while ((evt = virtqueue_get_buf(vq, &len)) != NULL) {
-		if (len >= sizeof(*evt))
-			nvkvm_evt_deliver(le32_to_cpu(evt->isolate_id),
-					  le32_to_cpu(evt->handle_id),
-					  le32_to_cpu(evt->events));
+		if (len >= sizeof(*evt)) {
+			/* The discriminator is the last word, and it was
+			 * `reserved` (always zero) until UI_INFO existed -- so
+			 * an older QEMU's poll events land in the default arm,
+			 * which is where they belong. */
+			switch (le32_to_cpu(evt->type)) {
+			case NVKVM_EVT_TYPE_UI_INFO: {
+				const struct nvkvm_evt_ui_info *ui =
+					(const struct nvkvm_evt_ui_info *)evt;
+
+				nvkvm_kms_set_host_size(le32_to_cpu(ui->width),
+							le32_to_cpu(ui->height));
+				break;
+			}
+			case NVKVM_EVT_TYPE_POLL:
+			default:
+				nvkvm_evt_deliver(le32_to_cpu(evt->isolate_id),
+						  le32_to_cpu(evt->handle_id),
+						  le32_to_cpu(evt->events));
+				break;
+			}
+		}
 		/* recycle the buffer back onto VQ_EVT */
 		if (nvkvm_evt_post_one(state, evt) < 0)
 			kfree(evt);

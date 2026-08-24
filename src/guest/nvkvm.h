@@ -418,6 +418,10 @@ bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
 /* nvkvm_kms.c — guest-emulated virtual KMS head (#102). Called from
  * nvkvm_drm_init on the nvkvm drm_device before drm_dev_register. */
 int  nvkvm_kms_init(struct drm_device *ddev);
+void nvkvm_kms_fini(void);
+/* The host's window changed size (ui_info, forwarded over VQ_EVT).  Offers it
+ * as the head's preferred mode and hotplugs; the guest compositor decides. */
+void nvkvm_kms_set_host_size(unsigned int w, unsigned int h);
 
 /* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
