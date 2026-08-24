@@ -109,6 +109,8 @@ struct nb_x11 {
     struct nb_sink *sink;
     struct nb_session *sess;
 
+    bool     quit;                  /* WM_DELETE_WINDOW with no client to
+                                     * defer the decision to                  */
     int      last_mode;             /* last PresentCompleteNotify mode; -1 =
                                      * nothing completed yet                  */
     uint32_t last_raw_seq;          /* de-dup for double-delivered XI2 raw    */
@@ -547,6 +549,36 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                           (ev->response_type & 0x7f) == XCB_FOCUS_IN);
             break;
         }
+        case XCB_CLIENT_MESSAGE: {
+            xcb_client_message_event_t *cm = (void *)ev;
+
+            /*
+             * WM_DELETE_WINDOW -- the title bar's X, drawn by the window
+             * manager on this backend.  The atom was already advertised in
+             * WM_PROTOCOLS; without this case the WM sent it and nothing
+             * listened, so the close button did nothing at all.
+             *
+             * Same meaning and same path as the Wayland backend: tell the
+             * VMM and let it decide.  The broker does not close a VM.
+             */
+            if (cm->type == x->a_wm_proto &&
+                cm->data.data32[0] == x->a_wm_delete) {
+                /*
+                 * No confirmation overlay on this backend yet -- the Wayland
+                 * one draws its own, and the equivalent here is a second
+                 * override-redirect window plus its own hit-testing.  Until
+                 * that exists, take the graceful choice, which is the same
+                 * default the Wayland dialog offers on Enter.
+                 */
+                nb_log("the window manager asked the window to close: "
+                       "requesting an ACPI powerdown");
+                if (!nb_sink_close_request(sink,
+                                           NVKVM_BROKER_CLOSE_POWERDOWN)) {
+                    x->quit = true;
+                }
+            }
+            break;
+        }
         case XCB_ENTER_NOTIFY:
             nb_sink_pointer(sink, true);
             break;
@@ -693,6 +725,11 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
     }
     if (xcb_connection_has_error(x->c)) {
         return -EIO;
+    }
+    if (x->quit) {
+        /* The close box with nobody connected.  Same shape as the display
+         * going away: main() says goodbye and tears the session down. */
+        return -ECONNRESET;
     }
     return 0;
 }

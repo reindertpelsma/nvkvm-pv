@@ -249,7 +249,8 @@ static void nb_emit(struct nb_sink *s, int type, int x, int y,
     s->tx[s->tx_head] = (struct nvkvm_broker_pkt){
         .type  = (uint16_t)type,
         .flags = (uint16_t)((s->grabbed ? NVKVM_BROKER_F_GRABBED : 0) |
-                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0)),
+                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0) |
+                            (s->fullscreen ? NVKVM_BROKER_F_FULLSCREEN : 0)),
         .seq   = s->seq++,
         .x = x, .y = y, .w0 = w0, .w1 = w1,
     };
@@ -317,7 +318,8 @@ static struct nvkvm_broker_pkt nb_pkt(struct nb_sink *s, int type,
     struct nvkvm_broker_pkt p = {
         .type  = (uint16_t)type,
         .flags = (uint16_t)((s->grabbed ? NVKVM_BROKER_F_GRABBED : 0) |
-                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0)),
+                            (s->focused ? NVKVM_BROKER_F_FOCUSED : 0) |
+                            (s->fullscreen ? NVKVM_BROKER_F_FULLSCREEN : 0)),
         .seq   = s->seq++,
         .x = x, .y = y, .w0 = w0, .w1 = w1,
     };
@@ -613,6 +615,27 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
 }
 
+void nb_sink_set_fullscreen(struct nb_sink *s, bool on)
+{
+    if (!s || s->fullscreen == on) {
+        return;
+    }
+    s->fullscreen = on;
+}
+
+bool nb_sink_close_request(struct nb_sink *s, int action)
+{
+    if (!s || s->client_fd < 0) {
+        return false;           /* nobody to tell; the caller quits instead */
+    }
+    nb_log("the user closed the display (%s); telling the VMM, which decides "
+           "what that means for the guest",
+           action == NVKVM_BROKER_CLOSE_FORCE ? "force off" : "ACPI powerdown");
+    nb_emit(s, NVKVM_BROKER_EV_CLOSE, action, 0, 0, 0);
+    nb_sink_flush(s);
+    return true;
+}
+
 void nb_sink_bye(struct nb_sink *s, int reason)
 {
     nb_emit(s, NVKVM_BROKER_EV_BYE, reason, 0, 0, 0);
@@ -849,7 +872,32 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             nb_err("WINDOW: %ux%u out of range — ignored", c->width, c->height);
             return;
         }
-        ss->ops->resize(ss, c->width, c->height);
+        /*
+         * A GUEST RE-MODE DOES NOT MOVE THE USER'S WINDOW.
+         *
+         * WINDOW is the one message where the guest legitimately drives
+         * geometry, and it is honoured EXACTLY ONCE: the first one sizes the
+         * window to whatever resolution the guest booted at, which is the only
+         * sensible initial size.  After that the window belongs to the user,
+         * and someone opening the guest's display settings changes the SOURCE
+         * the broker is scaling, not the window they arranged on their desk.
+         *
+         * That is the mirror of the rule in the other direction -- a host
+         * resize never re-modes the guest -- and without it the two rules
+         * fight: the guest re-modes, the window jumps, the window change is
+         * reported back, and the geometry oscillates.
+         *
+         * Nothing else is needed to adopt the new size: the next COMMIT
+         * carries a buffer with the new dimensions and the backend rescales it
+         * into the window it already has, per the active --scale mode.
+         */
+        if (!s->window_established) {
+            s->window_established = true;
+            ss->ops->resize(ss, c->width, c->height);
+        } else {
+            nb_log("the guest changed resolution to %ux%u: keeping the window "
+                   "and rescaling into it", c->width, c->height);
+        }
         return;
 
     default:
@@ -1126,12 +1174,24 @@ static void usage(void)
 "  --allow-user NAME    additional user allowed to connect (repeatable)\n"
 "  --allow-group NAME   additional group allowed to connect (repeatable)\n"
 "  --drop-user NAME     become this user after the window is up\n"
+"  --fullscreen         start fullscreen (CTRL+ALT+F toggles)\n"
+"  --scale MODE         aspect (default) keeps the guest's aspect ratio and\n"
+"                       fills the remainder with black; stretch fills the\n"
+"                       window and distorts; none is 1:1, no scaling\n"
+"  --persist            keep the window when the VMM disconnects and wait\n"
+"                       for another (default: exit with it)\n"
+"  --trace-frames       log one line per commit: frame counter, dma-buf\n"
+"                       inode, cache slot, buffers the compositor still holds\n"
 "  --verbose\n"
 "\n"
 "The broker owns the window, the compositor connection and the input grab.\n"
 "The VMM keeps only this socket: it relays the guest's scanout dma-buf fd\n"
 "here and receives input.  It needs no EGL, no GL and no display server.\n"
-"By default root and the invoking user may connect.\n", stderr);
+"By default root and the invoking user may connect.\n"
+"\n"
+"A host resize never changes the guest's resolution -- it is scaled here.\n"
+"Going fullscreen does tell the guest, so it can render at the output's own\n"
+"resolution, which is what lets the compositor scan its buffer out directly.\n", stderr);
 }
 
 static int add_user(struct nb_config *c, const char *name)
@@ -1211,7 +1271,7 @@ int main(int argc, char **argv)
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.backend = "auto";
-    cfg.scale_mode = 2;   /* 1:1 windowed, fit in fullscreen */
+    cfg.scale_mode = NB_SCALE_ASPECT;   /* preserve aspect, black bars */
     cfg.title = "nvkvm";
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -1248,8 +1308,17 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
-        else if (!strcmp(a, "--scale")) { cfg.scale_mode = 1; }
-        else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = 0; }
+        else if (!strcmp(a, "--persist"))    { cfg.persist = true; }
+        else if (!strcmp(a, "--scale")) { NEEDVAL();
+            if (!strcmp(v, "stretch"))     { cfg.scale_mode = NB_SCALE_STRETCH; }
+            else if (!strcmp(v, "aspect")) { cfg.scale_mode = NB_SCALE_ASPECT; }
+            else if (!strcmp(v, "none"))   { cfg.scale_mode = NB_SCALE_NONE; }
+            else {
+                nb_err("--scale must be stretch, aspect or none (not '%s')", v);
+                return 2;
+            } }
+        /* The old boolean pair, kept working because it is in scripts. */
+        else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = NB_SCALE_NONE; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
@@ -1357,6 +1426,19 @@ int main(int argc, char **argv)
                 if (nb_sink_flush(&sink) < 0) {
                     nb_sink_detach(&sink, "write failed");
                 }
+            }
+            /*
+             * The VMM went away.  By default so do we: a broker window that
+             * outlives its VM shows nothing and still holds a window, a
+             * compositor connection and the hotkeys.  --persist keeps it and
+             * waits for another client, which is what makes a VMM restart --
+             * or a broker that was told to close and let QEMU shut the guest
+             * down gracefully -- survivable without restarting both.
+             */
+            if (sink.client_fd < 0 && !cfg.persist) {
+                nb_log("the client is gone; exiting (use --persist to keep "
+                       "the window and wait for another)");
+                break;
             }
         }
 

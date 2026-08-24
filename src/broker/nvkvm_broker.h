@@ -78,8 +78,18 @@ struct nb_config {
      * Direct scanout is only possible fullscreen, so a measurement of it
      * should not depend on somebody pressing a key. */
     bool fullscreen;
+    /* Keep the window and wait for another client when one disconnects.  The
+     * default is to exit: a broker window outliving its VM is a window showing
+     * nothing, and the socket is the VMM's to reconnect on. */
+    bool persist;
     /* 0 = never scale the guest frame, 1 = always scale it to the window,
      * 2 = auto: 1:1 windowed, scaled to fit in fullscreen.  Default 2. */
+    /*
+     * How the guest's frame is mapped into the window.  "fit" is deliberately
+     * NOT one of the names: in video players it conventionally means preserve
+     * aspect and letterbox, while the user meant fill -- so the word would be
+     * read backwards by half the people who saw it.
+     */
     int  scale_mode;
 };
 
@@ -126,6 +136,12 @@ struct nb_sink {
     pid_t    client_pid;        /* from SO_PEERCRED, for log lines only       */
     uint32_t seq;
 
+    /*
+     * The window has been sized once from the guest's own resolution.  After
+     * that a guest re-mode changes the SOURCE, not the window -- see the
+     * WINDOW case in nb_handle_cmd().
+     */
+    bool     window_established;
     bool     focused;
     bool     pointer_in;
     bool     grabbed;
@@ -176,6 +192,16 @@ void nb_sink_pointer(struct nb_sink *s, bool inside);
 void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h);
 void nb_sink_frame(struct nb_sink *s);
 void nb_sink_release(struct nb_sink *s, uint64_t buf_id);
+/* The user closed the display.  Reports it to the client and returns; the
+ * client decides what that means for the VM.  Returns false when nobody is
+ * connected, in which case the caller should just quit -- there is no policy
+ * to defer to. */
+bool nb_sink_close_request(struct nb_sink *s, int action);
+/* The BACKEND reporting what the display server actually did.  Fullscreen can
+ * be entered and left without our hotkey -- a compositor binding, --fullscreen
+ * at startup -- and the F_FULLSCREEN flag on every packet has to be the truth,
+ * not our last request, because the client keys a guest mode switch off it. */
+void nb_sink_set_fullscreen(struct nb_sink *s, bool on);
 void nb_sink_bye(struct nb_sink *s, int reason);
 
 /* ── session backends ────────────────────────────────────────────────────── */
@@ -279,6 +305,11 @@ void nb_formats_log(const struct nb_formats *f, const char *what);
 void nb_placeholder_paint(uint32_t *px, unsigned w, unsigned h,
                           unsigned stride_px, const char *line1,
                           const char *line2);
+/* nb_config.scale_mode */
+#define NB_SCALE_NONE    0      /* 1:1, centred, no scaling at all           */
+#define NB_SCALE_STRETCH 1      /* fill the window, ignore aspect, distort   */
+#define NB_SCALE_ASPECT  2      /* as large as fits, aspect kept, black bars */
+
 /* The same 5x7 font, for the client-side title bar.  Uppercase-only. */
 unsigned nb_placeholder_text_w(const char *s, unsigned scale);
 void nb_placeholder_fill(uint32_t *px, unsigned w, unsigned h,

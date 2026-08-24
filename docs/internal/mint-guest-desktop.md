@@ -289,47 +289,93 @@ order and never changes the current page — so real handover means either a
 front-end change or the hardware-accurate shape (nvkvm's own device exposing a
 boot framebuffer, so there is exactly one console and nothing to select).
 
-### Running QEMU as an unprivileged host user breaks GPU forwarding
+### Running QEMU unprivileged does NOT break GPU forwarding — the 9p share does
 
-Found 2026-08-21 while bringing the desktop back up outside the container.
-Booting the Mint guest with `scripts/run_test_vm.sh` as the ordinary `ubuntu`
-user, rather than as root, produces a guest where **the KMS head comes up but
-the GPU does not work at all**:
+**Corrected 2026-08-24 on the physical PC.  The previous claim in this section
+was wrong, and it had been repeated as fact.**  It read "running QEMU as an
+ordinary user produces a guest where the KMS head comes up but the GPU does not
+work at all", and concluded "until then, run the VM as root".
 
-    guest: nvkvm: virtual KMS head ready (1920x1080, 1 connector/crtc)
-    guest: nvkvm: session 1: no command-buffer ring (ret=-19) — virtqueue path
-    guest: nvidia-smi -> "couldn't communicate with the NVIDIA driver"
+Measured, on RTX 4070 / 595.84, Mint 22.3 guest, QEMU built from this tree:
 
-and the session then dies in a way that points at the wrong thing entirely:
+    $ grep -E '^Uid:|^Cap(Prm|Eff)' /proc/$(pgrep qemu-system-x86_64)/status
+    Uid:    1000    1000    1000    1000
+    CapPrm: 0000000000000000
+    CapEff: 0000000000000000
 
-    weston: [libseat/backend/logind.c:137] Could not take device: No such file or directory
-    weston: ERROR: DRM device 'card1' is not a KMS device.
+    guest# nvidia-smi -L
+    GPU 0: NVIDIA GeForce RTX 4070 (UUID: GPU-66e52545-...)
+    guest# dmesg | grep 'RING MAPPED'
+    nvkvm: session 14 RING MAPPED gpa=0x380003513000 bytes=65536 - 3-way OK
+    nvkvm: virtual KMS head ready (3840x2160, up to 3840x2160, 1 connector/crtc)
 
-That error sends you hunting through logind, seats and udev — `card1` *is*
-tagged `master-of-seat`, *is* listed under `seat0` by `loginctl seat-status`,
-and the by-driver node selection picked it correctly. None of that is the
-problem. The problem is upstream: the GPU session never established, so there
-is no KMS device behind the node.
+**uid 1000, an empty capability set, and the GPU command ring establishes.**  So
+nvkvm's VMM requires no capabilities.  Anyone confining it with all capabilities
+dropped is making a true claim.
 
-The isolate reports the strongest rung in both cases —
+#### What actually failed
 
-    nvkvm: isolate mode auto -> namespace (strongest rung; clone(CLONE_NEWUSER|...) succeeded)
+The 9p export, and only the 9p export.  `run_test_vm.sh` shares the repo with
+`security_model=mapped`, and the guest's `nvkvm-guest.service` **builds the
+module from that share on every boot**:
 
-— so the log gives no hint that anything is degraded. `clone(CLONE_NEWUSER)`
-succeeds for an unprivileged user; something later in the isolate's setup does
-not, and the failure surfaces only as `-ENODEV` on `SETUP_RING` at the guest's
-first GPU ioctl.
+    ExecStart=... cd /mnt/nvkvm/src/guest && make ... && insmod ./nvkvm-guest.ko
 
-**Running the identical command under `sudo` fixes it completely** — same
-image, same flags, same isolate mode — and the desktop comes up accelerated.
-This is why it had not been seen before: the container runs QEMU as root, so
-every previous run of this guest was privileged.
+In `mapped` mode QEMU stores the guest's ownership in xattrs and creates the
+host-side files **as the QEMU process uid with host mode 0600**.  So every file
+a *privileged* run produced is host `root:root 0600`:
 
-Not yet root-caused, and it should be: either the isolate needs to refuse to
-report `namespace` when it cannot actually serve, or unprivileged operation
-needs to work. Until then, run the VM as root, and treat
-`no command-buffer ring (ret=-19)` in the guest as "the host side is not
-serving", not as a guest-side driver problem.
+    $ ls -la /srv/nvkvm-fl/src/guest/nvkvm-guest.ko
+    -rw-------+ 1 root root 2962680 nvkvm-guest.ko
+
+An unprivileged QEMU can then neither write the share nor **read what an
+earlier privileged run left in it**.  The guest sees:
+
+    guest# touch /mnt/nvkvm/.wtest
+    touch: cannot touch '/mnt/nvkvm/.wtest': Permission denied
+    guest# systemctl status nvkvm-guest
+    nvkvm_main.c:2746:1: fatal error: opening dependency file
+        ./.nvkvm_main.o.d: Permission denied
+    make: *** [Makefile:14: all] Error 2
+
+and because the unit is `make && insmod`, **a failed build means insmod never
+runs**.  No module, no DRM node, no GPU — with nothing wrong anywhere in the
+GPU path.  `nvidia-smi` then reports "couldn't communicate with the NVIDIA
+driver", which is what sent the original investigation towards logind and seats.
+
+The earlier report's `no command-buffer ring (ret=-19)` with a KMS head present
+is the same failure one step along: there, an older `.ko` was still readable and
+`insmod` loaded a **stale** module, so the head came up and the protocol did not
+match.  Either way the module, not the privilege, is the variable.
+
+#### The fix, which is also better isolation
+
+**Bake `nvkvm-guest.ko` into the guest image** and stop building it at boot.
+Verified: with the module at `/opt/nvkvm/nvkvm-guest.ko` and the unit preferring
+it over the 9p build, the unprivileged run above works completely.  It also
+removes the writable 9p export from the deployment entirely, which is worth
+doing on its own — a writable host-filesystem share into the guest is a far
+larger hole than anything it was buying.
+
+#### What IS required, and it is a device grant, not a capability
+
+`/dev/kvm`.  That is an access-control question about a device node, not a
+capability, and the two should not be conflated:
+
+- the usual grant is membership of the `kvm` group;
+- on a desktop the **active seat user also gets it via a systemd-logind ACL**
+  (`user:<name>:rw-` from `getfacl /dev/kvm`), which is why it worked here for
+  `ubuntu` even though the `kvm` group is empty.  Do not rely on that for a
+  service account or a container user — grant the group explicitly.
+
+The NVIDIA nodes need no grant: `/dev/nvidiactl` and `/dev/nvidia0` are `0666`
+(and uid isolate mode already *requires* `0666` — see
+`docs/internal/isolate-model.md`).  `/dev/dri/renderD128` is `root:render 0660`
+and is only needed for the capture/NVENC profile, not for broker display.
+
+Unrelated to nvkvm, but it is what you hit first when you try this: the harness
+writes its logs and its monitor socket into root-owned paths, so point
+`VM_SERIAL`, the monitor socket and the run log somewhere the user can write.
 
 ### screendump by device id — a QEMU abort we can hit
 

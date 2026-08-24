@@ -3,3 +3,5 @@ nvkvm-broker-testclient
 *.o
 *-client-protocol.h
 *-protocol.c
+nvkvm-broker-relay
+nvkvm-broker-dmabuf-src

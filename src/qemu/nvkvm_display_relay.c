@@ -60,6 +60,8 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
+#include "sysemu/runstate.h"   /* qemu_system_powerdown_request.  QEMU 9.2 path;
+                                 * renamed to system/ in 10.0.               */
 #include "ui/console.h"
 #include "ui/input.h"
 
@@ -87,6 +89,12 @@ typedef struct NvkvmRelay {
     size_t      rxlen;
 
     bool        grabbed;
+    /* An ACPI powerdown we asked for and the guest has not acted on.  Kept so
+     * a second close is answered with something rather than with silence --
+     * see the EV_CLOSE case. */
+    bool        powerdown_pending;
+    time_t      powerdown_at;
+    unsigned    powerdown_asks;
     uint64_t    n_sent, n_dropped;
     /* ATTACHed but the COMMIT could not be written.  A distinct failure from
      * n_dropped -- see the comment at the counter's only increment. */
@@ -445,6 +453,29 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
         break;
     case NVKVM_BROKER_EV_SURFACE:
         RELAY_LOG("broker window is now %dx%d", p->x, p->y);
+        /*
+         * FULLSCREEN ONLY, and that is a design rule rather than an
+         * optimisation.  A windowed resize must not reach the guest at all --
+         * the host scales the buffer it already has, and the guest goes on
+         * believing it is the same size, so nothing inside it reflows because
+         * someone dragged a window edge.  Fullscreen is the opposite case:
+         * propagating the size is exactly what makes the guest render at the
+         * output's resolution, which is 1:1 pixels and the precondition for
+         * the compositor scanning its buffer out directly.
+         *
+         * `delay` is true: entering fullscreen can produce more than one
+         * configure and only the last is worth a guest mode switch.  QEMU's
+         * own timer coalescing is the right tool and is already there.
+         */
+        if (con && p->x > 0 && p->y > 0 &&
+            (p->flags & NVKVM_BROKER_F_FULLSCREEN) &&
+            dpy_ui_info_supported(con)) {
+            QemuUIInfo info = *dpy_get_ui_info(con);
+
+            info.width  = (uint32_t)p->x;
+            info.height = (uint32_t)p->y;
+            dpy_set_ui_info(con, &info, true);
+        }
         break;
     case NVKVM_BROKER_EV_FRAME:
     case NVKVM_BROKER_EV_RELEASE:
@@ -459,6 +490,69 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
         break;
     case NVKVM_BROKER_EV_POINTER:
     case NVKVM_BROKER_EV_HELLO:
+        break;
+    case NVKVM_BROKER_EV_CLOSE:
+        /*
+         * The user closed the display.  THE POLICY IS OURS, and this is the
+         * only place in the system that has any business having one: the
+         * broker knows there is a window, we are the only party that knows
+         * there is a guest behind it.
+         *
+         * An ACPI powerdown, i.e. the same thing as pressing the power button
+         * on the case -- the guest's own OS decides whether to shut down, ask
+         * the user, or ignore it.  Not a `quit`: closing a window must not
+         * destroy a running machine's state without the guest getting a say.
+         * A guest that ignores ACPI keeps running with no display, and the
+         * broker is still there to reconnect to.
+         */
+        if (p->x == NVKVM_BROKER_CLOSE_FORCE) {
+            /*
+             * The user explicitly chose to stop the machine, having been
+             * offered the graceful option and declined it.  SHUTDOWN_CAUSE_
+             * HOST_UI is exactly what a UI close button reports elsewhere in
+             * QEMU, so this behaves like every other front-end's close.
+             */
+            RELAY_LOG("the user chose to force the VM off%s",
+                      r->powerdown_pending
+                          ? " after the guest ignored a powerdown" : "");
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        } else {
+            /*
+             * The same thing as the power button on the case: the guest's own
+             * OS decides whether to shut down, prompt, or ignore it.
+             *
+             * AND IT MAY IGNORE IT -- hung, or a modal dialog blocking
+             * shutdown.  Then the window just sits there, and a user clicking
+             * close again gets no sign that anything happened at all, which is
+             * a dead end in the most finished-looking part of the UI.  So a
+             * repeat ask is answered explicitly, and it is answered HERE
+             * because escalation is VM policy and the broker must not grow
+             * any: all it did was tell us the user asked again.
+             *
+             * It does NOT force on the second click.  Destroying a running
+             * machine on a double click is a worse failure than the one being
+             * fixed, and the user already has an explicit "force off" in front
+             * of them -- they need to be told it is the way out, not to have
+             * it happen to them.
+             */
+            time_t now = time(NULL);
+
+            r->powerdown_asks++;
+            if (r->powerdown_pending) {
+                RELAY_LOG("the guest has NOT responded to the powerdown "
+                          "requested %llds ago (asked %u times). It may be "
+                          "hung, or showing a dialog that blocks shutdown. "
+                          "Choose FORCE OFF THE VM to stop it anyway.",
+                          (long long)(now - r->powerdown_at),
+                          r->powerdown_asks);
+            } else {
+                r->powerdown_pending = true;
+                r->powerdown_at = now;
+                RELAY_LOG("the user closed the display: requesting an ACPI "
+                          "powerdown (the guest decides what to do with it)");
+            }
+            qemu_system_powerdown_request();
+        }
         break;
     case NVKVM_BROKER_EV_BYE:
         RELAY_LOG("the broker is going away (reason %d)", p->x);

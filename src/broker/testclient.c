@@ -53,6 +53,7 @@ static const char *evname(int t)
     case NVKVM_BROKER_EV_SURFACE: return "SURFACE";
     case NVKVM_BROKER_EV_FRAME:   return "FRAME";
     case NVKVM_BROKER_EV_RELEASE: return "RELEASE";
+    case NVKVM_BROKER_EV_CLOSE:   return "CLOSE";
     case NVKVM_BROKER_EV_KEY:     return "KEY";
     case NVKVM_BROKER_EV_BTN:     return "BTN";
     case NVKVM_BROKER_EV_ABS:     return "ABS";

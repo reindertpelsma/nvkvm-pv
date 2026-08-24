@@ -70,7 +70,34 @@ enum {
                                      * broker sends no KEY/BTN/ABS/REL at all  */
     NVKVM_BROKER_EV_POINTER   = 12, /* x=1 pointer over the window, 0 not      */
     NVKVM_BROKER_EV_BYE       = 13, /* broker is going away; x=reason code     */
+    /*
+     * EV_CLOSE — THE USER CLOSED THE DISPLAY.  The X button, or the
+     * compositor's own close request (Alt+F4, a window-list close).
+     *
+     * It states a fact and requests nothing: the broker knows nothing about
+     * VMs and has no business deciding what closing a window means for one.
+     * The VMM applies its own policy -- an ACPI powerdown, a prompt, a
+     * snapshot, or nothing at all.
+     *
+     * DELIBERATELY NOT A DIALOG IN THE BROKER.  The broker is the privileged
+     * process holding the keyboard grab; putting dialog UI, hit-testing and
+     * the state machine behind it in there buys attack surface for a decision
+     * it cannot make anyway.
+     *
+     * The broker does NOT exit on sending this.  It exits when the client
+     * disconnects (or keeps the window with --persist), so the VMM decides how
+     * and when the display goes away.
+     */
+    NVKVM_BROKER_EV_CLOSE     = 14,
 };
+
+/*
+ * EV_CLOSE.x — WHICH close the user asked for.  The broker asks the human and
+ * reports the answer; what each one MEANS is still entirely the VMM's, which
+ * is what keeps VM policy out of the privileged process.
+ */
+#define NVKVM_BROKER_CLOSE_POWERDOWN 0  /* graceful: the guest OS decides     */
+#define NVKVM_BROKER_CLOSE_FORCE     1  /* stop the machine now               */
 
 /*
  * Capability bits reported in HELLO (w1).  These describe what the backend on
@@ -126,6 +153,24 @@ struct nvkvm_broker_pkt {
  * about grab state, whatever it did with the GRAB event. */
 #define NVKVM_BROKER_F_GRABBED  (1u << 0)
 #define NVKVM_BROKER_F_FOCUSED  (1u << 1)
+/*
+ * The window is fullscreen.  Mirrored like the others, and load-bearing on
+ * EV_SURFACE: it is what separates the two kinds of size change.
+ *
+ *   windowed resize  -> the host scales the buffer it already has.  The guest
+ *                       is NOT told and MUST NOT re-mode: applications inside
+ *                       would reflow, games would reinitialise swapchains, and
+ *                       X clients would get a ConfigureNotify storm, all
+ *                       because someone dragged a window edge.
+ *   fullscreen       -> the size IS propagated, so the guest re-modes to the
+ *                       output's resolution.  That is when you want it: 1:1
+ *                       pixels, no scaling, and a surface that covers the
+ *                       output, which is the compositor's condition for
+ *                       promoting it to direct scanout.  It is also a
+ *                       deliberate user action where a brief re-mode is
+ *                       expected -- games do this routinely.
+ */
+#define NVKVM_BROKER_F_FULLSCREEN (1u << 2)
 
 /* ── VMM → broker: commands ──────────────────────────────────────────────── */
 

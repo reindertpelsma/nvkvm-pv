@@ -760,7 +760,7 @@ static void nvkvm_evt_push_bh(void *opaque)
 			.isolate_id = cpu_to_le32(p->isolate_id),
 			.handle_id  = cpu_to_le32(p->handle_id),
 			.events     = cpu_to_le32(p->revents),
-			.reserved   = 0,
+			.type       = cpu_to_le32(NVKVM_EVT_TYPE_POLL),
 		};
 		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
 		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
@@ -785,6 +785,59 @@ void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
 	p->handle_id  = handle_id;
 	p->revents    = revents;
 	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_evt_push_bh, p);
+}
+
+/* ── ui_info: the host window's size, on its way to the guest's KMS head ─────
+ * Same VQ_EVT transport and the same BH hop as the poll events above, for the
+ * same reason: this is called from the UI/main path, and only the device's
+ * AioContext may touch a VirtQueue.
+ *
+ * Dropping it when the queue is full is correct here and NOT merely tolerable:
+ * the payload is the CURRENT window size, so a lost event is superseded by the
+ * next one rather than lost work.  Resizing is a gesture that produces a
+ * stream, and the last one is the only one that matters. */
+struct nvkvm_ui_info_push {
+	VirtIONvgpu *nv;
+	uint32_t     width;
+	uint32_t     height;
+};
+
+static void nvkvm_ui_info_push_bh(void *opaque)
+{
+	struct nvkvm_ui_info_push *p = opaque;
+	VirtQueueElement *elem = virtqueue_pop(p->nv->vq_evt, sizeof(*elem));
+
+	if (elem) {
+		struct nvkvm_evt_ui_info msg = {
+			.width    = cpu_to_le32(p->width),
+			.height   = cpu_to_le32(p->height),
+			.reserved = 0,
+			.type     = cpu_to_le32(NVKVM_EVT_TYPE_UI_INFO),
+		};
+		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
+		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
+		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
+		g_free(elem);
+	} else {
+		NVKVM_DBG("nvkvm: vq_evt full, dropped ui_info %ux%u\n",
+			  p->width, p->height);
+	}
+	g_free(p);
+}
+
+void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
+			       uint32_t height)
+{
+	struct nvkvm_ui_info_push *p;
+
+	if (!nv || !nv->vq_evt || !width || !height) {
+		return;
+	}
+	p = g_malloc(sizeof(*p));
+	p->nv     = nv;
+	p->width  = width;
+	p->height = height;
+	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_ui_info_push_bh, p);
 }
 
 static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
