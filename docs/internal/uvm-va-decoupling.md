@@ -730,6 +730,69 @@ space in question is the guest process's own, created by its own isolate — a
 guest choosing `G` adversarially is choosing within its own GPU address space,
 not a shared one.
 
+## 6c. M4 — the backing object can be the VMM's *own* memory
+
+The open question after M1-M3 was where the RM memory object comes from. M4
+answers it, and the answer is better than the design assumed: **QEMU does not
+need the guest to allocate anything, and does not need a new RM object at all —
+it can register memory it already owns.**
+
+Measured on an RTX 3060, driver 595.84 (a second driver branch, deliberately):
+
+```
+[1] private anonymous @ 0x7dae98000000
+    cudaHostRegister(private anon)      -> 0    devPtr == host ptr
+
+[2] memfd MAP_SHARED: mapping#1 @ 0x7dae9801d000  mapping#2 @ 0x7dae7c49d000
+    cudaHostRegister(memfd MAP_SHARED)  -> 0
+    cudaHostGetDevicePointer            -> 0    devPtr = 0x7dae9801d000
+    COHERENCE via mapping#2 (different CPU VA): 0/524288 mismatched
+RESULT: MEMFD_BACKING_WORKS
+```
+
+Two things matter here.
+
+**`memfd` + `MAP_SHARED` is registerable.** That is exactly what QEMU's sparse
+window is made of. Note the contrast with §2g: HMM *refuses* shared VMAs
+(`uvm_hmm.c:2594-2602`) and forces sysmem for anything non-anonymous. RM's
+OS-descriptor path has no such restriction — so the mechanism HMM cannot provide
+is available through external ranges.
+
+**Coherence holds through a second CPU mapping at a different address.** The
+kernel's writes were made visible through `mapping#2`, which never took part in
+the registration. That is precisely the split the design needs:
+
+| who | how it reaches the pages |
+|---|---|
+| QEMU | registers the window extent at its own host VA, memslots it |
+| the guest | the same physical pages via the GPA, at its own address `G` |
+| the GPU | the external mapping |
+
+**The exact lifecycle to replicate**, straight from the trace — three ioctls,
+all already in nvkvm's schema with the right `va_mode`:
+
+```
+CREATE_EXTERNAL_RANGE    base=0x7dae9801d000 len=0x200000   (73, VA_CREATE)
+MAP_EXTERNAL_ALLOCATION  base=0x7dae9801d000 len=0x200000   (33, VA_USE)
+UVM_FREE                 base=0x7dae9801d000 len=0          (34, VA_FREE)
+```
+
+libcuda passes `base` = the CPU address it registered. **The one substitution
+nvkvm makes is passing `base` = `G`, the guest's VA**, which is what puts the GPU
+mapping where the guest's kernels dereference. `base` is an independent IN
+parameter (`uvm_ioctl.h:491-503`) and is stored verbatim as the range start
+(`ext_gpu_map->node.start = base`, `uvm_map_external.c:1131`), and §M3 showed
+`CREATE_EXTERNAL_RANGE` accepts an arbitrary fresh base — so this is
+well-supported, though binding a *given* `hMemory` at a base unrelated to its CPU
+mapping is the one mechanism assumption not yet directly exercised.
+
+**Consequence for Phase 4.** Because the backing is QEMU's own window memory,
+the guest supplies *no* address at any point: it supplies a handle and a length,
+QEMU picks the host VA from its window allocator, and the only guest number in
+play is `G` — which is used as a **GPU** virtual address in the guest's own RM VA
+space, never as a host CPU address. That is a stronger statement than the
+original design could have made.
+
 ## 7. What would settle it: the two measurements that decide the external-range design
 
 §2e is the only option not blocked by the driver, and its remaining risk is not
