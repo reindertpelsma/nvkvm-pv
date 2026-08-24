@@ -109,6 +109,17 @@ struct nb_wl_buf {
     uint64_t  modifier;
     uint64_t  used;                 /* LRU tick                               */
     struct nb_wl *owner;
+    /*
+     * HELD BY THE COMPOSITOR.  Set when the buffer is committed to the
+     * surface, cleared by wl_buffer.release.  A Wayland client must not touch
+     * a buffer between those two points -- and here the party that touches it
+     * is the GUEST, several processes away, which never sees the release.
+     * Tracking it is what makes "the guest overwrote a buffer the compositor
+     * was still reading" an observable event instead of a theory.
+     */
+    bool      held;
+    uint32_t  seq;                  /* client frame counter at last commit    */
+    uint64_t  commits;
 };
 
 struct nb_wl {
@@ -227,6 +238,8 @@ struct nb_wl {
     int      pending;           /* index of the ATTACHed-but-not-COMMITted buf */
     int      current;           /* index of the buffer the surface holds       */
     bool     frame_inflight;
+    uint64_t n_reuse_inflight;  /* commits of a buffer the compositor still
+                                 * held -- see wl_commit()                     */
 
     /* THREE sizes, deliberately not one:
      *   buf_w/buf_h   the guest's scanout buffer — the resolution it chose
@@ -268,6 +281,7 @@ static void buf_release(void *data, struct wl_buffer *b)
      * cycles its own bos regardless), which is why a missed release only costs
      * the client an optimisation.
      */
+    slot->held = false;
     if (slot->owner->sink) {
         nb_sink_release(slot->owner->sink, slot->id);
     }
@@ -327,6 +341,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
             sl->offset == d->offset && sl->fourcc == d->fourcc &&
             sl->modifier == d->modifier) {
             sl->used = w->tick;
+            sl->seq  = d->seq;
             w->pending = i;
             return 0;
         }
@@ -379,7 +394,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
         .valid = true, .id = d->id, .buf = b,
         .w = d->width, .h = d->height, .stride = d->stride,
         .offset = d->offset, .fourcc = d->fourcc, .modifier = d->modifier,
-        .used = w->tick, .owner = w,
+        .used = w->tick, .owner = w, .seq = d->seq,
     };
     wl_buffer_add_listener(b, &buf_listener, &w->bufs[victim]);
     w->pending = victim;
@@ -415,6 +430,44 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     if (!sl->valid) {
         w->pending = -1;
         return -ENOENT;
+    }
+
+    /*
+     * THE FRAME-GLITCH DETECTOR.
+     *
+     * `held` means the compositor took this buffer and has not sent
+     * wl_buffer.release for it.  Seeing it set here, for a buffer that is NOT
+     * the one currently on the surface, means the guest has cycled its whole
+     * scanout ring and come back to a buffer the compositor is still reading
+     * -- so the guest has been rendering into it underneath the compositor.
+     * That is exactly the "light, intermittent, stale-looking frame" a user
+     * reports, and it is a real correctness bug rather than a cosmetic one.
+     *
+     * It is DETECTED and counted here, not fixed here: the broker cannot stop
+     * the guest from drawing.  The fix is backpressure, and it has to reach
+     * the guest -- see nb_sink_release() and the relay.
+     */
+    if (sl->held && w->current != w->pending) {
+        w->n_reuse_inflight++;
+        if (nb_trace_frames || w->n_reuse_inflight <= 8 ||
+            (w->n_reuse_inflight % 256) == 0) {
+            nb_log("frame: REUSE-IN-FLIGHT seq=%u buf=%llu slot=%d "
+                   "(the compositor never released it; %llu so far)",
+                   sl->seq, (unsigned long long)sl->id, w->pending,
+                   (unsigned long long)w->n_reuse_inflight);
+        }
+    }
+    if (nb_trace_frames) {
+        int i, held = 0;
+
+        for (i = 0; i < NB_MAX_BUFS; i++) {
+            if (w->bufs[i].valid && w->bufs[i].held) {
+                held++;
+            }
+        }
+        nb_log("frame: commit seq=%u buf=%llu slot=%d prev-slot=%d held=%d",
+               sl->seq, (unsigned long long)sl->id, w->pending, w->current,
+               held);
     }
 
     /* A real frame supersedes the placeholder; drop its mapping rather than
@@ -551,6 +604,8 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     wl_surface_commit(w->surf);
 
+    sl->held = true;
+    sl->commits++;
     w->current = w->pending;
     w->pending = -1;
     if (new_w != w->surf_w || new_h != w->surf_h) {
