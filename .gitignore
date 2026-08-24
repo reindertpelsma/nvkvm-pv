@@ -70,3 +70,7 @@ tests/unit/drm_param_structs.inc
 # from the QEMU handler and from the stub between explicit markers
 tests/unit/r1_type_dev.inc
 tests/unit/r1_stub_type_dev.inc
+
+# scripts/sweep.sh run output: results, raw logs pulled off rented boxes,
+# and the instance registry the auto-destroy timer reads.
+sweep-runs/

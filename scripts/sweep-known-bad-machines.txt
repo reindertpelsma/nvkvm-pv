@@ -1,0 +1,21 @@
+# vast.ai machine_ids that CANNOT provision a KVM instance.
+#
+# The signature is specific and deterministic per machine, and it is host-side:
+# the instance reaches actual_status=created, sshd never listens, and the
+# instance log freezes at
+#
+#     libvirt: QEMU Driver error : Domain not found: no domain with matching
+#     name 'C.<instance-id>'
+#
+# `vastai reboot instance` and `vastai recycle instance` each reproduce a
+# BYTE-IDENTICAL frozen log, so retrying the same machine is pure waste. It says
+# nothing whatsoever about the guest stack -- re-rent on a different machine_id.
+#
+# scripts/sweep.sh reads this file to skip these machines when picking offers,
+# and APPENDS to it whenever it observes the signature itself.
+#
+# One machine_id per line. Everything after '#' is a comment.
+
+42636	# 8x RTX 3060 -- instance 48297558, 2026-08-20
+44906	# single RTX 4090, Denmark -- 2026-08-23; proved this is not a multi-GPU-only defect
+11908	# 2026-08-23
