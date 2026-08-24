@@ -114,6 +114,11 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+/* The per-driver-version command numbering lives in src/common now:
+ * the guest module and the stub need the same table, to recognise
+ * REGISTER_SURFACE for plane-fd translation. */
+#include "../../src/common/nvkvm_nvkms_ops.h"
+
 /* Investigation escape hatch, OFF unless the env var is set, and never a
  * default: NVKVM_NVKMS_EXTRA_ALLOW="33,34" widens the list for one QEMU run.
  * It exists because the list above is a live capture that expires with every
@@ -182,43 +187,15 @@ static inline bool nvkvm_nvkms_extra_allow(uint32_t cmd_type)
  * An unrecognised or unparseable version admits ALLOC_DEVICE/FREE_DEVICE only
  * (indices 0 and 1, which have never moved) and denies the rest.  That is
  * deliberate: extrapolating the numbering onto an unverified branch is exactly
- * how SET_FLIPLOCK_GROUP got in.  Adding a branch is one row below, once its
- * enum has actually been read.  NVKVM_NVKMS_EXTRA_ALLOW remains the one-run
- * escape hatch for bringing a new branch up.
+ * how SET_FLIPLOCK_GROUP got in.  Adding a branch is one row in
+ * src/common/nvkvm_nvkms_ops.h, once its enum has actually been read.
+ * NVKVM_NVKMS_EXTRA_ALLOW remains the one-run escape hatch for bringing a new
+ * branch up.
+ *
+ * The table itself MOVED to src/common/nvkvm_nvkms_ops.h (unchanged), because
+ * the guest module and the stub need the same numbering to recognise
+ * REGISTER_SURFACE and translate the plane fds embedded in its inner params.
  */
-struct nvkvm_nvkms_ops {
-	bool     known;
-	uint32_t reg_surface;
-	uint32_t unreg_surface;
-	int32_t  vblank_enable;    /* -1 when the branch has no vblank-sem ops */
-	int32_t  vblank_disable;
-	int32_t  vblank_accel;
-};
-
-static inline struct nvkvm_nvkms_ops
-nvkvm_nvkms_ops_for_version(unsigned major, unsigned minor)
-{
-	struct nvkvm_nvkms_ops o = { false, 0, 0, -1, -1, -1 };
-	/* 570 splits mid-branch: 570.195.03 and older number like 565, 570.207
-	 * and newer number like 575.  Everything else is stable per major. */
-	bool shifted = (major >= 575) || (major == 570 && minor >= 207) ||
-		       (major > 570 && major < 575);
-
-	if (major >= 515 && major <= 549) {
-		o.known = true; o.reg_surface = 16; o.unreg_surface = 17;
-	} else if (major >= 550 && major <= 574 && !shifted) {
-		o.known = true; o.reg_surface = 16; o.unreg_surface = 17;
-		o.vblank_enable = 60; o.vblank_disable = 61; o.vblank_accel = 62;
-	} else if (shifted && major <= 589) {
-		o.known = true; o.reg_surface = 17; o.unreg_surface = 18;
-		o.vblank_enable = 61; o.vblank_disable = 62; o.vblank_accel = 63;
-	} else if (major >= 590 && major <= 610) {
-		o.known = true; o.reg_surface = 17; o.unreg_surface = 18;
-		o.vblank_enable = 60; o.vblank_disable = 61; o.vblank_accel = 62;
-	}
-	return o;
-}
-
 static inline bool nvkvm_nvkms_cmd_allowed_ver(uint32_t cmd_type,
 					       unsigned major, unsigned minor)
 {

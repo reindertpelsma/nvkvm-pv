@@ -57,6 +57,7 @@
 #include "../common/nvkvm_ring.h"
 #include "../common/nvkvm_ring_ioctl.h"
 #include "../common/nvkvm_abi.h"
+#include "../common/nvkvm_nvkms_ops.h"
 
 /* fcntl(2) F_DUPFD_CLOEXEC — not pulled in by the freestanding headers. */
 #define NVKVM_F_DUPFD_CLOEXEC 1030
@@ -1199,10 +1200,26 @@ static void worker_thread(void *arg)
 		}
 
 		/*
-		 * NVKMS REGISTER_SURFACE (sub-cmd 17): the inner params carry up
-		 * to 3 plane fds (useFd=TRUE) holding our handle_ids; resolve each
-		 * to the stub's local fd so NVKMS dups the real memory object.
-		 * Restore the handle_ids after the ioctl (never leak a stub fd).
+		 * NVKMS REGISTER_SURFACE: the inner params carry up to 3 plane
+		 * fds (useFd=TRUE) holding our handle_ids; resolve each to the
+		 * stub's local fd so NVKMS dups the real memory object.  Restore
+		 * the handle_ids after the ioctl (never leak a stub fd).
+		 *
+		 * The sub-cmd is 16 on hosts up to 570.195.03 and 17 from
+		 * 570.207 on -- 570.207 inserted DECLARE_DYNAMIC_DPY_INTEREST at
+		 * 16 (src/common/nvkvm_nvkms_ops.h).  This used to test 17 only,
+		 * so on a <=570.195 host it never fired and the guest's
+		 * handle_ids were handed to NVKMS as if they were fds.
+		 *
+		 * The stub cannot resolve the version itself: it is handed an
+		 * `abi_profile`, and the 570.195/570.207 split falls INSIDE
+		 * NVKVM_ABI_570.  Matching both values is exactly as tight,
+		 * because on any one host only one of them can reach here at
+		 * all -- QEMU's allowlist admits REGISTER_SURFACE and
+		 * UNREGISTER_SURFACE and nothing else in this range, so the
+		 * other value is either UNREGISTER_SURFACE (which sets no
+		 * useFd byte, so the guard below still rejects it) or
+		 * DECLARE_DYNAMIC_DPY_INTEREST, which is denied outright.
 		 */
 		int     regsurf_off[NVKVM_NVKMS_MAX_PLANES];
 		int32_t regsurf_hid[NVKVM_NVKMS_MAX_PLANES];
@@ -1213,7 +1230,8 @@ static void worker_thread(void *arg)
 				    NVKVM_NVKMS_REGSURF_PLANE_STRIDE) {
 			uint32_t subcmd;
 			__builtin_memcpy(&subcmd, job.param_buf, sizeof(subcmd));
-			if (subcmd == NVKVM_NVKMS_CMD_REGISTER_SURFACE &&
+			if ((subcmd == NVKVM_NVKMS_REG_SURFACE_UNSHIFTED ||
+			     subcmd == NVKVM_NVKMS_REG_SURFACE_SHIFTED) &&
 			    *((unsigned char *)job.aux_buf +
 			      NVKVM_NVKMS_REGSURF_USEFD_OFF)) {
 				for (unsigned i = 0; i < NVKVM_NVKMS_MAX_PLANES; i++) {

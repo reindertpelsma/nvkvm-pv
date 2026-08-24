@@ -21,6 +21,7 @@
 
 #include "../../src/common/nvkvm_proto.h"
 #include "../../src/common/nvkvm_abi.h"
+#include "../../src/common/nvkvm_nvkms_ops.h"
 #include "../../src/common/nvkvm_ring.h"
 #include "../../src/common/nvkvm_ring_ioctl.h"
 #include "../../src/abi/nvgpu.h"
@@ -360,6 +361,30 @@ extern struct nvkvm_state nvkvm;
 static inline const struct nvkvm_abi_profile *nvkvm_prof(void)
 {
 	return nvkvm.abi ? nvkvm.abi : nvkvm_abi_by_id(NVKVM_ABI_570);
+}
+
+/*
+ * The cmdType that means NVKMS_IOCTL_REGISTER_SURFACE on THIS host.
+ *
+ * `enum NvKmsIoctlCommand` is unvalued, so position is the wire value, and
+ * 570.207 inserted a member at 16 that shifted REGISTER_SURFACE from 16 to 17
+ * (src/common/nvkvm_nvkms_ops.h).  This must be resolved from the host driver
+ * version, not hardcoded: it gates the plane-fd translation in
+ * nvkvm_sanitize_ioctl_params(), and getting it wrong forwards raw guest fds
+ * to the host, which fails every REGISTER_SURFACE on the affected branches.
+ *
+ * Falls back to the shifted value on an unparseable version, matching the
+ * numbering every branch from 570.207 to 610 uses.
+ */
+static inline __u32 nvkvm_nvkms_reg_surface(void)
+{
+	unsigned major = 0, minor = 0, patch = 0;
+	struct nvkvm_nvkms_ops ops;
+
+	nvkvm_abi_parse_version(nvkvm.driver_version, &major, &minor, &patch);
+	ops = nvkvm_nvkms_ops_for_version(major, minor);
+	return ops.known ? (__u32)ops.reg_surface
+			 : (__u32)NVKVM_NVKMS_REG_SURFACE_SHIFTED;
 }
 
 /* ── Function declarations ─────────────────────────────────────────────────── */
