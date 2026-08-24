@@ -104,8 +104,12 @@ them together "is correct, not a weakening"
 A guest that zeroes its own pointers is doing the boundary a favour, not
 providing a guarantee. So the stub does not check whether a pointer field is
 zero — it writes over it
-(`src/stub/nvkvm_stub.c:901-921`), and QEMU's dispatch does the same for the
-array-carrying case (`src/qemu/nvkvm_dispatch.c:383-403`).
+(`src/stub/nvkvm_stub.c:901-921`), including the array-carrying
+`NV_ESC_RM_IDLE_CHANNELS` case, whose 28-byte re-zero is in the same worker
+path. (QEMU's old synchronous dispatch had its own version of that overwrite;
+`nvkvm_dispatch.c` was unreachable and was deleted on 2026-08-24, DEAD-1. The
+principle is unchanged — what changed is that only one implementation of it now
+exists, and it is the one that runs.)
 
 That is also why the aux-slot design was chosen over a generated per-command
 pointer-rewrite table. A rewrite table describes where the pointers are; if the

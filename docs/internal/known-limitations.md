@@ -1002,9 +1002,11 @@ A100DBG FREE  hRoot=0xc1d0003c   hParent=0x5c000002 hObject=0x5c000157        nv
 guest VA is meaningless in the isolate's address space — and the comment there
 states the contract: *"host fills in from its map table"*.
 
-**Nothing on the live host path fills it in.** The only code that ever writes
-`p_linear_address` host-side is in `src/qemu/nvkvm_dispatch.c`, which is inside
-the `#if 0` legacy block and is not reachable. The stub knows NR `0x4f` only
+**Nothing on the live host path fills it in.** The only code that ever wrote
+`p_linear_address` host-side was in `src/qemu/nvkvm_dispatch.c`, which was
+unreachable and was **deleted on 2026-08-24 (DEAD-1)**. Deleting it changed no
+behaviour — it never ran — but it removes the thing a reader could mistake for
+the missing half. The stub knows NR `0x4f` only
 well enough to find its `status` field offset. So the driver receives every
 `RM_UNMAP_MEMORY` with VA 0, cannot find a mapping there, and answers
 `NV_ERR_OBJECT_NOT_FOUND`. The guest half of a two-part design shipped; the host
@@ -1401,10 +1403,16 @@ you think you are testing is not the one that compiles.
 
 ### Dead code you may trip over while reading
 
-`src/qemu/nvkvm_dispatch.c` and `src/qemu/nvkvm_frontend.c` implement the
-original synchronous path where QEMU ran the ioctl itself. The live path is
-`IOCTL_ON_ISOLATE` → the stub. The `NV_ESC_RM_IDLE_CHANNELS` case in dispatch
-says so explicitly:
+`src/qemu/nvkvm_dispatch.c` and `src/qemu/nvkvm_frontend.c` implemented the
+original synchronous path where QEMU ran the ioctl itself. **Both were deleted
+on 2026-08-24 (DEAD-1)** — so this entry is now history rather than a warning,
+and it is kept because the shape recurs. They were unreachable end to end,
+compiled and linked, and carried banners saying so; the banners were not enough,
+and `nvkvm_frontend.c`'s header comment advertised three "security invariants"
+none of which executed. The live path is `IOCTL_ON_ISOLATE` → the stub, and the
+per-fix accounting of what the pair protected is at the top of
+`src/qemu/virtio_nvgpu.c`. The `NV_ESC_RM_IDLE_CHANNELS` case said so
+explicitly, and was ignored anyway:
 
 > NOTE (audit P2-1): this dispatch path is NOT wired into the live
 > `IOCTL_ON_ISOLATE` flow (`handle_ioctl` is static/unused). The authoritative
@@ -1412,7 +1420,7 @@ says so explicitly:
 > 0x41 block). Kept here for the (currently dead) synchronous path; do not rely
 > on it.
 >
-> — `src/qemu/nvkvm_dispatch.c:375-379`
+> — `src/qemu/nvkvm_dispatch.c:375-379`, at `68a35c0`
 
 The legacy `NVKVM_REQ_OPEN` / `_CLOSE` / `_IOCTL` / `_MMAP` / `_MUNMAP`
 handlers in `src/qemu/virtio_nvgpu.c` are under `#if 0` as tombstones

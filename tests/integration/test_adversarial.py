@@ -104,6 +104,36 @@ class TestInvalidIoctls(unittest.TestCase):
         self.assertIn(err, (errno.ENOTTY, errno.EINVAL),
                       f"Expected ENOTTY/EINVAL, got {errno.errorcode.get(err, err)}")
 
+    def test_valid_sibling_type_on_frontend_handle(self):
+        """R-1: a VALID-but-wrong _IOC_TYPE aimed at /dev/nvidiactl.
+
+        test_completely_unknown_ioctl above uses 'Z', a type nothing
+        recognises, and it passed for years while R-1 was wide open.  The
+        dangerous shape is a type that IS recognised somewhere else: 'd' is
+        DRM, and 0x41 is simultaneously DRM_COMMAND_BASE+0x01 (on the DRM
+        allowlist) and NV_ESC_RM_IDLE_CHANNELS (frontend).  Aimed at a
+        frontend handle it used to take the host's 'd' branch, skip fourteen
+        'F'-keyed gates including the IDLE_CHANNELS memset, and reach the
+        driver -- which dispatches on _IOC_NR and ignores _IOC_TYPE.
+
+        READ THIS BEFORE TRUSTING A PASS.  Against the STOCK guest module this
+        case is refused IN THE GUEST: nvkvm_guest_ioctl_size() returns -1 for
+        any non-'F' type (src/guest/nvkvm_ioctl.c:143), so the record never
+        leaves the VM and this test would pass identically with the host gate
+        deleted.  It pins the end-to-end property for a cooperative guest, and
+        nothing more.  The threat model is a malicious guest KERNEL, which does
+        not consult that table.  What actually pins the HOST gate is
+        tests/unit/test_r1_type_dev, which calls the host's decision function
+        directly with no guest in front of it.
+        """
+        buf = (ctypes.c_uint8 * 40)()
+        for ioc_type, nr in (('d', 0x41), ('d', 0x4f), ('d', 0x54), ('d', 0x57)):
+            cmd = _IOWR(ioc_type, nr, 40)
+            ret, err = do_ioctl(self.fd, cmd, buf)
+            self.assertLess(ret, 0,
+                            f"_IOWR('{ioc_type}', {nr:#x}) on /dev/nvidiactl "
+                            f"was ACCEPTED -- R-1 type confusion")
+
     def test_nvidia_ioctl_wrong_size(self):
         # Send NV_ESC_RM_CONTROL with wrong parameter size (too small)
         buf = (ctypes.c_uint8 * 4)()  # real struct is 32 bytes

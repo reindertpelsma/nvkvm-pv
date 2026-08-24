@@ -241,7 +241,7 @@ the kernel UAPI types).
 **6. Patch `hw/misc/meson.build`** (`scripts/build_qemu.sh:151-197`) —
 idempotent, guarded by `grep -q virtio_nvgpu.c`. Adds
 `nvkvm_inc = include_directories('nvkvm_inc')` and a `system_ss.add(when:
-['CONFIG_VIRTIO'], ...)` block listing the eleven `.c` files.
+['CONFIG_VIRTIO'], ...)` block listing the nine `.c` files.
 
 **6b. Patch `hw/virtio/virtio.c`** (`scripts/build_qemu.sh:203-234`). Inserts
 `[50] = "virtio-nvgpu",` into `virtio_device_names[]` right after the
@@ -420,7 +420,7 @@ stopped running**, with nothing saying so. `run_tests.sh` builds with `make -k`,
 then requires every expected binary to exist and every suite to report its
 pinned assertion count (`tests/unit/run_tests.sh:1-33`).
 
-Thirteen binaries, all of which build. **Ten case-counted suites, 825 cases, zero
+Twelve binaries, all of which build. **Ten case-counted suites, 831 cases, zero
 failures** — nine pinned in `TALLY_SUITES` (`tests/unit/run_tests.sh:41-52`) plus
 `test_isolate`, which is counted separately via `ISOLATE_TOTAL` (`:99`). The runner's
 own closing line says *"all 9 suites"* because it counts only the nine tally suites;
@@ -429,8 +429,7 @@ follows it.
 
 | suite | pinned expectation |
 |---|---|
-| `test_dispatch` | 39/39 |
-| `test_frontend` | 8/8 |
+| `test_objects` | 20/20 |
 | `test_handle` | 11/11 |
 | `test_isolate` | 9/9 — **`ISOLATE_KNOWN_FAIL` is empty and must stay empty** |
 | `test_tables` | 17/17 |
@@ -439,6 +438,7 @@ follows it.
 | `test_kvm_slot` | 12/12 |
 | `test_stub_window` | 27/27 |
 | `test_drm_devinfo` | 67/67 |
+| `test_r1_type_dev` | 33/33 |
 | `test_open_scm` | prints `ALL OPEN_SCM TESTS PASSED` |
 | `test_ctrl_gate` | prints `test_ctrl_gate: PASS` |
 | `mock_stub` | not a suite — the fake isolate `test_isolate` spawns |
@@ -455,8 +455,13 @@ bugs** (the isolate closing its own fd 0, and `nvkvm_isolate_table_init()` leavi
 `sync_open_fd` at 0). All four are fixed. `ISOLATE_KNOWN_FAIL` is now empty; a case
 that starts failing again is a regression, not drift.
 
-`test_dispatch` targets `src/qemu/nvkvm_dispatch.c`, which is dead code (see
-[the pointer audit](../internal/audit-guest-pointers.md), section 2).
+This table itself had drifted — it said `test_handle` 9/9 against a suite that
+runs 11, and described `test_isolate` as 7 cases with 5 known failures against a
+suite that runs 9 with none. Both are corrected above. `test_dispatch` (39) and
+`test_frontend` (8) are gone: they targeted `src/qemu/nvkvm_dispatch.c` and
+`src/qemu/nvkvm_frontend.c`, an unreachable pair deleted on 2026-08-24 (DEAD-1),
+and what survived of `test_dispatch` is `test_objects`. See
+[the pointer audit](../internal/audit-guest-pointers.md), section 2.
 
 **ABI parity** — host, needs Go with cgo:
 

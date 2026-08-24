@@ -184,10 +184,10 @@ docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 \
 a pass/fail signal. `run_tests.sh` goes **red** if any case fails, if any suite
 regresses, if anything fails to build, **or if a suite quietly loses assertions** —
 the counts are pinned per suite in `tests/unit/run_tests.sh:41-52` and `:99`:
-`test_dispatch` 39, `test_frontend` 8, `test_handle` 11, `test_isolate` 9,
-`test_tables` 17, `test_nvkms_allowlist` 618, `test_stub_ptr_sanitize` 17,
-`test_kvm_slot` 12, `test_stub_window` 27, `test_drm_devinfo` 67 — **ten suites,
-825 cases, zero failures**, plus the two marker suites `test_open_scm` and
+`test_objects` 20, `test_handle` 11, `test_isolate` 9, `test_tables` 17,
+`test_nvkms_allowlist` 618, `test_stub_ptr_sanitize` 17, `test_kvm_slot` 12,
+`test_stub_window` 27, `test_drm_devinfo` 67, `test_r1_type_dev` 33 — **ten suites,
+831 cases, zero failures**, plus the two marker suites `test_open_scm` and
 `test_ctrl_gate`. Bump the pin in `run_tests.sh` when you add cases; that one-line
 diff is the point.
 

@@ -1,6 +1,5 @@
 # Compiled unit-test binaries
-test_dispatch
-test_frontend
+test_objects
 test_handle
 test_isolate
 test_tables
@@ -25,3 +24,9 @@ win_alloc.inc
 # from src/guest/nvkvm_drm.c at build time.
 test_drm_devinfo
 drm_param_structs.inc
+test_r1_type_dev
+
+# Generated: the U-5 function extracted from src/stub/nvkvm_stub.c at build time.
+stub_sanitize.inc
+r1_type_dev.inc
+r1_stub_type_dev.inc

@@ -38,8 +38,7 @@ __pycache__/
 
 # built test binaries -- tests/unit/test_ctrl_gate was committed as an ELF that
 # the Makefile rebuilds, so running the suite dirtied the tree.
-tests/unit/test_dispatch
-tests/unit/test_frontend
+tests/unit/test_objects
 tests/unit/test_handle
 tests/unit/test_isolate
 tests/unit/test_tables
@@ -49,6 +48,7 @@ tests/unit/mock_stub
 tests/unit/test_nvkms_allowlist
 tests/unit/test_stub_ptr_sanitize
 tests/unit/test_kvm_slot
+tests/unit/test_r1_type_dev
 
 # generated at build time by tests/unit/Makefile (the U-5 function, extracted
 # from src/stub/nvkvm_stub.c so the test cannot drift from the code it pins)
@@ -66,3 +66,7 @@ tests/unit/win_alloc.inc
 # structs extracted from src/guest/nvkvm_drm.c at build time.
 tests/unit/test_drm_devinfo
 tests/unit/drm_param_structs.inc
+# same trick for R-1: both halves of the type/dev_id cross-check, extracted
+# from the QEMU handler and from the stub between explicit markers
+tests/unit/r1_type_dev.inc
+tests/unit/r1_stub_type_dev.inc

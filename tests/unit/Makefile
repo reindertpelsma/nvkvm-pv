@@ -7,16 +7,16 @@ CFLAGS  = -Wall -Wextra -g \
           -I../../src/guest
 LDFLAGS = -lpthread
 
-DISPATCH_SRCS = test_dispatch.c \
+# DEAD-1 (2026-08-24): DISPATCH_SRCS/FRONTEND_SRCS were here.  The two QEMU
+# sources they named -- nvkvm_dispatch.c and nvkvm_frontend.c -- were unreachable
+# end to end and have been deleted, and frontend_stubs.c existed only to satisfy
+# nvkvm_dispatch.c's calls into the frontend.  test_frontend went with them (all
+# 8 of its cases drove the deleted handler); test_dispatch is now test_objects,
+# which keeps the object graph and the struct-size assertions.  See the DEAD-1
+# accounting at the top of src/qemu/virtio_nvgpu.c.
+OBJECTS_SRCS  = test_objects.c \
                 ../../src/qemu/nvkvm_objects.c \
-                ../../src/qemu/nvkvm_dispatch.c \
                 ../../src/qemu/nvkvm_handle.c \
-                frontend_stubs.c \
-                unit_stubs.c
-
-FRONTEND_SRCS = test_frontend.c \
-                ../../src/qemu/nvkvm_frontend.c \
-                ../../src/qemu/nvkvm_objects.c \
                 unit_stubs.c
 
 HANDLE_SRCS   = test_handle.c \
@@ -37,13 +37,10 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo
+all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev
 
-test_dispatch: $(DISPATCH_SRCS)
-	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
-
-test_frontend: $(FRONTEND_SRCS)
-	$(CC) $(CFLAGS) -o $@ $(FRONTEND_SRCS) $(LDFLAGS)
+test_objects: $(OBJECTS_SRCS)
+	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
 
 test_handle: $(HANDLE_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(HANDLE_SRCS) $(LDFLAGS)
@@ -125,6 +122,22 @@ drm_param_structs.inc: ../../src/guest/nvkvm_drm.c
 test_drm_devinfo: test_drm_devinfo.c drm_param_structs.inc \
                   ../../src/guest/nvkvm_drm_abi.h ../../src/common/nvkvm_abi.h
 	$(CC) $(CFLAGS) -I. -o $@ test_drm_devinfo.c
+# R-1.  Two independent implementations of one property (QEMU's boundary gate
+# and the stub's own assertion, which also covers the ring path QEMU never
+# sees), so both are extracted from the real sources between explicit markers
+# rather than copied into the test.  A copied gate is a gate that can silently
+# stop matching the one that runs; the markers make a rename or a reformat fail
+# the BUILD, which is the failure mode we want.  Empty extraction -> undefined
+# symbol -> compile error.
+r1_type_dev.inc: ../../src/qemu/nvkvm_isolate_handlers.c
+	awk '/NVKVM_R1_TYPE_DEV_BEGIN/,/NVKVM_R1_TYPE_DEV_END/' $< > $@
+
+r1_stub_type_dev.inc: ../../src/stub/nvkvm_stub.c
+	awk '/^#define NVKVM_DEV_UNKNOWN/ { print } \
+	     /^static int handle_type_matches_dev/,/^}$$/ { print }' $< > $@
+
+test_r1_type_dev: test_r1_type_dev.c r1_type_dev.inc r1_stub_type_dev.inc
+	$(CC) $(CFLAGS) -I. -o $@ test_r1_type_dev.c
 
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
@@ -135,9 +148,8 @@ test_drm_devinfo: test_drm_devinfo.c drm_param_structs.inc \
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo
-	./test_dispatch
-	./test_frontend
+run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev
+	./test_objects
 	./test_handle
 	./test_isolate
 	./test_tables
@@ -148,6 +160,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_kvm_slot
 	./test_stub_window
 	./test_drm_devinfo
+	./test_r1_type_dev
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -160,4 +173,6 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_kvm_slot kvm_slot_pool.inc test_stub_window stub_window.inc win_alloc.inc test_drm_devinfo drm_param_structs.inc
+	rm -f test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev \
+	      stub_sanitize.inc kvm_slot_pool.inc stub_window.inc win_alloc.inc \
+	      drm_param_structs.inc r1_type_dev.inc r1_stub_type_dev.inc

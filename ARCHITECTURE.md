@@ -596,11 +596,16 @@ That sentence is the design principle, and it is written in the code at the
 place where it was most nearly violated. `NV_ESC_RM_IDLE_CHANNELS` carries three
 `NvP64` pointers to arrays of channel handles, plus a count.
 
-Read the block below as a statement of intent, not as the shipping control: it
-lives in `src/qemu/nvkvm_dispatch.c`, whose **every** call site is inside the
-`#if 0` at `src/qemu/virtio_nvgpu.c:236-588`. The file still compiles and links
-(`scripts/build_qemu.sh:169`), so it reads as live; nothing in it executes. The
-control that does ship is quoted further down, in the stub.
+Read the block below as a statement of intent, not as the shipping control. It
+**lived** in `src/qemu/nvkvm_dispatch.c`, whose every call site was inside the
+`#if 0` in `src/qemu/virtio_nvgpu.c` — the file still compiled and linked, so it
+read as live while nothing in it executed. **That file was deleted on 2026-08-24
+(DEAD-1)**, along with `nvkvm_frontend.c`; the block is quoted here from history
+(`git show 68a35c0:src/qemu/nvkvm_dispatch.c`) because it is still the best
+worked example of the principle, and because the reasoning in it is worth more
+than the code was. The control that does ship is quoted further down, in the
+stub. See the DEAD-1 accounting at the top of `src/qemu/virtio_nvgpu.c` for what
+each deleted fix protected and where its live equivalent is.
 
 ```c
 /*
@@ -625,15 +630,16 @@ if (n > 0) {
         p->p_clients = p->p_devices = p->p_channels = 0;
 }
 ```
-— `src/qemu/nvkvm_dispatch.c:383-403`, cap defined at `:21`
+— was `src/qemu/nvkvm_dispatch.c:383-403`, cap defined at `:21`, at `68a35c0`
 
 Note the integer-overflow hardening specifically: `3 * n * sizeof(nvhandle_t)`
 computed in 32 bits wraps for `n ≈ 0x55555556`, which would let a small
 `aux_size` pass the check while `p_devices` and `p_channels` land past the end
 of the aux buffer — a guest-driven out-of-bounds read in the privileged VMM. The
 fix is 64-bit arithmetic *and* a hard cap of 4096 channels, not one or the other.
-(Both are unreachable, per the note above. They are worth keeping only as the
-template for what a live version must do.)
+(Both were unreachable, per the note above, and the code is now gone. The
+reasoning is worth keeping as the template for what a live version must do —
+which the stub's version, quoted below, is.)
 
 Two further points make this a good illustration rather than a footnote.
 
@@ -650,13 +656,17 @@ If the guest's zeroing were the mechanism, a malicious guest kernel would simply
 skip it.
 
 **The dispatch-side fix was dead code, and the real one had to move to the
-boundary.** `src/qemu/nvkvm_dispatch.c:375-379` says so:
+boundary.** The dead copy said so itself, in a banner it carried until the file
+was deleted (`nvkvm_dispatch.c:375-379` at `68a35c0`):
 
 > NOTE (audit P2-1): this dispatch path is NOT wired into the live
 > `IOCTL_ON_ISOLATE` flow (`handle_ioctl` is static/unused). The authoritative
 > `IDLE_CHANNELS` pointer-sanitisation lives in the stub (`nvkvm_stub.c`, nr
 > 0x41 block). Kept here for the (currently dead) synchronous path; do not rely
 > on it.
+
+A banner is a weaker instrument than a deletion, which is the lesson DEAD-1
+drew: the file wore that warning for months and still got counted as a path.
 
 The live neutralisation is in the stub, on a private copy of the parameters
 (`src/stub/nvkvm_stub.c:1268-1283`):

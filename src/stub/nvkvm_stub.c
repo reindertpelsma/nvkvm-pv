@@ -644,10 +644,35 @@ static uint32_t           g_ring_bytes;
 
 static int handle_fds[MAX_HANDLES];
 
+/*
+ * R-1: remember which DEVICE each handle was opened on, not just its fd.
+ *
+ * The stub re-derives job_type = (cmd >> 8) & 0xff from the guest's command
+ * word and branches on it in five places (ptr_off, zero_nvos64_rights,
+ * clamp_inner_params_size, the embedded-fd translation, the RM_IDLE_CHANNELS
+ * memset).  Without the device on hand, the stub cannot tell whether that type
+ * is the one the fd actually speaks -- so it took the guest's word for it.
+ *
+ * QEMU's gate (nvkvm_isolate_handlers.c, "R-1") is the boundary, but it is not
+ * the only route to this code: ring-routed records reach exec_ring_request()
+ * WITHOUT passing through nvkvm_req_ioctl_on_isolate at all.  Both command
+ * paths that install an fd already carry the dev_id
+ * (struct isolate_cmd_open_device.dev_id, struct isolate_cmd_receive_fd.dev_id
+ * -- src/common/nvkvm_isolate_proto.h:79, :219), so recording it is free.
+ *
+ * NVKVM_DEV_UNKNOWN is the fail-closed default: a slot that was never stored,
+ * or stored from a short RECEIVE_FD whose dev_id field did not arrive, matches
+ * no ioctl type.
+ */
+#define NVKVM_DEV_UNKNOWN 0xFFFFFFFFu
+static uint32_t handle_devs[MAX_HANDLES];
+
 static void handle_table_init(void)
 {
-	for (int i = 0; i < MAX_HANDLES; i++)
-		handle_fds[i] = -1;
+	for (int i = 0; i < MAX_HANDLES; i++) {
+		handle_fds[i]  = -1;
+		handle_devs[i] = NVKVM_DEV_UNKNOWN;
+	}
 }
 
 static int handle_lookup(uint32_t id)
@@ -656,9 +681,53 @@ static int handle_lookup(uint32_t id)
 	return handle_fds[id];
 }
 
-static void handle_store(uint32_t id, int fd)
+static uint32_t handle_dev_lookup(uint32_t id)
 {
-	if (id < MAX_HANDLES) handle_fds[id] = fd;
+	if (id >= MAX_HANDLES) return NVKVM_DEV_UNKNOWN;
+	return handle_devs[id];
+}
+
+static void handle_store(uint32_t id, int fd, uint32_t dev_id)
+{
+	if (id < MAX_HANDLES) {
+		handle_fds[id]  = fd;
+		handle_devs[id] = dev_id;
+	}
+}
+
+/*
+ * R-1, stub half: does this command word's _IOC_TYPE match the device the
+ * handle was opened on?  Mirrors the QEMU gate exactly
+ * (nvkvm_isolate_handlers.c); see the long rationale there.  Values from
+ * src/common/nvkvm_proto.h:96-100,131 and NVKVM_NVKMS_IOCTL_CMD :110.
+ *
+ * KNOWN INCOMPLETENESS, deliberately not papered over: this is a NARROWER
+ * check than QEMU's, because the stub is told a dev_id but never a handle
+ * TYPE.  A TYPE_MEMORY handle (a memfd) carries dev_id 0 -- nvkvm_handle.c:231
+ * leaves the field at its zero init, which is numerically NVKVM_DEV_CTL -- so
+ * if one is ever handed to an isolate (COPY_HANDLE_TO_ISOLATE can,
+ * nvkvm_isolate_handlers.c:616) this function reads it as /dev/nvidiactl and
+ * would admit 'F'.  QEMU's gate is the one that rejects that, by requiring
+ * NVKVM_HANDLE_TYPE_NVIDIA.  Closing it here needs a type field on
+ * ISOLATE_CMD_RECEIVE_FD.  This is defence in depth, not the boundary.
+ */
+static int handle_type_matches_dev(uint32_t handle_id, uint32_t cmd)
+{
+	uint32_t dev  = handle_dev_lookup(handle_id);
+	unsigned type = (cmd >> 8) & 0xff;
+
+	if (dev == 0)                              /* NVKVM_DEV_CTL      */
+		return type == 'F';
+	if (dev >= 16 && dev < 32)                 /* NVKVM_DEV_GPU(n)   */
+		return type == 'F';
+	if (dev >= 32 && dev < 48)                 /* NVKVM_DEV_DRM_RD(n)*/
+		return type == 'd';
+	if (dev == 48)                             /* NVKVM_DEV_MODESET  */
+		return cmd == NVKVM_NVKMS_IOCTL_CMD;
+	/* NVKVM_DEV_UVM (1) never rides this path -- QEMU runs UVM ioctls in
+	 * its own process.  NVKVM_DEV_EVENTFD (0xFF), NVKVM_DEV_UNKNOWN and
+	 * anything else: no ioctl type is legitimate. */
+	return 0;
 }
 
 /* ── #127 os-event poll set ──────────────────────────────────────────────────
@@ -706,7 +775,8 @@ static void handle_remove(uint32_t id)
 	if (id < MAX_HANDLES) {
 		poll_disarm(id);   /* #127: drop a closed os-event fd from the poll set */
 		if (handle_fds[id] >= 0) stub_close(handle_fds[id]);
-		handle_fds[id] = -1;
+		handle_fds[id]  = -1;
+		handle_devs[id] = NVKVM_DEV_UNKNOWN;   /* R-1: no stale device */
 	}
 }
 
@@ -1080,6 +1150,7 @@ static void worker_thread(void *arg)
 	while (dequeue_job(&job)) {
 		fs_mutex_lock(&fd_mutex);
 		int fd = handle_lookup(job.handle_id);
+		int dev_ok = handle_type_matches_dev(job.handle_id, job.cmd);
 		fs_mutex_unlock(&fd_mutex);
 
 		struct isolate_resp_ioctl resp = {
@@ -1089,6 +1160,20 @@ static void worker_thread(void *arg)
 
 		if (fd < 0) {
 			resp.retval = -EBADF;
+			goto send_resp;
+		}
+
+		/*
+		 * R-1, stub half.  QEMU's gate is the boundary and already
+		 * refused this; the point of repeating it is that everything
+		 * below re-derives job_type from the guest's own command word
+		 * and trusts it to select a struct layout.  A future request
+		 * type that reaches the worker queue without passing QEMU's
+		 * :2164 chain -- which is exactly how R-4 and R-7 arose -- would
+		 * otherwise inherit the confusion.  Refuse, never adapt.
+		 */
+		if (!dev_ok) {
+			resp.retval = -EPERM;
 			goto send_resp;
 		}
 
@@ -2101,7 +2186,7 @@ static void handle_open_device(struct isolate_cmd_open_device *cmd)
 		 * before overwriting — same defensive policy as RECEIVE_FD. */
 		stub_close(handle_fds[cmd->handle_id]);
 	}
-	handle_store(cmd->handle_id, fd);
+	handle_store(cmd->handle_id, fd, cmd->dev_id);
 	fs_mutex_unlock(&fd_mutex);
 
 	if (send_open_device_resp(cmd->txn_id, 0, fd) < 0) {
@@ -2822,9 +2907,24 @@ static void ring_exec_one(const uint8_t *pay, uint32_t len)
 
 	fs_mutex_lock(&fd_mutex);
 	int fd = handle_lookup(rq.handle_id);
+	int dev_ok = handle_type_matches_dev(rq.handle_id, rq.cmd);
 	fs_mutex_unlock(&fd_mutex);
 	if (fd < 0) {
 		ring_write_resp(rq.txn_id, -EBADF, 0, 0, NULL, 0, NULL, 0);
+		return;
+	}
+
+	/*
+	 * R-1 on the ring.  This path matters more than the worker one: a
+	 * ring-routed record NEVER passes through nvkvm_req_ioctl_on_isolate,
+	 * so QEMU's gate does not see it at all.  ring_ctrl_must_punt() pins
+	 * the type to 'F'/nr 0x2a, which bounds the exposure to "flat
+	 * RM_CONTROL aimed at a non-frontend fd" (the kernel answers that with
+	 * -ENOTTY today) -- but the property should hold here structurally, not
+	 * because of a check in a driver we do not own.
+	 */
+	if (!dev_ok) {
+		ring_write_resp(rq.txn_id, -EPERM, 0, 0, NULL, 0, NULL, 0);
 		return;
 	}
 
@@ -3016,7 +3116,14 @@ static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
 		if (c->recv_fd.handle_id < MAX_HANDLES &&
 		    handle_fds[c->recv_fd.handle_id] >= 0)
 			stub_close(handle_fds[c->recv_fd.handle_id]);
-		handle_store(c->recv_fd.handle_id, fd);
+		/* R-1: the dev_id is only there when the full struct arrived;
+		 * a short message leaves the slot NVKVM_DEV_UNKNOWN, which
+		 * matches no ioctl type.  QEMU always sends the whole struct
+		 * (nvkvm_isolate.c:2759-2763, iov_len = sizeof(hdr)), so the
+		 * short arm is defence, not a live compat path. */
+		handle_store(c->recv_fd.handle_id, fd,
+			     n >= (long)sizeof(struct isolate_cmd_receive_fd)
+				     ? c->recv_fd.dev_id : NVKVM_DEV_UNKNOWN);
 		fs_mutex_unlock(&fd_mutex);
 		send_ok();
 		return 0;

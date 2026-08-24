@@ -140,7 +140,20 @@ void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session)
 	/* Force-close host fds → releases kernel RM objects + GPU memory. */
 	nvkvm_handle_close_session(&nv->handles, session->id);
 
-	/* Free the QEMU-side RM object graph. */
+	/*
+	 * Free the QEMU-side RM object graph.
+	 *
+	 * DEAD-1: nothing POPULATES this graph any more.  register_client() and
+	 * every nvkvm_obj_add() call site lived in nvkvm_frontend.c, which is
+	 * deleted, so session->nclients is now always 0 and this loop always
+	 * runs zero times.  nvkvm_objects.c is kept — it still has this caller,
+	 * and tests/unit/test_objects.c pins its cascade-free semantics — but it
+	 * is vestigial, and removing it means also removing the clients[] /
+	 * nclients / clients_lock fields from struct nvkvm_session.  That is the
+	 * same "Step 3d.3" cleanup the #if 0 tombstone below is waiting on; done
+	 * as its own commit so the diff says so, and because this file is one of
+	 * the three that tests/qemu_syntax_check.sh cannot compile.
+	 */
 	pthread_mutex_lock(&session->clients_lock);
 	for (int i = 0; i < session->nclients; i++) {
 		if (session->clients[i]) {
@@ -378,9 +391,91 @@ send:
  *
  * The live path is virtio_nvgpu.c's IOCTL_ON_ISOLATE case ->
  * nvkvm_ioctl_work_fn -> nvkvm_req_ioctl_on_isolate (nvkvm_isolate_handlers.c),
- * where the A-1 gate now lives.  nvkvm_dispatch.c itself is kept only because
- * tests/unit/test_dispatch.c (39 cases) is built directly against it; the meson
- * patch already records that it is dead at runtime.
+ * where the A-1 gate now lives.
+ *
+ * ── DEAD-1, 2026-08-24 ── that removal stopped one step short.
+ *
+ * nvkvm_dispatch.c and nvkvm_frontend.c are now DELETED, not merely documented.
+ * The call graph, verified by grep over the whole tree: nvkvm_dispatch_ioctl()
+ * had zero callers once handle_ioctl() went; nvkvm_ioctl_expected_param_size()
+ * had zero callers outside its own unit test; and all eight exported functions
+ * of nvkvm_frontend.c (562 lines) were called ONLY from nvkvm_dispatch.c.  So
+ * the pair was unreachable end to end while still being compiled and linked,
+ * which is exactly what made it look alive -- and its header comment read as a
+ * specification of live controls ("Security invariants: we verify all handles
+ * ... we ensure NV01_ROOT_CLIENT allocations are unprivileged ... we do not
+ * allow handles from one session to appear in another session's requests").
+ * None of the three executed.
+ *
+ * Deleting a control is only safe if the live path has its own.  Every security
+ * fix that had landed in the pair, and where it lives now:
+ *
+ *   U-7, NVOS64.pRightsRequested zeroed for every class
+ *        (was nvkvm_frontend.c:129)
+ *        LIVE: zero_nvos64_rights(), src/stub/nvkvm_stub.c, called
+ *        unconditionally on the worker path.  Unit-pinned by
+ *        tests/unit/test_stub_ptr_sanitize (5 U-7 cases).  This is also the
+ *        code behind the header's "NV01_ROOT_CLIENT allocations are
+ *        unprivileged" invariant -- one fix, advertised twice.
+ *        The audit's "fixed on both paths" was always "fixed on one".
+ *
+ *   G-2, NV_ESC_RM_IDLE_CHANNELS array pointers neutralised
+ *        (was nvkvm_dispatch.c, the NVKVM_IDLE_MAX_CHANNELS block)
+ *        LIVE: the memset of [12,40) in src/stub/nvkvm_stub.c's worker path.
+ *        The dead copy already carried a "do not rely on it" banner (P2-1).
+ *
+ *   A-1, p_memory = 0 on NV_ESC_RM_ALLOC_MEMORY
+ *        (was nvkvm_dispatch.c)
+ *        LIVE: the iso_mmap_covers() gate in nvkvm_req_ioctl_on_isolate().
+ *        Stronger than the dead one, which only zeroed the field.
+ *
+ *   R-1's shape: `if (_IOC_TYPE(cmd) != 'F') return -ENOTTY;` before the NR
+ *        dispatch (was nvkvm_dispatch.c)
+ *        LIVE: nvkvm_ioctl_type_matches_dev() plus the M-A default-deny, both
+ *        in nvkvm_isolate_handlers.c.  Stronger: it binds the type to the
+ *        handle's device rather than only excluding non-'F'.
+ *
+ *   U-5, RM_CONTROL params_size bounded by the aux blob
+ *        (was nvkvm_frontend.c:344-348, as a rejection)
+ *        LIVE: clamp_inner_params_size(), src/stub/nvkvm_stub.c, on both the
+ *        worker and ring paths.  Unit-pinned (12 U-5 cases).  Note the live one
+ *        CLAMPS where the dead one REJECTED; that is the established U-5 fix,
+ *        not a regression introduced here.
+ *
+ *   per-session hClient validation via find_client()
+ *        (was nvkvm_frontend.c, on ALLOC/FREE/CONTROL/DUP)
+ *        LIVE, but at a different granularity ON PURPOSE: the H-3 hClient
+ *        allowlist in nvkvm_req_ioctl_on_isolate() is per-VM, not per-session,
+ *        and covers a SUPERSET of the NRs (ALLOC, ALLOC_MEMORY, CONTROL, FREE,
+ *        DUP, SHARE, MAP, UNMAP, MAP_DMA, UNMAP_DMA, VID_HEAP).  The header's
+ *        third invariant -- "no handles from one session in another session's
+ *        requests" -- has NO live equivalent, and that is a recorded decision,
+ *        not an oversight: see the long note at the top of
+ *        nvkvm_req_ioctl_on_isolate() and audit GP-A-2.  Intra-VM access
+ *        control is the guest module's job; QEMU's boundary is cross-VM.
+ *        Known residuals on the live gate: it is inert while
+ *        client_allow_n == 0 (R-6) and under-covers its own stated scope by
+ *        five allowlisted NRs (R-5).  Both predate this deletion.
+ *
+ *   NVOS33.pLinearAddress zeroed before the reply reaches the guest
+ *        (was nvkvm_dispatch.c, "guest must not use host VA")
+ *        NO LIVE EQUIVALENT -- and this is already recorded, as U-11 in
+ *        docs/internal/audit-guest-pointers.md, whose table names this exact
+ *        line as dead code and rates the field UNENFORCED.  Deleting it changes
+ *        nothing about the live behaviour: on a successful nr 0x4e the isolate
+ *        VA the driver wrote at offset 32 is recorded host-side
+ *        (nvkvm_mapva_record) and then copied back to the guest as-is.  What
+ *        the deletion changes is that nobody can now mistake the dead line for
+ *        the fix.  Left open deliberately rather than closed in passing, so it
+ *        stays U-11's decision and not a drive-by one.
+ *
+ * The param-size table (nvkvm_ioctl_expected_param_size) was not a fix for any
+ * named finding and had no live caller either.  The live bound on a guest's
+ * declared sizes is slot_blob()'s C-1 check above, plus the per-gate minimums
+ * that fail closed individually; the per-command size table that still runs is
+ * the guest's own (src/guest/nvkvm_ioctl.c), which is guest code and therefore
+ * not a control.  Its 19 unit assertions went with it -- see the header of
+ * tests/unit/test_objects.c, which records exactly what was dropped.
  */
 
 
