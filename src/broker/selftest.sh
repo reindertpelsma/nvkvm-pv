@@ -64,7 +64,12 @@ run_case() {
 echo "-- socket and handshake"
 
 SOCK="$TMP/display.sock"
-( sleep 4 ) | "$BROKER" --socket "$SOCK" --backend test \
+# --persist, DELIBERATELY.  The broker's default is now to exit when its client
+# disconnects (a display outliving its VM shows nothing).  This section reuses
+# ONE broker across several clients, so without --persist it exits after the
+# first and every later check tests a socket that is not there -- which reads
+# as "a second client was accepted" when in fact nothing was listening.
+( sleep 4 ) | "$BROKER" --socket "$SOCK" --backend test --persist \
     > "$TMP/broker.log" 2>&1 &
 sleep 0.7
 
@@ -84,7 +89,11 @@ check "FRAME primes the client"              '[[:space:]]FRAME[[:space:]]' "$TMP
 timeout 2 "$CLIENT" "$SOCK" > "$TMP/hold.log" 2>&1 &
 sleep 0.4
 timeout 1 "$CLIENT" "$SOCK" > "$TMP/second.log" 2>&1
-check   "second client is refused" 'refusing second client' "$TMP/broker.log"
+# Asserted on the SECOND CLIENT'S OWN OUTPUT, not on a broker log string: what
+# matters is that it was not served, and a log message is the broker's wording
+# rather than its behaviour.  The nocheck below is the real assertion; this one
+# confirms the broker noticed and said so.
+check   "second client is refused" 'refus|second client' "$TMP/broker.log"
 nocheck "the refused client got no HELLO" 'HELLO' "$TMP/second.log"
 wait %2 2>/dev/null
 
@@ -145,7 +154,14 @@ check "two fds on one ATTACH is a violation" 'more than one fd on a single comma
 check "and the client is disconnected"       'protocol violation'                   "$CASE_LOG"
 
 run_case '' --bad-reserved
-check "a non-zero reserved field is a violation" 'reserved fields are not zero' "$CASE_LOG"
+# Matches the FACT (a reserved field was non-zero and it was a violation), not
+# the exact sentence.  This assertion silently stopped asserting when the
+# message was reworded to name which reserved field -- a security check that
+# passes only while a log string is stable is not a security check.
+check "a non-zero reserved field is a violation" \
+      'reserved[0-9]? is not zero|reserved fields are not zero' "$CASE_LOG"
+check "and the reserved-field client is disconnected" \
+      'protocol violation' "$CASE_LOG"
 
 run_case '' --bad-commit-fd
 check "an fd on a COMMIT is a violation" 'COMMIT carried an fd' "$CASE_LOG"

@@ -132,8 +132,21 @@ $(OBJS): $(if $(HAVE_WL),$(WL_HDRS),)
 %-protocol.c:
 	$(WL_SCANNER) private-code $(filter %/$*.xml,$(WL_XML)) $@
 
+#
+# HEADER DEPENDENCIES.  Without these, editing a .h rebuilds NOTHING: `make`
+# sees every .o newer than its .c and stops.  That is not a slow build, it is a
+# WRONG one -- struct nb_sink grew several fields this cycle, and object files
+# compiled against different layouts of it link together happily and then
+# corrupt each other's memory.  The observable result was four selftest
+# failures in the input/grab tests, on a tree whose sources were correct.
+#
+# -MMD writes a .d beside each .o; -MP adds phony targets so a DELETED header
+# does not wedge the build with "no rule to make target".
+#
 %.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -c -o $@ $<
+
+-include $(wildcard *.d)
 
 # A minimal client, for proving the broker works before involving QEMU.  It is
 # also the selftest's attack harness: its --bad-* options are the ways a
@@ -167,5 +180,5 @@ install: $(BIN)
 	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
 clean:
-	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) *.o \
+	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) *.o *.d \
 	      *-client-protocol.h *-protocol.c
