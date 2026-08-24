@@ -37,7 +37,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev
+all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready
 
 test_objects: $(OBJECTS_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
@@ -138,6 +138,17 @@ r1_stub_type_dev.inc: ../../src/stub/nvkvm_stub.c
 
 test_r1_type_dev: test_r1_type_dev.c r1_type_dev.inc r1_stub_type_dev.inc
 	$(CC) $(CFLAGS) -I. -o $@ test_r1_type_dev.c
+# The device-presence guard.  src/guest/ is kernel code and cannot be linked
+# into a hosted binary, so extract the one predicate under test the same way the
+# stub's is extracted above: this suite pins the REAL function, and an empty
+# extraction fails the compile on an undefined symbol rather than passing
+# vacuously.  -Wno-unused-function because the extracted text may carry more
+# than the test calls.
+transport_ready.inc: ../../src/guest/nvkvm_virtio.c
+	awk '/^bool nvkvm_transport_ready/,/^}$$/' $< > $@
+
+test_transport_ready: test_transport_ready.c transport_ready.inc
+	$(CC) $(CFLAGS) -I. -Wno-unused-function -o $@ test_transport_ready.c
 
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
@@ -148,8 +159,10 @@ test_r1_type_dev: test_r1_type_dev.c r1_type_dev.inc r1_stub_type_dev.inc
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev
+run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready
 	./test_objects
+	./test_dispatch
+	./test_frontend
 	./test_handle
 	./test_isolate
 	./test_tables
@@ -161,6 +174,7 @@ run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_g
 	./test_stub_window
 	./test_drm_devinfo
 	./test_r1_type_dev
+	./test_transport_ready
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -176,3 +190,4 @@ clean:
 	rm -f test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev \
 	      stub_sanitize.inc kvm_slot_pool.inc stub_window.inc win_alloc.inc \
 	      drm_param_structs.inc r1_type_dev.inc r1_stub_type_dev.inc
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc

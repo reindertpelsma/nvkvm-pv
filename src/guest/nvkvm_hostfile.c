@@ -57,11 +57,16 @@ static int hostfile_show(struct seq_file *m, void *v)
 
 	(void)v;
 
+	/* Readable with no device attached: procfs is created from module_init,
+	 * not from probe.  Say ENODEV rather than ENOMEM -- there is nothing
+	 * wrong with memory. */
+	if (!nvkvm_transport_ready(&nvkvm))
+		return -ENODEV;
 	shm_slot = nvkvm_slot_alloc(&nvkvm);
 	if (shm_slot < 0)
 		return -ENOMEM;
 	slot_ptr = nvkvm_slot_addr(&nvkvm, shm_slot);
-	if (!slot_ptr) { nvkvm_slot_free(&nvkvm, shm_slot); return -ENOMEM; }
+	if (!slot_ptr) { nvkvm_slot_free(&nvkvm, shm_slot); return -ENODEV; }
 
 	ret = nvkvm_virtio_read_host_file(e->file_id, e->gpu_index,
 					  (__u32)shm_slot,
@@ -107,10 +112,13 @@ static ssize_t initstate_show(struct kobject *kobj, struct kobj_attribute *a,
 		  ? NVKVM_HFILE_NVIDIA_UVM_INITSTATE
 		  : NVKVM_HFILE_NVIDIA_INITSTATE;
 
+	/* Same as hostfile_show(): the sysfs attribute exists with no device. */
+	if (!nvkvm_transport_ready(&nvkvm))
+		return -ENODEV;
 	shm_slot = nvkvm_slot_alloc(&nvkvm);
 	if (shm_slot < 0) return -ENOMEM;
 	p = nvkvm_slot_addr(&nvkvm, shm_slot);
-	if (!p) { nvkvm_slot_free(&nvkvm, shm_slot); return -ENOMEM; }
+	if (!p) { nvkvm_slot_free(&nvkvm, shm_slot); return -ENODEV; }
 
 	/* Host-wide file: QEMU ignores gpu_index for these. */
 	ret = nvkvm_virtio_read_host_file(file_id, 0, (__u32)shm_slot,
@@ -264,13 +272,16 @@ int nvkvm_hostfile_discover_gpus(void)
 	void *slot_ptr;
 	char *tmp;
 
+	/* Called from register_devices(), which runs whether or not probe did. */
+	if (!nvkvm_transport_ready(&nvkvm))
+		return -ENODEV;
 	shm_slot = nvkvm_slot_alloc(&nvkvm);
 	if (shm_slot < 0)
 		return -ENOMEM;
 	slot_ptr = nvkvm_slot_addr(&nvkvm, shm_slot);
 	if (!slot_ptr) {
 		nvkvm_slot_free(&nvkvm, shm_slot);
-		return -ENOMEM;
+		return -ENODEV;
 	}
 	tmp = kmalloc(NVKVM_HFILE_MAX_SIZE, GFP_KERNEL);
 	if (!tmp) {

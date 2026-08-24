@@ -147,8 +147,18 @@ static int __init register_devices(void)
 	 * builds a few lines later. */
 	detected = nvkvm_hostfile_discover_gpus();
 	if (detected < 0) {
-		pr_warn("nvkvm: host GPU discovery failed (%d); assuming 1\n",
-			detected);
+		/*
+		 * -ENODEV here is not a failure to discover, it is the absence of
+		 * the device itself.  It used to surface as "-12" (-ENOMEM), which
+		 * sent people looking for a memory problem; say what it is.
+		 */
+		if (detected == -ENODEV)
+			pr_warn("nvkvm: no nvkvm virtio device is attached to this VM.\n"
+				"nvkvm: the device nodes below are created but every open will\n"
+				"nvkvm: return -ENODEV. Add nvkvm's device to the QEMU command line.\n");
+		else
+			pr_warn("nvkvm: host GPU discovery failed (%d); assuming 1\n",
+				detected);
 		detected = 0;
 	}
 	if (num_gpus > 0)
@@ -680,6 +690,23 @@ struct nvkvm_fd_ctx *nvkvm_fd_ctx_open_dev(int dev_id, unsigned int flags)
 	struct nvkvm_fd_ctx *ctx;
 	__u32 handle_id = 0;
 	int ret;
+
+	/*
+	 * The single gate for BOTH open paths -- nvkvm_open() on the five
+	 * character devices and nvkvm_drm_open() on the DRM node.  With no nvkvm
+	 * virtio device the transport was never initialised, and continuing here
+	 * reaches nvkvm_ensure_isolate() -> ... -> nvkvm_send_sync() and a NULL
+	 * deref.  Refusing the open makes an unsupported QEMU merely useless
+	 * rather than fatal: userspace gets ENODEV from open(), which every
+	 * NVIDIA client already handles as "no GPU here".
+	 */
+	if (!nvkvm_transport_ready(&nvkvm)) {
+		pr_warn_once("nvkvm: no nvkvm virtio device -- refusing opens with -ENODEV.\n"
+			     "nvkvm: the module was force-loaded (modules-load.d) on a VM whose QEMU\n"
+			     "nvkvm: exports no nvkvm device. Nothing here can work; this is not a bug\n"
+			     "nvkvm: in the guest image.\n");
+		return ERR_PTR(-ENODEV);
+	}
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)

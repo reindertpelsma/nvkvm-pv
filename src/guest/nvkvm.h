@@ -565,6 +565,17 @@ int   nvkvm_slot_alloc(struct nvkvm_state *state);
 void  nvkvm_slot_free(struct nvkvm_state *state, int slot);
 void *nvkvm_slot_addr(struct nvkvm_state *state, int slot);
 
+/* Is the virtio transport usable? (nvkvm_virtio.c)
+ *
+ * FALSE means nvkvm_virtio_probe() never ran -- no nvkvm virtio device is
+ * attached -- or the device has since been removed.  register_devices() and
+ * nvkvm_hostfile_init() run unconditionally from module_init, so the character
+ * devices, procfs and sysfs entries all exist in that state and are reachable
+ * from userspace.  Every one of them must consult this before touching the
+ * transport; see the comment on the definition.
+ */
+bool  nvkvm_transport_ready(const struct nvkvm_state *state);
+
 /* Internal transport send (nvkvm_virtio.c) */
 int   nvkvm_send_sync(struct nvkvm_state *state,
 		      void *req_buf, size_t req_len,

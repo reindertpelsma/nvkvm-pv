@@ -26,6 +26,36 @@
 
 #include "nvkvm.h"
 
+/* ── Is there a device at all? ────────────────────────────────────────────── */
+/*
+ * nvkvm_init() calls register_virtio_driver(), register_devices() and
+ * nvkvm_hostfile_init() unconditionally.  If the VM has no nvkvm virtio device,
+ * register_virtio_driver() still succeeds, probe() is never called -- and the
+ * five 0666 character devices, the procfs tree and the sysfs attributes are
+ * created anyway, backed by nothing.
+ *
+ * In that state nvkvm_init()'s memset(&nvkvm, 0, ...) is all the initialisation
+ * struct nvkvm_state ever gets: vdev, vq_tx and shm_base are NULL, and
+ * inflight_list is a list_head whose next/prev are BOTH NULL rather than
+ * pointing at itself.  MEASURED: ksplashqml open()ing /dev/nvidia0 reached
+ * inflight_enqueue() -> list_add_tail(), whose __list_add() does
+ * WRITE_ONCE(prev->next, new) with prev == NULL:
+ *
+ *   BUG: kernel NULL pointer dereference, address: 0000000000000000
+ *   RIP: 0010:nvkvm_send_sync+0xeb/0x240 [nvkvm_guest]
+ *   simple_req -> nvkvm_virtio_create_isolate -> nvkvm_fd_ctx_open_dev -> nvkvm_open
+ *
+ * inflight_list.next is checked as well as the pointers, and deliberately: it is
+ * the field that was actually dereferenced, and it is the one that distinguishes
+ * "probe never ran" from "probe ran".  A guard on vdev alone would have been
+ * satisfied by any future partial initialisation.
+ */
+bool nvkvm_transport_ready(const struct nvkvm_state *state)
+{
+	return state && state->vdev && state->vq_tx &&
+	       state->inflight_list.next && state->inflight_list.prev;
+}
+
 /* ── Slot allocator ───────────────────────────────────────────────────────── */
 
 int nvkvm_slot_alloc(struct nvkvm_state *state)
@@ -459,6 +489,14 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 	struct scatterlist *sgs[2] = { &out_sg, &in_sg };
 	int ret;
 
+	/*
+	 * Last line of defence, and the one the oops landed in.  Every caller
+	 * below is expected to have checked already; this is here so that a new
+	 * caller which forgets gets -ENODEV instead of taking the machine down.
+	 */
+	if (!nvkvm_transport_ready(state))
+		return -ENODEV;
+
 	/* Allocate the IN buffer that QEMU will write the response into. */
 	inf->resp_buf = kzalloc(NVKVM_RESP_BUF_SIZE, GFP_KERNEL);
 	if (!inf->resp_buf)
@@ -839,6 +877,15 @@ void nvkvm_virtio_fini(struct nvkvm_state *state)
 		state->vdev->config->del_vqs(state->vdev);
 		state->vdev = NULL;
 	}
+	/*
+	 * del_vqs() FREED these.  Leaving them set left every post-remove caller
+	 * a dangling pointer to pass to virtqueue_add_sgs(), which is strictly
+	 * worse than the NULL deref this file is about -- and it made
+	 * nvkvm_transport_ready() answer "yes" for a device that is gone.
+	 */
+	state->vq_tx  = NULL;
+	state->vq_rx  = NULL;
+	state->vq_evt = NULL;
 }
 
 /* ── Isolate-aware API ────────────────────────────────────────────────────── */
