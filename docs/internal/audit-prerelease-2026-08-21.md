@@ -21,7 +21,7 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 |---|---|---|---|---|
 | P-1 | **critical** | fail-open validation | guest process → another guest process | **fixed** — `71a490f` |
 | P-2 | **critical** | allowlist too permissive | guest process → host kernel | **fixed** — row dropped; see the EXCLUSIONS block in `nvkvm_ctrl_allowlist.h` |
-| P-3 | high | sandbox self-modification | isolate → isolate | see below |
+| P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (the writable alias); see below |
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
 | P-5 | high | design vs documentation | isolate → isolate | **open, needs a decision** |
 | P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
@@ -118,6 +118,44 @@ claims *"a fully static, position-independent executable"*. Fixed addresses, no
 ASLR.
 
 Fix is one line — `close(3)` in the stub, or seal before exec.
+
+### The writable alias — **FIXED, `073ece8`**, and this entry had gone stale
+
+`073ece8` ("isolate: seal the stub memfd so the stub can't rewrite its own
+text") took the seal option, which is strictly stronger than `close(3)`: the
+seal binds **every** holder of the fd, so it survives a stub that forgets to
+close, a `dup`, and an fd inherited by anything the stub later spawns.
+`src/qemu/nvkvm_isolate.c`, in the embedded-stub spawn path, now:
+
+- creates the memfd with `MFD_CLOEXEC | MFD_ALLOW_SEALING`;
+- `write(2)`s the image (never `mmap`s it, which is what lets `F_SEAL_WRITE`
+  take — the seal is refused while a writable mapping is outstanding);
+- applies `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` **before**
+  `fork`/`fexecve`, while the image is still the parent's alone;
+- **fails closed** if the seal does not take — it logs *"refusing to spawn
+  isolate: could not seal stub memfd"* and returns the errno rather than
+  spawning an isolate that can rewrite itself.
+
+After the seal, `mmap(PROT_WRITE, MAP_SHARED, 3, 0)` returns `EPERM` for every
+holder, forever, and `F_SEAL_SEAL` stops the set being reopened. Neither
+`F_SEAL_WRITE` nor `F_SEAL_SEAL` affects `execve`, so the `fexecve` of fd 3 is
+unchanged.
+
+The **on-disk** spawn path (`NVKVM_STUB_PATH`) was never affected: it
+`open(stub_path, O_RDONLY | O_CLOEXEC)`s the binary, so there is no writable
+descriptor to seal.
+
+Verified in this tree: the seal is applied at `nvkvm_isolate.c` before the
+`nvkvm_isolate_spawn(mode)` call, and reproduced end to end against the real
+stub through the exact production sequence — `memfd_create(MFD_ALLOW_SEALING)`,
+write, `F_ADD_SEALS`, park at fd 3, `fexecve` — which still starts a working
+stub with the seccomp filter on.
+
+`close(3)` in the stub was **not** added on top. Nothing else uses fd 3 after
+exec (`NVKVM_DEV_DIRFD` is 4 and `NVKVM_DRM_FD(k)` is 5+, both in
+`src/common/nvkvm_isolate_proto.h`), so it would be safe — but with the seal in
+place the residual is a read-only descriptor to a binary whose bytes are in the
+public source tree, which buys an attacker nothing.
 
 ---
 
