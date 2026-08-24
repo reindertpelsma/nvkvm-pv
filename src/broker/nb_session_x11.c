@@ -109,6 +109,10 @@ struct nb_x11 {
     struct nb_sink *sink;
     struct nb_session *sess;
 
+    int      last_mode;             /* last PresentCompleteNotify mode; -1 =
+                                     * nothing completed yet                  */
+    uint32_t last_raw_seq;          /* de-dup for double-delivered XI2 raw    */
+    int      last_raw_dx, last_raw_dy;
     int  win_w, win_h;              /* toplevel size, from ConfigureNotify    */
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
@@ -166,11 +170,30 @@ static bool x11_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
  * backend.  Screen modifiers are included as well as window modifiers: the
  * window list is the subset that could be scanned out directly, and a broker
  * that accepted only those would reject perfectly displayable frames.
+ *
+ * ASK, DO NOT INFER FROM THE VERSION NUMBER.  This used to be gated on
+ * DRI3QueryVersion reporting >= 1.2, which is what the specification says the
+ * gate should be — and it is wrong in practice on the one driver that matters
+ * here.  The NVIDIA DDX 580.105.08 reports DRI3 **1.0** and answers
+ * GetSupportedModifiers anyway, with twelve block-linear modifiers including
+ * the two src/guest/nvkvm_kms.c reads off real guest bos
+ * (0x0300000000606014, 0x0300000000e08014).  Under the version gate the
+ * broker never asked, advertised nothing but DRM_FORMAT_MOD_INVALID, and
+ * would have rejected every frame a real guest ever flips — presenting as
+ * "the window is black" with no attributable error, which is precisely the
+ * failure mode the zwp_linux_dmabuf_v1 version cap avoids on the other
+ * backend.  So: issue the request, and let the REPLY decide.  A server that
+ * genuinely lacks it answers with an error, `r` is NULL, and the implicit
+ * path below is all that is advertised — same outcome, arrived at honestly.
+ *
+ * Returns the number of explicitly-modified pairs learned, so the caller can
+ * set CAP_MODIFIERS from what happened rather than from what was claimed.
  */
-static void x11_collect_formats(struct nb_x11 *x)
+static unsigned x11_collect_formats(struct nb_x11 *x)
 {
     xcb_dri3_get_supported_modifiers_reply_t *r;
     uint64_t *m;
+    unsigned got = 0;
     int n, i;
 
     r = xcb_dri3_get_supported_modifiers_reply(
@@ -185,12 +208,20 @@ static void x11_collect_formats(struct nb_x11 *x)
         for (i = 0; i < n; i++) {
             nb_formats_add(&x->formats, NB_FCC_XR24, m[i]);
             nb_formats_add(&x->formats, NB_FCC_AR24, m[i]);
+            got++;
         }
+        /*
+         * The window list can be empty while the screen list is not — that is
+         * exactly what the NVIDIA DDX does (0 window, 12 screen).  A broker
+         * that read only the window list would advertise nothing and reject
+         * every frame, so both lists are read.
+         */
         m = xcb_dri3_get_supported_modifiers_screen_modifiers(r);
         n = xcb_dri3_get_supported_modifiers_screen_modifiers_length(r);
         for (i = 0; i < n; i++) {
             nb_formats_add(&x->formats, NB_FCC_XR24, m[i]);
             nb_formats_add(&x->formats, NB_FCC_AR24, m[i]);
+            got++;
         }
         free(r);
     }
@@ -202,6 +233,7 @@ static void x11_collect_formats(struct nb_x11 *x)
      */
     nb_formats_add(&x->formats, NB_FCC_XR24, NB_DRM_FORMAT_MOD_INVALID);
     nb_formats_add(&x->formats, NB_FCC_AR24, NB_DRM_FORMAT_MOD_INVALID);
+    return got;
 }
 
 /* ── buffers ─────────────────────────────────────────────────────────────── */
@@ -268,6 +300,25 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
 
     pix = xcb_generate_id(x->c);
     if (d->modifier == NB_DRM_FORMAT_MOD_INVALID) {
+        /*
+         * THE IMPLICIT PATH IS NOT SAFE FOR A BUFFER THAT IS NOT REALLY
+         * LINEAR, and it fails silently.  Measured on the NVIDIA DDX
+         * 580.105.08: a block-linear bo (0x0300000000606014) handed to
+         * PixmapFromBuffer is accepted with no X error and then presented as
+         * shredded scanlines — the server reads the tiled bytes as linear.
+         * There is no error to catch and no way to tell from this side, so the
+         * only defence is to say out loud that the client asked for it.  The
+         * geometry bound still holds either way: nothing is read past
+         * offset + stride*height, which was checked against the real fd size.
+         */
+        if (x->formats.n > 2) {
+            nb_log("WARNING: importing via the implicit (no-modifier) DRI3 1.0 "
+                   "path on a server that DOES advertise explicit modifiers. "
+                   "If this buffer is not genuinely linear the image will be "
+                   "silently garbled, not rejected. The client declared "
+                   "DRM_FORMAT_MOD_INVALID; it should declare the real "
+                   "modifier.");
+        }
         /* DRI3 1.0.  `size` is the whole buffer; the server derives the rest. */
         uint32_t size = (uint32_t)(d->size > 0xffffffffu ? 0xffffffffu
                                                          : d->size);
@@ -403,11 +454,36 @@ static void x11_present_event(struct nb_x11 *x, struct nb_sink *sink,
                               xcb_ge_generic_event_t *ge)
 {
     switch (ge->event_type) {
-    case XCB_PRESENT_COMPLETE_NOTIFY:
+    case XCB_PRESENT_COMPLETE_NOTIFY: {
+        xcb_present_complete_notify_event_t *ce = (void *)ge;
+
+        /*
+         * THE ONE PLACE EITHER STACK TELLS YOU WHETHER YOU GOT A PLANE.
+         *
+         * README §6 says a hardware plane can only be qualified for, never
+         * requested, and that the compositor will not tell you.  On X11 that
+         * is not quite true: PresentCompleteNotify carries `mode`, and FLIP
+         * means the frame went to the CRTC instead of being composited.  It
+         * costs nothing to read, and without it "is this actually zero-copy
+         * to the screen" is unanswerable from the outside.  Logged on every
+         * CHANGE, not every frame, so it stays one line in normal use.
+         */
+        if (ce->mode != x->last_mode) {
+            static const char *modes[] = { "COPY", "FLIP", "SKIP",
+                                           "SUBOPTIMAL_COPY" };
+
+            x->last_mode = ce->mode;
+            nb_log("Present: %s%s", ce->mode < 4 ? modes[ce->mode] : "?",
+                   ce->mode == XCB_PRESENT_COMPLETE_MODE_FLIP
+                       ? "  — the frame reached a hardware plane; nothing "
+                         "composited it"
+                       : "  — the frame is being composited, not scanned out");
+        }
         /* Pacing.  This is the X11 equivalent of a wl frame callback: the
          * frame is on screen, another may be drawn. */
         nb_sink_frame(sink);
         break;
+    }
     case XCB_PRESENT_IDLE_NOTIFY: {
         xcb_present_idle_notify_event_t *ie = (void *)ge;
         int i;
@@ -438,12 +514,39 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
     while ((ev = xcb_poll_for_event(x->c)) != NULL) {
         switch (ev->response_type & 0x7f) {
         case XCB_FOCUS_IN:
-            nb_sink_focus(sink, true);
-            break;
-        case XCB_FOCUS_OUT:
+        case XCB_FOCUS_OUT: {
+            xcb_focus_in_event_t *f = (void *)ev;
+
+            /*
+             * A GRAB IS NOT A FOCUS CHANGE, AND X11 REPORTS IT AS ONE.
+             *
+             * FocusOut/FocusIn carry a `mode`.  NotifyNormal and
+             * NotifyWhileGrabbed mean the keyboard focus really moved.
+             * NotifyGrab and NotifyUngrab mean *this* client's own
+             * XGrabKeyboard took or released the keyboard — the window has
+             * not lost anything.  Acting on those is self-defeating here,
+             * because the grab-induced FocusOut arrives immediately after
+             * CTRL+ALT+G and the focus-loss rule then drops the grab that
+             * caused it.  Measured on X.Org 1.21.1.4 with the NVIDIA DDX and
+             * KWin: every grab lasted a few milliseconds —
+             *     GRAB x=1 ; FOCUS x=0 ; GRAB x=0
+             * — so grab on the X11 backend never actually held.  The selftest
+             * could not have caught it: --backend test synthesises focus from
+             * stdin and has no X server to generate a NotifyGrab.
+             *
+             * The security property is unchanged: a REAL focus loss is still
+             * NotifyNormal/NotifyWhileGrabbed and still drops the grab.  Only
+             * the two self-inflicted modes are ignored.
+             */
+            if (f->mode == XCB_NOTIFY_MODE_GRAB ||
+                f->mode == XCB_NOTIFY_MODE_UNGRAB) {
+                break;
+            }
             /* The property that stops the grab being a keylogger. */
-            nb_sink_focus(sink, false);
+            nb_sink_focus(sink,
+                          (ev->response_type & 0x7f) == XCB_FOCUS_IN);
             break;
+        }
         case XCB_ENTER_NOTIFY:
             nb_sink_pointer(sink, true);
             break;
@@ -530,6 +633,45 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 if (nvals >= 2) {
                     dy = (int)vals[1].integral;
                 }
+                if (nb_verbose) {
+                    nb_log("XI RawMotion seq=%u dev=%u src=%u dx=%d dy=%d",
+                           (unsigned)re->full_sequence,
+                           (unsigned)re->deviceid, (unsigned)re->sourceid,
+                           dx, dy);
+                }
+                /*
+                 * UNDER AN ACTIVE GRAB THE SERVER DELIVERS EACH RAW MOTION
+                 * TWICE, and the guest turns at exactly double speed.
+                 *
+                 * Measured on X.Org 1.21.1.4 + NVIDIA DDX 580.105.08: with
+                 * the pointer grabbed, one physical motion arrives once via
+                 * the root-window raw selection and once more because this
+                 * client also holds the grab.  Both copies carry the SAME
+                 * full_sequence, the same deviceid and the same valuators —
+                 * they are one event delivered twice, not two events:
+                 *     RawMotion seq=23 dev=2 src=4 dx=33 dy=44
+                 *     RawMotion seq=23 dev=2 src=4 dx=33 dy=44
+                 * Ungrabbed, the same motion arrives exactly once.  Nothing
+                 * without a real X server and a real grab can see this, which
+                 * is why it survived 42 selftests.
+                 *
+                 * Dropped by matching sequence AND deltas, which is the
+                 * conservative pairing: a genuine second motion that shares a
+                 * serial almost always differs in its deltas, and if it does
+                 * not, the cost is one lost delta rather than a permanent 2x.
+                 * The clean fix is to grab with XIGrabDevice instead of core
+                 * XGrabPointer, which does not double-deliver — that is a
+                 * larger change to the grab path and is left deliberate
+                 * rather than smuggled in behind a bug fix.
+                 */
+                if (x->grabbed && re->full_sequence == x->last_raw_seq &&
+                    dx == x->last_raw_dx && dy == x->last_raw_dy) {
+                    x->last_raw_seq = 0;   /* only ever drop the pair's twin */
+                    break;
+                }
+                x->last_raw_seq = re->full_sequence;
+                x->last_raw_dx = dx;
+                x->last_raw_dy = dy;
                 nb_sink_rel(sink, dx, dy);
             }
 #endif
@@ -669,6 +811,7 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     x->sess = s;
     x->pending = -1;
     x->current = -1;
+    x->last_mode = -1;
     x->win_w = (int)cfg->win_w;
     x->win_h = (int)cfg->win_h;
 
@@ -743,10 +886,16 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
         nb_err("DRI3QueryVersion failed");
         goto fail;
     }
-    have_mods = (dv->major_version > 1 ||
-                 (dv->major_version == 1 && dv->minor_version >= 2));
-    nb_log("DRI3 %u.%u%s", dv->major_version, dv->minor_version,
-           have_mods ? "" : " (< 1.2: no explicit modifiers)");
+    /*
+     * The reported version is LOGGED, not believed.  See x11_collect_formats()
+     * — the NVIDIA DDX reports 1.0 and serves the 1.2 requests regardless, so
+     * whether explicit modifiers are available is decided by asking, further
+     * down, once the content window exists.
+     */
+    nb_log("DRI3 %u.%u reported%s", dv->major_version, dv->minor_version,
+           (dv->major_version == 1 && dv->minor_version < 2)
+               ? " (below 1.2 — asking for modifiers anyway, some drivers "
+                 "under-report)" : "");
     free(dv);
 
     ext = xcb_get_extension_data(x->c, &xcb_present_id);
@@ -817,13 +966,13 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     }
     xcb_flush(x->c);
 
-    if (have_mods) {
-        x11_collect_formats(x);
-    } else {
-        nb_formats_add(&x->formats, NB_FCC_XR24, NB_DRM_FORMAT_MOD_INVALID);
-        nb_formats_add(&x->formats, NB_FCC_AR24, NB_DRM_FORMAT_MOD_INVALID);
-    }
+    have_mods = x11_collect_formats(x) > 0;
     nb_formats_log(&x->formats, "the X server");
+    if (!have_mods) {
+        nb_log("this X server offers NO explicit modifiers: only implicitly-"
+               "modified (DRM_FORMAT_MOD_INVALID) buffers will be accepted, "
+               "and a guest that flips a block-linear bo will be rejected");
+    }
 
     s->width = (uint32_t)x->win_w;
     s->height = (uint32_t)x->win_h;

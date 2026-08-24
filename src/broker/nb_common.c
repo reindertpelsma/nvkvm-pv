@@ -67,6 +67,29 @@ void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier)
 {
     unsigned i;
 
+    /*
+     * DROP WHAT WE COULD NEVER ACCEPT ANYWAY, BEFORE IT COSTS A SLOT.
+     *
+     * nb_validate_desc() rejects any fourcc nb_fourcc_bpp() does not know, so
+     * a pair for R8 or NV12 can only ever be looked up and refused.  Storing
+     * it is pure cost — and on a real compositor that cost is the whole
+     * feature.  Measured on sway 1.7 / wlroots 0.15 on an NVIDIA RTX 3090:
+     * zwp_linux_dmabuf_v1 advertises every DRM format the driver knows times
+     * thirteen modifiers, far more than 256 pairs.  The table filled with
+     * AB24/XB24/R8/... in enumeration order and XR24 — the format the nvkvm
+     * guest head actually flips (src/guest/nvkvm_kms.c) — never got in, so
+     * every single frame was rejected as "not advertised by this display".
+     * A black window, with the reason buried in a truncated list.
+     *
+     * Filtering here rather than in each backend keeps HARDENING 3 in one
+     * place: the set the validator consults holds exactly the pairs that
+     * could pass it.  The overflow flag stays, because it is still the only
+     * warning that would be given if even the filtered set were too large.
+     */
+    if (nb_fourcc_bpp(fourcc) == 0) {
+        return;
+    }
+
     for (i = 0; i < f->n; i++) {
         if (f->e[i].fourcc == fourcc && f->e[i].modifier == modifier) {
             return;
