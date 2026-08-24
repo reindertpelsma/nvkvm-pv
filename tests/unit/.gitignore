@@ -20,3 +20,8 @@ kvm_slot_pool.inc
 test_stub_window
 stub_window.inc
 win_alloc.inc
+
+# test_drm_devinfo: compiled suite + the nvidia-drm param structs extracted
+# from src/guest/nvkvm_drm.c at build time.
+test_drm_devinfo
+drm_param_structs.inc

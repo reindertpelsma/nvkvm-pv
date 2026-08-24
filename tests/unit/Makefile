@@ -3,7 +3,8 @@ CFLAGS  = -Wall -Wextra -g \
           -Istubs \
           -I../../src \
           -I../../src/qemu \
-          -I../../src/common
+          -I../../src/common \
+          -I../../src/guest
 LDFLAGS = -lpthread
 
 DISPATCH_SRCS = test_dispatch.c \
@@ -36,7 +37,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -111,6 +112,20 @@ win_alloc.inc: ../../src/qemu/nvkvm_isolate_handlers.c
 test_stub_window: test_stub_window.c stub_window.inc win_alloc.inc
 	$(CC) $(CFLAGS) -I. -o $@ test_stub_window.c
 
+# The nvidia-drm GET_DEV_INFO layout table.  The selector and the fixup are
+# header-only (src/guest/nvkvm_drm_abi.h), so those are just included -- same as
+# test_nvkms_allowlist.  The OTHER seven drm_nvidia_*_params structs live inside
+# a kernel .c that cannot be compiled hosted, so they are EXTRACTED between
+# markers like kvm_slot_pool.inc above: the test static-asserts their sizes and
+# offsets against the vendor headers, and a lost marker yields an empty .inc and
+# a compile error rather than a suite that silently pins nothing.
+drm_param_structs.inc: ../../src/guest/nvkvm_drm.c
+	awk '/NVKVM_DRM_PARAM_STRUCTS_BEGIN/,/NVKVM_DRM_PARAM_STRUCTS_END/' $< > $@
+
+test_drm_devinfo: test_drm_devinfo.c drm_param_structs.inc \
+                  ../../src/guest/nvkvm_drm_abi.h ../../src/common/nvkvm_abi.h
+	$(CC) $(CFLAGS) -I. -o $@ test_drm_devinfo.c
+
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
 # runtime until 2026-08-21, and the note that used to sit here blamed "isolate
@@ -120,7 +135,7 @@ test_stub_window: test_stub_window.c stub_window.inc win_alloc.inc
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo
 	./test_dispatch
 	./test_frontend
 	./test_handle
@@ -132,6 +147,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_stub_ptr_sanitize
 	./test_kvm_slot
 	./test_stub_window
+	./test_drm_devinfo
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -144,4 +160,4 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_kvm_slot kvm_slot_pool.inc test_stub_window stub_window.inc win_alloc.inc
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_kvm_slot kvm_slot_pool.inc test_stub_window stub_window.inc win_alloc.inc test_drm_devinfo drm_param_structs.inc
