@@ -142,6 +142,11 @@ struct nb_sink {
      * WINDOW case in nb_handle_cmd().
      */
     bool     window_established;
+    /* Command-rate limiter (audit B-1b).  A legitimate VMM sends about three
+     * commands per frame; anything orders of magnitude above that is a client
+     * trying to burn the broker's CPU, not one trying to display. */
+    uint64_t rate_ms;           /* start of the current 1s window          */
+    unsigned rate_count;
     bool     focused;
     bool     pointer_in;
     bool     grabbed;

@@ -1495,7 +1495,13 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
 /* ops->dismiss_dialog: the broker took a state that contradicts the dialog. */
 static void wl_dismiss_dialog(struct nb_session *s)
 {
-    dlg_hide(s->priv);
+    struct nb_wl *w = s->priv;
+
+    /* Also clears the "you already asked" memory: it is per-connection, and
+     * the two callers are a client going away and the user choosing a
+     * contradictory mode -- after either, the next close starts fresh. */
+    w->close_asked = false;
+    dlg_hide(w);
 }
 
 static int wl_show_idle(struct nb_session *s)

@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <linux/input-event-codes.h>
@@ -342,6 +343,12 @@ int nb_sink_attach(struct nb_sink *s, int fd)
         s->rxfd = -1;
     }
     s->n_attach = s->n_commit = s->n_reject = 0;
+    /*
+     * AUDIT B-2.  Per-connection, and it must be: it gates "the guest may size
+     * the window once".  Left set from a previous client, the NEXT VM's WINDOW
+     * is ignored and it inherits the dead one's window size forever.
+     */
+    s->window_established = false;
     memset(s->key_down, 0, sizeof(s->key_down));
     memset(nb_consumed, 0, sizeof(nb_consumed));
     /*
@@ -410,6 +417,14 @@ void nb_sink_detach(struct nb_sink *s, const char *why)
         /* Never leave the host's keyboard grabbed because the VMM died. */
         s->sess->ops->set_grab(s->sess, false);
         s->grabbed = false;
+    }
+    /*
+     * AUDIT B-2.  A dialog asking what to do about a VM is meaningless once
+     * that VM is gone, and its "you already asked" memory belongs to the
+     * connection, not to the window.
+     */
+    if (s->sess->ops->dismiss_dialog) {
+        s->sess->ops->dismiss_dialog(s->sess);
     }
     nb_log("client detached: %s "
            "(%llu attach, %llu commit, %llu rejected)", why,
@@ -942,8 +957,67 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
  * buffer of exactly that size.  The read length is `remaining`, so a client
  * cannot cause a write past the end of `s->rx` even in principle.
  */
+/*
+ * How many commands one readable() call will process before returning to the
+ * event loop.  Far more than a well-behaved VMM sends per frame (an ATTACH, a
+ * COMMIT, occasionally a WINDOW), and small enough that a hostile one cannot
+ * hold the loop.  See B-1 in the audit note above nb_sink_readable().
+ */
+#define NB_RX_BUDGET 64
+
+/*
+ * Sustained commands per second above which a client is hung up on (B-1b).
+ *
+ * A VMM sends an ATTACH, a COMMIT and occasionally a WINDOW per frame -- about
+ * 500/s at 144 Hz.  This is forty times that, so no honest client can reach it,
+ * and it is two orders of magnitude below the 1.8 million/s a flooding client
+ * actually achieved on this hardware.  The budget above keeps the event loop
+ * alive under a flood; this stops the flood being free.
+ */
+#define NB_RX_MAX_PER_SEC 20000u
+
+static uint64_t nb_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* True when the client has exceeded the sustained command rate. */
+static bool nb_rate_exceeded(struct nb_sink *s)
+{
+    uint64_t now = nb_now_ms();
+
+    if (now - s->rate_ms >= 1000u) {
+        s->rate_ms = now;
+        s->rate_count = 0;
+    }
+    return ++s->rate_count > NB_RX_MAX_PER_SEC;
+}
+
+/*
+ * AUDIT B-1.  This loop used to run until the socket drained, which a client
+ * controls: it can keep data available indefinitely, and measured on hardware a
+ * flood of valid COMMITs pinned the broker at 100% of a core with `syscall`
+ * showing "running" and never ppoll, for as long as the flood lasted.
+ *
+ * That is not merely a busy loop.  The SAME poll() services the display server,
+ * so while it is starved NO key is dispatched -- which includes CTRL+ALT+G, and
+ * includes the focus-loss auto-ungrab.  A client that starts flooding while the
+ * grab is on therefore leaves the user's keyboard captured with no way out,
+ * which is the single failure mode this whole design treats as unacceptable.
+ * The client never gains the grab (see the audit: no client-reachable path
+ * turns one on) -- it makes an existing one unreleasable, which is as bad.
+ *
+ * The budget fixes it because a return with data still pending is not a loss:
+ * poll() reports POLLIN again immediately and the next call resumes.  Progress
+ * is preserved; monopoly is not.
+ */
 void nb_sink_readable(struct nb_sink *s)
 {
+    unsigned budget = NB_RX_BUDGET;
+
     for (;;) {
         union {
             char buf[CMSG_SPACE(sizeof(int) * 4)];
@@ -1033,7 +1107,19 @@ void nb_sink_readable(struct nb_sink *s)
             memcpy(&c, s->rx, sizeof(c));
             s->rxlen = 0;
             s->rxfd = -1;
+            if (nb_rate_exceeded(s)) {
+                if (fd >= 0) {
+                    close(fd);
+                }
+                nb_violation(s, "command rate far beyond anything a display "
+                                "needs; treating it as an attempt to burn the "
+                                "broker's CPU");
+                return;
+            }
             nb_handle_cmd(s, &c, fd);
+        }
+        if (--budget == 0) {
+            return;             /* let the display server have the loop */
         }
     }
 }
