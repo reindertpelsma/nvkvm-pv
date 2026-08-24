@@ -2403,6 +2403,30 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 					 * is what RM itself does.  NV_ERR_INVALID_-
 					 * ADDRESS is what the driver returns for a
 					 * descriptor it cannot pin. */
+					/*
+					 * Write the refusal into the params
+					 * too, not just resp->nvstatus.
+					 * MEASURED: with only resp->nvstatus
+					 * set, the guest returned rc=0 and left
+					 * NVOS02.status at 0, so a caller saw a
+					 * SUCCESSFUL allocation and would go on
+					 * to use an hMemory that was never
+					 * created.  Unlike nr 0x4a, this ioctl's
+					 * status field is how RM reports errors
+					 * on this path, and the guest does not
+					 * synthesise it from nvstatus.  A
+					 * security refusal that reads as success
+					 * is worse than no refusal.
+					 */
+					if (param_buf && req->param_size >=
+					    offsetof(struct nv_ioctl_nvos02_parameters_with_fd,
+						     status) + 4) {
+						uint32_t st = 0x1e;
+						memcpy((char *)param_buf +
+						       offsetof(struct nv_ioctl_nvos02_parameters_with_fd,
+								status),
+						       &st, 4);
+					}
 					resp->retval     = 0;
 					resp->status     = 0;
 					resp->nvstatus   = 0x1e;
