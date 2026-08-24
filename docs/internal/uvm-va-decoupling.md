@@ -793,6 +793,89 @@ play is `G` — which is used as a **GPU** virtual address in the guest's own RM
 space, never as a host CPU address. That is a stronger statement than the
 original design could have made.
 
+## 6d. Can the fallback be built with no QEMU change? No — and the blocker is one of ours
+
+The proposal was: translate the UVM call **in the guest module** into an external
+RM allocation via **dma-buf**, so the fallback needs no QEMU or isolate edit.
+Three findings, in the order they close the question.
+
+### 1. There is no dma-buf import path
+
+NVIDIA's dma-buf support is **export only**. `nv_dma_buf_export()` is declared
+*and implemented* (`kernel-open/common/inc/nv-dmabuf.h:29`).
+`nv_dma_import_dma_buf()` is **declared and never defined** — it appears in
+`nv.h:998` in both copies of the header and in no `.c` file in the open modules.
+The remaining `dma_buf_attach` hits are `conftest.sh` probes for
+`struct dma_buf_attachment::peer2peer`, not an import implementation.
+
+And UVM's external path does not take an fd of any kind.
+`UVM_MAP_EXTERNAL_ALLOCATION` resolves its allocation with
+
+```c
+nvUvmInterfaceDupMemory(uvmGpuDeviceHandle device,
+                        NvHandle hClient, NvHandle hPhysMemory,
+                        NvHandle *hDupMemory, UvmGpuMemoryInfo *pGpuMemoryInfo);
+```
+
+(`uvm_map_external.c:909`, contract at `nv_uvm_interface.h:745-767`) — RM
+handles, with `NV_ERR_OBJECT_NOT_FOUND` "if the allocation is not found under the
+provided client" and `NV_ERR_NOT_SUPPORTED` "if the allocation is not a physical
+allocation". There is no seam where a dma-buf fd could enter.
+
+### 2. The mechanism that *does* work is the OS-descriptor path — and it is host-only by construction
+
+M4 (§6c) already proved the effect the proposal wants: memfd/`MAP_SHARED` pages
+registered and made GPU-visible, coherent through a second CPU mapping. That
+works via RM's **OS descriptor** allocation, `NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR`
+— what `cudaHostRegister` issues underneath.
+
+Its argument is a **virtual address in the caller's address space**. From this
+project's own audit (`nvkvm_isolate_handlers.c:2210-2227`):
+
+> the driver then reads `data.AllocOsDesc.descriptor` (an NvP64 inside that
+> union) and hands it straight to `os_lock_user_pages()` i.e.
+> `pin_user_pages()`, with `data.AllocOsDesc.limit` as the length — pinning an
+> arbitrary attacker-named address range **in the isolate's address space**
+
+So the descriptor must name **host** pages, in the **host** process. A guest
+module cannot issue it meaningfully: the address it would supply is a guest
+address, and forwarding one is the exact pattern U-6/U-15 exist to prevent.
+
+### 3. nvkvm already blocks it deliberately — this is U-3
+
+`NVOS32` is default-denied down to a single function. Allowed: `2`
+(`NVOS32_FUNCTION_ALLOC_SIZE`), whose union arm contains no input pointer.
+`27` (`ALLOC_OS_DESCRIPTOR`) is refused, and the audit says why: it is an
+arbitrary-address pin primitive, with the driver's only checks being page
+alignment and an overflow test. gVisor's nvproxy takes the same position.
+
+**So the answer to "can the guest module do this alone" is no, twice over.**
+Not merely "it lacks `hDevice`/`hSubdevice`" (it does — it tracks only
+`h_client`/`h_va_space` in `nvkvm_uvm_vas_reg`, and could learn the rest by
+observing RM traffic). Even with every handle it needs, a guest-issued
+`ALLOC_OS_DESCRIPTOR` **is** U-3. The correct move is not to relax that control
+but to keep it and have QEMU compose the call itself, over memory QEMU owns.
+
+### What the fallback therefore requires
+
+Host-side, and modest — but real:
+
+- QEMU issues `ALLOC_OS_DESCRIPTOR` over a window extent **it** owns, yielding an
+  `hMemory`. The guest never names an address; U-3's default-deny for
+  guest-originated `NVOS32` stays exactly as it is.
+- QEMU then issues `CREATE_EXTERNAL_RANGE(base=G)` + `MAP_EXTERNAL_ALLOCATION`
+  (the §6c lifecycle), `G` being the guest's VA used as a **GPU** address.
+- Guest-side: intercept the UVM `mmap`, record the range as external-backed, and
+  answer cmd 45 locally for exactly those ranges (§M1).
+
+An alternative backing worth weighing: rather than a window extent, QEMU could
+OS-descriptor the **guest RAM pages behind `G`** — the guest module can supply
+the GPA list (it already walks its own page tables, `nvkvm_mmap.c:78-104`,
+`:462-488`) and QEMU owns the GPA→HVA mapping. That removes the window
+allocation and the extra copy of the pages, at the cost of a new virtio message
+carrying a page list. Either way the descriptor is composed host-side from
+host addresses, which is the property that matters.
+
 ## 7. What would settle it: the two measurements that decide the external-range design
 
 §2e is the only option not blocked by the driver, and its remaining risk is not
