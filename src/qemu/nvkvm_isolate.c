@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <poll.h>
 #include <signal.h>
+#include <time.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include <sched.h>
 #include <sys/prctl.h>
 #include <sys/mount.h>
@@ -3161,6 +3164,85 @@ int nvkvm_isolate_open_device(struct nvkvm_isolate_table *t,
 	return 0;
 }
 
+
+/* ── PRESENT export timing (#106 hot path) ───────────────────────────────────
+ *
+ * present_mean in nvkvm_present_egl.c does NOT cover this.  It starts after the
+ * slot handoff, on the consumer thread, so it times the import/readback and is
+ * blind to the export round-trip that happens first on the virtio TX thread.
+ * Anyone measuring the cost of the per-frame export with present_mean measures
+ * the wrong thing and sees no change however much the export improves.
+ *
+ * Two numbers, because they answer different questions:
+ *   lock_us  — time spent waiting for present_lock, i.e. queueing behind another
+ *              frame's round-trip.
+ *   rt_us    — the round-trip itself, send -> stub -> response.
+ * Both are BQL-held (see the F4-1 note below), so their sum is vCPU stall time,
+ * which is the number that actually matters.
+ *
+ * One-shot line on the first export so the cost is visible without a debug
+ * build (same idea as the #106 proof); a periodic summary under
+ * NVKVM_EXPORT_TIMING=1.
+ */
+static unsigned long nvkvm_exp_n;
+static double nvkvm_exp_rt_us, nvkvm_exp_rt_max;
+static double nvkvm_exp_lock_us, nvkvm_exp_lock_max;
+static pthread_mutex_t nvkvm_exp_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool nvkvm_export_timing(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("NVKVM_EXPORT_TIMING");
+		on = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+static double nvkvm_exp_now_us(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e6 + ts.tv_nsec / 1e3;
+}
+
+static void nvkvm_exp_record(double lock_us, double rt_us)
+{
+	unsigned long n;
+
+	pthread_mutex_lock(&nvkvm_exp_stats_lock);
+	nvkvm_exp_n++;
+	n = nvkvm_exp_n;
+	nvkvm_exp_rt_us   += rt_us;
+	nvkvm_exp_lock_us += lock_us;
+	if (rt_us > nvkvm_exp_rt_max) {
+		nvkvm_exp_rt_max = rt_us;
+	}
+	if (lock_us > nvkvm_exp_lock_max) {
+		nvkvm_exp_lock_max = lock_us;
+	}
+	double rt_mean   = nvkvm_exp_rt_us / n;
+	double lock_mean = nvkvm_exp_lock_us / n;
+	double rt_max = nvkvm_exp_rt_max, lock_max = nvkvm_exp_lock_max;
+	pthread_mutex_unlock(&nvkvm_exp_stats_lock);
+
+	if (n == 1) {
+		fprintf(stderr,
+			"nvkvm present #106: first PRESENT_EXPORT round-trip "
+			"%.0f us (lock wait %.0f us).  This runs per flip on "
+			"the TX thread under the BQL.\n", rt_us, lock_us);
+	}
+	if (nvkvm_export_timing() && (n % 300) == 0) {
+		fprintf(stderr,
+			"nvkvm export: n=%lu rt_mean=%.0fus rt_max=%.0fus "
+			"lock_mean=%.0fus lock_max=%.0fus stall_mean=%.0fus\n",
+			n, rt_mean, rt_max, lock_mean, lock_max,
+			rt_mean + lock_mean);
+	}
+}
+
 int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
 				 uint32_t isolate_id, uint32_t handle_id,
 				 uint32_t gem_handle, int *fd_out)
@@ -3189,7 +3271,9 @@ int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
 
 	/* present_lock serializes present-export callers (held across the whole
 	 * round-trip); present_sync_lock + present_cond are the reader handoff. */
+	double t_pre = nvkvm_exp_now_us();
 	pthread_mutex_lock(&iso->present_lock);
+	double t_locked = nvkvm_exp_now_us();
 	pthread_mutex_lock(&iso->present_sync_lock);
 	iso->present_done = false;
 	iso->present_err  = 0;
@@ -3221,6 +3305,7 @@ int nvkvm_isolate_present_export(struct nvkvm_isolate_table *t,
 	iso->present_fd = -1;
 	pthread_mutex_unlock(&iso->present_sync_lock);
 	pthread_mutex_unlock(&iso->present_lock);
+	nvkvm_exp_record(t_locked - t_pre, nvkvm_exp_now_us() - t_locked);
 
 	if (err) {
 		if (fd >= 0)

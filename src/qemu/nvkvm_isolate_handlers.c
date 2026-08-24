@@ -18,6 +18,9 @@
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <pthread.h>
+#include <stdlib.h>
 
 #include "virtio_nvgpu.h"
 #include "nvkvm_ctrl_allowlist.h"
@@ -25,6 +28,231 @@
 #include "nvkvm_drm_allowlist.h"
 #include "nvkvm_nvkms_allowlist.h"
 #include "nvkvm_present_egl.h"
+
+
+/* ── PRESENT dma-buf fd cache (#106 hot path) ────────────────────────────── */
+/*
+ * WHY.  nvkvm_req_present() used to call nvkvm_isolate_present_export() on
+ * EVERY flip: a synchronous round-trip to the isolate stub plus an SCM_RIGHTS
+ * fd transfer, 60/s at 60 Hz.  That is worse than it sounds — the round-trip
+ * holds the isolate's present_lock for its whole duration AND, per the F4-1
+ * note in nvkvm_isolate_present_export(), runs inline on the virtio TX thread
+ * under the BQL, so every frame stops the guest's vCPUs for the length of an
+ * IPC round-trip.  A compositor cycles a handful of scanout bos, so the same
+ * few (isolate, gem) pairs are re-exported forever.
+ *
+ * THE SUBTLETY THAT MAKES THIS DELICATE.  The import cache in
+ * nvkvm_present_egl.c detects a RECYCLED GEM handle — same id, different
+ * buffer — by comparing the dma-buf's inode.  That works only because the fd
+ * is re-derived every frame: a fresh export of a reallocated handle yields a
+ * new dma_buf with a new inode.  Cache the fd and you keep a reference to the
+ * OLD buffer, its inode never changes, and the display shows stale pixels
+ * forever.  So the round-trip is load-bearing for correctness, not merely slow,
+ * and a cache is only safe with a real invalidation signal.
+ *
+ * THE SIGNAL.  A GEM handle is an IDR id in the owning stub's drm_file; it
+ * cannot be reused until it is closed, and DRM_IOCTL_GEM_CLOSE (nr 0x09) is
+ * allowlisted and passes through nvkvm_req_ioctl_on_isolate().  So observing
+ * GEM_CLOSE is a COMPLETE invalidation signal, and that is what this hooks.
+ *
+ * BELT AND BRACES.  If that observation ever has a hole, the failure is silent
+ * stale frames — the worst kind.  So a cache hit is periodically revalidated by
+ * doing the export anyway and comparing inodes; a mismatch means a GEM_CLOSE
+ * was missed and is logged loudly rather than papered over.  See
+ * nvkvm_fdcache_revalidate_every().
+ *
+ * Default OFF.  NVKVM_PRESENT_FDCACHE=1 enables it, so the change can be A/B'd
+ * on one box in one session without a rebuild.
+ */
+#define NVKVM_FDCACHE_N  16
+
+struct nvkvm_fdcache_ent {
+	bool     valid;
+	uint32_t iso;
+	uint32_t gem;
+	int      fd;      /* owned by the cache; callers get dup()s */
+	uint64_t ino;     /* dma-buf inode at insert, for revalidation */
+	uint64_t used;    /* LRU stamp */
+};
+
+static struct nvkvm_fdcache_ent nvkvm_fdcache[NVKVM_FDCACHE_N];
+static pthread_mutex_t nvkvm_fdcache_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t nvkvm_fdcache_tick;
+
+/* Stats — read by the periodic export-timing line. */
+static unsigned long nvkvm_fdcache_hits, nvkvm_fdcache_misses;
+static unsigned long nvkvm_fdcache_revals, nvkvm_fdcache_stale;
+
+/*
+ * Periodic hit-rate line.  Without it the counters below are invisible and the
+ * A/B measurement has no denominator: "the export got faster" means nothing if
+ * you cannot say how many exports were actually skipped.
+ */
+static void nvkvm_fdcache_report(void)
+{
+	unsigned long h = nvkvm_fdcache_hits, m = nvkvm_fdcache_misses;
+	unsigned long tot = h + m;
+
+	if (!getenv("NVKVM_EXPORT_TIMING") || tot == 0 || (tot % 300) != 0) {
+		return;
+	}
+	fprintf(stderr,
+		"nvkvm fdcache: hits=%lu misses=%lu (%.1f%% skipped) "
+		"revalidations=%lu stale=%lu\n",
+		h, m, 100.0 * (double)h / (double)tot,
+		nvkvm_fdcache_revals, nvkvm_fdcache_stale);
+}
+
+static bool nvkvm_fdcache_enabled(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		const char *e = getenv("NVKVM_PRESENT_FDCACHE");
+		on = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+/*
+ * Revalidate a hit every N frames (0 disables).  120 ≈ two seconds at 60 Hz,
+ * which bounds how long a missed GEM_CLOSE could show stale pixels while still
+ * removing 119 of every 120 round-trips.
+ */
+static unsigned nvkvm_fdcache_revalidate_every(void)
+{
+	static int n = -1;
+
+	if (n < 0) {
+		const char *e = getenv("NVKVM_PRESENT_FDCACHE_REVALIDATE");
+		n = e ? atoi(e) : 120;
+		if (n < 0) {
+			n = 0;
+		}
+	}
+	return (unsigned)n;
+}
+
+static uint64_t nvkvm_fd_ino(int fd)
+{
+	struct stat st;
+
+	return fstat(fd, &st) == 0 ? (uint64_t)st.st_ino : 0;
+}
+
+/* Drop entry i.  Caller holds the lock. */
+static void nvkvm_fdcache_drop(int i)
+{
+	if (nvkvm_fdcache[i].valid) {
+		close(nvkvm_fdcache[i].fd);
+		nvkvm_fdcache[i].valid = false;
+		nvkvm_fdcache[i].fd = -1;
+	}
+}
+
+/*
+ * Look up (iso, gem).  On a hit returns a NEW fd (a dup) the caller owns, and
+ * sets *ino_out to the inode recorded at insert.  Returns -1 on a miss.
+ *
+ * A dup shares the underlying struct file, so the dma-buf inode — which is what
+ * the import cache keys on — is identical to the one the first export produced.
+ * That is exactly what we want: the import cache keeps working unchanged and
+ * keeps its texture.
+ */
+static int nvkvm_fdcache_get(uint32_t iso, uint32_t gem, uint64_t *ino_out)
+{
+	int out = -1;
+
+	pthread_mutex_lock(&nvkvm_fdcache_lock);
+	for (int i = 0; i < NVKVM_FDCACHE_N; i++) {
+		if (nvkvm_fdcache[i].valid && nvkvm_fdcache[i].iso == iso &&
+		    nvkvm_fdcache[i].gem == gem) {
+			nvkvm_fdcache[i].used = ++nvkvm_fdcache_tick;
+			if (ino_out) {
+				*ino_out = nvkvm_fdcache[i].ino;
+			}
+			out = dup(nvkvm_fdcache[i].fd);
+			if (out < 0) {
+				/* Out of fds: behave exactly as a miss. */
+				nvkvm_fdcache_drop(i);
+			}
+			break;
+		}
+	}
+	pthread_mutex_unlock(&nvkvm_fdcache_lock);
+	return out;
+}
+
+/*
+ * Insert (iso, gem) -> fd.  TAKES OWNERSHIP of `fd`.  Returns a dup for the
+ * caller to hand downstream, or -1 (having closed nothing: on failure the
+ * caller's fd is still theirs because we did not store it).
+ */
+static int nvkvm_fdcache_put(uint32_t iso, uint32_t gem, int fd)
+{
+	int victim = -1, dupfd;
+
+	pthread_mutex_lock(&nvkvm_fdcache_lock);
+	for (int i = 0; i < NVKVM_FDCACHE_N; i++) {
+		if (!nvkvm_fdcache[i].valid) {
+			victim = i;
+			break;
+		}
+		/* Replacing an existing entry for the same key is correct: it is
+		 * a revalidation that found a different buffer. */
+		if (nvkvm_fdcache[i].iso == iso && nvkvm_fdcache[i].gem == gem) {
+			victim = i;
+			break;
+		}
+	}
+	if (victim < 0) {
+		/* Bounded: drop the least recently used and close its fd, so the
+		 * fd count can never grow with uptime. */
+		uint64_t oldest = ~0ull;
+		victim = 0;
+		for (int i = 0; i < NVKVM_FDCACHE_N; i++) {
+			if (nvkvm_fdcache[i].used < oldest) {
+				oldest = nvkvm_fdcache[i].used;
+				victim = i;
+			}
+		}
+	}
+	nvkvm_fdcache_drop(victim);
+	nvkvm_fdcache[victim] = (struct nvkvm_fdcache_ent){
+		.valid = true, .iso = iso, .gem = gem, .fd = fd,
+		.ino = nvkvm_fd_ino(fd), .used = ++nvkvm_fdcache_tick,
+	};
+	dupfd = dup(fd);
+	pthread_mutex_unlock(&nvkvm_fdcache_lock);
+	return dupfd;
+}
+
+/* DRM_IOCTL_GEM_CLOSE observed: this handle no longer means what it did. */
+static void nvkvm_fdcache_forget(uint32_t iso, uint32_t gem)
+{
+	pthread_mutex_lock(&nvkvm_fdcache_lock);
+	for (int i = 0; i < NVKVM_FDCACHE_N; i++) {
+		if (nvkvm_fdcache[i].valid && nvkvm_fdcache[i].iso == iso &&
+		    nvkvm_fdcache[i].gem == gem) {
+			nvkvm_fdcache_drop(i);
+		}
+	}
+	pthread_mutex_unlock(&nvkvm_fdcache_lock);
+}
+
+/* S-4: the isolate died.  Same event that drops its imported textures must
+ * drop its fds, or a dead isolate keeps its scanout VRAM pinned for the life
+ * of the VM — the exact bug S-4 fixed one layer up. */
+static void nvkvm_fdcache_forget_isolate(uint32_t iso)
+{
+	pthread_mutex_lock(&nvkvm_fdcache_lock);
+	for (int i = 0; i < NVKVM_FDCACHE_N; i++) {
+		if (nvkvm_fdcache[i].valid && nvkvm_fdcache[i].iso == iso) {
+			nvkvm_fdcache_drop(i);
+		}
+	}
+	pthread_mutex_unlock(&nvkvm_fdcache_lock);
+}
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -499,6 +727,10 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 	 * import and displayed its pixels.
 	 */
 	nvkvm_present_forget_isolate(nv, req->isolate_id);
+	/* Same event, one layer earlier: drop this isolate's cached
+	 * exported fds too, or a dead compositor's scanout VRAM stays
+	 * pinned by an fd nothing will ever close. */
+	nvkvm_fdcache_forget_isolate(req->isolate_id);
 	/* Retire this isolate's MAP->VA entries too, or the table fills up
 	 * with dead mappings over a long-lived VM's process churn. */
 	nvkvm_mapva_forget_isolate(req->isolate_id);
@@ -1241,6 +1473,110 @@ static bool nvkvm_present_geom_ok(const struct nvkvm_req_present *req,
 	return true;
 }
 
+
+/*
+ * Obtain the host dma-buf for (iso_id, stub_handle), from the cache when it is
+ * enabled and warm, otherwise by the round-trip.  Returns 0 and an fd the
+ * CALLER OWNS, or -errno.
+ *
+ * `*from_cache_out` reports whether the round-trip was skipped, purely so the
+ * timing line can show the hit rate.
+ */
+static int nvkvm_present_get_dmabuf(VirtIONvgpu *nv, uint32_t iso_id,
+				    uint32_t handle_id, uint32_t stub_handle,
+				    int *fd_out, bool *from_cache_out)
+{
+	static unsigned frames;
+	uint64_t cached_ino = 0;
+	int cached_fd = -1;
+	unsigned reval = nvkvm_fdcache_revalidate_every();
+	bool on = nvkvm_fdcache_enabled();
+	bool do_reval;
+
+	*fd_out = -1;
+	*from_cache_out = false;
+
+	if (on) {
+		cached_fd = nvkvm_fdcache_get(iso_id, stub_handle, &cached_ino);
+	}
+	/*
+	 * Revalidate every Nth hit: re-export anyway and compare inodes.  This
+	 * is the belt-and-braces check behind GEM_CLOSE invalidation — if the
+	 * two ever disagree it means a close was missed, which would otherwise
+	 * show as silently stale pixels.
+	 */
+	do_reval = (cached_fd >= 0) && reval &&
+		   ((__atomic_add_fetch(&frames, 1, __ATOMIC_RELAXED) % reval) == 0);
+
+	if (cached_fd >= 0 && !do_reval) {
+		nvkvm_fdcache_hits++;
+		nvkvm_fdcache_report();
+		*fd_out = cached_fd;
+		*from_cache_out = true;
+		return 0;
+	}
+
+	int fresh = -1;
+	int r = nvkvm_isolate_present_export(&nv->isolates, iso_id, handle_id,
+					     stub_handle, &fresh);
+	if (r < 0 || fresh < 0) {
+		if (cached_fd >= 0) {
+			/* Revalidation failed but we still hold a good fd.  A
+			 * transient stub error must not drop a frame. */
+			nvkvm_fdcache_hits++;
+			*fd_out = cached_fd;
+			*from_cache_out = true;
+			return 0;
+		}
+		return r < 0 ? r : -EIO;
+	}
+
+	if (cached_fd >= 0) {
+		nvkvm_fdcache_revals++;
+		uint64_t fresh_ino = nvkvm_fd_ino(fresh);
+
+		if (fresh_ino != cached_ino) {
+			/*
+			 * LOUD on purpose.  The cache believed this handle still
+			 * named the same buffer and the stub disagrees, which
+			 * means a GEM_CLOSE went unobserved.  That is a bug in
+			 * the invalidation, not a frame to drop quietly.
+			 */
+			nvkvm_fdcache_stale++;
+			fprintf(stderr,
+				"nvkvm present: FDCACHE STALE iso=%u gem=0x%x "
+				"ino %llu -> %llu (a GEM_CLOSE was missed; "
+				"invalidation is buggy)\n",
+				iso_id, stub_handle,
+				(unsigned long long)cached_ino,
+				(unsigned long long)fresh_ino);
+			close(cached_fd);
+			cached_fd = -1;
+		} else {
+			/* Agreed: keep the cached fd, drop the probe. */
+			close(fresh);
+			*fd_out = cached_fd;
+			*from_cache_out = true;
+			return 0;
+		}
+	}
+
+	nvkvm_fdcache_misses++;
+	if (on) {
+		int dupfd = nvkvm_fdcache_put(iso_id, stub_handle, fresh);
+
+		if (dupfd < 0) {
+			/* Stored but could not dup: the cache owns `fresh` now,
+			 * so we must not use or close it here. */
+			return -EMFILE;
+		}
+		*fd_out = dupfd;
+	} else {
+		*fd_out = fresh;
+	}
+	return 0;
+}
+
 /*
  * PRESENT (#106 present path B) — the guest's virtual KMS head flipped a
  * scanout bo backed by a render-node GEM.  Ask the owning isolate's stub to
@@ -1312,9 +1648,10 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	}
 
 	int dmabuf_fd = -1;
-	int r = nvkvm_isolate_present_export(&nv->isolates, iso_id,
-					     req->handle_id, req->stub_handle,
-					     &dmabuf_fd);
+	bool fd_from_cache = false;
+	int r = nvkvm_present_get_dmabuf(nv, iso_id, req->handle_id,
+					 req->stub_handle, &dmabuf_fd,
+					 &fd_from_cache);
 	if (r < 0 || dmabuf_fd < 0) {
 		NVKVM_DBG("nvkvm present: export rc=%d iso=%u handle=%u gem=0x%x\n",
 			  r, iso_id, req->handle_id, req->stub_handle);
@@ -2175,6 +2512,27 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
 			resp->fault_addr = 0;
 			return 0;
+		}
+		/*
+		 * PRESENT fd cache invalidation.  A GEM handle is an IDR id in
+		 * the owning stub's drm_file and cannot be reused until it is
+		 * closed, so GEM_CLOSE is the COMPLETE signal that a cached
+		 * (isolate, handle) -> dma-buf mapping has stopped being true.
+		 * Observing it here is what makes caching the exported fd safe:
+		 * without it a recycled handle would keep displaying the old
+		 * buffer, because holding the fd also holds the buffer alive and
+		 * the inode the import cache checks would never change.
+		 *
+		 * Done BEFORE forwarding: if the close succeeds we must already
+		 * have forgotten it, and if it fails the worst case is a cold
+		 * cache and one extra round-trip.
+		 */
+		if (_IOC_NR(req->cmd) == 0x09 /* DRM_IOCTL_GEM_CLOSE */ &&
+		    param_buf && req->param_size >= 4) {
+			uint32_t closing;
+
+			memcpy(&closing, param_buf, sizeof(closing));
+			nvkvm_fdcache_forget(req->isolate_id, closing);
 		}
 	} else if (req->cmd == NVKVM_NVKMS_IOCTL_CMD) {
 		/* NVKMS (/dev/nvidia-modeset): the ONE allowed outer ioctl
