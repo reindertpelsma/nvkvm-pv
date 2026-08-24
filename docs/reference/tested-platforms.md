@@ -1,5 +1,36 @@
 # Tested platforms — the full matrix
 
+> ## ⚠ HISTORICAL. This matrix is being rebuilt (2026-08-23).
+>
+> **Every row below is real, and every row is narrower than it reads.** Two
+> reasons, and the second one alone forces a reset:
+>
+> **1. The suite never exercised UVM.** `tests/validate.sh` checks that
+> `/dev/nvidia-uvm` *exists* (it is in `$NODES`) and never uses it — no
+> `cuMemAllocManaged`, no managed-memory allocation, no touch-and-verify. So a
+> `28/28` here says nothing whatsoever about unified memory, **on any part in this
+> table, ever**. That gap was found on 2026-08-23 after `cuMemAllocManaged` failed
+> in a guest on Blackwell while succeeding on the host in 177–190 µs; whether UVM
+> is broken generally is under investigation. Either way, this table never
+> measured it.
+>
+> **2. A matrix is only meaningful if every row ran the same suite.** These rows
+> span 17 driver versions from 535 to 610 and many revisions of the code. Once
+> `validate.sh` gains a UVM test, "28/28" means something different from what it
+> meant when these were recorded — so old and new rows are not comparable, no
+> matter what the UVM investigation concludes.
+>
+> **What these rows DO still establish**, and it is not nothing: that on each of
+> these parts and drivers, the ABI profile resolved correctly, the guest booted,
+> the device nodes appeared, CUDA initialised, and the workloads the suite did
+> cover passed. That is genuine coverage of the forwarding path. It is simply not
+> the "everything works on this GPU" the number implies.
+>
+> Rows re-run against the current suite will move to a new matrix above this
+> banner, each stating the suite revision it ran. Nothing here is deleted — a
+> result is not worthless for having been narrower than its header.
+
+
 Every row below reached a real CUDA kernel launch through the forwarder. The
 README carries a condensed view organised by architecture; this is the complete
 list, including near-duplicate rows that are evidence rather than reading
