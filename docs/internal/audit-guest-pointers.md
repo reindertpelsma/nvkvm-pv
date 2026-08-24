@@ -21,6 +21,8 @@ the rest are open. Read this table before the detail.
 | U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
 | U-13 | UNKNOWN | open |
 | U-14 | by design | documented for completeness |
+| A-1 | **CRITICAL** | **fixed** — `NV_ESC_RM_ALLOC_MEMORY` + `hClass 0x71` pinned arbitrary stub memory; now gated on host-installed ranges |
+| A-2 | not a control | the missing session gate on `ioctl_on_isolate` — analysed below, deliberately not added |
 | U-15 | HIGH | **closed by revert** — QEMU-side UVM `mmap()` at a guest-chosen host address; layout oracle. Existed only between `c8ea92d` and `2406a3c`. See below. |
 
 A separate defect found while fixing U-6 — the host driver writing past a
@@ -89,6 +91,100 @@ memory does not work without that mapping — is still open, and any future atte
 to close it must not reintroduce this. The measured reasons a VMM-chosen address
 is *not* the way out are in
 [UVM VA decoupling](uvm-va-decoupling.md).
+
+### A-1 — an untrusted guest could pin and map arbitrary stub memory (CRITICAL, fixed)
+
+`NV01_MEMORY_SYSTEM_OS_DESCRIPTOR` (`hClass 0x71`) makes RM hand `pMemory`
+straight to `os_lock_user_pages()` — `pin_user_pages()` **on the calling task**.
+In the forwarded model the calling task is the stub, so an unvalidated `pMemory`
+pins an arbitrary range of a host process's address space: its heap, its stack,
+its libraries. `NV_ESC_RM_MAP_MEMORY` (nr `0x4e`) then maps that back to the
+guest. The result is a read/write window into a process running as **the same
+host uid as QEMU**, separated from it only by namespaces and seccomp.
+
+The guest reaches it with one ioctl, `NV_ESC_RM_ALLOC_MEMORY` (nr `0x27`), and
+needs nothing but a live `hClient` — which any legitimate prior allocation
+provides.
+
+**Why every existing gate missed it.** Four things lined up:
+
+1. **The class allowlist does exclude `0x71`** — deliberately, following
+   nvproxy (`nvkvm_fe_alloc_allowlist.h:12-15`). But it is applied under
+   `if (nr == 0x2b)`, and `0x2b` is `NV_ESC_RM_ALLOC`, **a different ioctl**.
+   Nr `0x27` is in the frontend NR allowlist and carries no class check at all.
+2. **`nvkvm_dispatch.c`'s `p->p_memory = 0` looks exactly like the fix** and is
+   dead code: its only caller, `handle_ioctl()`, had no callers of its own. It
+   is easy to read that line and conclude the pointer is handled.
+3. **The stub forwards it verbatim** — `nvkvm_stub.c` remaps only the embedded
+   fd at offset 48; `p_memory` at offset 24 reaches `stub_ioctl` untouched.
+4. **H-3's `hClient`-ownership gate applies but does not help** — it constrains
+   *whose* client, never *which address*.
+
+**The fix, and why it is not a default-deny.** Refusing `0x71` outright would
+break U-14, which is a live feature (`cudaHostRegister` / host registration). So
+the gate takes U-6's shape: an ownership test against ranges **the host itself
+established in that isolate**. Every legitimate OS-descriptor range gets there
+through the guest's page-migration path
+(`src/guest/nvkvm_ioctl.c:409-440`), which installs it via `mmap_on_isolate` —
+so QEMU already knows all of them, in `iso_mmap_tbl`, flagged `stub_mirrored`.
+`iso_mmap_covers()` requires full containment in **one** such entry, deliberately
+not a union (same reasoning as `uvm_va_covers()`). Anything else is refused
+before `nvkvm_isolate_ioctl()`, never clamped, and logged the way the U-3 gate
+logs.
+
+One property worth stating: **the check does not depend on `req->session_id`
+being truthful.** It is keyed on the isolate that will actually run the ioctl, so
+a guest that forges an `isolate_id` is checked against that same isolate. There
+is no ordering of guest-supplied values that makes the pin land somewhere the
+host did not install.
+
+Refusal is RM-shaped — the ioctl succeeds and `status` carries
+`NV_ERR_INVALID_ADDRESS` — matching the alloc-class gate, because failing the
+ioctl outright is a more severe signal than the real driver ever produces and
+userspace treats it as fatal rather than falling back.
+
+Also in this change: the dead `handle_ioctl()` is **removed** rather than left as
+a decoy, and the `p_memory = 0` line that remains (the file is still built by
+`tests/unit/test_dispatch.c`) is labelled as not being a control. A comment
+asserting *"RM_ALLOC_MEMORY always allocates NV01_MEMORY_LOCAL_USER"* is
+corrected — the guest chooses the class, and `0x71` is exactly the case; the
+hardcoded `hClass = 0x40` was benign (it only selects whether to skip the
+DUP_OBJECT grant) but it asserted something the code contradicted, which is the
+species of false statement that hid this.
+
+### A-2 — the missing session gate on `ioctl_on_isolate` (analysed, deliberately not added)
+
+`nvkvm_req_ioctl_on_isolate()` takes `req->isolate_id` from the guest and passes
+it straight to `nvkvm_isolate_ioctl()`, with no check that the isolate belongs to
+the calling session — while the sibling `nvkvm_req_mmap_on_isolate()` has exactly
+such a check (S-2). The asymmetry is real and was worth examining.
+
+**It should not be closed by adding the check, for three reasons.**
+
+- **The tree already argues against it, with a concrete regression.** The comment
+  at the head of the handler states that a session-ownership check "would wrongly
+  reject a handle that the guest LEGITIMATELY shared into another isolate via a
+  guest-commanded `COPY_HANDLE_TO_ISOLATE` (e.g. CUDA IPC)".
+- **It would be trivially bypassed.** `nvkvm_req_copy_handle_to_isolate()`
+  performs *no* session validation of its own — it forwards `isolate_id` and
+  `handle_id` to `nvkvm_isolate_send_handle()` directly. A guest blocked by a
+  session gate on the ioctl path would simply copy the handle first.
+- **It is intra-VM, and intra-VM is not this boundary.** `nv->handles` and
+  `nv->isolates` are per-`VirtIONvgpu`, i.e. per-VM. Directing an ioctl into
+  another isolate of the *same* VM crosses no trust boundary QEMU defends:
+  per-process access control inside the guest is emulated by the guest module,
+  which is untrusted but authoritative for guest policy. A malicious guest
+  *kernel* is already assumed able to do anything a guest process could.
+
+**Independently exploitable? No.** It grants no reach a guest does not already
+have by design, and it does not widen A-1 — A-1's severity is that it escapes the
+*isolate* into host process memory, not which isolate it lands in, and the A-1
+gate is keyed on the isolate that runs the ioctl rather than on session identity.
+
+Adding the check would give the appearance of a control while changing nothing an
+attacker can do, and would break CUDA IPC. Recorded here rather than silently
+left alone, so the asymmetry with S-2 is a documented decision instead of an
+oversight waiting to be re-found.
 
 **This document names locations, not techniques.** It deliberately contains no
 working bypass procedure for anything still open. The source is public, so it

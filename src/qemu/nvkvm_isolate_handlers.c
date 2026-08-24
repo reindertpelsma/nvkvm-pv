@@ -53,6 +53,91 @@ static struct nvkvm_iso_mmap_entry iso_mmap_tbl[NVKVM_ISO_MMAP_MAX];
 static uint32_t iso_mmap_seq = 1;
 static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * ── A-1: is [base, base+len) fully covered by ranges the host itself installed
+ *        into this isolate's address space? ─────────────────────────────────
+ *
+ * The check behind the NV01_MEMORY_SYSTEM_OS_DESCRIPTOR gate below.  Only
+ * entries with `stub_mirrored` count: that flag is set exactly when QEMU
+ * MAP_FIXED'd a memfd it owns into the isolate at `gva`, which is the only way
+ * a legitimate OS-descriptor range comes to exist (the guest's page-migration
+ * path in src/guest/nvkvm_ioctl.c:409-440 routes every such range through
+ * mmap_on_isolate first).  A QEMU-side mapping with no isolate-side mirror is
+ * not addressable by the stub at all and must not authorise anything.
+ *
+ * MULTI-ENTRY BY NECESSITY.  The migration installs the range in
+ * NVKVM_MIG_CHUNK (2 MiB) pieces, one mmap_on_isolate -- and therefore one
+ * table entry -- per chunk (nvkvm_mmap.c:1402-1460).  So a 16 MiB
+ * cudaHostRegister is EIGHT adjacent entries, not one.  An earlier version of
+ * this function demanded containment in a single entry and would have refused
+ * every registration above 2 MiB; the 2 MiB probe that "verified" it was
+ * exactly one chunk and sailed past the bug.
+ *
+ * So the walk: find the entry containing the current offset, advance to its
+ * end, repeat until the whole range is spanned.  A gap anywhere fails.  This is
+ * deliberately NOT "overlaps some entry" -- that would authorise the uncovered
+ * remainder and reopen the hole for everything past the first chunk.  It is a
+ * union only over ranges the host installed, which is the property that matters
+ * here; U-6's uvm_va_covers() refuses unions because there the ranges are
+ * distinct driver objects, whereas here the chunks are one registration the
+ * host itself split.
+ *
+ * Stale entries cannot pass: iso_mmap_free() clears `used` under the table lock
+ * BEFORE the isolate-side munmap runs, and iso_mmap_alloc() rewrites every
+ * field on reuse, so a freed or recycled slot never reads as live mirrored
+ * memory.  The reverse window -- mapped but not yet recorded -- fails closed.
+ *
+ * This does NOT depend on req->session_id being truthful.  The lookup is keyed
+ * on the isolate that will actually run the ioctl, so a guest that forges an
+ * isolate_id is checked against that same isolate; there is no ordering of
+ * guest-supplied values that makes the pin land somewhere the host did not
+ * install.
+ */
+static bool iso_mmap_covers(uint32_t isolate_id, uint64_t base, uint64_t len)
+{
+	uint64_t cur, end;
+	bool ok = false;
+
+	if (!len || base + len < base)          /* zero, or u64 wrap */
+		return false;
+	end = base + len;
+
+	pthread_mutex_lock(&iso_mmap_lock);
+	for (cur = base;;) {
+		const struct nvkvm_iso_mmap_entry *hit = NULL;
+		uint64_t next;
+
+		for (uint32_t i = 1; i < NVKVM_ISO_MMAP_MAX; i++) {
+			const struct nvkvm_iso_mmap_entry *e = &iso_mmap_tbl[i];
+			uint64_t e_end;
+
+			if (!e->used || !e->stub_mirrored)
+				continue;
+			if (e->isolate_id != isolate_id || !e->gva || !e->len)
+				continue;
+			e_end = e->gva + (uint64_t)e->len;
+			if (e_end < e->gva)             /* entry wraps: ignore */
+				continue;
+			if (cur >= e->gva && cur < e_end) {
+				hit = e;
+				break;
+			}
+		}
+		if (!hit)                               /* gap -- not covered */
+			break;
+		next = hit->gva + (uint64_t)hit->len;
+		if (next <= cur)                        /* defensive: no progress */
+			break;
+		if (next >= end) {
+			ok = true;
+			break;
+		}
+		cur = next;
+	}
+	pthread_mutex_unlock(&iso_mmap_lock);
+	return ok;
+}
+
 static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 				size_t len, int kvm_slot, uint64_t gpa,
 				bool stub_mirrored, uint32_t handle_id)
@@ -2285,6 +2370,117 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		 * contain instead, exactly as the VID_HEAP gate above and the
 		 * NVKMS gate do: a param too short to hold the discriminator is
 		 * a request we cannot classify, and unclassifiable is denied. */
+		/*
+		 * ── A-1 ── NV_ESC_RM_ALLOC_MEMORY (nr 0x27) with
+		 * hClass == NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (0x71).
+		 *
+		 * That class hands `pMemory` straight to os_lock_user_pages()
+		 * i.e. pin_user_pages() ON THE CALLING TASK -- which is the
+		 * stub.  An unvalidated pMemory therefore pins an arbitrary
+		 * range of the STUB's address space (its heap, stack,
+		 * libraries), and nr 0x4e can then map it back to the guest:
+		 * a read/write window into a host process running as the same
+		 * uid as QEMU, separated only by namespaces and seccomp.
+		 *
+		 * Why the existing gates did not catch it:
+		 *   - the alloc-class allowlist (which DOES exclude 0x71,
+		 *     nvkvm_fe_alloc_allowlist.h:12-15, deliberately and
+		 *     following nvproxy) is applied under `if (nr == 0x2b)`
+		 *     below -- 0x2b is NV_ESC_RM_ALLOC, a different ioctl.
+		 *   - nvkvm_dispatch.c's `p->p_memory = 0` looks like the
+		 *     sanitisation but is dead code: its only caller,
+		 *     handle_ioctl(), had no callers of its own.  It is removed
+		 *     in this change rather than left as a decoy.
+		 *   - H-3's hClient-ownership gate applies, but is satisfied by
+		 *     any legitimate prior allocation.
+		 *
+		 * Straight default-deny of 0x71 is not available: U-14's
+		 * OS-descriptor path is a live feature (host registration /
+		 * cudaHostRegister).  So this takes U-6's shape instead -- an
+		 * ownership test against ranges THE HOST ITSELF established in
+		 * that isolate.  The guest's own migration path installs every
+		 * legitimate range through mmap_on_isolate, so the host already
+		 * knows them all; anything else is refused before the ioctl is
+		 * forwarded, never clamped.
+		 *
+		 * Unclassifiable is denied, per S-5: a param too short to hold
+		 * the class discriminator, or too short to hold the range when
+		 * the class IS 0x71, is a request we cannot check.
+		 */
+		if (nr == 0x27) {
+			uint32_t cls = 0xffffffffu;
+			bool     classifiable = param_buf && req->param_size >= 16;
+
+			if (classifiable)
+				memcpy(&cls, (char *)param_buf + 12, 4);
+
+			if (!classifiable || cls == 0x71) {
+				uint64_t base = 0, limit = 0;
+				bool     ok   = false;
+
+				if (classifiable && cls == 0x71 && param_buf &&
+				    req->param_size >= 40) {
+					memcpy(&base,  (char *)param_buf + 24, 8);
+					memcpy(&limit, (char *)param_buf + 32, 8);
+					/* `limit` is size-1 (the guest passes
+					 * limit+1 as the length, see
+					 * nvkvm_ioctl.c:428). */
+					/* `limit` is size-1 and is guest-supplied,
+					 * so guard the +1 before using it; the
+					 * base+len wrap is checked inside
+					 * iso_mmap_covers(). */
+					ok = base && limit != UINT64_MAX &&
+					     iso_mmap_covers(req->isolate_id,
+							     base, limit + 1);
+				}
+
+				if (!ok) {
+					fprintf(stderr,
+						"nvkvm: DENY OS_DESCRIPTOR "
+						"0x%llx+0x%llx not host-installed "
+						"in isolate %u (A-1)\n",
+						(unsigned long long)base,
+						(unsigned long long)(limit + 1),
+						req->isolate_id);
+					/* Same signalling shape as the alloc-class
+					 * refusal below: the ioctl succeeds and
+					 * the status field carries the error, which
+					 * is what RM itself does.  NV_ERR_INVALID_-
+					 * ADDRESS is what the driver returns for a
+					 * descriptor it cannot pin. */
+					/*
+					 * Write the refusal into the params
+					 * too, not just resp->nvstatus.
+					 * MEASURED: with only resp->nvstatus
+					 * set, the guest returned rc=0 and left
+					 * NVOS02.status at 0, so a caller saw a
+					 * SUCCESSFUL allocation and would go on
+					 * to use an hMemory that was never
+					 * created.  Unlike nr 0x4a, this ioctl's
+					 * status field is how RM reports errors
+					 * on this path, and the guest does not
+					 * synthesise it from nvstatus.  A
+					 * security refusal that reads as success
+					 * is worse than no refusal.
+					 */
+					if (param_buf && req->param_size >=
+					    offsetof(struct nv_ioctl_nvos02_parameters_with_fd,
+						     status) + 4) {
+						uint32_t st = 0x1e;
+						memcpy((char *)param_buf +
+						       offsetof(struct nv_ioctl_nvos02_parameters_with_fd,
+								status),
+						       &st, 4);
+					}
+					resp->retval     = 0;
+					resp->status     = 0;
+					resp->nvstatus   = 0x1e;
+					resp->fault_addr = 0;
+					return 0;
+				}
+			}
+		}
+
 		if (nr == 0x2b) {
 			uint32_t cls = 0xffffffffu;
 			if (param_buf && req->param_size >= 16)
@@ -2718,8 +2914,25 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		if (_IOC_NR(req->cmd) == NV_ESC_RM_ALLOC) {
 			memcpy(&hClass,  (char *)param_buf + 12, sizeof(uint32_t));
 		} else {
-			/* RM_ALLOC_MEMORY always allocates NV01_MEMORY_LOCAL_USER */
-			hClass = 0x40;
+			/*
+			 * NVOS02 (nr 0x27) carries hClass at the same offset as
+			 * NVOS21/NVOS64 -- h_root@0, h_object_parent@4,
+			 * h_object_new@8, h_class@12 (src/abi/nvgpu.h,
+			 * nv_ioctl_nvos02_parameters_with_fd) -- so read it,
+			 * rather than asserting a class.
+			 *
+			 * This used to hardcode 0x40 with the comment
+			 * "RM_ALLOC_MEMORY always allocates
+			 * NV01_MEMORY_LOCAL_USER".  That is not true: the guest
+			 * chooses the class, and 0x71 (OS descriptor) is exactly
+			 * the case A-1 above exists for.  The hardcode was
+			 * benign -- hClass only selects whether to skip the
+			 * DUP_OBJECT grant for RM client objects, and every
+			 * other class gets the grant regardless -- but it
+			 * asserted something the code contradicted, which is the
+			 * kind of false statement that hid A-1.
+			 */
+			memcpy(&hClass, (char *)param_buf + 12, sizeof(uint32_t));
 		}
 
 		/* Grant DUP_OBJECT on every successful RM_ALLOC.  UVM duplicates

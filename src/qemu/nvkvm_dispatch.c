@@ -367,6 +367,19 @@ int nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd)
 			p->fd = (int32_t)h->fd;
 		}
 		ret = nvkvm_handle_simple_ioctl(ctx, cmd);
+		/*
+		 * NOT A SECURITY CONTROL, and specifically not the one for
+		 * NV01_MEMORY_SYSTEM_OS_DESCRIPTOR (hClass 0x71).  Nothing calls
+		 * this function: its only caller, handle_ioctl(), was itself
+		 * dead and has been removed (A-1).  This file survives only
+		 * because tests/unit/test_dispatch.c is built against it.
+		 *
+		 * The live path never inspects p_memory at all.  The gate that
+		 * does is in nvkvm_req_ioctl_on_isolate()
+		 * (nvkvm_isolate_handlers.c, "A-1"), which requires the range to
+		 * be one the host itself installed in that isolate.  Read that,
+		 * not this.
+		 */
 		p->p_memory = 0;
 		return ret;
 	}

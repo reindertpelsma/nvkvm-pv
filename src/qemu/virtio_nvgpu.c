@@ -367,108 +367,22 @@ send:
 	virtio_notify(VIRTIO_DEVICE(nv), vq);
 }
 
-/* ── IOCTL request handler ───────────────────────────────────────────────── */
+/* ── IOCTL request handler ───────────────────────────────────────────────────
+ *
+ * REMOVED (A-1).  handle_ioctl() lived here and was dead: static, and with no
+ * callers.  It was the sole caller of nvkvm_dispatch_ioctl(), which contains a
+ * `p->p_memory = 0` for NV_ESC_RM_ALLOC_MEMORY that reads exactly like the
+ * sanitisation for the OS-descriptor class -- and is not, because nothing
+ * reaches it.  A reviewer (and an auditor) can find that line, conclude the
+ * pointer is handled, and be wrong; that is how A-1 survived.
+ *
+ * The live path is virtio_nvgpu.c's IOCTL_ON_ISOLATE case ->
+ * nvkvm_ioctl_work_fn -> nvkvm_req_ioctl_on_isolate (nvkvm_isolate_handlers.c),
+ * where the A-1 gate now lives.  nvkvm_dispatch.c itself is kept only because
+ * tests/unit/test_dispatch.c (39 cases) is built directly against it; the meson
+ * patch already records that it is dead at runtime.
+ */
 
-static void handle_ioctl(VirtIONvgpu *nv, VirtQueue *vq,
-			 VirtQueueElement *elem,
-			 const struct nvkvm_hdr *hdr,
-			 const struct nvkvm_req_ioctl *req)
-{
-	struct {
-		struct nvkvm_hdr        hdr;
-		struct nvkvm_resp_ioctl resp;
-	} resp_msg = {
-		.hdr.type   = hdr->type,
-		.hdr.txn_id = hdr->txn_id,
-	};
-	uint32_t fd_token    = le32_to_cpu(req->fd_token);
-	uint32_t cmd         = le32_to_cpu(req->cmd);
-	uint32_t param_size  = le32_to_cpu(req->param_size);
-	uint32_t shm_slot    = le32_to_cpu(req->shm_slot);
-	uint32_t session_id  = le32_to_cpu(req->session_id);
-	struct nvkvm_session  *session;
-	struct nvkvm_host_fd  *hfd;
-	size_t expected_size;
-	struct nvkvm_req_ctx  ctx = {0};
-	long ret;
-
-	/* Validate session */
-	pthread_mutex_lock(&nv->sessions_lock);
-	session = nvkvm_session_find(nv, session_id);
-	pthread_mutex_unlock(&nv->sessions_lock);
-	if (!session) {
-		resp_msg.resp.status = cpu_to_le32(EBADF);
-		goto send;
-	}
-
-	/* Validate fd_token belongs to this session */
-	pthread_mutex_lock(&session->lock);
-	hfd = nvkvm_fd_lookup(session, fd_token);
-	pthread_mutex_unlock(&session->lock);
-	if (!hfd) {
-		resp_msg.resp.status = cpu_to_le32(EBADF);
-		goto send;
-	}
-
-	/* Validate param_size against the known ABI size for this command */
-	expected_size = nvkvm_ioctl_expected_param_size(cmd, nv->abi);
-	if (expected_size == (size_t)-1) {
-		resp_msg.resp.status = cpu_to_le32(ENOTTY);
-		goto send;
-	}
-	if (param_size != expected_size) {
-		error_report("nvkvm: ioctl cmd=0x%x: param_size=%u expected=%zu",
-			     cmd, param_size, expected_size);
-		resp_msg.resp.status = cpu_to_le32(EINVAL);
-		goto send;
-	}
-
-	/* Validate shm_slot */
-	if (param_size > 0) {
-		if (!slot_valid(nv, shm_slot) ||
-		    param_size > nv->slot_size) {
-			resp_msg.resp.status = cpu_to_le32(EINVAL);
-			goto send;
-		}
-	}
-
-	ctx.nv         = nv;
-	ctx.vq         = vq;
-	ctx.elem       = elem;
-	ctx.session    = session;
-	ctx.hfd        = hfd;
-	ctx.param_size = param_size;
-	ctx.params_buf = param_size > 0 ? slot_ptr(nv, shm_slot) : NULL;
-
-	/* Handle aux slot */
-	if (le32_to_cpu(req->aux_size) > 0) {
-		uint32_t aux_slot = le32_to_cpu(req->shm_aux_slot);
-		uint32_t aux_size = le32_to_cpu(req->aux_size);
-		if (!slot_valid(nv, aux_slot) || aux_size > nv->slot_size) {
-			resp_msg.resp.status = cpu_to_le32(EINVAL);
-			goto send;
-		}
-		ctx.aux_buf  = slot_ptr(nv, aux_slot);
-		ctx.aux_size = aux_size;
-	}
-
-	/* Dispatch to the appropriate handler */
-	ret = nvkvm_dispatch_ioctl(&ctx, cmd);
-	if (ret < 0) {
-		resp_msg.resp.status = cpu_to_le32((uint32_t)-ret);
-		resp_msg.resp.retval = 0;
-	} else {
-		resp_msg.resp.status = 0;
-		resp_msg.resp.retval = cpu_to_le64((uint64_t)ret);
-	}
-	/* params_buf was modified in-place in shared memory; no copy needed */
-
-send:
-	iov_from_buf(elem->in_sg, elem->in_num, 0,
-		     &resp_msg, sizeof(resp_msg));
-	virtqueue_push(vq, elem, sizeof(resp_msg));
-	virtio_notify(VIRTIO_DEVICE(nv), vq);
-}
 
 /* ── MMAP request handler ────────────────────────────────────────────────── */
 
