@@ -922,3 +922,125 @@ away, and a GPU-heavy kernel crosses PCIe on every access. For nvkvm's compute
 workloads that may be entirely acceptable; it should be an explicit choice, and
 `known-limitations.md` should say so plainly rather than letting users discover
 it as a performance mystery.
+
+---
+
+## 8. Is per-stream attach structural, or is it a vacuous hint we can answer?
+
+`UnifiedMemoryStreams` dies on `cudaStreamAttachMemAsync(..., cudaMemAttachSingle)`
+(§known-limitations).  The question is whether that is a real wall or a hint
+that is already unconditionally satisfied by pinned-sysmem backing.  Source
+says: **it is a hint, and against this backing it is vacuous.**
+
+### What `UVM_SET_RANGE_GROUP` actually does
+
+`uvm_api_set_range_group()` (`uvm_range_group.c:300-360`), in order:
+
+1. look the range group up; unknown id → `NV_ERR_OBJECT_NOT_FOUND`
+2. if the group is **not** migratable, every overlapping managed range must have
+   a preferred location, else `NV_ERR_INVALID_ADDRESS`
+3. **require the whole `[base, last]` to be covered by managed ranges with no
+   gaps** — `!managed_range_last || managed_range_last->end < last_address` →
+   `NV_ERR_INVALID_ADDRESS`.  *This is the check we fail.*
+4. `uvm_range_group_assign_range()` — the bookkeeping
+5. **if the group is migratable, `goto done` — an explicit early exit before any
+   page movement**
+6. otherwise migrate pages to the preferred location
+
+So for a migratable group — which is what a plain stream attach uses — the
+entire effect is step 4. No page moves, no mapping change, no visibility change.
+
+### Every consumer of group membership is a migration path
+
+Tracing what the membership is *read* for:
+
+| consumer | what it drives |
+|---|---|
+| `uvm_range_group_all_migratable`, `..._migratable_page_mask`, `..._address_migratable` (`uvm_va_block.c:11322-11327`, `:12833`) | whether pages **may migrate** |
+| `migrated_ranges` lists (`uvm_va_block.c:4145-4148`, `:8300-8303`, `uvm_va_range.c:1696-1699`) | re-checking migration policy after a change |
+| `range_map_uvm_lite_gpus`, `uvm_va_block_unmap_preferred_location_uvm_lite` (`uvm_va_range.c:1060-1061`, `:1572-1588`) | UVM-Lite preferred-location pinning |
+
+There is no consumer that affects ordering, coherence, or fault behaviour for a
+range that is permanently resident in sysmem and permanently mapped to the CPU
+and to every registered GPU.  We never migrate, so every one of them is inert.
+
+### The one place range groups carry correctness meaning is out of scope
+
+UVM-Lite is the pre-Pascal case, and the driver defines it exactly that way:
+`calc_uvm_lite_gpus_mask()` adds a GPU to the mask when
+`!uvm_processor_mask_test(&va_space->faultable_processors, gpu_id)`
+(`uvm_va_range.c:1628-1632`) — i.e. **non-faultable GPUs only**.
+
+On `concurrentManagedAccess == 0` hardware, `cudaMemAttachSingle` really did
+carry a correctness guarantee: it let the CPU touch a range while kernels ran.
+That is live on non-faulting GPUs. **nvkvm's oldest supported architecture is
+Turing** (`docs/reference/tested-platforms.md`; `ARCH_FLOOR` in
+`scripts/sweep_matrix.py` starts at `turing`), which is faultable, so UVM-Lite
+cannot arise on anything nvkvm supports.
+
+And note the direction of the difference: with our backing the CPU may *always*
+touch the range while kernels run, because it is ordinary pinned sysmem with a
+permanent CPU mapping. Answering the hint with success is **more** permissive
+than the guarantee, never less — there is no case where an application relying
+on the documented semantics gets less than it asked for.
+
+### Honest gap in the evidence
+
+The specific ioctl behind `cudaStreamAttachMemAsync` was **inferred, not
+traced**. `UVM_SET_RANGE_GROUP` fits (it is managed-only, carries a VA range at
+the offset nvkvm's schema records, and returns the observed
+`NV_ERR_INVALID_ADDRESS` → `CUDA_ERROR_INVALID_VALUE`), but so would
+`SET_PREFERRED_LOCATION` / `SET_ACCESSED_BY` / read-duplication. The conclusion
+does not depend on which: **every managed-only policy ioctl in that set is a
+migration hint, and all of them are vacuous against a range that never
+migrates.** One `LD_PRELOAD` trace on a box settles which, and should be run
+before the fix rather than after.
+
+### The rule this suggests, and its limit
+
+Answer locally the ones whose failure is **fatal**; keep returning honest errors
+for the ones an application survives. Cmd 45 met that bar; per-stream attach
+meets it too. `cudaMemAdvise` does not — its failure is visible and harmless,
+and a visible error beats a silent no-op for anything a user might need to
+diagnose. Scoping stays as it is: only ranges this fd backed itself, never
+blanket.
+
+**Not yet verified**: that `UnifiedMemoryStreams` then produces *correct output*
+rather than merely not crashing. Not crashing is not the bar.
+
+## 9. Would pooling freed ranges remove the per-allocation cost?
+
+**For allocation-heavy workloads, yes — substantially. For `UnifiedMemoryPerf`,
+no, and that is the more important half of the answer.**
+
+Per allocation the fallback currently costs 3 virtio round trips (BACK, MAP,
+UNBACK) and 4+ host ioctls (`CREATE_EXTERNAL_RANGE`, `ALLOC_OS_DESCRIPTOR` and
+`MAP_EXTERNAL_ALLOCATION` per chunk, `UVM_FREE`, RM free). Measured:
+`cuda_micro` case 5 at **1842 µs/op** for a 1 MiB alloc+touch+free.
+
+**What pooling could remove depends on whether libcuda reuses the VA.** This
+tree already answers that: the `c8ea92d` reclaim work records that *"libcuda
+reuses one address for a `cuMemAllocManaged`/`cuMemFree` loop — without it, 1
+mapping was followed by 23 fallbacks at one address"*. If the VA repeats, a pool
+keyed on `(gva, length)` can retain the external range, the descriptors and the
+mappings intact, and a repeat allocation becomes **zero host round trips** —
+the 1842 µs would collapse toward the virtio floor. If the VA does not repeat,
+only the RM object create/destroy is saved (still the most expensive host part),
+which is worth maybe 30-50%, not orders of magnitude.
+
+**But `UnifiedMemoryPerf` is not allocation-bound.** It sat in `Rl` burning
+8m30s of CPU in 8m30s of wall clock — a process blocked on virtio round trips
+would be sleeping, not spinning. Its cost is the GPU touching sysmem across
+PCIe, which pooling does not address at all. The 500× cliff there is the
+*absence of migration*, and no amount of allocation caching touches it.
+
+So pooling is worth doing for the alloc/free-loop shape and does not rescue the
+workloads that repeatedly stream a managed buffer through the GPU. It should not
+be counted on to change the merge calculus.
+
+**Cost**: retained backing is retained *pinned guest RAM*, on top of a pinning
+story that is already the headline limitation. It needs a bounded pool with
+eviction, and the bound needs documenting next to the existing reservation note.
+There is also a correctness obligation: a pooled entry must be dropped, not
+reused, if a later mmap at that VA has a different length or is not a fallback
+range, or a stale GPU mapping survives at an address the guest has repurposed.
