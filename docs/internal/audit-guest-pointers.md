@@ -21,10 +21,74 @@ the rest are open. Read this table before the detail.
 | U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
 | U-13 | UNKNOWN | open |
 | U-14 | by design | documented for completeness |
+| U-15 | HIGH | **closed by revert** — QEMU-side UVM `mmap()` at a guest-chosen host address; layout oracle. Existed only between `c8ea92d` and `2406a3c`. See below. |
 
 A separate defect found while fixing U-6 — the host driver writing past a
 `g_malloc` on every `REGISTER_CHANNEL` — is in the addendum at the end, and is
 also fixed.
+
+### U-15 — the guest chose a host mmap address (introduced and reverted the same night)
+
+`c8ea92d` made QEMU map `/dev/nvidia-uvm` at an address the guest supplied
+(`nvkvm_isolate_handlers.c:3427,3447` on that commit):
+
+```c
+void *want = (void *)(uintptr_t)req->offset;   /* GUEST-SUPPLIED */
+real = mmap(want, len, PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_FIXED_NOREPLACE, h->fd, (off_t)req->offset);
+```
+
+`req->offset` is `vma->vm_pgoff << PAGE_SHIFT` forwarded verbatim from the guest
+(`src/guest/nvkvm_mmap.c:150`), so a malicious guest names any address it likes
+by mmap'ing the device with an arbitrary `pgoff`. That is a guest pointer used
+host-side, against the invariant this audit is scoped against.
+
+**Correctly prevented: overwrite.** `MAP_FIXED_NOREPLACE` returns `EEXIST`
+rather than replacing, and the `real != want` guard catches kernels that ignore
+the flag and relocate. A guest could not land a mapping over QEMU's heap, a
+memslot, the KVM fd or an isolate socket.
+
+**Not prevented: probing.** Request an address, observe whether the range got a
+real UVM mapping or the announced anonymous-window fallback, repeat. That is an
+address-space layout oracle over the privileged QEMU process — the same
+primitive class as U-7, which was rated HIGH precisely because a distinguishable
+outcome gave a guest an address probe, and whose severity rested on being a
+stepping stone to U-1/U-2/U-4. This one is cheaper and more reliable: the signal
+is a logged, unambiguous per-range outcome rather than a status code.
+
+**Sharpening of U-6 found while checking this.** The U-6 write-up above describes
+the pageable fallthrough as UVM migrating *"the CALLER'S OWN anonymous pages"*.
+The driver's actual test is broader. `uvm_api_range_type_check()`
+(`uvm_policy.c:59-106`) takes the pageable branch whenever **no** UVM range
+covers the interval, gated on `uvm_is_valid_vma_range(mm, base, length)` — and
+that helper (`uvm_policy.c:39-57`) just walks the caller's mm with
+`find_vma_intersection()` and returns true if the interval is spanned by any run
+of VMAs. **It tests no property of the VMA at all**: the sparse window, an RM
+sysmem mapping, a memslot's backing and a mapped library all qualify equally.
+The qualifying condition is *any mapping in QEMU*, not *anonymous memory*, and
+the non-anonymous targets are the more interesting ones. U-6's containment check
+blocks all of it, so nothing is open — but the control has to stay
+unconditional, and the reason is broader than the original wording implies.
+
+Two properties in the same function are worth recording because they corroborate
+U-6's design rather than merely coexisting with it:
+
+- **Full containment is the driver's own rule too.** A partially covered
+  interval returns `UVM_API_RANGE_TYPE_INVALID`
+  (`managed_range_last->va_range.node.end < last_address`), matching
+  `uvm_va_covers()`'s deliberate refusal to stitch adjacent entries together.
+- **A non-managed range is protective.** Any covering range makes
+  `uvm_va_space_range_empty()` false, so the pageable branch is never reached;
+  an external range over an address removes it from the "treat as the caller's
+  CPU memory" path entirely.
+
+**Status: closed.** `2406a3c` reverted the mapping, so `main` makes no UVM device
+mmap and there is no guest-influenced host address left to probe. It is recorded
+here rather than dropped because the functional gap that motivated it — managed
+memory does not work without that mapping — is still open, and any future attempt
+to close it must not reintroduce this. The measured reasons a VMM-chosen address
+is *not* the way out are in
+[UVM VA decoupling](uvm-va-decoupling.md).
 
 **This document names locations, not techniques.** It deliberately contains no
 working bypass procedure for anything still open. The source is public, so it
