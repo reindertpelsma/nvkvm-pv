@@ -484,6 +484,17 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
     if (down && s->ctrl_down && s->alt_down &&
         (code == KEY_G || code == KEY_F)) {
         bit_set(nb_consumed, code, true);
+        /*
+         * TURNING EITHER ON CANCELS A DIALOG.  Grabbing while a host dialog is
+         * up, or going fullscreen over it, are contradictory states; the later
+         * action wins rather than leaving the two to fight.  Done before the
+         * state changes so the backend sees a consistent world.
+         */
+        if (s->sess->ops->dismiss_dialog &&
+            ((code == KEY_G && !s->grabbed) ||
+             (code == KEY_F && !s->fullscreen))) {
+            s->sess->ops->dismiss_dialog(s->sess);
+        }
         if (code == KEY_G) {
             nb_set_grab(s, !s->grabbed);
         } else {
@@ -613,6 +624,19 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
 {
     nb_emit(s, NVKVM_BROKER_EV_RELEASE, 0, 0,
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
+}
+
+bool nb_sink_has_client(const struct nb_sink *s)
+{
+    return s && s->client_fd >= 0;
+}
+
+void nb_sink_force_ungrab(struct nb_sink *s)
+{
+    if (s && s->grabbed) {
+        nb_log("dropping the grab: the broker is showing its own UI");
+        nb_set_grab(s, false);
+    }
 }
 
 void nb_sink_set_fullscreen(struct nb_sink *s, bool on)

@@ -1064,7 +1064,16 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         return;
     }
     cur_build(w);
-    if (w->current >= 0) {
+    if (w->dlg_open) {
+        /*
+         * THE DIALOG IS HOST UI AND ALWAYS HAS A POINTER, exactly like the
+         * title bar.  It can be up WHILE a guest buffer is on the surface, so
+         * it has to be tested before the guest-content case below -- otherwise
+         * the user is asked a question with four buttons and given no cursor
+         * to answer it with.
+         */
+        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+    } else if (w->current >= 0) {
         /* Guest content: it composites its own cursor, so ours must go. */
         wl_pointer_set_cursor(w->ptr, serial, NULL, 0, 0);
     } else {
@@ -1254,6 +1263,7 @@ static void dlg_hide(struct nb_wl *w)
     w->dlg_open = false;
     w->dlg_hover = w->dlg_press = -1;
     w->ptr_on_dlg = false;
+    cur_apply(w, w->last_serial);   /* back to whatever the content wants */
     if (w->dlg_surf) {
         wl_surface_attach(w->dlg_surf, NULL, 0, 0);
         wl_surface_commit(w->dlg_surf);
@@ -1293,10 +1303,28 @@ static void dlg_show(struct nb_wl *w)
     if (w->dlg_open) {
         return;
     }
+    /*
+     * NOTHING TO ASK ABOUT WITH NO VM.  Over the placeholder there is no guest
+     * to shut down and no client to defer the policy to, so the four-way
+     * question is meaningless -- X just closes the display, which is what it
+     * has always meant when nobody is connected.
+     */
+    if (!nb_sink_has_client(w->sink)) {
+        nb_log("close: no VM is connected, so there is nothing to ask about");
+        w->quit = true;
+        return;
+    }
     if (!w->shm || !w->subcomp || !w->comp) {
         w->quit = true;         /* no way to ask; the old behaviour */
         return;
     }
+    /*
+     * DROP THE GRAB BEFORE SHOWING HOST UI.  A dialog the user cannot click
+     * because the pointer is locked to the guest, in front of a guest that is
+     * swallowing the keyboard, is exactly the state a grab is hardest to get
+     * out of.  Done before the dialog maps, not after.
+     */
+    nb_sink_force_ungrab(w->sink);
     if (!w->dlg_surf) {
         w->dlg_surf = wl_compositor_create_surface(w->comp);
         if (!w->dlg_surf) {
@@ -1348,6 +1376,7 @@ static void dlg_show(struct nb_wl *w)
     }
     w->dlg_open = true;
     w->dlg_hover = w->dlg_press = -1;
+    cur_apply(w, w->last_serial);   /* give the pointer back over the content */
     nb_log("close: asking what to do (ACPI / force off / display only / cancel)");
     dlg_commit(w);
 }
@@ -1461,6 +1490,12 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
     nb_placeholder_paint(px, (unsigned)wd, (unsigned)ht, (unsigned)wd,
                          "NVKVM DISPLAY BROKER", "WAITING FOR A VM");
     return 0;
+}
+
+/* ops->dismiss_dialog: the broker took a state that contradicts the dialog. */
+static void wl_dismiss_dialog(struct nb_session *s)
+{
+    dlg_hide(s->priv);
 }
 
 static int wl_show_idle(struct nb_session *s)
@@ -1746,7 +1781,16 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         return;
     }
     if (w->dlg_open) {
-        return;                 /* modal: nothing outside it reaches the guest */
+        /*
+         * A CLICK OUTSIDE CANCELS.  Standard modal behaviour, and it is what
+         * stops the dialog ever being a trap: whatever else is confusing,
+         * clicking away from it always works.  The click is consumed, never
+         * forwarded -- it was aimed at host UI, not at the guest.
+         */
+        if (state) {
+            dlg_hide(w);
+        }
+        return;
     }
     if (w->bd_hot >= 0) {
         if (state && w->toplevel && w->seat) {
@@ -2974,6 +3018,7 @@ static const struct nb_session_ops wl_ops = {
     .commit = wl_commit,
     .resize = wl_resize,
     .show_idle = wl_show_idle,
+    .dismiss_dialog = wl_dismiss_dialog,
 };
 
 struct nb_session *nb_session_wayland(const struct nb_config *cfg)

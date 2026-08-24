@@ -202,6 +202,13 @@ bool nb_sink_close_request(struct nb_sink *s, int action);
  * at startup -- and the F_FULLSCREEN flag on every packet has to be the truth,
  * not our last request, because the client keys a guest mode switch off it. */
 void nb_sink_set_fullscreen(struct nb_sink *s, bool on);
+/* Is a VMM actually connected?  A backend asking "is there anything here to
+ * shut down" -- with no client there is no policy to defer to. */
+bool nb_sink_has_client(const struct nb_sink *s);
+/* Drop the grab because the broker is about to show host UI.  A host dialog
+ * while the guest holds the keyboard is incoherent, and it is the state a
+ * stuck grab is least recoverable from. */
+void nb_sink_force_ungrab(struct nb_sink *s);
 void nb_sink_bye(struct nb_sink *s, int reason);
 
 /* ── session backends ────────────────────────────────────────────────────── */
@@ -242,6 +249,13 @@ struct nb_session_ops {
      * arrives, which is what every backend did before.
      */
     int  (*show_idle)(struct nb_session *s);
+    /*
+     * Cancel any modal UI the backend is showing.  OPTIONAL -- may be NULL,
+     * and is on the X11 backend, which draws no dialog.  Called when the
+     * broker takes a state that contradicts one (grab on, fullscreen on):
+     * the later action wins, rather than leaving two modes fighting.
+     */
+    void (*dismiss_dialog)(struct nb_session *s);
 };
 
 struct nb_session {
