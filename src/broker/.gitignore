@@ -7,3 +7,4 @@ nvkvm-broker-relay
 nvkvm-broker-dmabuf-src
 test-utf8
 test/utf8_extracted.inc
+*.d
