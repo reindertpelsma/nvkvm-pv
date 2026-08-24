@@ -52,3 +52,9 @@ tests/unit/test_stub_ptr_sanitize
 # generated at build time by tests/unit/Makefile (the U-5 function, extracted
 # from src/stub/nvkvm_stub.c so the test cannot drift from the code it pins)
 tests/unit/stub_sanitize.inc
+
+# U-9 (tests/unit/test_stub_window.c): the compiled suite, plus the window gate
+# and the window allocator, extracted from real source at build time.
+tests/unit/test_stub_window
+tests/unit/stub_window.inc
+tests/unit/win_alloc.inc

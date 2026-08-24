@@ -113,6 +113,12 @@
 #define MAP_ANONYMOUS  0x20
 #define MAP_GROWSDOWN  0x0100
 #endif
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE  0x4000
+#endif
+#ifndef PROT_NONE
+#define PROT_NONE      0x0
+#endif
 #ifndef MAP_SHARED
 #define MAP_SHARED     0x01
 #endif
@@ -424,6 +430,120 @@ static void *stub_mmap(void *a, size_t l, int p, int f, int fd, off_t o)
 static long stub_munmap(void *a, size_t l)
 {
 	return sc2(__NR_munmap, (long)a, (long)l);
+}
+
+/* ── The guest-mapping window (audit U-9; hardens the A-1 class) ────────────
+ *
+ * The isolate's address space is INTENTIONALLY shared with the guest in
+ * places -- the memfd MAP_FIXED aliasing is what lets pin_user_pages() on the
+ * stub's task find pages that alias guest userspace (U-14).  So a guest-
+ * directed mapping existing here is not the bug.  The bug was that nothing
+ * distinguished "the region the guest is supposed to reach" from the
+ * isolate's own text, stack and allocations: ISOLATE_CMD_MMAP took an
+ * address and MAP_FIXED'd there, full stop.
+ *
+ * This is that distinction, made structural.  One PROT_NONE MAP_NORESERVE
+ * reservation is taken as the first act of main(), before anything else in
+ * this process maps.  From then on:
+ *
+ *   - the kernel's mmap allocator can never hand any of it to the stub's own
+ *     anonymous allocations (ring region, job blobs, worker stacks), because
+ *     it is a live VMA;
+ *   - every guest-directed mapping is placed inside it by QEMU's window
+ *     allocator and REFUSED here if it is not (never clamped);
+ *   - so an address the host has not placed cannot land on stub-private
+ *     memory even if some future path forgets to check.
+ *
+ * PLACEMENT is deliberately left to the kernel: we pass addr=NULL, so the
+ * window inherits the stub's own mmap-region entropy (measured 32 bits of
+ * mmap_rnd on the reference host) instead of sitting at a constant a guest
+ * could predict.  Hardcoding a base would have thrown away exactly the ASLR
+ * that making the stub a real static-PIE was for.  QEMU learns the base over
+ * the command socket (ISOLATE_CMD_WINDOW_INFO) and never tells the guest.
+ *
+ * SIZE: 1 TiB.  The ceiling on live guest-directed bytes in one isolate is
+ * the VM-wide sparse GPA window (128 GiB, nvkvm_mmap_host.c) -- nothing can
+ * be mapped into an isolate without a GPA extent behind it -- and on top of
+ * that QEMU reserves up to NVKVM_MIG_MAX_RANGE (2 GiB) of window VA per
+ * in-flight OS-descriptor registration so the migration's 2 MiB chunks land
+ * contiguously.  1 TiB clears both with room to spare, so the window can
+ * never become the binding constraint (a guest cannot turn "window full"
+ * into a denial the 128 GiB GPA ceiling does not already impose).  It costs
+ * one VMA and no memory, and it removes 1 TiB from the 128 TiB the stub's
+ * own allocator draws from -- 0.011 bits of ASLR entropy.
+ */
+
+/* NVKVM_STUB_WINDOW_BEGIN -- extracted verbatim into tests/unit by the
+ * stub_window.inc rule.  Everything between the markers must stay free of
+ * syscalls and stub-only helpers so it compiles in a hosted test binary. */
+#define STUB_WINDOW_SIZE  (1024ULL << 30)
+
+static uint64_t g_win_base;   /* 0 until stub_window_init() succeeds */
+static uint64_t g_win_size;
+
+/*
+ * Is [addr, addr+len) entirely inside the window?
+ *
+ * Fails closed on every degenerate input: no window yet, zero length, or a
+ * u64 wrap.  `addr + len` is computed only after the wrap test, and the
+ * upper bound is written as a subtraction so it cannot wrap either.
+ */
+static int stub_window_contains(uint64_t addr, uint64_t len)
+{
+	if (!g_win_base || !g_win_size)   /* no window => nothing is inside it */
+		return 0;
+	if (!len)
+		return 0;
+	if (addr + len < addr)            /* u64 wrap */
+		return 0;
+	if (addr < g_win_base)
+		return 0;
+	if (len > g_win_size)
+		return 0;
+	return addr <= g_win_base + (g_win_size - len);
+}
+/* NVKVM_STUB_WINDOW_END */
+
+/*
+ * Take the reservation.  Called from main() before any other mapping this
+ * process makes, and FATAL if it fails: without the window there is no way to
+ * bound a guest-directed mapping, and an isolate that cannot enforce that
+ * must not run.  MAP_NORESERVE + PROT_NONE means no commit accounting and no
+ * pages -- a 1 TiB reservation is one VMA.
+ */
+static int stub_window_init(void)
+{
+	void *p = stub_mmap(NULL, (size_t)STUB_WINDOW_SIZE, PROT_NONE,
+			    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+			    -1, 0);
+	if (p == MAP_FAILED) {
+		fs_dprintf(STDERR_FD,
+			   "nvkvm_stub: guest-mapping window reservation "
+			   "(%llu GiB) failed\n",
+			   (unsigned long long)(STUB_WINDOW_SIZE >> 30));
+		return -1;
+	}
+	g_win_base = (uint64_t)(uintptr_t)p;
+	g_win_size = STUB_WINDOW_SIZE;
+	return 0;
+}
+
+/*
+ * Give an extent back to the reservation.
+ *
+ * NOT a plain munmap.  munmap would punch a hole in the PROT_NONE VMA, and a
+ * hole is exactly what the kernel's mmap allocator hands out next -- so the
+ * stub's own ring/blob/stack allocations would start landing inside the
+ * window, and the window would stop meaning anything.  Re-establishing
+ * PROT_NONE over the extent with MAP_FIXED both unmaps the old mapping and
+ * restores the reservation in one syscall.  Same reasoning as QEMU's
+ * nvkvm_window_restore_anon() on the sparse GPA window.
+ */
+static void stub_window_reclaim(uint64_t addr, uint64_t len)
+{
+	(void)stub_mmap((void *)(uintptr_t)addr, (size_t)len, PROT_NONE,
+			MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE |
+			MAP_FIXED, -1, 0);
 }
 
 static long stub_close(int fd) { return sc1(__NR_close, fd); }
@@ -2189,16 +2309,60 @@ static void handle_mmap(struct isolate_cmd_mmap *cmd)
 	struct isolate_resp_mmap r = { .type = ISOLATE_RESP_MMAP };
 	if (fd < 0) { r.retval = -EBADF; locked_send(&r, sizeof(r)); return; }
 
+	/*
+	 * U-9.  This used to take cmd->gva -- the guest process's own VA for
+	 * its /dev/nvidia* mapping, carried untouched from the virtqueue
+	 * through nvkvm_req_mmap_on_isolate() -- and MAP_FIXED there.  Nothing
+	 * bounded it, so an arbitrary guest address landed on whatever the
+	 * stub had at that address: its text, its stack, its job blobs.
+	 *
+	 * The target is now a window VA that QEMU's per-isolate allocator
+	 * chose (cmd->win_va), and the containment test below is what makes
+	 * that a guarantee rather than a convention.  REJECT, never clamp: a
+	 * clamped mapping would be at an address the caller does not know it
+	 * has, which is a worse outcome than a failed mmap.
+	 */
+	if (!stub_window_contains(cmd->win_va, cmd->length)) {
+		fs_dprintf(STDERR_FD,
+			   "nvkvm: DENY mmap 0x%llx+0x%llx outside the "
+			   "guest-mapping window (U-9)\n",
+			   (unsigned long long)cmd->win_va,
+			   (unsigned long long)cmd->length);
+		r.retval = -EFAULT;
+		locked_send(&r, sizeof(r));
+		return;
+	}
+
 	uint32_t flags = cmd->map_flags | MAP_FIXED;
-	void *addr = stub_mmap((void *)(uintptr_t)cmd->gva, (size_t)cmd->length,
+	void *addr = stub_mmap((void *)(uintptr_t)cmd->win_va,
+			       (size_t)cmd->length,
 			       (int)cmd->prot, (int)flags, fd, (off_t)cmd->offset);
 	r.retval = ((uintptr_t)addr == (uintptr_t)MAP_FAILED) ? -ENOMEM : 0;
+	if (r.retval == 0)
+		r.host_va = (uint64_t)(uintptr_t)addr;
 	locked_send(&r, sizeof(r));
 }
 
 static void handle_munmap_cmd(struct isolate_cmd_munmap *cmd)
 {
-	stub_munmap((void *)(uintptr_t)cmd->gva, (size_t)cmd->length);
+	/*
+	 * U-9's other half.  Same reasoning as handle_mmap above, and the
+	 * consequence of getting it wrong is if anything more direct: an
+	 * unbounded munmap is a way to delete the stub's own mappings.
+	 *
+	 * Reclaim rather than munmap -- see stub_window_reclaim() for why a
+	 * hole in the reservation would undo the whole scheme.
+	 */
+	if (!stub_window_contains(cmd->win_va, cmd->length)) {
+		fs_dprintf(STDERR_FD,
+			   "nvkvm: DENY munmap 0x%llx+0x%llx outside the "
+			   "guest-mapping window (U-9)\n",
+			   (unsigned long long)cmd->win_va,
+			   (unsigned long long)cmd->length);
+		send_error(-EFAULT);
+		return;
+	}
+	stub_window_reclaim(cmd->win_va, cmd->length);
 	send_ok();
 }
 
@@ -2400,10 +2564,35 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		goto cleanup;
 	}
 
-	/* 9. mmap(2) at the requested host VA. */
+	/* 9. mmap(2) at the requested host VA.
+	 *
+	 * U-9, third path.  A non-zero host_va_hint is a MAP_FIXED target, so
+	 * it is subject to the window exactly as ISOLATE_CMD_MMAP is.  QEMU
+	 * passes 0 today (nvkvm_isolate_handlers.c), which means the address
+	 * is chosen by the KERNEL, not by anything guest-influenced -- that
+	 * mapping is stub-placed and legitimately sits OUTSIDE the window.
+	 *
+	 * Moving the hint==0 case into the window too would mean MAP_FIXED at
+	 * a window VA, and uvm_mmap() requires vm_start == (vm_pgoff <<
+	 * PAGE_SHIFT) (ogkm kernel-open/nvidia-uvm/uvm.c:791-795), so the
+	 * offset would have to be rewritten to match.  That is a driver-
+	 * behaviour change with no test short of a GPU run, so it is NOT done
+	 * here; see docs/internal/audit-guest-pointers.md U-9.
+	 */
 	uint32_t mmap_flags = cmd->map_flags;
-	if (cmd->host_va_hint)
+	if (cmd->host_va_hint) {
+		if (!stub_window_contains(cmd->host_va_hint, cmd->length)) {
+			fs_dprintf(STDERR_FD,
+				   "nvkvm: DENY realize host_va_hint "
+				   "0x%llx+0x%llx outside the guest-mapping "
+				   "window (U-9)\n",
+				   (unsigned long long)cmd->host_va_hint,
+				   (unsigned long long)cmd->length);
+			resp.retval = -EFAULT;
+			goto cleanup;
+		}
 		mmap_flags |= MAP_FIXED;
+	}
 	void *host_va = stub_mmap((void *)(uintptr_t)cmd->host_va_hint,
 				  (size_t)cmd->length,
 				  (int)cmd->prot, (int)mmap_flags,
@@ -2446,6 +2635,7 @@ union stub_cmd {
 	struct isolate_cmd_enter_loop       enter_loop;
 	struct isolate_cmd_present_export   present_export;
 	struct isolate_cmd_xiso_import      xiso_import;
+	struct isolate_cmd_window_info      window_info;
 };
 
 /* ── Command-buffer consumer loop (docs/design/command_buffer.md, Phase 3) ───
@@ -2817,6 +3007,16 @@ static int stub_dispatch_cmd(union stub_cmd *c, struct msghdr *msg_hdr, long n)
 	case ISOLATE_CMD_MUNMAP:
 		handle_munmap_cmd(&c->munmap_cmd);
 		return 0;
+	case ISOLATE_CMD_WINDOW_INFO: {
+		struct isolate_resp_window_info r = {
+			.type   = ISOLATE_RESP_WINDOW_INFO,
+			.retval = g_win_base ? 0 : -ENOMEM,
+			.base   = g_win_base,
+			.size   = g_win_size,
+		};
+		locked_send(&r, sizeof(r));
+		return 0;
+	}
 	case ISOLATE_CMD_POLL:
 		/* #127: arm the host os-event fd; the reader loop ppoll()s it and
 		 * sends ISOLATE_RESP_POLL_EVENT when it fires. */
@@ -3111,6 +3311,32 @@ int main(int argc, char **argv)
 #ifdef NVKVM_STUB_EMBEDDED
 	apply_relocations();
 #endif
+
+	/*
+	 * U-9: take the guest-mapping window BEFORE anything else in this
+	 * process maps.  "Before anything else" is exact here, and cheaper to
+	 * guarantee than it would be under a libc: -nostdlib -ffreestanding
+	 * means no malloc arena and no C runtime constructors, so the only
+	 * things already placed are what the kernel's ELF loader and fexecve
+	 * set up (image, stack, vdso/vvar) -- none of which we can move, and
+	 * all of which the kernel's mmap allocator will route this reservation
+	 * around.  Everything the stub allocates for itself from here on (the
+	 * ring region, job blobs, worker stacks, the realize intent buffer)
+	 * comes from mmap(NULL, ...) AFTER this point, so the kernel cannot
+	 * place any of it inside the reservation.  That ordering is the whole
+	 * invariant; do not move this call down.
+	 *
+	 * The one thing that must precede it is apply_relocations() above --
+	 * until that has run, g_win_base is not addressable in a static-PIE
+	 * build.
+	 *
+	 * Fail CLOSED.  An isolate that cannot bound guest-directed mappings
+	 * has no way to keep them off its own text and stack, so it must not
+	 * run at all rather than run without the bound.
+	 */
+	if (stub_window_init() != 0)
+		return 1;
+
 	for (int i = 1; i < argc && argv && argv[i]; i++) {
 		if (stub_streq(argv[i], "--no-seccomp"))
 			want_seccomp = 0;

@@ -313,10 +313,14 @@ TEST(sync_mmap_munmap)
 	ret = nvkvm_isolate_send_handle(&g_it, &g_ht, iso_id, hid);
 	EXPECT_EQ(ret, 0);
 
-	/* mmap */
+	/* mmap.  U-9: the address argument is now a window VA the host
+	 * allocator picked, not the guest's; mock_stub does not model the
+	 * window, so any value round-trips here. */
+	uint64_t stub_va = 0;
 	ret = nvkvm_isolate_mmap(&g_it, iso_id, hid,
-				 /*gva=*/0x100000, /*len=*/4096,
-				 /*offset=*/0, PROT_READ, MAP_SHARED);
+				 /*win_va=*/0x100000, /*len=*/4096,
+				 /*offset=*/0, PROT_READ, MAP_SHARED,
+				 &stub_va);
 	EXPECT_EQ(ret, 0);
 
 	/* munmap */

@@ -12,3 +12,8 @@ test_stub_ptr_sanitize
 
 # Generated: the U-5 function extracted from src/stub/nvkvm_stub.c at build time.
 stub_sanitize.inc
+
+# U-9: compiled suite + the two build-time extractions it pins.
+test_stub_window
+stub_window.inc
+win_alloc.inc
