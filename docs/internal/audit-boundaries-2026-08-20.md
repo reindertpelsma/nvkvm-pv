@@ -44,6 +44,7 @@ guest kernel → guest process, VMM → anything.
 | A-17 | medium | allowlist-bypass | guest kernel → VMM | **fixed** — gates select a denied sentinel instead of being skipped |
 | A-18 | medium | missing-validation | guest kernel → VMM | **fixed** — geometry validated pre- and post-export against the real dma-buf size |
 | A-19 | low | oob read | guest kernel → VMM | **fixed** — guard corrected to `>= 52` |
+| A-21 | medium | missing ownership check | guest kernel → VMM | **fixed** — slot release gated on a per-slot live bit; fails closed. See §9 |
 | A-13 | medium | blocking-under-lock | guest process → VMM | **fixed** — EXIT sent outside `iso->lock`, `MSG_DONTWAIT` |
 | A-14 | medium | lock-order | guest kernel → VMM | **fixed** — the slot wait takes `iso->lock` for the snapshot and the re-check |
 | A-15 | medium | sandbox surface | isolate → host | **fixed** — `clone3` removed from the allowlist |
@@ -517,7 +518,82 @@ while a worker still holds `nv`, `vq` and the `VirtQueueElement` it was handed
 ownership of. Use-after-free on teardown. Found by reading, not yet reproduced;
 recorded here because it was previously written down nowhere at all.
 
-### A-21 — `nvkvm_kvm_slot_release()` does not validate the slot (OPEN)
+### A-21 — `nvkvm_kvm_slot_release()` does not validate the slot (**FIXED**, 2026-08-24)
 
 It does not check that the slot being released was ever allocated. Same
 provenance as A-20: found by reading, recorded so it is not lost.
+
+**What was missing, precisely.** The range check was already there —
+`slot < NVKVM_KVM_SLOT_BASE || slot >= BASE + COUNT` returns early. What was
+absent is any notion of *ownership*: a slot released twice, or a slot number
+that was never handed out, was pushed onto `kvm_slot_free_stack` regardless.
+
+**Why that is a boundary bug and not an accounting one.** The freelist then
+holds N copies of one slot number, so the next N `nvkvm_kvm_slot_alloc()` calls
+return the **same KVM memslot** to N unrelated mappings. Each calls
+`KVM_SET_USER_MEMORY_REGION` on it with its own GPA and its own host VA, and
+the last writer wins — so a guest physical range ends up backed by a host VA
+belonging to a *different isolate's* device memory. That is cross-isolate
+memory aliasing arranged entirely inside the slot allocator, underneath every
+ownership gate above it (A-6's `session_has_isolate` checks, A-12's extent
+checks). Teardown compounds it: whichever mapping unmaps first deletes the
+memslot the other still believes it owns, and releases the number again.
+
+**Fixed** with a per-slot live bit (`kvm_slot_live[]`, under `kvm_slot_lock`),
+and both gates **fail closed** — reject and log, never clamp, never repair the
+count. Same shape and same `nvkvm: DENY …(A-21)` logging as the A-1 and U-3
+gates in `nvkvm_isolate_handlers.c`:
+
+- **release, range** — already present, now *says so*. Silence is how a
+  sentinel that should have been filtered (`NVKVM_IN_WINDOW_SLOT` is `-2`) or
+  an uninitialised `kvm_slot` stays invisible.
+- **release, ownership** — the gate this finding is about. A slot that is not
+  currently live is refused and stays out of the freelist. Leaking one number
+  out of 448 is bounded and observable; putting one in twice is not.
+- **alloc, ownership** — belt and braces. If a duplicate ever reaches the
+  freelist by a route this does not anticipate, the second hand-out is refused
+  rather than silently aliased, and the duplicate is dropped rather than pushed
+  back.
+- `nvkvm_kvm_slot_rejects()` exposes the refusal count. Non-zero means somebody
+  is double-releasing, which nothing could previously observe.
+
+**One adjacent hazard fixed with it, and it was worse than A-21 itself.**
+`kvm_remove_memory_region()` issued `KVM_SET_USER_MEMORY_REGION` with
+`memory_size = 0` — which **deletes** the named memslot — before calling
+release, and checked nothing. Every teardown path is written
+`if (kvm_slot >= 0)`, and `struct nvkvm_mmap_region` is `g_new0`'d, so its
+`kvm_slot` is **0** until `nvkvm_mmap_map_to_guest()` fills it in. Slot 0 is
+guest RAM. The range check inside `release` would have caught the release but
+not the ioctl, so the check now sits before the ioctl too. **Not reachable at
+HEAD** — a region only reaches a session's mmap list after `map_to_guest` has
+set a real slot or `-1` — so this is a latent hazard, recorded rather than
+claimed as a live bug. It is the P-15 pattern from
+[`audit-prerelease-2026-08-21.md`](audit-prerelease-2026-08-21.md) exactly: a
+zero-initialised field with a `>= 0` sentinel test.
+
+**Pinned by `tests/unit/test_kvm_slot.c`** (12 cases), and the property it
+measures is deliberately *not* "release logs something" — a test that counted
+refusals would pass against a build that logs and then aliases anyway, which is
+the false pass the A-1 work hit twice. What it asserts is the invariant the
+finding is actually about: **no two live allocations ever share a slot number,
+for any sequence of releases, valid or not.** Every hostile-release case ends
+by allocating and checking the results are pairwise distinct and in range.
+
+The allocator's own code is **extracted from `nvkvm_mmap_host.c` at build
+time** between `NVKVM_KVM_SLOT_POOL_BEGIN/_END` markers rather than copied into
+the test — the same technique as `test_stub_ptr_sanitize.c`, for the same
+reason. Lose the markers and the `.inc` is empty and the test fails to link.
+
+**Proved to fail with the fix reverted.** Compiled against the pre-fix pool
+verbatim, with only the two new symbols added so the difference under test is
+the gate and not a compile error: **6/12, exit 1**, and the headline case reads
+
+```
+FAIL a double release cannot alias two allocations   released 64 twice, then got 64 and 64
+```
+
+which is the aliasing primitive, printed. With the fix: 12/12.
+
+Whole suite green: 84 named PASS + 618 allowlist + 17 sanitize + 12 slot, zero
+failures. Not runtime-tested against a GPU; the change is confined to the slot
+bookkeeping and adds no ioctl.
