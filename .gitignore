@@ -48,7 +48,10 @@ tests/unit/test_ctrl_gate
 tests/unit/mock_stub
 tests/unit/test_nvkms_allowlist
 tests/unit/test_stub_ptr_sanitize
+tests/unit/test_transport_ready
 
 # generated at build time by tests/unit/Makefile (the U-5 function, extracted
 # from src/stub/nvkvm_stub.c so the test cannot drift from the code it pins)
 tests/unit/stub_sanitize.inc
+# ...and the guest device-presence guard, extracted from src/guest/nvkvm_virtio.c
+tests/unit/transport_ready.inc

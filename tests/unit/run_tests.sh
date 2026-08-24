@@ -46,6 +46,7 @@ declare -A TALLY_SUITES=(
     [test_tables]=17
     [test_nvkms_allowlist]=618
     [test_stub_ptr_sanitize]=17
+    [test_transport_ready]=6
 )
 
 # Suites with their own ad-hoc output.  Value is a line that must appear.
@@ -116,7 +117,7 @@ ISOLATE_KNOWN_FAIL=""
 # is environment-dependent, name it here WITH the reason.
 ISOLATE_ENV_DEPENDENT=""
 
-ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize mock_stub"
+ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_transport_ready mock_stub"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }
@@ -223,7 +224,11 @@ fi
 
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "UNIT SUITE OK — all 8 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
+    # Counted, not hardcoded: the number said "8" for a while after a ninth
+    # suite was added, which is exactly the kind of stale claim this file exists
+    # to prevent.
+    n_suites=$(( ${#TALLY_SUITES[@]} + ${#MARKER_SUITES[@]} ))
+    echo "UNIT SUITE OK — all ${n_suites} suites built and ran; ${ISOLATE_TOTAL} isolate cases"
     if [ -n "$ISOLATE_KNOWN_FAIL" ]; then
         echo "ran with exactly the ${ISOLATE_KNOWN_FAIL// /, } known failures."
     else

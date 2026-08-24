@@ -36,7 +36,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_transport_ready
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -85,6 +85,18 @@ stub_sanitize.inc: ../../src/stub/nvkvm_stub.c
 test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
 	$(CC) $(CFLAGS) -I. -o $@ test_stub_ptr_sanitize.c
 
+# The device-presence guard.  src/guest/ is kernel code and cannot be linked
+# into a hosted binary, so extract the one predicate under test the same way the
+# stub's is extracted above: this suite pins the REAL function, and an empty
+# extraction fails the compile on an undefined symbol rather than passing
+# vacuously.  -Wno-unused-function because the extracted text may carry more
+# than the test calls.
+transport_ready.inc: ../../src/guest/nvkvm_virtio.c
+	awk '/^bool nvkvm_transport_ready/,/^}$$/' $< > $@
+
+test_transport_ready: test_transport_ready.c transport_ready.inc
+	$(CC) $(CFLAGS) -I. -Wno-unused-function -o $@ test_transport_ready.c
+
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
 # runtime until 2026-08-21, and the note that used to sit here blamed "isolate
@@ -94,7 +106,7 @@ test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_transport_ready
 	./test_dispatch
 	./test_frontend
 	./test_handle
@@ -104,6 +116,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_ctrl_gate
 	./test_nvkms_allowlist
 	./test_stub_ptr_sanitize
+	./test_transport_ready
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -116,4 +129,4 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc
