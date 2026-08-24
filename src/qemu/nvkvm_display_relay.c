@@ -88,6 +88,9 @@ typedef struct NvkvmRelay {
 
     bool        grabbed;
     uint64_t    n_sent, n_dropped;
+    /* ATTACHed but the COMMIT could not be written.  A distinct failure from
+     * n_dropped -- see the comment at the counter's only increment. */
+    uint64_t    n_uncommitted;
 } NvkvmRelay;
 
 static NvkvmRelay *nvkvm_relay;
@@ -177,8 +180,9 @@ static void relay_drop(NvkvmRelay *r, const char *why)
     aio_bh_schedule_oneshot(qemu_get_aio_context(), relay_close_bh,
                             (void *)(intptr_t)fd);
     error_report("nvkvm-broker: %s; the display and input are gone "
-                 "(%" PRIu64 " frames relayed, %" PRIu64 " dropped)",
-                 why, r->n_sent, r->n_dropped);
+                 "(%" PRIu64 " frames relayed, %" PRIu64 " dropped, "
+                 "%" PRIu64 " attached without a commit)",
+                 why, r->n_sent, r->n_dropped, r->n_uncommitted);
 }
 
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
@@ -188,6 +192,7 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
 {
     NvkvmRelay *r = nvkvm_relay;
     struct nvkvm_broker_cmd cmd;
+    uint32_t cmd_seq = 0;
     int rc;
 
     if (!r || r->sock < 0 || dmabuf_fd < 0) {
@@ -227,6 +232,7 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     cmd.fourcc = fourcc;
     cmd.modifier = modifier;
     cmd.seq = (uint32_t)r->n_sent;
+    cmd_seq = cmd.seq;
     rc = relay_send(r, &cmd, dmabuf_fd);
     if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
         /*
@@ -252,7 +258,28 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = NVKVM_BROKER_CMD_COMMIT;
     rc = relay_send(r, &cmd, -1);
-    if (rc != 0 && rc != -EAGAIN && rc != -EWOULDBLOCK) {
+    if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
+        /*
+         * ATTACH went out and its COMMIT did not.  This is NOT the same as
+         * dropping the frame before ATTACH: over there the broker never heard
+         * about the buffer, whereas here it has imported it, staged it as
+         * `pending`, and will go on showing the PREVIOUS frame until the next
+         * COMMIT arrives.  So the screen holds a stale frame for one interval
+         * and the buffer is pinned out of the broker's LRU meanwhile.
+         *
+         * It self-corrects on the next flip, which is why this is a counter
+         * and not a disconnect -- but it was previously swallowed entirely,
+         * counted nowhere and logged nowhere, which made exactly this
+         * "occasional stale frame" invisible to anyone looking for it.
+         */
+        r->n_uncommitted++;
+        if (r->n_uncommitted <= 4 || (r->n_uncommitted % 256) == 0) {
+            RELAY_LOG("the broker did not drain: frame %u attached but not "
+                      "committed, so the display holds the previous frame "
+                      "(%" PRIu64 " so far)",
+                      cmd_seq, r->n_uncommitted);
+        }
+    } else if (rc != 0) {
         relay_drop(r, "the broker socket failed on commit");
     }
     r->n_sent++;

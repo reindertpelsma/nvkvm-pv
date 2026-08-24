@@ -74,6 +74,7 @@
 #endif
 
 int nb_verbose;
+int nb_trace_frames;
 
 /* ── logging ─────────────────────────────────────────────────────────────── */
 
@@ -750,6 +751,7 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     d->fourcc   = c->fourcc;
     d->modifier = c->modifier;
     d->bpp      = bpp;
+    d->seq      = c->seq;
     return 0;
 }
 
@@ -1244,6 +1246,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--allow-group")) { NEEDVAL();
             if (add_group(&cfg, v)) { return 2; } }
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
+        else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
         else if (!strcmp(a, "--scale")) { cfg.scale_mode = 1; }
         else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = 0; }
