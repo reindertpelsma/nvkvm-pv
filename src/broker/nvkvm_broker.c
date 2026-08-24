@@ -1126,7 +1126,80 @@ void nb_sink_readable(struct nb_sink *s)
 
 /* ── listener ────────────────────────────────────────────────────────────── */
 
-static int nb_listen(const char *path)
+/*
+ * SOCKET ACTIVATION, without linking libsystemd.
+ *
+ * The protocol is three environment variables and a convention, so the
+ * dependency buys nothing: LISTEN_PID must be OUR pid (that is what stops a
+ * parent's variables being inherited by a grandchild and misread), LISTEN_FDS
+ * is a count, and the descriptors start at fd 3.
+ *
+ * Returns the fd, or -1 when we were not socket-activated.  The variables are
+ * cleared either way so nothing downstream can misread them.
+ */
+#define NB_LISTEN_FDS_START 3
+
+static int nb_listen_fds_take(void)
+{
+    const char *pid_s = getenv("LISTEN_PID");
+    const char *fds_s = getenv("LISTEN_FDS");
+    long pid, n;
+    int fd = -1;
+
+    if (pid_s && fds_s) {
+        pid = strtol(pid_s, NULL, 10);
+        n   = strtol(fds_s, NULL, 10);
+        if (pid == (long)getpid() && n >= 1) {
+            if (n > 1) {
+                nb_log("socket activation passed %ld descriptors; using the "
+                       "first and ignoring the rest", n);
+            }
+            fd = NB_LISTEN_FDS_START;
+        } else if (pid != (long)getpid()) {
+            nb_err("LISTEN_PID is %ld but we are %ld — not socket-activated, "
+                   "ignoring inherited activation variables",
+                   pid, (long)getpid());
+        }
+    }
+    unsetenv("LISTEN_PID");
+    unsetenv("LISTEN_FDS");
+    unsetenv("LISTEN_FDNAMES");
+    return fd;
+}
+
+/*
+ * Adopt a listening fd we did not create (socket activation, or --socket-fd).
+ * It is already bound and listening, so we must NOT bind, chmod or unlink it --
+ * and on shutdown must not remove a path we do not own.
+ */
+static int nb_adopt_fd(int fd)
+{
+    struct stat st;
+    int val = 0;
+    socklen_t len = sizeof(val);
+
+    if (fstat(fd, &st) < 0 || !S_ISSOCK(st.st_mode)) {
+        nb_err("--socket-fd %d is not a socket", fd);
+        return -EINVAL;
+    }
+    /* Refuse anything that is not already listening: adopting a connected or
+     * unbound socket would fail later and much less clearly. */
+    if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &val, &len) < 0 || !val) {
+        nb_err("--socket-fd %d is not a listening socket", fd);
+        return -EINVAL;
+    }
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 ||
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+        nb_err("--socket-fd %d: cannot set CLOEXEC/NONBLOCK: %s",
+               fd, strerror(errno));
+        return -errno;
+    }
+    nb_log("using a pre-bound listening socket (fd %d); its path, mode and "
+           "ownership are whoever created it's business, not ours", fd);
+    return fd;
+}
+
+static int nb_listen(const char *path, const struct nb_config *cfg)
 {
     struct sockaddr_un sa;
     struct stat st;
@@ -1159,7 +1232,7 @@ static int nb_listen(const char *path)
 
     /* bind() applies the umask to the socket's mode, so set it here rather
      * than chmod()ing afterwards and leaving a window where it is 0777. */
-    old = umask(0177);
+    old = umask((mode_t)(~cfg->socket_mode & 0777));
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         int e = errno;
         umask(old);
@@ -1170,11 +1243,36 @@ static int nb_listen(const char *path)
     umask(old);
     /* Belt and braces: umask can only clear bits, and a hostile umask cannot
      * ADD any, but an unusual filesystem could.  Assert the mode we want. */
-    if (chmod(path, 0600) < 0) {
-        nb_err("chmod 0600 %s: %s", path, strerror(errno));
+    if (chmod(path, (mode_t)cfg->socket_mode) < 0) {
+        nb_err("chmod %04o %s: %s", cfg->socket_mode, path, strerror(errno));
         close(fd);
         unlink(path);
         return -errno;
+    }
+    /*
+     * The group has to be set for --socket-mode 0660 to mean anything: a mode
+     * that grants the group access is useless while the group is the broker
+     * user's own.  Done after chmod so a failure leaves the tighter mode.
+     */
+    if (cfg->socket_group) {
+        struct group *gr = getgrnam(cfg->socket_group);
+
+        if (!gr) {
+            nb_err("--socket-group %s: no such group", cfg->socket_group);
+            close(fd);
+            unlink(path);
+            return -EINVAL;
+        }
+        if (chown(path, (uid_t)-1, gr->gr_gid) < 0) {
+            nb_err("chgrp %s %s: %s (you must own the socket and be a member "
+                   "of that group, or be root)",
+                   cfg->socket_group, path, strerror(errno));
+            close(fd);
+            unlink(path);
+            return -errno;
+        }
+        nb_log("socket group is %s (gid %u)", cfg->socket_group,
+               (unsigned)gr->gr_gid);
     }
     if (listen(fd, 4) < 0) {
         nb_err("listen: %s", strerror(errno));
@@ -1198,6 +1296,17 @@ static bool nb_peer_allowed(int fd, const struct nb_config *cfg,
     int i;
 
     memset(out, 0, sizeof(*out));
+    /*
+     * --no-peercred.  Documented opt-out for the case the credential check
+     * cannot answer: a peer behind a proxy, or a userns where the uid we see
+     * is not the uid that matters.  It hands the whole decision to the
+     * socket's filesystem permissions, which is why the two are validated
+     * together at startup and the wide-open combination is refused.
+     */
+    if (cfg->no_peercred) {
+        (void)getsockopt(fd, SOL_SOCKET, SO_PEERCRED, out, &len);
+        return true;
+    }
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, out, &len) < 0 ||
         len != sizeof(*out)) {
         nb_err("SO_PEERCRED failed: %s", strerror(errno));
@@ -1277,7 +1386,17 @@ static void usage(void)
     fputs(
 "usage: nvkvm-display-broker --socket PATH [options]\n"
 "\n"
-"  --socket PATH        unix socket to listen on (created mode 0600)\n"
+"  --socket PATH        unix socket to listen on (mode from --socket-mode)\n"
+"  --socket-mode OCTAL  socket permissions (default 0600).  0660 with\n"
+"                       --socket-group is what lets another user connect\n"
+"  --socket-group NAME  group to own the socket; without it a group-\n"
+"                       readable mode grants nobody anything new\n"
+"  --no-peercred        serve any peer the socket permissions admit, instead\n"
+"                       of checking SO_PEERCRED against the allow list.\n"
+"                       Refused together with a world-accessible mode\n"
+"  --socket-fd N        use an already-bound listening fd instead of\n"
+"                       creating one.  LISTEN_FDS socket activation is also\n"
+"                       honoured, and takes precedence over --socket\n"
 "  --backend NAME       auto (default) | wayland | x11 | test\n"
 "  --size WxH           initial window size (default 1920x1080)\n"
 "  --title TEXT         window title\n"
@@ -1297,7 +1416,10 @@ static void usage(void)
 "The broker owns the window, the compositor connection and the input grab.\n"
 "The VMM keeps only this socket: it relays the guest's scanout dma-buf fd\n"
 "here and receives input.  It needs no EGL, no GL and no display server.\n"
-"By default root and the invoking user may connect.\n"
+"By default root and the invoking user may connect, and only they can reach\n"
+"the socket at all.  To let a DIFFERENT user's VMM connect you need both\n"
+"gates opened: --socket-mode 0660 --socket-group vmm  (the filesystem) and\n"
+"--allow-group vmm  (the credential check).\n"
 "\n"
 "A host resize never changes the guest's resolution -- it is scaled here.\n"
 "Going fullscreen does tell the guest, so it can render at the output's own\n"
@@ -1376,12 +1498,17 @@ int main(int argc, char **argv)
      * keyboard grab, so it is spelled out rather than left as "2 +". */
     struct pollfd pfd[3 + NB_MAX_SESSION_FDS];
     int listen_fd, sigfd, i, rc = 1;
+    /* We only unlink a path we created ourselves: an adopted or activated
+     * socket belongs to whoever handed it over. */
+    bool socket_is_ours = true;
     bool had_client = false;
     sigset_t mask;
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.backend = "auto";
     cfg.scale_mode = NB_SCALE_ASPECT;   /* preserve aspect, black bars */
+    cfg.socket_mode = 0600;
+    cfg.socket_fd = -1;
     cfg.title = "nvkvm";
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -1419,6 +1546,28 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
         else if (!strcmp(a, "--persist"))    { cfg.persist = true; }
+        else if (!strcmp(a, "--socket-mode")) { NEEDVAL();
+            char *end = NULL;
+            unsigned long m = strtoul(v, &end, 8);
+
+            if (!end || *end || m > 0777) {
+                nb_err("--socket-mode must be an octal mode like 0660 "
+                       "(got '%s')", v);
+                return 2;
+            }
+            cfg.socket_mode = (unsigned)m; }
+        else if (!strcmp(a, "--socket-group")) { NEEDVAL();
+            cfg.socket_group = v; }
+        else if (!strcmp(a, "--no-peercred")) { cfg.no_peercred = true; }
+        else if (!strcmp(a, "--socket-fd")) { NEEDVAL();
+            char *end = NULL;
+            long n = strtol(v, &end, 10);
+
+            if (!end || *end || n < 0 || n > 1024) {
+                nb_err("--socket-fd must be a descriptor number (got '%s')", v);
+                return 2;
+            }
+            cfg.socket_fd = (int)n; }
         else if (!strcmp(a, "--scale")) { NEEDVAL();
             if (!strcmp(v, "stretch"))     { cfg.scale_mode = NB_SCALE_STRETCH; }
             else if (!strcmp(v, "aspect")) { cfg.scale_mode = NB_SCALE_ASPECT; }
@@ -1433,7 +1582,9 @@ int main(int argc, char **argv)
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
     }
-    if (!cfg.socket_path) {
+    /* --socket is no longer the only way to get a listening socket; the check
+     * that matters happens once activation has had its say, below. */
+    if (!cfg.socket_path && cfg.socket_fd < 0 && !getenv("LISTEN_FDS")) {
         usage();
         return 2;
     }
@@ -1453,6 +1604,38 @@ int main(int argc, char **argv)
     }
 
     /* 1. put a window on the user's desktop and start reading input */
+    /*
+     * THE TWO GATES ARE VALIDATED TOGETHER, because each is only safe while
+     * the other holds.  A socket any local user can reach is fine while
+     * SO_PEERCRED decides who is served; an unchecked peer is fine while the
+     * filesystem keeps everyone else out.  BOTH open at once means any user on
+     * the machine can drive the process holding your keyboard, so it is
+     * refused rather than warned about.
+     */
+    if (cfg.no_peercred && (cfg.socket_mode & 0006)) {
+        nb_err("--no-peercred with --socket-mode %04o would let ANY local user "
+               "connect to the process that owns your display and can grab "
+               "your keyboard. Refusing. Use a group (--socket-mode 0660 "
+               "--socket-group ...) or keep the credential check.",
+               cfg.socket_mode);
+        return 2;
+    }
+    if (cfg.no_peercred) {
+        nb_log("WARNING: --no-peercred: any peer the socket's permissions let "
+               "through is served. The socket is mode %04o%s%s.",
+               cfg.socket_mode, cfg.socket_group ? ", group " : "",
+               cfg.socket_group ? cfg.socket_group : "");
+    }
+    if (cfg.socket_mode & 0006) {
+        nb_log("NOTE: socket mode %04o is world-accessible; only SO_PEERCRED "
+               "is keeping other users out.", cfg.socket_mode);
+    }
+    if (cfg.socket_group && !(cfg.socket_mode & 0060)) {
+        nb_log("NOTE: --socket-group %s has no effect at mode %04o — the "
+               "group has no access. Did you mean --socket-mode 0660?",
+               cfg.socket_group, cfg.socket_mode);
+    }
+
     sess = nb_session_open(&cfg);
     if (!sess) {
         return 1;               /* the backend already said why */
@@ -1465,12 +1648,39 @@ int main(int argc, char **argv)
     }
 
     /* 2. bind the socket */
-    listen_fd = nb_listen(cfg.socket_path);
+    /*
+     * Socket activation wins over --socket, because a manager that handed us a
+     * listening fd has already decided the path, mode and ownership; binding
+     * our own would quietly ignore all three.
+     */
+    if (cfg.socket_fd < 0) {
+        cfg.socket_fd = nb_listen_fds_take();
+        if (cfg.socket_fd >= 0) {
+            nb_log("socket-activated: LISTEN_FDS gave us fd %d", cfg.socket_fd);
+        }
+    }
+    if (cfg.socket_fd >= 0) {
+        listen_fd = nb_adopt_fd(cfg.socket_fd);
+        socket_is_ours = false;
+    } else if (!cfg.socket_path) {
+        nb_err("--socket PATH is required (or pass --socket-fd, or use socket "
+               "activation)");
+        return 2;
+    } else {
+        listen_fd = nb_listen(cfg.socket_path, &cfg);
+    }
     if (listen_fd < 0) {
         sess->ops->close(sess);
         return 1;
     }
-    nb_log("listening on %s (mode 0600)", cfg.socket_path);
+    if (socket_is_ours) {
+        nb_log("listening on %s (mode %04o%s%s)", cfg.socket_path,
+               cfg.socket_mode, cfg.socket_group ? ", group " : "",
+               cfg.socket_group ? cfg.socket_group : "");
+    }
+    if (cfg.no_peercred) {
+        nb_log("  peer credential check DISABLED (--no-peercred)");
+    }
     for (i = 0; i < cfg.n_allow_uid; i++) {
         nb_log("  allowed uid %u", (unsigned)cfg.allow_uid[i]);
     }
@@ -1611,7 +1821,11 @@ int main(int argc, char **argv)
     rc = 0;
 out:
     close(listen_fd);
-    unlink(cfg.socket_path);
+    /* Never unlink a socket we did not create: with activation the manager
+     * owns the path and will hand it to the next start. */
+    if (socket_is_ours && cfg.socket_path) {
+        unlink(cfg.socket_path);
+    }
     sess->ops->close(sess);
     close(sigfd);
     return rc;

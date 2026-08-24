@@ -70,6 +70,18 @@ struct nb_config {
     const char *title;
     unsigned    win_w, win_h;   /* initial window size                        */
     const char *drop_user;      /* user to become after setup, or NULL        */
+    /*
+     * SOCKET ACCESS.  Until these existed the socket was created 0600 and
+     * owned by the broker's user, so no other user could connect() at all --
+     * which made --allow-group a flag that could never fire: SO_PEERCRED never
+     * got the chance to say yes, because the filesystem had already said no.
+     * The two controls are complementary and both apply: the mode decides who
+     * may reach the socket, SO_PEERCRED decides who may be served.
+     */
+    unsigned    socket_mode;    /* octal; default 0600                        */
+    const char *socket_group;   /* chgrp the socket to this group, or NULL    */
+    bool        no_peercred;    /* opt OUT of the credential allow-list       */
+    int         socket_fd;      /* pre-bound listening fd, or -1              */
     uid_t  allow_uid[NB_MAX_ALLOW_IDS];
     int    n_allow_uid;
     gid_t  allow_gid[NB_MAX_ALLOW_IDS];
