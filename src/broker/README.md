@@ -342,13 +342,56 @@ broker restarts and recreates it):
 ```
 
 and **do not** bind `/tmp/.X11-unix`, `$XDG_RUNTIME_DIR/wayland-*`, or
-`/dev/dri/renderD*` for the display-only profile. `SO_PEERCRED` reports the
-peer's uid **as seen in the broker's user namespace**, so if the container
-maps uids (rootless podman with `--userns`), pass the *host-visible* uid to
-`--allow-user`, or run the container without a uid map for this socket.
+`/dev/dri/renderD*` for the display-only profile.
 
 The capture/NVENC profile additionally needs `/dev/dri/renderD*` and the NVIDIA
 userspace stack inside the container — but still no display server.
+
+### What this actually costs, measured (RTX 3090 box, podman 3.4)
+
+Both profiles were run. **Display only**, QEMU configured
+`--disable-opengl --audio-drv-list=`:
+
+```
+DT_NEEDED: libgnutls libpixman-1 libpng16 libz libudev liblzo2 libfdt
+           libgio-2.0 libgobject-2.0 libglib-2.0 libslirp libdw libaio
+           libgmodule-2.0 libm libc
+```
+
+Not one X, GL, EGL, GBM, DRM, epoxy or Wayland library — and `-display help`
+still lists `nvkvm-broker` (`egl-headless` is gone). Inside the container
+`/dev/dri` does not exist, `/tmp/.X11-unix` does not exist, `DISPLAY` and
+`WAYLAND_DISPLAY` are empty, and QEMU logs *"broker mode active: this QEMU
+holds no display-server connection and imports nothing"*. **A frame reached
+the screen from that container**, relayed by a helper linking libc alone.
+
+Two details worth keeping:
+
+- `--disable-opengl` **alone** still leaves `libX11` in the image, pulled in
+  transitively by **`libpulse`** — QEMU itself references zero X symbols.
+  Dropping the audio backend removes it. If a graphics-free container is the
+  claim being made, drop audio too or say why libX11 is there.
+- The BIOS blobs must come along (`-L`, or copy `share/qemu`), which is easy to
+  forget when the container is this thin.
+
+### `SO_PEERCRED` and rootless podman, precisely
+
+`SO_PEERCRED` reports the peer's uid **as seen in the broker's user
+namespace**. Measured, with the broker running as uid 1000:
+
+| rootless invocation | broker sees | result |
+|---|---|---|
+| default (container root) | `uid 1000` | **works** — container root maps to the host user |
+| `--user 1000:100` | *nothing* | **fails earlier than you expect** |
+| `--userns=keep-id` | `uid 1000` | **works** |
+
+The middle row is the trap, and it does not fail where §3 rule 7 would suggest:
+container uid 1000 maps into the **subuid** range (100000+), and the socket is
+`0600` owned by the broker's uid, so `connect()` returns **`EPERM` before
+`SO_PEERCRED` is ever consulted**. Adding the mapped uid to `--allow-user` is
+therefore *not enough* on its own — the socket's mode has to let that uid open
+it too. **`--userns=keep-id` is the clean answer** and needs no `--allow-user`
+at all.
 
 ### Fullscreen is where the frame reaches a hardware plane
 
@@ -368,9 +411,52 @@ compositor's call, and it will not tell you.
 
 ## 7. What is verified, and what is not
 
-This matters more than anything else in this document. The machine this was
-written on **has no GPU and no `/dev/dri` at all**, so nothing here has met
-real hardware.
+This matters more than anything else in this document.
+
+It was originally written on a machine with **no GPU and no `/dev/dri` at
+all**. It has since been run on real hardware once: a rented KVM box with an
+**RTX 3090**, NVIDIA **580.105.08**, X.Org 1.21.1.4 driving the real **NVIDIA
+DDX** on a forced virtual head (`ConnectedMonitor "DFP-0"`) under KDE Plasma,
+and **sway 1.7 / wlroots 0.15** headless on the same GPU. That run is the
+source of everything marked *(hardware, RTX 3090)* below. **It has still never
+met a physical monitor**, which is exactly why the scanout question below is
+still open.
+
+### First light — both backends, on real hardware
+
+**A guest-shaped dma-buf reaches the screen on both backends.** The test buffer
+is allocated through GBM on the NVIDIA render node and comes back with
+modifier **`0x0300000000606014`** — one of the two block-linear modifiers
+`src/guest/nvkvm_kms.c` records off real guest bos — so it is representative
+of what a guest actually flips, not a linear stand-in.
+
+- **X11**: `DRI3PixmapFromBuffers` + `PresentPixmap`, no GL in the broker.
+  Frame correct, stride and offset correct.
+- **Wayland**: `zwp_linux_buffer_params_v1` → `create_immed` →
+  `wl_surface_attach`, bound at version 3. Frame correct.
+
+Getting there took **three fixes, none of which any GPU-less test could have
+found**; each is described where it lives:
+
+1. **`nb_session_x11.c` — the DRI3 version gate was wrong on the one driver
+   that matters.** The NVIDIA DDX reports **DRI3 1.0** and answers the 1.2
+   `GetSupportedModifiers` request anyway, returning **twelve** block-linear
+   modifiers. Gated on the version, the broker never asked, advertised only
+   `DRM_FORMAT_MOD_INVALID`, and rejected every real frame. It now asks and
+   lets the reply decide. Note also **0 window modifiers, 12 screen
+   modifiers** — reading both lists, which the code already did, is what makes
+   this work at all.
+2. **`nb_common.c` — the 256-pair format table overflowed on a real
+   compositor.** sway advertises every format the driver knows times thirteen
+   modifiers; the table filled with `AB24`/`XB24`/`R8`/… in enumeration order
+   and **`XR24`, the format the guest head actually flips, never got in**.
+   Every frame rejected, black window. `nb_formats_add()` now drops any fourcc
+   `nb_fourcc_bpp()` would reject anyway — 256 pairs became 56.
+3. **`nb_session_x11.c` — the grab dropped itself instantly.**
+   `XGrabKeyboard` generates its own `FocusOut` with `mode == NotifyGrab`, the
+   focus-loss rule fired on it, and every grab lasted milliseconds
+   (`GRAB 1; FOCUS 0; GRAB 0`). The two self-inflicted modes are now ignored;
+   a real focus loss still drops the grab.
 
 ### Verified by running it
 
@@ -422,40 +508,104 @@ real hardware.
   `weston` with the pixman renderer and fails at the intended gate with the
   intended message (no GPU ⇒ no `zwp_linux_dmabuf_v1`).
 
-### NOT verified — needs the physical PC
+### Verified on hardware (RTX 3090, 580.105.08)
 
-- **No frame has ever been displayed.** Not one pixel, on either backend.
-- The Wayland import path (`zwp_linux_buffer_params_v1` → `create_immed` →
-  `wl_surface_attach`) has never met a real compositor with a real dma-buf.
-- The X11 import path (`DRI3PixmapFromBuffers` → `PresentPixmap`) has never met
-  a real X server with a real dma-buf. In particular: whether the NVIDIA DDX
-  accepts NVIDIA's block-linear modifiers through `PixmapFromBuffers`, and
-  whether `DRI3GetSupportedModifiers` reports them, is **unknown**.
+- **A frame on screen, both backends**, with a real block-linear dma-buf — see
+  "First light" above. `make check` is still 42/42 on that machine.
+- **The NVIDIA DDX accepts NVIDIA block-linear modifiers through
+  `DRI3PixmapFromBuffers`**, and `DRI3GetSupportedModifiers` **does** report
+  them — twelve of them, `0x03000000006060{10..15}` and
+  `0x0300000000e080{10..15}` — despite the extension reporting version 1.0.
+  This was the single biggest unknown and the answer is yes.
+- **The X11 grab is real**: `XGrabKeyboard`/`XGrabPointer` hold, `CTRL+ALT+G`
+  is consumed and toggles, keys reach the client under grab, true relative
+  deltas arrive from XI2 raw motion, and **a real focus loss really does drop
+  the grab** (the security property, on real hardware, not synthesised).
+- **The Wayland grab announces `GRAB IS TOTAL` on sway**, which advertises
+  `keyboard-shortcuts-inhibit`, `pointer-constraints` and `relative-pointer`.
+- **The containerised VMM** — see §6. QEMU in a podman container with only
+  `/run/nvkvm` bind-mounted, no render node, no display socket, and (built
+  `--disable-opengl --audio-drv-list=`) **not one X, GL, EGL, GBM, DRM or
+  Wayland library loaded** — connects, handshakes, and is driven by the broker.
+  A frame reaches the screen from a container process that links libc alone.
+
+### Known-bad on hardware, and what it costs
+
+- **X11: the implicit (`DRM_FORMAT_MOD_INVALID`) path silently corrupts a
+  buffer that is not really linear.** The same block-linear bo that renders
+  perfectly through `PixmapFromBuffers` is accepted **without any X error** by
+  DRI3 1.0's `PixmapFromBuffer` and drawn as shredded scanlines. There is no
+  error to catch. The size bound still holds, so this is a correctness trap and
+  not a memory-safety one; `x11_attach()` now logs a warning when a client
+  takes that path on a server that does advertise explicit modifiers. A guest
+  that reports its real modifier is unaffected.
+- **X11: NVIDIA does not advertise `DRM_FORMAT_MOD_LINEAR`.** A genuinely
+  linear buffer with modifier 0 is therefore *rejected* by the validator on
+  this driver, though the same buffer works on Wayland (sway does advertise
+  it). Correct behaviour by the rules in §3, but surprising, and worth knowing
+  before reading a rejection log.
+- **X11: XI2 raw motion is delivered twice under an active grab**, same
+  `full_sequence`, same valuators — one copy via the root selection and one
+  via the grab. Uncorrected this is exactly **2× mouse sensitivity** in the
+  guest. De-duplicated in `nb_session_x11.c`; the clean fix is `XIGrabDevice`
+  instead of core `XGrabPointer`, which is left as a deliberate change rather
+  than smuggled in.
+
+### NOT verified — still needs the physical PC
+
+- **Direct scanout / unredirect: not established, and this box could not.**
+  Every `PresentCompleteNotify` reported `COPY`, fullscreen and windowed,
+  composited and with KWin compositing suspended — but the head was a *forced
+  virtual DFP with no monitor attached*, where a page flip may be impossible
+  for reasons that have nothing to do with the broker. Note also that
+  `PresentPixmap` targets the **content child window**, and the child is sized
+  to the guest buffer, so it can only ever cover the CRTC when the guest
+  resolution equals the host's. The X11 backend now logs the Present mode on
+  every change (`Present: FLIP` / `Present: COPY`), so on a real monitor this
+  is a one-glance answer rather than an investigation. Wayland offers no
+  equivalent signal — the compositor still will not tell you.
 - Whether a 32-bpp `ARGB8888` guest buffer imported as depth 24 renders
   correctly (it should — a scanout's alpha is not composited) is untested.
 - Pacing under load, `EV_FRAME`/`EV_RELEASE` timing, and whether dropping on
-  `EAGAIN` produces acceptable smoothness: untested.
-- The grab: no real `XGrabKeyboard`, no real `keyboard-shortcuts-inhibit`, no
-  real focus loss. The *policy* around them is tested; the *plumbing* is not.
+  `EAGAIN` produces acceptable smoothness: untested. Every hardware test above
+  drove frames from a test client, not from a guest flipping at its own rate.
+- `keyboard-shortcuts-inhibit` was *advertised* by sway and announced as total;
+  no compositor shortcut was actually fired at it to confirm it is inhibited.
 - `relay_set_relative()` — switching the guest to a relative pointing device on
   grab — is **known not to work** in the equivalent GTK path (patch 0007), and
-  nothing here changes that. Mouse-look in the guest is expected to still be
-  broken, for reasons believed to be guest-side.
-- Whether the compositor ever actually promotes the surface to direct scanout.
+  nothing here changes that: it is still `qemu_mouse_set()` over
+  `qmp_query_mice()`, unchanged. **Mouse-look in the guest is expected to still
+  be broken, and this hardware run neither fixed nor disproved that** — the
+  transport is now known good (GRAB packets reach QEMU from inside a
+  container), so what remains is the device switch and the guest side.
 - The whole end-to-end path with a real guest, a real isolate and a real
-  `nvkvm_req_present` relay.
+  `nvkvm_req_present` relay. Everything above used a dma-buf allocated by a
+  test tool and handed over the same way the isolate hands one over; no guest
+  was booted.
 
 ### First things to try on the physical PC
 
-1. `cd src/broker && make check` — should be 42/42.
+1. `cd src/broker && make check` — should be 42/42. Run it from a path
+   `nobody` can traverse (see §8).
 2. Start the broker in your session; check the one-line grab announcement is
-   the truth for your compositor.
-3. `nvkvm-broker-testclient <sock> --present 640x480`. A memfd will be
+   the truth for your compositor, and that the advertised pair count is
+   **not** followed by `(TRUNCATED …)`.
+3. `nvkvm-broker-dmabuf-src --present <sock> --modifier default
+   --fill-via-x11` — this is the one that puts a picture up. A red-bordered
+   set of colour bars with diagonal stripes means the whole import path works
+   with a genuine block-linear buffer. `--modifier linear` and
+   `--modifier implicit` are the other two interesting cells.
+4. `nvkvm-broker-testclient <sock> --present 640x480`. A memfd will be
    **rejected** on a real backend (`the fd is not a dma-buf`) — that is the
    validator working, not a failure. It still proves the handshake, the window
    and input.
-4. Run each `--bad-*` option and confirm the rejection messages.
-5. Only then start QEMU with `-display nvkvm-broker`. If the window stays
+5. Run each `--bad-*` option and confirm the rejection messages.
+6. Grab it (`CTRL+ALT+G`), move a **physical** mouse, and check the guest turns
+   at 1× — the XI2 double-delivery above was found with synthetic input and its
+   de-duplication deserves a real mouse.
+7. Fullscreen it (`CTRL+ALT+F`) on a real monitor and read the `Present:` line.
+   `FLIP` is the answer nobody has yet seen.
+8. Only then start QEMU with `-display nvkvm-broker`. If the window stays
    black, the broker's stderr says which validation rejected the frame — that
    log line is the whole debugging story.
 
@@ -478,8 +628,23 @@ nb_session_x11.c      X11: xcb + DRI3 + Present, two windows (see the file
 nb_session_test.c     no display at all; input from stdin, memfds accepted.
                       Unreachable from --backend auto.
 testclient.c          the pre-QEMU smoke test, and the selftest's attack
-                      harness (--bad-*).
-selftest.sh           42 behavioural checks, no GPU required.
+                      harness (--bad-*).  Sends a MEMFD, so it proves the
+                      validator and can never put a pixel on screen.
+dmabuf_source.c       test tooling, NOT part of the broker: allocates a REAL
+                      dma-buf through GBM on the render node and either
+                      presents it (--present) or serves the fd over a socket
+                      (--serve), standing in for the isolate.  The only thing
+                      here that links libgbm.  --fill-via-x11 makes the X
+                      server draw into a tiled buffer that gbm_bo_map refuses,
+                      which is what turns "black window" into an answer.
+dmabuf_relay.c        the sandboxed side: receives an fd, relays it to the
+                      broker.  Links libc and nothing else — run ldd on it
+                      inside the container; that link line IS the §1 claim.
+selftest.sh           42 behavioural checks, no GPU required.  Note it needs
+                      the tree to be reachable by `nobody` for the
+                      SO_PEERCRED check — run it from /opt, not from /root,
+                      or that one check fails for a permissions reason that
+                      has nothing to do with the broker.
 ```
 
 QEMU side: `src/qemu/nvkvm_display_relay.{c,h}`, the hook in

@@ -24,6 +24,8 @@ PKG_CONFIG ?= pkg-config
 PREFIX     ?= /usr/local
 BIN         = nvkvm-display-broker
 TESTCLIENT  = nvkvm-broker-testclient
+RELAY       = nvkvm-broker-relay
+DMASRC      = nvkvm-broker-dmabuf-src
 
 CFLAGS  ?= -O2 -g
 CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
@@ -91,12 +93,24 @@ $(warning   Wayland: apt install libwayland-dev wayland-protocols)
 $(warning   X11:     apt install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)
 endif
 
+# ── test tooling: a real dma-buf producer ─────────────────────────────────
+# dmabuf_source is the ONLY thing here that links libgbm, and it is not part
+# of the broker.  It exists because testclient sends a memfd, which every real
+# backend correctly rejects — so it can prove the validator but can never put
+# a pixel on screen.  Built only when gbm is present.
+ifeq ($(shell $(PKG_CONFIG) --exists gbm && echo yes),yes)
+HAVE_GBM = 1
+GBM_CFLAGS = $(shell $(PKG_CONFIG) --cflags gbm)
+GBM_LIBS   = $(shell $(PKG_CONFIG) --libs gbm)
+endif
+
 .SECONDARY:
 .PHONY: all install clean report check
-all: report $(BIN) $(TESTCLIENT)
+all: report $(BIN) $(TESTCLIENT) $(RELAY) $(if $(HAVE_GBM),$(DMASRC),)
 
 report:
 	@echo "nvkvm-display-broker backends:"
+	@echo "  dma-buf test source : $(if $(HAVE_GBM),yes (libgbm),NO - apt install libgbm-dev)"
 	@echo "  wayland : $(if $(HAVE_WL),yes,NO - install libwayland-dev wayland-protocols)"
 	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
@@ -123,6 +137,15 @@ $(OBJS): $(if $(HAVE_WL),$(WL_HDRS),)
 $(TESTCLIENT): testclient.c ../common/nvkvm_broker_proto.h
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 
+# The sandboxed side, deliberately linked against libc and nothing else — run
+# ldd on it inside the container; that link line IS the security claim.
+$(RELAY): dmabuf_relay.c ../common/nvkvm_broker_proto.h
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+
+$(DMASRC): dmabuf_source.c ../common/nvkvm_broker_proto.h
+	$(CC) $(CFLAGS) $(GBM_CFLAGS) $(if $(HAVE_X11),-DSRC_HAVE_X11,) \
+	      -o $@ $< $(LDFLAGS) $(GBM_LIBS) $(if $(HAVE_X11),$(shell $(PKG_CONFIG) --libs xcb xcb-dri3),)
+
 check: all
 	bash selftest.sh
 
@@ -131,4 +154,5 @@ install: $(BIN)
 	install -m 0755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
 clean:
-	rm -f $(BIN) $(TESTCLIENT) *.o *-client-protocol.h *-protocol.c
+	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) *.o \
+	      *-client-protocol.h *-protocol.c
