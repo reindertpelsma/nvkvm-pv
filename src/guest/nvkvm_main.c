@@ -1485,8 +1485,34 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			 * so swap each for our handle_id (the stub resolves its
 			 * own local fd), exactly like EXPORT_OBJECT_TO_FD.  Save
 			 * the caller's fds to restore on the response.
+			 *
+			 * The cmdType is VERSION-KEYED and this used to be a
+			 * hardcoded 17.  17 is REGISTER_SURFACE only from
+			 * 570.207 on; every tag from 515 through 570.195.03
+			 * numbers it 16, because 570.207 inserted
+			 * DECLARE_DYNAMIC_DPY_INTEREST at 16 and pushed the
+			 * tail up (src/common/nvkvm_nvkms_ops.h).
+			 *
+			 * On such a host the test below never matched, so the
+			 * plane fds were forwarded UNTRANSLATED: raw guest fd
+			 * numbers, meaningless in the stub, which is a different
+			 * (or no) object there.  MEASURED on an RTX 4090 /
+			 * 570.133.20 host with a SteamOS 3.8.14 guest, from an
+			 * NVKVM_NVKMS_TRACE run: ALLOC_DEVICE (cmdType 0)
+			 * succeeded 12/12 while REGISTER_SURFACE (cmdType 16)
+			 * failed 48/48 with ret=-1 -- and ALLOC_DEVICE is
+			 * precisely the one of the two that embeds no fd.
+			 *
+			 * NVIDIA's EGL reports the refused surface registration
+			 * as `GL_OUT_OF_MEMORY ... Failed to allocate memory for
+			 * buffer object` and then dereferences the surface
+			 * object it never got, so kwin_wayland died on
+			 * `segfault at 0 in libnvidia-eglcore.so.570.133.20`
+			 * and crash-looped every ~5s, with no desktop.  Nothing
+			 * was denied and nothing was out of memory: the whole
+			 * failure is this one constant being a version behind.
 			 */
-			if (*(__u32 *)params_buf == NVKVM_NVKMS_CMD_REGISTER_SURFACE &&
+			if (*(__u32 *)params_buf == nvkvm_nvkms_reg_surface() &&
 			    inner_sz >= NVKVM_NVKMS_REGSURF_PLANE0_OFF +
 					NVKVM_NVKMS_MAX_PLANES *
 					NVKVM_NVKMS_REGSURF_PLANE_STRIDE &&
