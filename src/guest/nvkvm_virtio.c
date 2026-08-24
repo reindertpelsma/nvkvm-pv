@@ -326,6 +326,33 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->status = le32_to_cpu(resp->status);
 			break;
 		}
+		/*
+		 * The managed-memory fallback's three requests.  A missing case
+		 * here does not fail loudly at the call site -- the reply is
+		 * never matched to its inflight record, simple_req reports an
+		 * error, and the caller believes the HOST refused.  Measured:
+		 * the host had actually created the external range, the guest
+		 * concluded it had failed, its cleanup UNBACK went unmatched
+		 * for the same reason, and the leaked range then collided with
+		 * every later allocation ("tx_done: unknown type 32").
+		 */
+		case NVKVM_REQ_UVM_EXTERNAL_BACK: {
+			struct nvkvm_resp_uvm_external_back *resp = (void *)(hdr + 1);
+			inf->status   = le32_to_cpu(resp->status);
+			inf->nvstatus = le32_to_cpu(resp->nvstatus);
+			break;
+		}
+		case NVKVM_REQ_UVM_EXTERNAL_MAP: {
+			struct nvkvm_resp_uvm_external_map *resp = (void *)(hdr + 1);
+			inf->status   = le32_to_cpu(resp->status);
+			inf->nvstatus = le32_to_cpu(resp->nvstatus);
+			break;
+		}
+		case NVKVM_REQ_UVM_EXTERNAL_UNBACK: {
+			struct nvkvm_resp_uvm_external_unback *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			break;
+		}
 		case NVKVM_REQ_WRITE_MEMORY_HANDLE: {
 			struct nvkvm_resp_write_memory_handle *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);

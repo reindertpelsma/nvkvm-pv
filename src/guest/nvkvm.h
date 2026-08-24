@@ -143,7 +143,10 @@ struct nvkvm_mmap_region {
 	 * `ext_pages` is the compound allocation backing it; it must outlive
 	 * the GPU mapping, so it is freed only after the host has unbacked.
 	 */
+	struct nvkvm_fd_ctx *ctx;  /* owner, for teardown from vma_close   */
 	bool           ext_backed;
+	bool           ext_claimed; /* whoever sets this under mmap_lock owns
+				     * the teardown; the other side skips it  */
 	__u64          ext_gva;    /* the GPU VA it was published at; the vma
 				    * may already be gone at teardown time  */
 	struct nvkvm_ext_chunk_rec *ext_chunks;  /* the backing, in pieces  */

@@ -1179,11 +1179,32 @@ static int nvkvm_uvm_ext_map_one(VirtIONvgpu *nv, int uvm_fd,
 static void nvkvm_uvm_ext_teardown(VirtIONvgpu *nv, int uvm_fd,
 				   struct nvkvm_uvm_ext_ent *e)
 {
-	if (uvm_fd >= 0 && e->gva) {
+	if (uvm_fd >= 0 && e->gva && e->length) {
 		struct { uint64_t base, length; uint32_t rm_status; } fr;
 		memset(&fr, 0, sizeof fr);
-		fr.base = e->gva;
-		ioctl(uvm_fd, 34 /* UVM_FREE */, &fr);
+		/*
+		 * BOTH base and length, exactly.  uvm_free() requires
+		 * `node.start == base && node.end == base + length - 1` and
+		 * rejects length 0 outright via uvm_api_range_invalid_4k()
+		 * (uvm_va_range.c:663-685) -- non-managed ranges cannot be
+		 * partially freed, so there is no "look it up by base" form
+		 * here the way there is for a managed range.
+		 *
+		 * Measured the hard way: passing length 0 returned
+		 * NV_ERR_INVALID_ADDRESS and freed nothing, and because the
+		 * status was ignored the range leaked.  The next allocation
+		 * overlapped it and failed with NV_ERR_UVM_ADDRESS_IN_USE.
+		 * Hence both the length and the check below.
+		 */
+		fr.base   = e->gva;
+		fr.length = e->length;
+		if (ioctl(uvm_fd, 34 /* UVM_FREE */, &fr) < 0 ||
+		    fr.rm_status != 0)
+			fprintf(stderr,
+				"nvkvm: UVM unback: FREE 0x%llx+0x%llx "
+				"rmStatus=0x%x — range may be leaked\n",
+				(unsigned long long)e->gva,
+				(unsigned long long)e->length, fr.rm_status);
 	}
 	for (uint32_t i = 0; i < e->n_desc; i++) {
 		nvkvm_uvm_ext_free_descriptor(nv, e->desc[i].h_memory);

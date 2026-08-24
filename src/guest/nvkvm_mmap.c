@@ -126,6 +126,62 @@ static void nvkvm_vma_close(struct vm_area_struct *vma)
 	if (!region)
 		return;
 
+	/*
+	 * A fallback-backed managed range must be released HERE, not deferred.
+	 *
+	 * For a forwarded device mapping, deferring the host munmap to fd close
+	 * is right -- the NVIDIA driver expects those to outlive individual
+	 * VMAs.  A fallback range is the opposite: the VA *is* the object's
+	 * identity host-side, and libcuda reuses it immediately.  Measured: with
+	 * teardown deferred, a 4 MiB managed allocation freed and followed by a
+	 * 64 MiB one failed with NV_ERR_UVM_ADDRESS_IN_USE, because the new
+	 * range overlapped the old one that was still live in the va_space.
+	 *
+	 * Order is the same as everywhere else: the host drops the GPU mappings
+	 * and descriptors first, and only then do the pages go back to the
+	 * allocator.
+	 */
+	if (region->ext_backed) {
+		struct nvkvm_fd_ctx *ctx = region->ctx;
+		unsigned int i;
+		bool mine = false;
+
+		/*
+		 * vma_close and mmap_release_fd can both reach a region -- on
+		 * process exit the kernel tears VMAs down and then closes files.
+		 * Exactly one of them must do the teardown; the claim decides
+		 * which, under the same lock that guards the list.
+		 */
+		if (ctx) {
+			spin_lock(&ctx->mmap_lock);
+			if (!region->ext_claimed) {
+				region->ext_claimed = true;
+				list_del(&region->list);
+				mine = true;
+			}
+			spin_unlock(&ctx->mmap_lock);
+		}
+		if (!mine) {
+			region->vma = NULL;
+			return;
+		}
+
+		nvkvm_virtio_uvm_external_unback(
+			(unsigned int)(ctx->session ? ctx->session->id : 0),
+			region->handle_id, region->ext_gva,
+			(__u64)region->length);
+
+		if (region->ext_chunks) {
+			for (i = 0; i < region->ext_nchunks; i++)
+				__free_pages(region->ext_chunks[i].pages,
+					     region->ext_chunks[i].order);
+			kvfree(region->ext_chunks);
+		}
+		vma->vm_private_data = NULL;
+		kfree(region);
+		return;
+	}
+
 	/* Mark VMA as gone; the actual host munmap is deferred to fd close
 	 * or explicit unmap, consistent with how the NVIDIA driver expects
 	 * mappings to outlive individual VMAs in some cases. */
@@ -475,6 +531,7 @@ static int nvkvm_mmap_request_uvm_fallback(struct nvkvm_fd_ctx *ctx,
 	region->length      = vma_len;
 	region->offset      = (__u64)vma->vm_pgoff << PAGE_SHIFT;
 	region->vma         = vma;
+	region->ctx         = ctx;
 	region->ext_backed  = true;
 	region->ext_gva     = gva;
 	region->ext_chunks  = recs;
@@ -1435,6 +1492,15 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
 
 	spin_lock(&ctx->mmap_lock);
+	{
+		struct nvkvm_mmap_region *r;
+		/* Claim every fallback region while still holding the lock, so a
+		 * concurrent vma_close sees ext_claimed and steps aside rather
+		 * than tearing down a region this loop is about to free. */
+		list_for_each_entry(r, &ctx->mmap_regions, list)
+			if (r->ext_backed)
+				r->ext_claimed = true;
+	}
 	list_splice_init(&ctx->mmap_regions, &to_free);
 	spin_unlock(&ctx->mmap_lock);
 
