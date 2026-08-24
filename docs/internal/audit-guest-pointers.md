@@ -13,7 +13,7 @@ the rest are open. Read this table before the detail.
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
 | U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_stub_ptr_sanitize.c` |
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
-| U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally on both paths (`nvkvm_frontend.c`, `zero_nvos64_rights` in `nvkvm_stub.c`) |
+| U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally by `zero_nvos64_rights` in `nvkvm_stub.c`. ~~on both paths (`nvkvm_frontend.c`, …)~~ — the second "path" was `nvkvm_frontend.c`, which never executed and was deleted on 2026-08-24 (DEAD-1). One path, and it is the live one. |
 | U-8 | MEDIUM | **open** — blocked on the ogkm struct layout, see the note in its section |
 | U-9 | MEDIUM | open |
 | U-10 | MEDIUM | **fixed** — offset 16 decided from the cmd, offset 32 zeroed (`nvkvm_stub.c`) |
@@ -144,8 +144,11 @@ ioctl outright is a more severe signal than the real driver ever produces and
 userspace treats it as fatal rather than falling back.
 
 Also in this change: the dead `handle_ioctl()` is **removed** rather than left as
-a decoy, and the `p_memory = 0` line that remains (the file is still built by
-`tests/unit/test_dispatch.c`) is labelled as not being a control. A comment
+a decoy, and the `p_memory = 0` line that remained (the file was still built by
+`tests/unit/test_dispatch.c`) is labelled as not being a control. **2026-08-24
+(DEAD-1): the line is gone with the file.** Labelling it was the weaker
+instrument — the label sat there while `nvkvm_dispatch.c` went on being counted
+as a path in this very document. A comment
 asserting *"RM_ALLOC_MEMORY always allocates NV01_MEMORY_LOCAL_USER"* is
 corrected — the guest chooses the class, and `0x71` is exactly the case; the
 hardcoded `hClass = 0x40` was benign (it only selects whether to skip the
@@ -248,6 +251,15 @@ hand-written sites are themselves bypassable by choosing the right guest-supplie
 
 **Nothing.** Not "mostly dead" — dead.
 
+**Resolved 2026-08-24 (DEAD-1): the file is gone.** So is `nvkvm_frontend.c`, whose eight exported
+functions were called only from `nvkvm_dispatch.c` — this section chased the call graph one step and
+stopped, and the step it did not take was the 562-line half that advertised three security
+invariants in its header comment. The analysis below is preserved as written, against `68a35c0`,
+because it is the evidence the deletion rests on; the per-fix accounting of what each file protected
+and where the live equivalent is now sits at the top of `src/qemu/virtio_nvgpu.c`. Consequence 2
+below is also resolved — the unit suites were repaired long before the deletion, and
+`test_dispatch` is now `test_objects`.
+
 `nvkvm_dispatch.c` exports exactly two symbols. Both have exactly one non-test call site, and both
 call sites are inside an `#if 0` block:
 
@@ -270,9 +282,9 @@ likewise unreachable. The file's own note at `:375-379` is accurate and should b
 
 **Two consequences beyond the comment being misleading:**
 
-1. **There is no ABI param-size validation on the live path.** The size table
-   (`nvkvm_ioctl_expected_param_size`) was the only place that checked `param_size == sizeof(struct)`
-   per command. The live path (`nvkvm_req_ioctl_on_isolate`) has `min_size` floors for UVM only
+1. **There is no ABI param-size validation on the live path.** Still true after the deletion, and
+   the deletion is what makes it visible: the size table (`nvkvm_ioctl_expected_param_size`) was the
+   only place that checked `param_size == sizeof(struct)` per command, and it never ran. The live path (`nvkvm_req_ioctl_on_isolate`) has `min_size` floors for UVM only
    (`nvkvm_isolate_handlers.c:1284`) and, for `'F'` ioctls, nothing but ad-hoc
    `req->param_size >= N` guards before individual field reads. A guest may declare any
    `param_size` up to `MAX_PARAM_SIZE` (`nvkvm_stub.c:443`) for any command.
@@ -726,11 +738,16 @@ other class it saved the guest's value, forwarded it verbatim to `host_ioctl`,
 and restored it afterwards. So the finding held on that path too; it was one
 `if` away from being invisible.
 
-**FIXED 2026-08-23** on both paths:
+**FIXED 2026-08-23** on both paths — but read that as **one path**, per the
+correction below:
 
-- `nvkvm_frontend.c` — the zeroing is now unconditional rather than gated on
-  `NV01_ROOT_CLIENT`. The save/restore around the ioctl is unchanged, so the
-  guest still sees its own bytes come back.
+- ~~`nvkvm_frontend.c` — the zeroing is now unconditional rather than gated on
+  `NV01_ROOT_CLIENT`.~~ **Superseded 2026-08-24 (DEAD-1).** That change was
+  correct as written and never executed: `nvkvm_frontend.c` was unreachable end
+  to end and has been deleted. The claim "fixed on both paths" counted a path
+  that did not exist, which is exactly the failure this document exists to
+  catch — and it survived here for a day because nobody followed the call graph
+  past `handle_ioctl`. §2 above did follow it, one step short.
 - `nvkvm_stub.c` — `zero_nvos64_rights()` zeroes offset 24 for `RM_ALLOC`
   alongside the U-5 clamp. `NVOS21` is exactly 32 bytes and its offset 24 is
   `{ status, pad }` — real data, not a pointer — so the discriminator is
@@ -845,7 +862,7 @@ identical.
 | ioctl | field | offset | guest zeroes at | host overwrite |
 |---|---|---|---|---|
 | `NV_ESC_RM_UNMAP_MEMORY` (0x4f) | `NVOS34.pLinearAddress` | 16 | `nvkvm_ioctl.c:436` | only if `aux_size>0`; this ioctl has no aux → none |
-| `NV_ESC_RM_MAP_MEMORY` (0x4e) | `NVOS33.pLinearAddress` | 32 | `nvkvm_ioctl.c:418` | none (the `p_linear_address = 0` at `nvkvm_dispatch.c:353` is dead code) |
+| `NV_ESC_RM_MAP_MEMORY` (0x4e) | `NVOS33.pLinearAddress` | 32 | `nvkvm_ioctl.c:418` | none (the `p_linear_address = 0` that used to sit at `nvkvm_dispatch.c:353` was dead code, and the file was deleted on 2026-08-24 — DEAD-1; behaviour unchanged, the decoy is not) |
 | `NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO` (0x5e) | `NVOS56.pOldCpuAddress` | 16 | `nvkvm_ioctl.c:451` | only if `aux_size>0` → none |
 | `NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO` (0x5e) | `NVOS56.pNewCpuAddress` | 24 | `nvkvm_ioctl.c:452` | none |
 

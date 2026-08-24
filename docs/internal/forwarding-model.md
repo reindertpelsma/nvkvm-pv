@@ -15,8 +15,10 @@ crosses. The stub then *overwrites* those fields unconditionally with pointers
 into buffers it owns. If the guest skipped its half, nothing changes: the stub
 does not read the field, it writes it.
 
-The design principle is stated at the site where it was most nearly violated
-(`src/qemu/nvkvm_dispatch.c:383-385`):
+The design principle was stated at the site where it was most nearly violated —
+`src/qemu/nvkvm_dispatch.c:383-385`, a file deleted on 2026-08-24 (DEAD-1) after
+it was established to be unreachable end to end; the sentence is worth keeping
+and the code was not, so it is quoted from `68a35c0`:
 
 > the boundary (not the untrusted guest) must ensure no guest pointer is ever
 > forwarded. Always overwrite the `p_*` fields.
@@ -295,9 +297,11 @@ by clearing `VM_MAYWRITE` (`src/guest/nvkvm_mmap.c:907-925`).
 Three guest pointers to handle arrays that the single-aux-slot path cannot
 carry. The guest forces the single-channel form
 (`src/guest/nvkvm_ioctl.c:462-479`) and the stub re-zeroes the same 28 bytes at
-the boundary on a private copy (`src/stub/nvkvm_stub.c:1268-1283`). The
-integer-overflow hardening on the aux-slot variant of this path is at
-`src/qemu/nvkvm_dispatch.c:383-403`.
+the boundary on a private copy (`src/stub/nvkvm_stub.c:1268-1283`) — that is the
+control that ships. The integer-overflow hardening on the aux-slot variant was
+at `src/qemu/nvkvm_dispatch.c:383-403`, in the file DEAD-1 deleted; it never
+executed, and `ARCHITECTURE.md` keeps the block as the worked example of what a
+live version of that check must do.
 
 ### Two ioctls are faked successful
 
@@ -328,9 +332,16 @@ not correctness."
 
 ## Reading pitfalls
 
-- **`src/qemu/nvkvm_dispatch.c` and `src/qemu/nvkvm_frontend.c` are the old
-  synchronous path** where QEMU ran the ioctl itself. The live path is
-  `IOCTL_ON_ISOLATE` → the stub. `src/qemu/nvkvm_dispatch.c:375-379` says so.
+- **`src/qemu/nvkvm_dispatch.c` and `src/qemu/nvkvm_frontend.c` were the old
+  synchronous path** where QEMU ran the ioctl itself. Both were **deleted on
+  2026-08-24 (DEAD-1)**: `nvkvm_dispatch_ioctl()` had no callers left once
+  `handle_ioctl()` was removed, and every exported function of the 562-line
+  `nvkvm_frontend.c` was called only from `nvkvm_dispatch.c`. They stayed in the
+  build for months carrying "do not rely on this" banners and were counted as a
+  live path anyway — which is why the entry now reads "deleted" rather than
+  "documented". The live path is `IOCTL_ON_ISOLATE` → the stub. The per-fix
+  accounting (what each of them protected, and where the live equivalent is) is
+  at the top of `src/qemu/virtio_nvgpu.c`.
 - **`REALIZE_UVM_MAPPING` is unreachable** — the guest call site is disabled
   behind a `(void)` cast (`src/guest/nvkvm_mmap.c:270-275`). The transport, the
   QEMU handler and the stub handler are all present and all dead.

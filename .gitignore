@@ -38,8 +38,7 @@ __pycache__/
 
 # built test binaries -- tests/unit/test_ctrl_gate was committed as an ELF that
 # the Makefile rebuilds, so running the suite dirtied the tree.
-tests/unit/test_dispatch
-tests/unit/test_frontend
+tests/unit/test_objects
 tests/unit/test_handle
 tests/unit/test_isolate
 tests/unit/test_tables

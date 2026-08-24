@@ -7,7 +7,11 @@
  *
  * These structs describe the kernel-driver ABI for /dev/nvidia*, /dev/nvidiactl
  * and /dev/nvidia-uvm. They must not be modified unless the corresponding
- * driver version support in nvkvm_dispatch.c is also updated.
+ * driver-version support is also updated -- which now means the ABI profile
+ * table (src/common/nvkvm_abi.h) and the guest size table
+ * (src/guest/nvkvm_ioctl.c), plus tests/abi_parity.  This line used to name
+ * nvkvm_dispatch.c, which held a third copy of the size table; that file was
+ * unreachable and was deleted on 2026-08-24 (DEAD-1).
  */
 
 #ifndef NVGPU_H

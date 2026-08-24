@@ -419,25 +419,21 @@ typedef struct VirtIONvgpu {
 #define TYPE_VIRTIO_NVGPU  "virtio-nvgpu-device"
 #define VIRTIO_NVGPU(obj)  OBJECT_CHECK(VirtIONvgpu, (obj), TYPE_VIRTIO_NVGPU)
 
-/* ── Handler context (per in-flight request) ─────────────────────────────── */
-
-struct nvkvm_req_ctx {
-	VirtIONvgpu       *nv;
-	VirtQueue         *vq;
-	VirtQueueElement  *elem;
-
-	struct nvkvm_session  *session;
-	struct nvkvm_host_fd  *hfd;
-
-	/* Pointers into shared memory (already validated for bounds) */
-	void              *params_buf;
-	size_t             param_size;
-	void              *aux_buf;
-	size_t             aux_size;
-
-	/* For mmap requests */
-	struct nvkvm_mmap_region *mmap_region;
-};
+/*
+ * ── DEAD-1, 2026-08-24 ── `struct nvkvm_req_ctx` was here.
+ *
+ * It was the argument type of the legacy synchronous dispatch layer —
+ * nvkvm_dispatch.c and nvkvm_frontend.c — and of nothing else.  Both files were
+ * deleted with it: nvkvm_dispatch_ioctl() had no callers after handle_ioctl()
+ * was removed, and every exported function of nvkvm_frontend.c was called only
+ * from nvkvm_dispatch.c.  See the DEAD-1 note at the top of virtio_nvgpu.c for
+ * the per-fix accounting of what each of them protected and where the live
+ * equivalent is.
+ *
+ * The live request path is NVKVM_REQ_IOCTL_ON_ISOLATE →
+ * nvkvm_req_ioctl_on_isolate() (nvkvm_isolate_handlers.c) → the stub, and it
+ * passes a `struct nvkvm_req_ioctl_on_isolate` off the wire, not a req_ctx.
+ */
 
 /* ── Function declarations ───────────────────────────────────────────────── */
 
@@ -449,23 +445,12 @@ void virtio_nvgpu_fini(VirtIONvgpu *nv);
 void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
 			   uint32_t handle_id, uint32_t revents);
 
-/* nvkvm_dispatch.c */
-int  nvkvm_dispatch_ioctl(struct nvkvm_req_ctx *ctx,
-			  unsigned int cmd);
-/* #81: two UVM param sizes are driver-version-variant, so the expected size
- * depends on the active ABI profile — pass it in. */
-size_t nvkvm_ioctl_expected_param_size(unsigned int cmd,
-                                       const struct nvkvm_abi_profile *prof);
-
-/* nvkvm_frontend.c */
-int nvkvm_handle_rm_alloc(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_rm_free(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_rm_control(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_rm_dup_object(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_register_fd(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_alloc_os_event(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_free_os_event(struct nvkvm_req_ctx *ctx);
-int nvkvm_handle_simple_ioctl(struct nvkvm_req_ctx *ctx, unsigned int cmd);
+/*
+ * DEAD-1, 2026-08-24: the nvkvm_dispatch.c and nvkvm_frontend.c declarations
+ * were here — nvkvm_dispatch_ioctl(), nvkvm_ioctl_expected_param_size() and the
+ * eight nvkvm_handle_* frontend handlers.  Both files are gone; see
+ * virtio_nvgpu.c's DEAD-1 note.
+ */
 
 /* nvkvm_isolate_handlers.c — new isolate/handle virtio request handlers */
 int nvkvm_req_list_nvidia_devices(VirtIONvgpu *nv,
@@ -643,10 +628,15 @@ int  nvkvm_mmap_map_to_guest(VirtIONvgpu *nv,
 void nvkvm_mmap_unmap_from_guest(VirtIONvgpu *nv,
 				 struct nvkvm_mmap_region *region);
 
-/* nvkvm_ptr.c — pointer translation for ioctl secondary buffers */
-int nvkvm_translate_ptr_to_host(struct nvkvm_req_ctx *ctx,
-				uint64_t guest_p64, size_t size,
-				void **host_ptr_out);
+/*
+ * DEAD-1, 2026-08-24: nvkvm_translate_ptr_to_host() was declared here for a
+ * "nvkvm_ptr.c" that does not exist in this tree — no definition, no caller,
+ * and its only parameter type (struct nvkvm_req_ctx) has been removed.  A
+ * declaration with no definition is the cheapest possible review hazard: it
+ * reads as "pointer translation is handled somewhere".  It is not; the live
+ * marshalling is the stub's ptr_off decision (src/stub/nvkvm_stub.c) plus the
+ * aux-slot protocol.
+ */
 
 /* Session helpers */
 struct nvkvm_session *nvkvm_session_find(VirtIONvgpu *nv, uint32_t session_id);

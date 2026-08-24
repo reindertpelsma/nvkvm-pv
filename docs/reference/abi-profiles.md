@@ -91,11 +91,18 @@ before the real ioctl). Two independent mechanisms converge:
 | guest ioctl size table | `src/guest/nvkvm_ioctl.c:85`, `:113`, `:187` | `uvm_map_ext_size`, `uvm_sem_pool_size`, `nvos46_size` |
 | guest sanitiser fd offset | `src/guest/nvkvm_ioctl.c:313` | `uvm_map_ext_fd_off` |
 | guest alloc-param sizing | `src/guest/nvkvm_main.c:1659`, `:1662`, `:1701`, `:1712` | `nv00de_alloc_size`, `vaspace_alloc_size`, `mem_alloc_size`, `chan_alloc_size` |
-| QEMU expected-size table | `src/qemu/nvkvm_dispatch.c:61`, `:88` | UVM sizes |
 | QEMU UVM schema floor override | `src/qemu/nvkvm_isolate_handlers.c:1280-1283` | UVM sizes |
-| QEMU dispatch fd offset | `src/qemu/nvkvm_dispatch.c:274` | `uvm_map_ext_fd_off` |
 | stub UVM fd offset | `src/stub/nvkvm_stub.c:1202` | `uvm_map_ext_fd_off` |
 | stub NVOS46 status offset | `src/stub/nvkvm_stub.c:1488` | `nvos46_status_off` |
+
+Two rows left this table on 2026-08-24 (DEAD-1): the "QEMU expected-size table"
+(`nvkvm_dispatch.c:61`, `:88`) and the "QEMU dispatch fd offset"
+(`nvkvm_dispatch.c:274`). Both were in `nvkvm_dispatch.c`, which was unreachable
+end to end and has been deleted. They are named here rather than silently
+dropped because a profile consumer disappearing is the kind of change that
+should be visible: the live QEMU-side consumers of `uvm_map_ext_size` /
+`uvm_sem_pool_size` are now the schema floor override alone, and the live
+consumer of `uvm_map_ext_fd_off` is the stub's.
 
 ## Values are measured, never derived
 

@@ -339,8 +339,10 @@ consumer card cannot stand in for it. GA100 needed two fixes that had been
 silently wrong on every consumer Ampere die, so cross-architecture substitution
 is not a safe assumption for anything architecture-specific.
 
-Host-side unit suite (`tests/unit`): `test_ctrl_gate`, `test_dispatch`,
-`test_frontend`, `test_handle` all pass.
+Host-side unit suite (`tests/unit`): `test_ctrl_gate`, `test_objects`,
+`test_handle` all pass. (Read at the time as `test_dispatch` / `test_frontend`;
+those two targeted the unreachable dispatch/frontend pair and went with it on
+2026-08-24 — DEAD-1. `test_dispatch` is now `test_objects`.)
 
 **Not established:** *why* the 580 userspace was immune. It issues the same
 `0xc661` allocation and got the same NULL parameter block, and still worked — so

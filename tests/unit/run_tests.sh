@@ -8,6 +8,15 @@
 # Two separate things went wrong on 2026-08-20/21, and a plain `make && make
 # run` catches neither:
 #
+#   0. DEAD-1 (2026-08-24): test_dispatch and test_frontend used to be pinned
+#      here at 39 and 8.  Both suites targeted src/qemu/nvkvm_dispatch.c and
+#      src/qemu/nvkvm_frontend.c, which were unreachable end to end and have
+#      been deleted; test_frontend went with them and test_dispatch became
+#      test_objects at 20.  The 27 assertions that disappeared are named
+#      individually in tests/unit/test_objects.c's DEAD-1 banner and in
+#      src/qemu/virtio_nvgpu.c's, because "the count went down" is exactly the
+#      shape of failure (1) below and must never be allowed to look routine.
+#
 #   1. test_isolate stopped LINKING (undefined nvkvm_present_forget_isolate).
 #      `make` aborts on the first failure, so test_tables and test_open_scm
 #      were never built -- 26 passing assertions silently stopped running and
@@ -40,8 +49,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 # Suites whose harness prints a trailing "<passed>/<run> tests passed" line.
 # The number is the exact case count that must run AND pass.
 declare -A TALLY_SUITES=(
-    [test_dispatch]=39
-    [test_frontend]=8
+    [test_objects]=20
     [test_handle]=11
     [test_tables]=17
     [test_nvkms_allowlist]=618
@@ -117,7 +125,7 @@ ISOLATE_KNOWN_FAIL=""
 # is environment-dependent, name it here WITH the reason.
 ISOLATE_ENV_DEPENDENT=""
 
-ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_r1_type_dev mock_stub"
+ALL_BINARIES="test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_r1_type_dev mock_stub"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }
@@ -224,7 +232,7 @@ fi
 
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "UNIT SUITE OK — all 9 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
+    echo "UNIT SUITE OK — all 8 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
     if [ -n "$ISOLATE_KNOWN_FAIL" ]; then
         echo "ran with exactly the ${ISOLATE_KNOWN_FAIL// /, } known failures."
     else

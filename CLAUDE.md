@@ -187,8 +187,17 @@ that is red by default is a suite nobody reads. `run_tests.sh` names those five
 explicitly and goes **red** if a sixth fails, if one of the five starts passing
 (the drift got fixed — update the file), if any suite regresses, if anything
 fails to build, **or if a suite quietly loses assertions** (the counts are
-pinned: `test_dispatch` 39, `test_tables` 17, `test_handle` 9, `test_frontend`
-8). Do not "fix" the five by deleting the test.
+pinned: `test_objects` 20, `test_tables` 17, `test_handle` 11,
+`test_nvkms_allowlist` 618, `test_stub_ptr_sanitize` 17, `test_r1_type_dev` 33).
+Do not "fix" the five by deleting the test.
+
+Two of those names changed on 2026-08-24 and the counts with them: `test_frontend`
+(8) is **gone** and `test_dispatch` (39) is now `test_objects` (20), because both
+targeted `src/qemu/nvkvm_dispatch.c` / `nvkvm_frontend.c` — an unreachable pair
+that DEAD-1 deleted. A shrinking pinned count is normally the exact failure this
+mechanism exists to catch, so the 27 dropped assertions are named individually in
+`tests/unit/test_objects.c` and in `src/qemu/virtio_nvgpu.c`'s DEAD-1 note. If you
+find a count here that the suite disagrees with, the suite wins.
 
 **`-count=1` on the Go tests is mandatory.** Go's build cache does track the
 cgo-included header, but the *test-result* cache is keyed on the test binary, so

@@ -3,7 +3,7 @@ From: Reindert Pelsma <reindert.pelsma@gmail.com>
 Date: Fri, 21 Aug 2026 02:31:59 +0200
 Subject: [PATCH] hw/misc: register the virtio-nvgpu sources with meson
 
-nvkvm's device lives in hw/misc/ as eleven .c files copied in from this
+nvkvm's device lives in hw/misc/ as nine .c files copied in from this
 repo's src/qemu/ (see docs/howto/build.md).  Meson has no globbing, so
 the file list has to be written out; this adds it, plus the
 include_directories() entry for hw/misc/nvkvm_inc/, which is where the
@@ -24,19 +24,21 @@ Two things a reader will notice and should not "fix" without thinking:
     patch series is provably a no-op.  Moving it to the end of the file
     is a safe follow-up -- do it as its own commit so the diff says so.
 
-  * nvkvm_dispatch.c is in the list but is dead code at runtime (see
-    docs/internal/audit-guest-pointers.md).  It still has to compile and
-    link; dropping it from the build is a separate decision from
-    dropping it from the tree.
+  * nvkvm_dispatch.c and nvkvm_frontend.c used to be in this list and are
+    no longer: DEAD-1 established that the pair was unreachable end to end
+    and both files were deleted from the tree.  The note that used to sit
+    here said "dropping it from the build is a separate decision from
+    dropping it from the tree" -- that decision was taken, in the other
+    order.  See the DEAD-1 accounting at the top of virtio_nvgpu.c.
 ---
- hw/misc/meson.build | 16 ++++++++++++++++
- 1 file changed, 16 insertions(+)
+ hw/misc/meson.build | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
 
 diff --git a/hw/misc/meson.build b/hw/misc/meson.build
 index d02d96e..ef97efc 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -151,4 +151,20 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
+@@ -151,4 +151,18 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
  system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
  
  # HPPA devices
@@ -46,8 +48,6 @@ index d02d96e..ef97efc 100644
 +system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
 +  'virtio_nvgpu.c',
 +  'virtio_nvgpu_pci.c',
-+  'nvkvm_dispatch.c',
-+  'nvkvm_frontend.c',
 +  'nvkvm_objects.c',
 +  'nvkvm_mmap_host.c',
 +  'nvkvm_handle.c',

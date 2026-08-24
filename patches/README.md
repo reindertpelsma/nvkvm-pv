@@ -15,7 +15,7 @@ string, which used to mean that rewording a comment made a patch apply twice.
 
 | patch | file | what it does |
 |---|---|---|
-| `0001-meson-register-virtio-nvgpu-sources.patch` | `hw/misc/meson.build` | lists the eleven nvkvm `.c` files and the `nvkvm_inc/` include dir, gated on `CONFIG_VIRTIO` |
+| `0001-meson-register-virtio-nvgpu-sources.patch` | `hw/misc/meson.build` | lists the nine nvkvm `.c` files and the `nvkvm_inc/` include dir, gated on `CONFIG_VIRTIO` |
 | `0002-virtio-add-virtio-nvgpu-to-device-name-table.patch` | `hw/virtio/virtio.c` | adds `[50] = "virtio-nvgpu"` to `virtio_device_names[]`, which otherwise stops at 41 and aborts on our ID |
 | `0003-egl-helpers-import-dmabuf-via-texstorage.patch` | `ui/egl-helpers.c` | imports dma-bufs with `glEGLImageTargetTexStorageEXT`; NVIDIA rejects the legacy OES bind for external-only images |
 | `0004-console-do-not-abort-on-deviceless-console.patch` | `ui/console.c` | skips non-graphic consoles in `qemu_console_lookup_by_device()`, which otherwise aborts QEMU on `screendump` |
@@ -101,8 +101,9 @@ the QEMU log before looking anywhere else.
 
 ## What is *not* here
 
-The device itself — ~12,900 lines across eleven `.c` files and their headers in
-`src/qemu/` — is **copied** into `hw/misc/`, not patched in. It touches nothing
+The device itself — ~12,000 lines across nine `.c` files and their headers in
+`src/qemu/` (eleven until DEAD-1 deleted `nvkvm_dispatch.c` and
+`nvkvm_frontend.c` on 2026-08-24) — is **copied** into `hw/misc/`, not patched in. It touches nothing
 upstream, so a patch would be 12,900 lines of pure addition and no easier to
 review than the files themselves. See [`docs/howto/build.md`](../docs/howto/build.md).
 

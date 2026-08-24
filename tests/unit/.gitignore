@@ -1,6 +1,5 @@
 # Compiled unit-test binaries
-test_dispatch
-test_frontend
+test_objects
 test_handle
 test_isolate
 test_tables
@@ -9,6 +8,9 @@ test_open_scm
 test_ctrl_gate
 test_nvkms_allowlist
 test_stub_ptr_sanitize
+test_r1_type_dev
 
 # Generated: the U-5 function extracted from src/stub/nvkvm_stub.c at build time.
 stub_sanitize.inc
+r1_type_dev.inc
+r1_stub_type_dev.inc
