@@ -551,6 +551,93 @@ found**; each is described where it lives:
   instead of core `XGrabPointer`, which is left as a deliberate change rather
   than smuggled in.
 
+### On the physical PC: a real guest, a real monitor (2026-08-24)
+
+RTX 4070, driver 595.84, **GNOME Shell 50.1 / Mutter on Wayland**, a real
+3840×2160 monitor on DP-1, and a **Linux Mint 22.3 Cinnamon guest** behind the
+broker. This is the first time any guest has run behind it — every earlier
+frame came from a test tool handing over a dma-buf.
+
+- **A Mint desktop reached the screen and was usable.** Keyboard, mouse, and
+  the desktop interactive; the user's words were "screen is smooth. no lag".
+  Guest scanout `1600×900 XR24 modifier 0x0300000000606014`, imported and
+  presented with no copy in the broker and no GL anywhere in it.
+- **QEMU held no display stack.** This build has neither GTK nor SDL
+  (`-display help` lists only `none`, `egl-headless`, `dbus`, `nvkvm-broker`),
+  and it was launched with `DISPLAY`, `WAYLAND_DISPLAY`, `GDK_BACKEND`,
+  `XDG_RUNTIME_DIR` and `XAUTHORITY` all unset — see
+  `/srv/launch-mint-broker.sh`. It logged *"broker mode active: this QEMU holds
+  no display-server connection and imports nothing"* and put a desktop up.
+- **GNOME advertises the whole grab set**: `keyboard=1 abs=1 rel=1 lock=1
+  shortcuts-inhibited=1 focus-events=1 fullscreen=1`, and the broker announces
+  `GRAB IS TOTAL`. `keyboard-shortcuts-inhibit` was previously only known from
+  sway; Mutter has it. Focus-loss auto-ungrab observed working before any grab
+  was taken.
+- **`XR24` is in the advertised set** with both block-linear modifier families
+  and linear, 56 pairs, no truncation. The format-table overflow that bit on
+  sway does not happen here.
+
+#### `Present: COPY`, and on this machine it can be nothing else
+
+`wp_presentation` is the Wayland answer to the FLIP/COPY question — its
+`presented` event carries `KIND_ZERO_COPY`, set exactly when the compositor
+scanned the client's buffer out rather than compositing a copy. The broker now
+binds it and logs `Present: FLIP` / `Present: COPY` on every change, the same
+line the X11 backend prints.
+
+**Windowed and fullscreen both report `COPY`**, and the host DRM state agrees:
+`/sys/kernel/debug/dri/0000:01:00.0/state` shows the primary plane holding
+`fb=150 allocated by = gnome-shell, imported=no` — the compositor's own
+framebuffer, not the guest's buffer.
+
+**The blocker is not the broker.** Mutter can only promote a surface that
+covers the output. The output is 3840×2160; the guest renders 1600×900, and
+**the nvkvm guest head's mode list stops at 1600×900**
+(`/sys/class/drm/card0-Virtual-1/modes`). The guest buffer can therefore never
+cover this CRTC, at any window size.
+
+Two things have to change before FLIP is even reachable, and neither is in this
+directory:
+
+1. **The nvkvm virtual connector needs modes up to the host's native
+   resolution.** Today it tops out at 1600×900.
+2. **The window size has to reach the guest so it re-modes.** nvkvm's
+   `QemuConsole` implements no `GraphicHwOps.ui_info`, so QEMU has no channel
+   to tell the guest the window changed — which is also why enlarging the
+   window only resamples 1600×900 pixels and looks soft. The user reached that
+   conclusion from the picture alone: *"it does not become sharper if you
+   resize, so it's only sharp at the initial window size or smaller"*. Correct,
+   and now explained.
+
+So the honest status is **not** "Wayland direct scanout does not work" — it is
+"this guest cannot yet produce a buffer that qualifies". The measurement path
+is in place and will answer the moment one can.
+
+#### Grab, and the thing that made it look flaky
+
+Grab engages, `CTRL+ALT+G` toggles it, and focus loss drops it. Two real
+defects were found by using it:
+
+- **With only `virtio-tablet` attached there is no relative device**, so the
+  broker's REL events under grab land on nothing and the pointer freezes until
+  ungrab. This is a guest-configuration gap, not a broker bug:
+  `VM_RELATIVE_MOUSE=1` adds `virtio-mouse-pci` and mouse-look works.
+  **Note this contradicts the standing expectation** that patch 0007's
+  mechanism does not work on hardware — with a relative device present, the
+  switch does work here: `grab ON → #5 QEMU Virtio Mouse (relative)`,
+  `grab off → #4 QEMU Virtio Tablet (absolute)`.
+- **The device selection was not deterministic**, which made the grab work
+  roughly every other try. See the relay commit; it now prefers virtio and
+  logs its choice.
+
+#### Pacing
+
+Qualitative only, and good: the guest desktop was described as smooth with no
+lag, at `refresh 16.667 ms` (60 Hz) reported by `wp_presentation`. No frame
+interval histogram was taken. Note for whoever does: the guest's flip log is
+`pr_info_ratelimited`, so counting log lines reads ~2 fps on a guest doing 60 —
+measure intervals, not counts.
+
 ### NOT verified — still needs the physical PC
 
 - **Direct scanout / unredirect: not established, and this box could not.**
