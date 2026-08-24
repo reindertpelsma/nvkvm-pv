@@ -1174,12 +1174,24 @@ static void usage(void)
 "  --allow-user NAME    additional user allowed to connect (repeatable)\n"
 "  --allow-group NAME   additional group allowed to connect (repeatable)\n"
 "  --drop-user NAME     become this user after the window is up\n"
+"  --fullscreen         start fullscreen (CTRL+ALT+F toggles)\n"
+"  --scale MODE         aspect (default) keeps the guest's aspect ratio and\n"
+"                       fills the remainder with black; stretch fills the\n"
+"                       window and distorts; none is 1:1, no scaling\n"
+"  --persist            keep the window when the VMM disconnects and wait\n"
+"                       for another (default: exit with it)\n"
+"  --trace-frames       log one line per commit: frame counter, dma-buf\n"
+"                       inode, cache slot, buffers the compositor still holds\n"
 "  --verbose\n"
 "\n"
 "The broker owns the window, the compositor connection and the input grab.\n"
 "The VMM keeps only this socket: it relays the guest's scanout dma-buf fd\n"
 "here and receives input.  It needs no EGL, no GL and no display server.\n"
-"By default root and the invoking user may connect.\n", stderr);
+"By default root and the invoking user may connect.\n"
+"\n"
+"A host resize never changes the guest's resolution -- it is scaled here.\n"
+"Going fullscreen does tell the guest, so it can render at the output's own\n"
+"resolution, which is what lets the compositor scan its buffer out directly.\n", stderr);
 }
 
 static int add_user(struct nb_config *c, const char *name)
