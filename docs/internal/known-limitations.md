@@ -845,70 +845,157 @@ Do not put untrusted tenants behind this.
 
 ## Functional gaps worth knowing
 
-### Managed memory (`cuMemAllocManaged`) does not work — OPEN, fails loudly
+### Managed memory (`cuMemAllocManaged`) works, but it is NOT unified memory — the fallback, 2026-08-24
 
-**State on `main` (`2406a3c`).** Nothing maps `/dev/nvidia-uvm` on the host.
-`uvm_mmap()` → `uvm_va_range_create_mmap()` is the *only* thing that puts a
-managed range into a `uvm_va_space` (ogkm `kernel-open/nvidia-uvm/uvm.c:759-858`),
-so no range exists — not for the U-6 ownership table to record, not for
-`uvm_api_validate_va_range()` to find. `cuMemAllocManaged` returns
-`CUDA_ERROR_INVALID_VALUE`. `cuCtxCreate` and the rest of the UVM surface work;
-only managed memory is missing.
+**What you get.** `cuMemAllocManaged` succeeds, the pointer is coherent between
+the guest CPU and the GPU, and kernels read and write it correctly. What backs it
+is **pinned host memory mapped into the GPU** — the semantics of
+`cudaHostAlloc(cudaHostAllocMapped)` + `cudaHostGetDevicePointer`, not of
+`cudaMallocManaged`. There is **no migration to VRAM and no oversubscription**,
+and a GPU-heavy kernel crosses PCIe on every access rather than hitting VRAM.
 
-This is universal, not architecture-specific: reproduced on Blackwell GB202, Ada
-AD104 and Ampere GA102. `validate.sh`'s `cuda_managed_alloc` and
-`cuda_managed_coherence` exist to report it, and they are the first tests in this
-project that could see it — the gap dates to `b46e9c0` (28 May 2026) and went
-three months unnoticed because nothing called `cuMemAllocManaged`.
+Branch `uvm-fallback-guest-side`. `validate.sh` goes from 28/1/1 to **30 PASS /
+0 FAIL / 0 SKIP** on an RTX 3060 / 575.51.03 guest.
 
-**Why it is not a one-line fix.** The mapping has to be at the *guest's* VA, and
-QEMU has one address space:
+**Why a fallback rather than forwarding.** A UVM *managed* range's GPU VA **is**
+the CPU VA of the VMA that created it (`uvm_va_range.c:224` →
+`uvm_va_block.c:1308` → `:7738-7769`), and the guest's kernels dereference the
+guest's pointer inside kernel launch parameters, never inside an ioctl. So no
+address QEMU picks can be the address the GPU needs, and no ioctl translation can
+reach the pointer. Full measurement record:
+[UVM VA decoupling](uvm-va-decoupling.md).
 
-- The managed pointer is the CPU VA of the `/dev/nvidia-uvm` VMA, and the GPU VA
-  is that same number — measured, `cuPointerGetAttribute` returns the host
-  pointer unchanged. So a VMM-chosen host address produces a mapping the guest's
-  kernels cannot address, and no ioctl translation can help: the pointer reaches
-  the GPU inside kernel launch parameters, not inside an ioctl.
-- The guest's VA cannot be steered either. libcuda reserves the range with an
-  anonymous `PROT_NONE` `mmap(NULL, …)` and then `MAP_FIXED`s the UVM fd inside
-  it, so the address is settled by the guest kernel's ASLR before any device we
-  own is touched.
-- Mapping at the guest VA in QEMU (what `c8ea92d` did) makes managed memory work,
-  but hands the guest an address-space layout oracle over the QEMU process —
-  recorded as U-15 in
-  [audit-guest-pointers.md](audit-guest-pointers.md).
-- Letting the **isolate** own the mapping and having QEMU map the same UVM
-  object elsewhere does not work either: a managed range holds exactly one
-  `vma_wrapper`, so it has exactly one VMA, and mmap'ing the fd at a second
-  address creates a second independent range rather than aliasing the first
-  (`uvm_va_range.h:288`, `uvm.c:743-757`).
+**What the guest does instead.** On a `/dev/nvidia-uvm` mmap that no
+range-creating ioctl asked for — which is exactly "libcuda is creating a managed
+range", because managed memory is the one UVM range kind with no creating ioctl
+(`uvm.c:743-757`) — the guest module does not forward the mmap. It:
 
-> **Correction, 2026-08-24.** The revert commit `2406a3c` states that "libcuda
-> picks the same UVM VA in every process, so the collision is deterministic". That
-> is **false**, and so is the `ARCHITECTURE.md` sentence it was taken from.
-> Measured on RTX 5090 / 580.95.05-open: **12 concurrent processes produced 12
-> distinct addresses.** libcuda reserves via an anonymous `PROT_NONE mmap(NULL,…)`
-> — guest-kernel ASLR picks the address — then `MAP_FIXED`s the UVM fd inside it.
-> The collision is a birthday collision at 2 MiB granularity over ~14 TiB: rare,
-> not certain. `known-limitations.md`'s original "where their allocators happened
-> to land" was right; the revert's repudiation of it was wrong.
->
-> This also means the guest VA **cannot be steered** — it is settled before any
-> device we own is touched.
->
-> The revert itself stands: it closes U-15 (the layout oracle). Only its reasoning
-> about collision frequency was wrong, and that changes the trade-off, not the
-> conclusion. See `docs/internal/uvm-va-decoupling.md`.
+1. allocates an ordinary RM sysmem object (`NV01_MEMORY_SYSTEM`, class `0x3e`) on
+   a private client/device tree of its own;
+2. arms a CPU mapping of it with `NV_ESC_RM_MAP_MEMORY` and pulls those exact
+   pages into the guest at the guest's VA `G` through the existing sparse-window
+   path;
+3. publishes the same object to the GPU at `G` with `UVM_CREATE_EXTERNAL_RANGE` +
+   `UVM_MAP_EXTERNAL_ALLOCATION`.
 
-What is **not** solved: two guest processes that genuinely want the same VA at
-the same time. The second takes the fallback. Measured on 1x RTX 5090: two
-concurrent CUDA processes both got working managed memory, with one unrelated
-fallback logged — but that is a property of where their allocators happened to
-land, not a guarantee. Fixing it properly needs the guest's UVM VAs steered into
-a region QEMU has reserved, which libcuda's own address selection does not
-currently allow.
->
-> Full measurements and the option analysis: [UVM VA decoupling](uvm-va-decoupling.md).
+One object, three views — guest CPU at `G`, host RAM, GPU at `G` — and no copy.
+An external range's address is an **ioctl argument**, which is the whole reason
+this works where the managed range could not.
+
+**This is a guest-kernel-module change with ZERO QEMU changes.** Every ioctl
+already existed and was already gated: class `0x3e` is in the alloc allowlist,
+UVM 73/33/34 are already in the U-6 schema with `va_mode` CREATE/USE/FREE, and the
+CPU mapping is an ordinary `/dev/nvidiactl` mmap taking QEMU's existing in-window
+branch. The guest supplies **no host address at any point** — a handle and a
+length — and `G` is used only as a *GPU* virtual address in the guest's own RM VA
+space. U-15 (the layout oracle) stays closed, and `u3_u6_gate_test` still reports
+`GATE_TEST PASS (0 accepted)`.
+
+#### What does not work, and returns what
+
+| API | behaviour |
+|---|---|
+| `cuMemAllocManaged` / `cuMemFree` | work |
+| CPU and GPU access to the pointer | work, coherent, verified by value |
+| `cudaMemPrefetchAsync` (`UVM_MIGRATE`, 51) | fails `NV_ERR_INVALID_ADDRESS` |
+| `cudaMemAdvise` preferred-location / accessed-by (42/43/46/47) | fail `NV_ERR_INVALID_ADDRESS` |
+| read duplication (44) | fails `NV_ERR_INVALID_ADDRESS` |
+| **oversubscription** | refused: `cuMemAllocManaged` past host RAM returns an error and a NULL pointer |
+
+All of those are managed-only policy paths that iterate
+`uvm_va_space_iter_managed_*` (`uvm_policy.c:429`, `uvm_migrate.c:1159-1163`), and
+an external range is not managed. Measured (M1, `uvm-va-decoupling.md` §6b):
+libcuda **tolerates** every one of them failing — an application that ignores the
+return value still gets correct data, because a managed allocation's data path
+issues no `UVM_MIGRATE` at all; GPU faults service it in-kernel.
+
+#### Two UVM commands are answered by the guest module, not forwarded
+
+Both are scoped to ranges *this fd backed itself*, by exact containment — never
+blanket, and never for a range the module knows nothing about.
+
+- **`UVM_DISABLE_READ_DUPLICATION` (45).** libcuda issues it *inside*
+  `cuMemAllocManaged` and treats failure as fatal to the allocation (measured: it
+  is the ONLY one of the six whose injected failure kills the allocation). The
+  answer asserts "read duplication is not enabled on this range", which for an
+  external range is simply true.
+- **`UVM_SET_RANGE_GROUP` (31).** This is what `cuStreamAttachMemAsync` issues
+  (traced, not inferred), and NVIDIA's own `UnifiedMemoryStreams` sample does not
+  survive its failure. Range-group membership is consumed only by migration
+  policy, and for a migratable group `uvm_api_set_range_group()` takes an early
+  exit before any page movement (`uvm_range_group.c:348-354`). The one case where
+  range groups carry real correctness meaning is pre-Pascal UVM-Lite, which keys
+  on non-faultable GPUs (`uvm_va_range.c:1628-1632`); nvkvm's floor is Turing,
+  which is faultable.
+
+The answers live in the **guest**, deliberately: a guest-side answer grants
+nothing the guest did not already have, whereas QEMU fabricating a driver
+response would be a trusted component inventing kernel results.
+
+#### Costs and limits
+
+- **One RM sysmem object, one `/dev/nvidiactl` handle and one host fd per live
+  managed allocation.** The per-allocation handle is forced by the driver: RM arms
+  its mmap context on the `struct file` named by `NVOS33.fd` and **never clears
+  it** (`nv-usermap.c:52-56` arms; only `nv_free_file_private()` releases), so a
+  second `NV_ESC_RM_MAP_MEMORY` against a file that already carries one returns
+  `NV_ERR_STATE_IN_USE` (0x63). Measured both ways by
+  `tools/uvm_sysmem_probe.c`.
+- **`NVKVM_UVM_VA_MAX` headroom.** Each live managed allocation occupies exactly
+  one entry of the 16384-entry U-6 ownership table, which is VM-global and shared
+  with every other external range in the VM (`cudaMalloc` already creates ~24 per
+  context). The entry is added on `UVM_CREATE_EXTERNAL_RANGE` and dropped on
+  `UVM_FREE`, so the cost is proportional to *concurrently live* allocations, not
+  to allocation churn — 1,000 sequential managed alloc/free cycles (4 GiB of
+  cumulative demand) left both the table and host RAM flat
+  (`tests/integration/managed_leak.c`). A workload holding more than ~16k live
+  managed allocations across the whole VM would exhaust it, and the table fails
+  closed (`DENY … VA ownership table full`).
+- **`mmap` ceiling.** A single managed allocation is bounded by the pre-existing
+  forwarded-mmap guard `vma_len > SZ_1G` (`nvkvm_mmap.c`), i.e. 1 GiB. A ladder
+  from 4 MiB to 1 GiB inclusive is verified end to end
+  (`tests/integration/managed_ladder.c`).
+- **Allocation is slow**: 14-19 ms per managed alloc+touch+free cycle
+  (`cuda_micro` case 5, RTX 3060 / 575.51.03), because each one is an RM
+  allocation, an RM map, a window
+  mmap and two UVM ioctls, each a virtio round trip. Managed memory is not a hot
+  path in most CUDA code, but a program that allocates managed buffers in a loop
+  will notice.
+- **Teardown is on `munmap`, not fd close.** The VA *is* the object's identity
+  host-side and libcuda reuses it immediately; deferring produced
+  `NV_ERR_UVM_ADDRESS_IN_USE` on a 4 MiB free followed by a 64 MiB allocation.
+- **`NV_ESC_RM_FREE` must be issued through the fd that OWNS the RM client.**
+  RM resolves a client handle against the file it was allocated on and answers
+  anything else `NV_ERR_INVALID_CLIENT` (0x23) — *silently*, in a status field a
+  fire-and-forget free would never read. Freeing the sysmem object through the
+  per-mapping ctl handle instead of the client-owning one leaked ~1 MiB of pinned
+  host memory per allocation and killed the host with an OOM kill of QEMU at
+  ~17k iterations. The free is now status-checked and logged, because a leak here
+  is host RAM, not guest RAM.
+
+#### Two test names that no longer measure what they say
+
+Both PASS, and both are now measuring a different thing. Recorded here rather
+than renamed, so the numbers are not read as evidence about migration:
+
+- **`cuda_micro` case 6 (`uvm_migrate`)** is described as "GPU<->CPU migration
+  thrash". Under the fallback there is **no migration**: the kernel and the
+  `memset` touch the same pinned sysmem pages, so the 650 µs/cycle it reports for
+  4 MiB is PCIe access cost plus launch overhead, not page migration.
+- **`validate.sh`'s `cuda_managed_coherence`** reports "3 CPU<->GPU migration
+  cycles". It genuinely verifies coherence in both directions by value, which is
+  the property that matters; the word "migration" is wrong for this backing.
+
+#### Cross-process collision: no longer a thing
+
+The collision that motivated `b46e9c0` was two guest processes picking UVM VAs
+that clashed in QEMU's single address space. A managed allocation no longer puts
+anything of the guest's choosing into QEMU's address space at all — QEMU picks
+the window VA itself — so there is nothing left to collide. `G` is arbitrated by
+UVM's own range tree inside the guest process's own `uvm_va_space`, which refuses
+overlap (measured, M3). Measured on the fallback itself: two concurrent guest
+processes each running the full 4 MiB -> 1 GiB ladder both passed with every
+element verified.
 
 ### Reserving the UVM sub-window costs the sparse window 16 GiB
 

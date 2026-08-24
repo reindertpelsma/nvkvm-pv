@@ -794,6 +794,10 @@ static void nvkvm_fd_ctx_destroy(struct nvkvm_fd_ctx *ctx)
 		list_for_each_entry_safe(re, retmp,
 			&ctx->uvm_state->realizations, list)
 			kfree(re);
+		/* After nvkvm_mmap_release_fd() above, so the RM_FREEs those
+		 * releases issue still have the ctl handle to run on. */
+		nvkvm_uvm_ext_fd_teardown(ctx->uvm_state);
+		mutex_destroy(&ctx->uvm_state->ext_lock);
 		mutex_destroy(&ctx->uvm_state->lock);
 		kfree(ctx->uvm_state);
 	}
@@ -857,6 +861,7 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 			return -ENOMEM;
 		}
 		mutex_init(&ctx->uvm_state->lock);
+		mutex_init(&ctx->uvm_state->ext_lock);
 		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
 		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
 		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
@@ -1192,6 +1197,98 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			sr = -EFAULT;
 		kfree(params_buf);
 		return sr;
+	}
+
+	/*
+	 * ── Managed-memory fallback: answer UVM_DISABLE_READ_DUPLICATION ────
+	 *
+	 * libcuda issues cmd 45 on a freshly created managed range, INSIDE
+	 * cuMemAllocManaged, and treats its failure as fatal to the allocation.
+	 * Measured (docs/internal/uvm-va-decoupling.md §6b, M1): injecting
+	 * NV_ERR_INVALID_ADDRESS into 45 alone makes cuMemAllocManaged return
+	 * CUDA_ERROR_INVALID_VALUE with a NULL pointer, while the same injection
+	 * into 51/42/43/44/46/47 is tolerated and the data still comes out
+	 * correct.
+	 *
+	 * A fallback range is an EXTERNAL range host-side, and read duplication
+	 * is a managed-only policy: uvm_api_disable_read_duplication() ->
+	 * read_duplication_set() -> uvm_api_range_type_check(), which returns
+	 * UVM_API_RANGE_TYPE_INVALID for a non-managed range and therefore
+	 * NV_ERR_INVALID_ADDRESS (uvm_policy.c:59-106, :877-879).
+	 *
+	 * So we answer it here instead of forwarding.  What the answer asserts is
+	 * "read duplication is not enabled on this range", and for an external
+	 * range that is simply true — there is no duplication to disable.  It
+	 * lives HERE, in the untrusted guest, on purpose: a guest-side answer
+	 * grants nothing the guest did not already have, whereas QEMU fabricating
+	 * a driver response would be a trusted component inventing kernel
+	 * results.
+	 *
+	 * Scoped, never blanket: only a range THIS fd backed itself.  Any other
+	 * range is forwarded and fails honestly.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM && cmd == UVM_DISABLE_READ_DUPLICATION &&
+	    params_buf &&
+	    param_size >= sizeof(struct uvm_disable_read_duplication_params)) {
+		struct uvm_disable_read_duplication_params *p = params_buf;
+
+		if (nvkvm_uvm_ext_covers(ctx, p->requested_base, p->length)) {
+			long sr = 0;
+			p->rm_status = 0;              /* NV_OK */
+			if (uparams &&
+			    copy_to_user(uparams, params_buf, param_size))
+				sr = -EFAULT;
+			kfree(params_buf);
+			return sr;
+		}
+	}
+
+	/*
+	 * ── Same treatment for UVM_SET_RANGE_GROUP ──────────────────────────
+	 *
+	 * This is what cuStreamAttachMemAsync() issues — TRACED, not inferred:
+	 * an LD_PRELOAD of tools/uvm_ioctl_shim.c over a driver-API attach shows
+	 *     UVM cmd=31 SET_RANGE_GROUP rmStatus=0x1e base=<managed ptr> len=4MiB
+	 * i.e. NV_ERR_INVALID_ADDRESS naming exactly the fallback range, because
+	 * uvm_api_set_range_group() requires the interval to be covered by
+	 * MANAGED ranges with no gaps (uvm_range_group.c:322-346).  NVIDIA's own
+	 * cuda-samples UnifiedMemoryStreams does not survive the failure.
+	 *
+	 * Why answering it is accurate rather than a fake.  Range-group
+	 * membership is consumed by exactly one thing: migration policy — the
+	 * migratable masks, the migrated_ranges lists, and UVM-Lite
+	 * preferred-location pinning.  For a MIGRATABLE group the driver itself
+	 * does nothing else: it assigns the group and takes an explicit early
+	 * exit before any page movement (uvm_range_group.c:348-354).  For a
+	 * NON-migratable group the promise is "these pages will not move", which
+	 * pinned sysmem satisfies by construction.  Either way there is nothing
+	 * left to do.
+	 *
+	 * And the one case where range groups carry real correctness meaning —
+	 * pre-Pascal UVM-Lite, where cudaMemAttachSingle governed whether the CPU
+	 * could touch managed memory during a kernel — cannot arise here.
+	 * calc_uvm_lite_gpus_mask() keys on !faultable_processors
+	 * (uvm_va_range.c:1628-1632) and nvkvm's oldest supported architecture is
+	 * Turing, which is faultable.  Our backing lets the CPU touch the range
+	 * during kernels unconditionally, so the answer is MORE permissive than
+	 * the guarantee, never less.
+	 *
+	 * Scoped exactly as cmd 45 is.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM && cmd == UVM_SET_RANGE_GROUP &&
+	    params_buf &&
+	    param_size >= sizeof(struct uvm_set_range_group_params)) {
+		struct uvm_set_range_group_params *p = params_buf;
+
+		if (nvkvm_uvm_ext_covers(ctx, p->base, p->length)) {
+			long sr = 0;
+			p->rm_status = 0;              /* NV_OK */
+			if (uparams &&
+			    copy_to_user(uparams, params_buf, param_size))
+				sr = -EFAULT;
+			kfree(params_buf);
+			return sr;
+		}
 	}
 
 	/*

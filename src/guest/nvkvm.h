@@ -125,6 +125,45 @@ struct nvkvm_mmap_region {
 	unsigned long length;
 	__u64    offset;           /* fd offset at which we were mapped     */
 	struct vm_area_struct *vma; /* NULL after munmap                   */
+
+	/*
+	 * Managed-memory fallback (nvkvm_uvm_ext.c).  Set when this region is
+	 * NOT a forwarded device mapping but a UVM MANAGED range this module
+	 * downgraded to an EXTERNAL range over an RM sysmem object.
+	 *
+	 * Everything teardown needs is cached HERE rather than reached through
+	 * the fd context, because teardown runs from vma_close(), which can fire
+	 * after the owning fd has been closed.  `ctx` is used for exactly one
+	 * thing -- the mmap_lock that arbitrates the claim below.
+	 */
+	struct nvkvm_fd_ctx *ctx;   /* owning UVM fd, for the claim lock     */
+	/*
+	 * The /dev/nvidiactl handle this ONE mapping owns.  RM arms a mapping
+	 * context per `struct file` and never clears it (nv-usermap.c:52-56 vs
+	 * nv_free_file_private), so a file carries exactly one mapping for its
+	 * whole lifetime and a second NV_ESC_RM_MAP_MEMORY against it returns
+	 * NV_ERR_STATE_IN_USE.  One handle per allocation, released with it.
+	 */
+	struct nvkvm_fd_ctx *ext_map_ctl;
+	bool     ext_backed;
+	bool     ext_claimed;       /* whoever sets this under mmap_lock owns
+				     * the teardown; the other side steps aside */
+	__u64    ext_gva;           /* the GPU VA it was published at        */
+	__u32    ext_isolate_id;
+	__u32    ext_session_id;
+	__u32    ext_uvm_handle_id; /* the UVM fd's QEMU handle              */
+	__u32    ext_ctl_handle_id; /* this mapping's /dev/nvidiactl handle  */
+	/*
+	 * The fd-wide /dev/nvidiactl handle that OWNS the RM client.  RM resolves
+	 * a client handle against the file it was allocated on, so NV_ESC_RM_FREE
+	 * issued through any other fd returns NV_ERR_INVALID_CLIENT (0x23) and the
+	 * sysmem object -- pinned host pages -- is never released.  Measured: a
+	 * 300-iteration alloc/free loop logged 0x23 on every free.
+	 */
+	__u32    ext_owner_handle_id;
+	__u32    ext_h_client;
+	__u32    ext_h_device;
+	__u32    ext_h_memory;
 };
 
 /*
@@ -197,6 +236,24 @@ struct nvkvm_uvm_fd_state {
 	struct mutex     lock;
 	bool             initialized;
 	__u64            init_flags;
+	/*
+	 * Managed-memory fallback: the private RM object tree this UVM fd owns
+	 * (nvkvm_uvm_ext.c).  Built lazily on the first managed allocation and
+	 * torn down with the fd; a CUDA process that never calls
+	 * cudaMallocManaged pays nothing for it.
+	 *
+	 * ext_lock serialises the whole synthesis, and has to: RM's mmap context
+	 * is ONE-SHOT PER `struct file` (nv-mmap.c:503-509), so the
+	 * NV_ESC_RM_MAP_MEMORY that arms it and the mmap that consumes it must
+	 * not interleave with another thread's pair on the same ctl handle.
+	 */
+	struct mutex     ext_lock;
+	struct nvkvm_fd_ctx *ext_ctl;   /* private /dev/nvidiactl handle     */
+	struct nvkvm_fd_ctx *ext_dev;   /* private /dev/nvidia0, REGISTER_FD */
+	__u32            ext_h_client;
+	__u32            ext_h_device;
+	__u32            ext_h_subdev;
+	bool             ext_ready;
 	struct list_head registered_gpus;     /* nvkvm_uvm_gpu_reg */
 	struct list_head registered_va_spaces;/* nvkvm_uvm_vas_reg */
 	struct list_head range_groups;        /* nvkvm_uvm_range_group */
@@ -459,6 +516,12 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
 				   void *aux_buf, size_t aux_size,
 				   __u32 flags,
 				   __u64 *fault_addr_out);
+/* Same forward with the VMA whitelist suppressed -- mandatory for any caller
+ * that already holds mmap_write_lock (the managed-memory fallback). */
+long nvkvm_virtio_ioctl_on_isolate_nomm(__u32 isolate_id, __u32 handle_id,
+					__u32 session_id, unsigned int cmd,
+					void *params_buf, size_t param_size,
+					void *aux_buf, size_t aux_size);
 int  nvkvm_virtio_mmap_on_isolate(__u32 isolate_id, __u32 handle_id,
 				  __u64 gva, __u64 offset, __u64 length,
 				  __u32 prot, __u32 map_flags,
@@ -529,6 +592,21 @@ static inline bool nvkvm_file_is_ours(struct file *f)
 extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx);
+/* Rewrite the leaf PTEs of [start,end) back to write-back caching; see the
+ * definition in nvkvm_mmap.c.  Callers must hold mmap lock. */
+void nvkvm_force_range_wb(struct mm_struct *mm,
+			  unsigned long start, unsigned long end);
+
+/* nvkvm_uvm_ext.c -- managed-memory fallback (docs/internal/uvm-va-decoupling.md
+ * section 2e).  A UVM mmap that no range-creating ioctl asked for IS libcuda
+ * creating a MANAGED range; we do not forward it, we synthesise an EXTERNAL
+ * range over an RM sysmem object instead. */
+int  nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
+void nvkvm_uvm_ext_release(struct nvkvm_mmap_region *region);
+void nvkvm_uvm_ext_fd_teardown(struct nvkvm_uvm_fd_state *st);
+/* Is [base,base+len) inside a range THIS fd backed itself?  The scoping for the
+ * two locally-answered UVM commands (45 and 31). */
+bool nvkvm_uvm_ext_covers(struct nvkvm_fd_ctx *ctx, __u64 base, __u64 len);
 int  nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr);
 void nvkvm_cpu_pages_reap_stale(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_refresh(struct nvkvm_fd_ctx *ctx);

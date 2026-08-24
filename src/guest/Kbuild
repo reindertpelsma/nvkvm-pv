@@ -4,6 +4,7 @@ nvkvm-guest-objs := nvkvm_main.o \
                     nvkvm_ioctl.o \
                     nvkvm_virtio.o \
                     nvkvm_mmap.o \
+                    nvkvm_uvm_ext.o \
                     nvkvm_session.o \
                     nvkvm_hostfile.o
 
