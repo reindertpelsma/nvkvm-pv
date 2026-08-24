@@ -861,7 +861,32 @@ equivalent reservation at all.
 
 - **Enforcement, reject-never-clamp.** `stub_window_contains()` gates `handle_mmap`,
   `handle_munmap_cmd`, and the `host_va_hint` arm of `handle_realize_uvm_fd`, logging
-  `nvkvm: DENY ... (U-9)`.
+  `nvkvm: DENY ... (U-9)`. In `handle_mmap` the address check runs **before** the
+  handle lookup, deliberately: it does not depend on the fd, and a control sitting behind another
+  check is one a later edit to that other check can bypass — which is exactly A-1's shape.
+
+**Evidence.** Two suites, neither needing a GPU.
+
+- `tests/unit/test_stub_window.c` (27 cases) pins the predicate and the allocator, both extracted
+  from real source at build time. Verified to fail when reverted: a naive
+  `addr >= base && addr + len <= base + size` scores 23/27 (the u64-wrap and zero-length cases);
+  the gate removed outright scores 12/27; the run reservations removed score 26/27 — the
+  interleaved registration fails while the *non*-interleaved one still passes, which is the same
+  shape as the 2 MiB A-1 probe that sailed past its bug.
+- `tests/security/u9_window_gate_test.c` (12 probes) spawns the **real built stub** and sends real
+  `ISOLATE_CMD_MMAP` / `_MUNMAP` / `_WINDOW_INFO` messages over the real socket, because neither
+  unit suite can see whether the predicate is actually *wired into* the handlers — a stub with
+  `stub_window_contains()` defined and never called passes the whole unit suite. Against a
+  gate-removed build it scores 4/12, and the probe at `0x401000` makes that stub **unmap its own
+  text and die**, which is U-9 demonstrated rather than described.
+
+Two things that suite got wrong first, recorded because both are the shape of a green result that
+measures nothing. (1) A hardcoded "obviously outside" address of `0x7f1122200000` was *accepted*,
+and the gate was right — the window is 1 TiB and that run had placed it at `0x7e46fb400000`. Guest
+VAs and the window are drawn from the same band; every probe is now derived from the reported base.
+(2) The MMAP probe first asserted only `retval != 0` and got `-EBADF`, because the handle lookup ran
+first and the address was never examined — it would have passed with the gate deleted. That is what
+prompted the reordering above, and the probe now asserts the exact errno only the window produces.
 
 **What it does not cover.** `REALIZE_UVM_FD` with `host_va_hint == 0` — which is what QEMU passes
 today — maps at a **kernel-chosen** address, outside the window. That address is not

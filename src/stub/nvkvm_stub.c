@@ -2302,12 +2302,7 @@ static void handle_ioctl_cmd(struct isolate_cmd_ioctl *cmd)
 
 static void handle_mmap(struct isolate_cmd_mmap *cmd)
 {
-	fs_mutex_lock(&fd_mutex);
-	int fd = handle_lookup(cmd->handle_id);
-	fs_mutex_unlock(&fd_mutex);
-
 	struct isolate_resp_mmap r = { .type = ISOLATE_RESP_MMAP };
-	if (fd < 0) { r.retval = -EBADF; locked_send(&r, sizeof(r)); return; }
 
 	/*
 	 * U-9.  This used to take cmd->gva -- the guest process's own VA for
@@ -2321,6 +2316,14 @@ static void handle_mmap(struct isolate_cmd_mmap *cmd)
 	 * that a guarantee rather than a convention.  REJECT, never clamp: a
 	 * clamped mapping would be at an address the caller does not know it
 	 * has, which is a worse outcome than a failed mmap.
+	 *
+	 * FIRST, ahead of the handle lookup, deliberately.  The address check
+	 * does not depend on the fd, and a security control that sits behind
+	 * another check is one a later edit to that other check can bypass --
+	 * which is precisely A-1's shape (a control that was real, but applied
+	 * under the wrong ioctl number).  The only visible consequence is that
+	 * a request with both a bad handle and a bad address now reports
+	 * EFAULT rather than EBADF.
 	 */
 	if (!stub_window_contains(cmd->win_va, cmd->length)) {
 		fs_dprintf(STDERR_FD,
@@ -2332,6 +2335,11 @@ static void handle_mmap(struct isolate_cmd_mmap *cmd)
 		locked_send(&r, sizeof(r));
 		return;
 	}
+
+	fs_mutex_lock(&fd_mutex);
+	int fd = handle_lookup(cmd->handle_id);
+	fs_mutex_unlock(&fd_mutex);
+	if (fd < 0) { r.retval = -EBADF; locked_send(&r, sizeof(r)); return; }
 
 	uint32_t flags = cmd->map_flags | MAP_FIXED;
 	void *addr = stub_mmap((void *)(uintptr_t)cmd->win_va,
