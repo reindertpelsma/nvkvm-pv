@@ -199,21 +199,41 @@ int main(void)
 			cuDeviceGet(&dev, 0);
 			cuCtxRetain(&ctx, dev);
 			cuCtxSetCurrent(ctx);
-			size_t sz = 2u << 20;
-			void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
-				       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-			memset(p, 0xa5, sz);
-			int rc = cuMemHostRegister(p, sz, 0x01 /* PORTABLE */);
-			if (rc == 0) {
-				printf("  ok   %-38s registered (rc=0)\n",
-				       "U-14 cuMemHostRegister");
-				if (cuMemHostUnregister) cuMemHostUnregister(p);
-			} else {
-				printf("  FAIL %-38s rc=%d — A-1 broke host registration\n",
-				       "U-14 cuMemHostRegister", rc);
-				failures++;
+			/*
+			 * SIZES MATTER HERE, and 2 MiB alone does not test it.
+			 * The migration installs the range in 2 MiB chunks, one
+			 * table entry per chunk, so a registration above one
+			 * chunk spans several entries.  A gate that demands
+			 * containment in a single entry passes at 2 MiB and
+			 * refuses everything larger -- which is precisely the
+			 * regression a 2 MiB-only probe missed once already.
+			 * 16 MiB is 8 chunks; 96 MiB is 48 and is past 64 MiB.
+			 */
+			static const size_t sizes[] = {
+				2u << 20, 16u << 20, 96u << 20,
+			};
+			for (unsigned i = 0; i < 3; i++) {
+				size_t sz = sizes[i];
+				char label[64];
+				void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+					       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+				if (p == MAP_FAILED) continue;
+				memset(p, 0xa5, sz);
+				snprintf(label, sizeof label,
+					 "U-14 cuMemHostRegister %zu MiB",
+					 sz >> 20);
+				int rc = cuMemHostRegister(p, sz, 0x01 /* PORTABLE */);
+				if (rc == 0) {
+					printf("  ok   %-38s registered (rc=0, ~%zu chunks)\n",
+					       label, (sz + (2u<<20) - 1) / (2u<<20));
+					if (cuMemHostUnregister) cuMemHostUnregister(p);
+				} else {
+					printf("  FAIL %-38s rc=%d — A-1 broke host registration\n",
+					       label, rc);
+					failures++;
+				}
+				munmap(p, sz);
 			}
-			munmap(p, sz);
 		} else {
 			printf("  SKIP registration probe: CUDA unavailable\n");
 		}

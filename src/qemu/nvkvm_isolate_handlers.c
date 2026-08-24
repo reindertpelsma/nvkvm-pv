@@ -54,8 +54,8 @@ static uint32_t iso_mmap_seq = 1;
 static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * ── A-1: is [base, base+len) inside ONE range the host itself installed into
- *        this isolate's address space? ────────────────────────────────────────
+ * ── A-1: is [base, base+len) fully covered by ranges the host itself installed
+ *        into this isolate's address space? ─────────────────────────────────
  *
  * The check behind the NV01_MEMORY_SYSTEM_OS_DESCRIPTOR gate below.  Only
  * entries with `stub_mirrored` count: that flag is set exactly when QEMU
@@ -65,36 +65,77 @@ static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
  * mmap_on_isolate first).  A QEMU-side mapping with no isolate-side mirror is
  * not addressable by the stub at all and must not authorise anything.
  *
- * Deliberately not a union-of-ranges test, for the same reason U-6's
- * uvm_va_covers() is not: stitching adjacent entries together would let a
- * caller span a boundary it never owns as one object.
+ * MULTI-ENTRY BY NECESSITY.  The migration installs the range in
+ * NVKVM_MIG_CHUNK (2 MiB) pieces, one mmap_on_isolate -- and therefore one
+ * table entry -- per chunk (nvkvm_mmap.c:1402-1460).  So a 16 MiB
+ * cudaHostRegister is EIGHT adjacent entries, not one.  An earlier version of
+ * this function demanded containment in a single entry and would have refused
+ * every registration above 2 MiB; the 2 MiB probe that "verified" it was
+ * exactly one chunk and sailed past the bug.
  *
- * Note this does NOT depend on req->session_id being truthful.  The lookup is
- * keyed on the isolate that will actually run the ioctl, so a guest that forges
- * an isolate_id is checked against that same isolate -- there is no way to make
- * the check pass for a range the host did not install where the pin will land.
+ * So the walk: find the entry containing the current offset, advance to its
+ * end, repeat until the whole range is spanned.  A gap anywhere fails.  This is
+ * deliberately NOT "overlaps some entry" -- that would authorise the uncovered
+ * remainder and reopen the hole for everything past the first chunk.  It is a
+ * union only over ranges the host installed, which is the property that matters
+ * here; U-6's uvm_va_covers() refuses unions because there the ranges are
+ * distinct driver objects, whereas here the chunks are one registration the
+ * host itself split.
+ *
+ * Stale entries cannot pass: iso_mmap_free() clears `used` under the table lock
+ * BEFORE the isolate-side munmap runs, and iso_mmap_alloc() rewrites every
+ * field on reuse, so a freed or recycled slot never reads as live mirrored
+ * memory.  The reverse window -- mapped but not yet recorded -- fails closed.
+ *
+ * This does NOT depend on req->session_id being truthful.  The lookup is keyed
+ * on the isolate that will actually run the ioctl, so a guest that forges an
+ * isolate_id is checked against that same isolate; there is no ordering of
+ * guest-supplied values that makes the pin land somewhere the host did not
+ * install.
  */
 static bool iso_mmap_covers(uint32_t isolate_id, uint64_t base, uint64_t len)
 {
-	bool found = false;
+	uint64_t cur, end;
+	bool ok = false;
 
-	if (!len || base + len < base)
+	if (!len || base + len < base)          /* zero, or u64 wrap */
 		return false;
+	end = base + len;
+
 	pthread_mutex_lock(&iso_mmap_lock);
-	for (uint32_t i = 1; i < NVKVM_ISO_MMAP_MAX; i++) {
-		const struct nvkvm_iso_mmap_entry *e = &iso_mmap_tbl[i];
-		if (!e->used || !e->stub_mirrored)
-			continue;
-		if (e->isolate_id != isolate_id || !e->gva || !e->len)
-			continue;
-		if (base >= e->gva &&
-		    base + len <= e->gva + (uint64_t)e->len) {
-			found = true;
+	for (cur = base;;) {
+		const struct nvkvm_iso_mmap_entry *hit = NULL;
+		uint64_t next;
+
+		for (uint32_t i = 1; i < NVKVM_ISO_MMAP_MAX; i++) {
+			const struct nvkvm_iso_mmap_entry *e = &iso_mmap_tbl[i];
+			uint64_t e_end;
+
+			if (!e->used || !e->stub_mirrored)
+				continue;
+			if (e->isolate_id != isolate_id || !e->gva || !e->len)
+				continue;
+			e_end = e->gva + (uint64_t)e->len;
+			if (e_end < e->gva)             /* entry wraps: ignore */
+				continue;
+			if (cur >= e->gva && cur < e_end) {
+				hit = e;
+				break;
+			}
+		}
+		if (!hit)                               /* gap -- not covered */
+			break;
+		next = hit->gva + (uint64_t)hit->len;
+		if (next <= cur)                        /* defensive: no progress */
+			break;
+		if (next >= end) {
+			ok = true;
 			break;
 		}
+		cur = next;
 	}
 	pthread_mutex_unlock(&iso_mmap_lock);
-	return found;
+	return ok;
 }
 
 static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
@@ -2384,7 +2425,11 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 					/* `limit` is size-1 (the guest passes
 					 * limit+1 as the length, see
 					 * nvkvm_ioctl.c:428). */
-					ok = base && limit + 1 > limit &&
+					/* `limit` is size-1 and is guest-supplied,
+					 * so guard the +1 before using it; the
+					 * base+len wrap is checked inside
+					 * iso_mmap_covers(). */
+					ok = base && limit != UINT64_MAX &&
 					     iso_mmap_covers(req->isolate_id,
 							     base, limit + 1);
 				}
