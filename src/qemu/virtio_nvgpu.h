@@ -490,6 +490,9 @@ int nvkvm_req_close_handle(VirtIONvgpu *nv,
 int nvkvm_req_uvm_external_back(VirtIONvgpu *nv,
 				struct nvkvm_req_uvm_external_back *req,
 				struct nvkvm_resp_uvm_external_back *resp);
+int nvkvm_req_uvm_external_map(VirtIONvgpu *nv,
+			       struct nvkvm_req_uvm_external_map *req,
+			       struct nvkvm_resp_uvm_external_map *resp);
 int nvkvm_req_uvm_external_unback(VirtIONvgpu *nv,
 				  struct nvkvm_req_uvm_external_unback *req,
 				  struct nvkvm_resp_uvm_external_unback *resp);

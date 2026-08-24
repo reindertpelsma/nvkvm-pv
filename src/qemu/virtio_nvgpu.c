@@ -849,6 +849,10 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_uvm_external_back,
 			    nvkvm_resp_uvm_external_back,
 			    nvkvm_req_uvm_external_back)
+		ISOLATE_REQ(NVKVM_REQ_UVM_EXTERNAL_MAP,
+			    nvkvm_req_uvm_external_map,
+			    nvkvm_resp_uvm_external_map,
+			    nvkvm_req_uvm_external_map)
 		ISOLATE_REQ(NVKVM_REQ_UVM_EXTERNAL_UNBACK,
 			    nvkvm_req_uvm_external_unback,
 			    nvkvm_resp_uvm_external_unback,

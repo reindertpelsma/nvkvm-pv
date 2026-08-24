@@ -935,19 +935,30 @@ the differences are user-visible:
   gets correct data. Visible beats silent, but code that checks these calls will
   see them fail.
 - **`cudaMemPrefetchAsync`** returns success and does nothing.
-- **The pages are pinned.** The guest module holds them with `alloc_pages()` and
-  the host pins the matching HVA range via the RM OS-descriptor
-  (`pin_user_pages()`). That is in tension with **ballooning** and with **live
-  migration** of the VM: those pages cannot be reclaimed or moved for as long as
-  the managed allocation lives. nvkvm does not support live migration anyway,
-  but the balloon interaction is real and is why a large managed footprint
-  should be treated as a hard reservation of guest RAM.
-- **One contiguous block per allocation.** QEMU turns one GPA into one host VA
-  range for the descriptor, so the backing must be physically contiguous. The
-  guest module allocates it with `alloc_pages()`, and anything the buddy
-  allocator cannot satisfy in a single block above `MAX_PAGE_ORDER` is refused
-  rather than silently split — `cuMemAllocManaged` fails instead of returning
-  memory the GPU cannot address.
+- **The pages are pinned, and it gets worse with size.** The guest module holds
+  them with `alloc_pages()` and the host pins the matching HVA range via the RM
+  OS-descriptor (`pin_user_pages()`). A 1 GiB managed allocation therefore
+  **permanently locks 1 GiB of guest RAM** for as long as it lives, with no
+  oversubscription and no reclaim — where real UVM would keep most of it in VRAM
+  and page the rest. Treat a large managed footprint as a hard reservation of
+  guest RAM, sized on top of everything else the guest needs. It is also in
+  tension with **ballooning** and with **live migration**: those pages can be
+  neither reclaimed nor moved. nvkvm does not support live migration anyway, but
+  the balloon interaction is real.
+- **Chunked backing, and a 4 GiB ceiling.** Contiguity is required per
+  *descriptor*, not per range: UVM finds an external range by any address inside
+  it and keeps a per-GPU range tree of sub-mappings, so one range is covered by
+  many allocations. The guest takes the backing largest-block-first with
+  `alloc_pages()` (max `MAX_PAGE_ORDER`, 4 MB on x86_64) and the host makes one
+  RM descriptor per chunk. Both sides cap the count at 1024, so **the largest
+  managed allocation is 4 GiB** — and a 4 GiB one costs 1024 RM objects, which
+  is a real resource on the host side, not just bookkeeping.
+  Fragmentation degrades gracefully: smaller chunks still work, they just map
+  with a smaller GPU page size (`uvm_map_external.c:931-940` derives the mapping
+  page size from `pageSize | base | length | map_offset`), costing TLB coverage.
+  The ordinary 1 GiB guard on `nvkvm_mmap_request()` still bounds *forwarded*
+  device mmaps; it does not apply to fallback ranges, which are guest RAM the
+  host only describes.
 
 `cuda_micro` case 6 is named `uvm_migrate` and measures a GPU↔CPU cycle. It
 still passes, but under the fallback there is no migration happening, so the

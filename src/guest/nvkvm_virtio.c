@@ -1425,26 +1425,25 @@ int nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 }
 
 /*
- * Managed-memory fallback: ask QEMU to publish guest pages we allocated to the
- * GPU as a UVM external range at `gva`.
+ * Managed-memory fallback: establish the external range, then feed it the
+ * backing chunks.
  *
  * `gva` travels as a GPU virtual address, not a host one -- QEMU derives every
- * host address it touches from `gpa_base`, which it validates against this VM's
- * own RAM.  See the U-3 note on nvkvm_req_uvm_external_back().
+ * host address it touches from each chunk's `gpa`, which it validates against
+ * this VM's own RAM.  See the U-3 note on nvkvm_req_uvm_external_back().
  */
 int nvkvm_virtio_uvm_external_back(unsigned int session_id, __u32 handle_id,
-				   __u64 gva, __u64 length, __u64 gpa_base,
+				   __u64 gva, __u64 length,
 				   const __u8 *gpu_uuids, __u32 n_gpus)
 {
 	struct {
-		struct nvkvm_hdr                        hdr;
-		struct nvkvm_req_uvm_external_back      req;
+		struct nvkvm_hdr                   hdr;
+		struct nvkvm_req_uvm_external_back req;
 	} msg = {};
 	__u64 retval = 0;
 
 	msg.req.gva        = cpu_to_le64(gva);
 	msg.req.length     = cpu_to_le64(length);
-	msg.req.gpa_base   = cpu_to_le64(gpa_base);
 	msg.req.handle_id  = cpu_to_le32(handle_id);
 	msg.req.session_id = cpu_to_le32(session_id);
 	if (n_gpus > NVKVM_UVM_MAX_REG_GPUS)
@@ -1457,12 +1456,46 @@ int nvkvm_virtio_uvm_external_back(unsigned int session_id, __u32 handle_id,
 			  &retval);
 }
 
+/* One batch of chunks.  Kept off the stack: the request carries 64 x 24 bytes
+ * of chunk table, and simple_req copies into a kmalloc'd buffer anyway. */
+int nvkvm_virtio_uvm_external_map(unsigned int session_id, __u32 handle_id,
+				  __u64 gva,
+				  const struct nvkvm_uvm_ext_chunk *chunks,
+				  __u32 n_chunks)
+{
+	struct {
+		struct nvkvm_hdr                  hdr;
+		struct nvkvm_req_uvm_external_map req;
+	} *msg;
+	__u64 retval = 0;
+	int ret;
+
+	if (!n_chunks || n_chunks > NVKVM_UVM_EXT_CHUNKS_PER_MSG)
+		return -EINVAL;
+
+	msg = kzalloc(sizeof(*msg), GFP_KERNEL);
+	if (!msg)
+		return -ENOMEM;
+
+	msg->req.gva        = cpu_to_le64(gva);
+	msg->req.handle_id  = cpu_to_le32(handle_id);
+	msg->req.session_id = cpu_to_le32(session_id);
+	msg->req.n_chunks   = cpu_to_le32(n_chunks);
+	memcpy(msg->req.chunk, chunks,
+	       (size_t)n_chunks * sizeof(struct nvkvm_uvm_ext_chunk));
+
+	ret = simple_req(NVKVM_REQ_UVM_EXTERNAL_MAP, msg, sizeof(*msg),
+			 &retval);
+	kfree(msg);
+	return ret;
+}
+
 int nvkvm_virtio_uvm_external_unback(unsigned int session_id, __u32 handle_id,
 				     __u64 gva, __u64 length)
 {
 	struct {
-		struct nvkvm_hdr                        hdr;
-		struct nvkvm_req_uvm_external_unback    req;
+		struct nvkvm_hdr                     hdr;
+		struct nvkvm_req_uvm_external_unback req;
 	} msg = {};
 	__u64 retval = 0;
 

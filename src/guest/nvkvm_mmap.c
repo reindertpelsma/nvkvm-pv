@@ -309,17 +309,27 @@ static bool nvkvm_uvm_mmap_has_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
  * address space at a VA the guest chose, which is the design that gave us the
  * U-15 layout oracle and a cross-process collision.  Instead:
  *
- *   1. allocate the backing pages HERE, contiguous in guest-physical space
- *   2. map them into the caller's VMA at the VA libcuda asked for
- *   3. ask QEMU to publish those same physical pages to the GPU as a UVM
- *      external range based at that VA
+ *   1. allocate the backing HERE, as physically contiguous chunks
+ *   2. map them into the caller's VMA so userspace sees one flat range at the
+ *      VA libcuda asked for
+ *   3. ask QEMU to publish those same physical pages to the GPU as ONE UVM
+ *      external range based at that VA, covered by one descriptor per chunk
  *
  * The result is one set of pages with three views -- guest CPU, host RAM block,
  * GPU -- rather than a copy.  The guest VA is used as a GPU virtual address in
  * this process's own RM VA space and never as a host address; QEMU derives
- * every host address it touches from the GPA below.
+ * every host address it touches from the GPAs below.
  *
- * What this is NOT: real unified memory.  There is no migration to VRAM and no
+ * WHY CHUNKS.  alloc_pages() cannot exceed MAX_PAGE_ORDER -- 4 MB on x86_64 --
+ * and real managed allocations are hundreds of MB.  The contiguity requirement
+ * is per DESCRIPTOR, not per range: UVM finds an external range by any address
+ * inside it and keeps a per-GPU range tree of sub-mappings, so one range may be
+ * covered by many allocations.  Chunks are taken largest-first, which also
+ * keeps them naturally aligned -- UVM picks its GPU page size from
+ * `pageSize | base | length | map_offset`, so a well-aligned chunk maps with
+ * big pages and a ragged one merely costs TLB coverage.
+ *
+ * What this is NOT: real unified memory.  No migration to VRAM and no
  * oversubscription -- see docs/internal/known-limitations.md.
  */
 static int nvkvm_mmap_request_uvm_fallback(struct nvkvm_fd_ctx *ctx,
@@ -327,114 +337,148 @@ static int nvkvm_mmap_request_uvm_fallback(struct nvkvm_fd_ctx *ctx,
 {
 	unsigned long vma_len = vma->vm_end - vma->vm_start;
 	__u64 gva = vma->vm_start;
-	struct nvkvm_mmap_region *region;
-	struct page *pages;
-	unsigned int order;
-	__u64 gpa;
+	struct nvkvm_mmap_region *region = NULL;
+	struct nvkvm_ext_chunk_rec *recs = NULL;
+	struct nvkvm_uvm_ext_chunk *batch = NULL;
+	unsigned int max_chunks, nch = 0, nbatch = 0;
+	unsigned long remaining = vma_len;
+	__u64 off = 0;
+	__u8 uuids[NVKVM_UVM_MAX_REG_GPUS][16];
+	__u32 n_gpus = 0;
+	bool backed = false;
 	int ret;
 
-	/*
-	 * Contiguity is a requirement, not a hope: QEMU turns one GPA into one
-	 * host VA range for the descriptor, so a scattered allocation could not
-	 * be described.  alloc_pages() gives physical contiguity by
-	 * construction; anything the buddy allocator cannot satisfy in one
-	 * block is refused here rather than silently split.
-	 */
-	order = get_order(vma_len);
-	if (order > MAX_PAGE_ORDER) {
-		pr_warn_ratelimited(
-			"nvkvm: managed alloc of %lu bytes exceeds the largest "
-			"contiguous block this guest can allocate (order %u > %u); "
-			"refusing rather than splitting\n",
-			vma_len, order, (unsigned int)MAX_PAGE_ORDER);
-		return -ENOMEM;
-	}
-
-	pages = alloc_pages(GFP_KERNEL | __GFP_ZERO | __GFP_COMP, order);
-	if (!pages)
-		return -ENOMEM;
-	gpa = (__u64)page_to_phys(pages);
-
-	region = kzalloc(sizeof(*region), GFP_KERNEL);
-	if (!region) {
-		__free_pages(pages, order);
-		return -ENOMEM;
-	}
-
-	/*
-	 * Publish to the GPU BEFORE installing the PTEs.  If the host refuses,
-	 * the caller must not be left holding a mapping the GPU cannot see --
-	 * cuMemAllocManaged failing is recoverable, a pointer that faults on the
-	 * GPU is not.
-	 */
+	/* The GPUs this va_space has registered.  Passing none is refused by the
+	 * driver (gpuAttributesCount == 0 -> NV_ERR_INVALID_ARGUMENT), and a GPU
+	 * not registered here gives NV_ERR_INVALID_DEVICE -- so the set has to
+	 * come from the state recorded off UVM_REGISTER_GPU. */
 	{
-		/*
-		 * The GPUs this va_space has registered.  Passing none would be
-		 * refused by the driver (gpuAttributesCount == 0 ->
-		 * NV_ERR_INVALID_ARGUMENT), and passing a GPU that is not
-		 * registered here gives NV_ERR_INVALID_DEVICE -- so the set has
-		 * to come from the state we recorded off UVM_REGISTER_GPU.
-		 */
 		struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
 		struct nvkvm_uvm_gpu_reg *g;
-		__u8 uuids[NVKVM_UVM_MAX_REG_GPUS][16];
-		__u32 n = 0;
 
 		if (st) {
 			mutex_lock(&st->lock);
 			list_for_each_entry(g, &st->registered_gpus, list) {
-				if (n >= NVKVM_UVM_MAX_REG_GPUS)
+				if (n_gpus >= NVKVM_UVM_MAX_REG_GPUS)
 					break;
-				memcpy(uuids[n], g->gpu_uuid, 16);
-				n++;
+				memcpy(uuids[n_gpus], g->gpu_uuid, 16);
+				n_gpus++;
 			}
 			mutex_unlock(&st->lock);
 		}
-		if (!n) {
-			pr_warn_ratelimited(
-				"nvkvm: managed alloc at 0x%llx with no GPU "
-				"registered on this UVM fd -- refusing\n",
-				(unsigned long long)gva);
-			kfree(region);
-			__free_pages(pages, order);
-			return -ENODEV;
+	}
+	if (!n_gpus) {
+		pr_warn_ratelimited(
+			"nvkvm: managed alloc at 0x%llx with no GPU registered "
+			"on this UVM fd -- refusing\n",
+			(unsigned long long)gva);
+		return -ENODEV;
+	}
+
+	/* Worst case is every chunk a single page; cap it so a huge request
+	 * cannot mint an unbounded number of RM objects.  The host enforces its
+	 * own ceiling too (NVKVM_UVM_EXT_MAX_DESC). */
+	max_chunks = (unsigned int)(vma_len >> PAGE_SHIFT);
+	if (max_chunks > NVKVM_UVM_EXT_MAX_CHUNKS)
+		max_chunks = NVKVM_UVM_EXT_MAX_CHUNKS;
+
+	recs  = kvcalloc(max_chunks, sizeof(*recs), GFP_KERNEL);
+	batch = kcalloc(NVKVM_UVM_EXT_CHUNKS_PER_MSG, sizeof(*batch), GFP_KERNEL);
+	region = kzalloc(sizeof(*region), GFP_KERNEL);
+	if (!recs || !batch || !region) {
+		ret = -ENOMEM;
+		goto err;
+	}
+
+	/* Establish the range first: a chunk can only be mapped into a range
+	 * that already exists. */
+	ret = nvkvm_virtio_uvm_external_back((unsigned int)ctx->session->id,
+					     ctx->handle_id, gva,
+					     (__u64)vma_len, &uuids[0][0],
+					     n_gpus);
+	if (ret)
+		goto err;
+	backed = true;
+
+	while (remaining) {
+		unsigned int order = get_order(remaining);
+		struct page *pages = NULL;
+		unsigned long clen;
+		__u64 gpa;
+
+		if (order > MAX_PAGE_ORDER)
+			order = MAX_PAGE_ORDER;
+		/* Take the largest block available; fragmentation costs GPU
+		 * page size, not correctness. */
+		for (;;) {
+			pages = alloc_pages(GFP_KERNEL | __GFP_ZERO |
+					    __GFP_COMP | __GFP_NORETRY, order);
+			if (pages || order == 0)
+				break;
+			order--;
 		}
-		ret = nvkvm_virtio_uvm_external_back(
-			(unsigned int)ctx->session->id, ctx->handle_id, gva,
-			(__u64)vma_len, gpa, &uuids[0][0], n);
-	}
-	if (ret) {
-		kfree(region);
-		__free_pages(pages, order);
-		return ret;
+		if (!pages) {
+			pr_warn_ratelimited(
+				"nvkvm: managed alloc 0x%llx: out of guest RAM "
+				"after %lu of %lu bytes\n",
+				(unsigned long long)gva,
+				(unsigned long)(vma_len - remaining), vma_len);
+			ret = -ENOMEM;
+			goto err;
+		}
+		if (nch >= max_chunks) {
+			__free_pages(pages, order);
+			ret = -E2BIG;
+			goto err;
+		}
+
+		clen = PAGE_SIZE << order;
+		if (clen > remaining)
+			clen = remaining;
+		gpa = (__u64)page_to_phys(pages);
+
+		ret = remap_pfn_range(vma, (unsigned long)(vma->vm_start + off),
+				      (unsigned long)(gpa >> PAGE_SHIFT), clen,
+				      vma->vm_page_prot);
+		if (ret) {
+			__free_pages(pages, order);
+			goto err;
+		}
+
+		recs[nch].pages = pages;
+		recs[nch].order = order;
+		nch++;
+
+		batch[nbatch].gpa = cpu_to_le64(gpa);
+		batch[nbatch].off = cpu_to_le64(off);
+		batch[nbatch].len = cpu_to_le64((__u64)clen);
+		nbatch++;
+
+		off       += clen;
+		remaining -= clen;
+
+		if (nbatch == NVKVM_UVM_EXT_CHUNKS_PER_MSG || !remaining) {
+			ret = nvkvm_virtio_uvm_external_map(
+				(unsigned int)ctx->session->id, ctx->handle_id,
+				gva, batch, nbatch);
+			if (ret)
+				goto err;
+			nbatch = 0;
+		}
 	}
 
-	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
-	/* Ordinary RAM: write-back, like every other UVM/nvidiactl mapping. */
-	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
-
-	ret = remap_pfn_range(vma, vma->vm_start, (unsigned long)(gpa >> PAGE_SHIFT),
-			      vma_len, vma->vm_page_prot);
-	if (ret) {
-		nvkvm_virtio_uvm_external_unback((unsigned int)ctx->session->id,
-						 ctx->handle_id, gva,
-						 (__u64)vma_len);
-		kfree(region);
-		__free_pages(pages, order);
-		return ret;
-	}
 	nvkvm_force_range_wb(vma->vm_mm, vma->vm_start, vma->vm_end);
 
-	region->mmap_token = 0;          /* no isolate mapping to release */
-	region->handle_id  = ctx->handle_id;
-	region->gpa_base   = (unsigned long)gpa;
-	region->length     = vma_len;
-	region->offset     = (__u64)vma->vm_pgoff << PAGE_SHIFT;
-	region->vma        = vma;
-	region->ext_backed = true;
-	region->ext_gva    = gva;
-	region->ext_pages  = pages;
-	region->ext_order  = order;
+	region->mmap_token  = 0;          /* no isolate mapping to release */
+	region->handle_id   = ctx->handle_id;
+	region->gpa_base    = 0;          /* many chunks; see ext_chunks    */
+	region->length      = vma_len;
+	region->offset      = (__u64)vma->vm_pgoff << PAGE_SHIFT;
+	region->vma         = vma;
+	region->ext_backed  = true;
+	region->ext_gva     = gva;
+	region->ext_chunks  = recs;
+	region->ext_nchunks = nch;
 
 	spin_lock(&ctx->mmap_lock);
 	list_add_tail(&region->list, &ctx->mmap_regions);
@@ -442,7 +486,26 @@ static int nvkvm_mmap_request_uvm_fallback(struct nvkvm_fd_ctx *ctx,
 
 	vma->vm_ops          = &nvkvm_vm_ops;
 	vma->vm_private_data = region;
+	kfree(batch);
 	return 0;
+
+err:
+	/*
+	 * Unwind in the same order teardown uses: the host drops the GPU
+	 * mappings and its descriptors first, and only then do the pages go.
+	 * Doing it the other way round would leave the GPU mapping memory we
+	 * had already handed back to the allocator.
+	 */
+	if (backed)
+		nvkvm_virtio_uvm_external_unback((unsigned int)ctx->session->id,
+						 ctx->handle_id, gva,
+						 (__u64)vma_len);
+	while (nch--)
+		__free_pages(recs[nch].pages, recs[nch].order);
+	kvfree(recs);
+	kfree(batch);
+	kfree(region);
+	return ret;
 }
 
 static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
@@ -455,7 +518,22 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	/* Basic validation: size must be page-aligned and non-zero */
 	if (!vma_len || (vma_len & ~PAGE_MASK))
 		return -EINVAL;
-	if (vma_len > SZ_1G)
+	/*
+	 * 1 GiB bounds a FORWARDED device mmap, where the size becomes a host
+	 * mapping in the window.  A managed-memory fallback range is not that:
+	 * it is guest RAM this module allocates and the host only ever
+	 * describes, so the bound that matters there is the chunk ceiling
+	 * (NVKVM_UVM_EXT_MAX_CHUNKS x MAX_PAGE_ORDER, i.e. 4 GiB) plus however
+	 * much guest RAM the allocator will actually part with.  Real
+	 * cudaMallocManaged allocations run to multiple GB, so applying the
+	 * forwarded-path bound to them would fail nearly everything worth
+	 * testing.
+	 */
+	if (vma_len > SZ_1G &&
+	    !(ctx->dev_id == NVKVM_DEV_UVM &&
+	      !nvkvm_uvm_mmap_has_intent(ctx, vma->vm_start, vma_len)))
+		return -EINVAL;
+	if (vma_len > SZ_4G)
 		return -EINVAL;
 
 	/*
@@ -1404,9 +1482,14 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 			}
 		}
 		list_del(&region->list);
-		/* Only now, with the GPU mapping provably gone. */
-		if (region->ext_backed && region->ext_pages)
-			__free_pages(region->ext_pages, region->ext_order);
+		/* Only now, with the GPU mappings provably gone. */
+		if (region->ext_backed && region->ext_chunks) {
+			unsigned int i;
+			for (i = 0; i < region->ext_nchunks; i++)
+				__free_pages(region->ext_chunks[i].pages,
+					     region->ext_chunks[i].order);
+			kvfree(region->ext_chunks);
+		}
 		kfree(region);
 	}
 }

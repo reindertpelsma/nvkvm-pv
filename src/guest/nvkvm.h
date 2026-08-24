@@ -116,6 +116,17 @@ struct nvkvm_session {
 
 /* ── Per-FD context (one per open(/dev/nvidia*)) ──────────────────────────── */
 
+/*
+ * One physically contiguous piece of a fallback-backed managed range.  A
+ * managed allocation is far larger than the biggest block alloc_pages() can
+ * return (MAX_PAGE_ORDER, 4 MB on x86_64), so the backing is many of these and
+ * each becomes its own RM descriptor host-side.
+ */
+struct nvkvm_ext_chunk_rec {
+	struct page   *pages;
+	unsigned int   order;
+};
+
 struct nvkvm_mmap_region {
 	struct list_head list;
 	__u32    mmap_token;       /* opaque token from host                */
@@ -135,8 +146,8 @@ struct nvkvm_mmap_region {
 	bool           ext_backed;
 	__u64          ext_gva;    /* the GPU VA it was published at; the vma
 				    * may already be gone at teardown time  */
-	struct page   *ext_pages;
-	unsigned int   ext_order;
+	struct nvkvm_ext_chunk_rec *ext_chunks;  /* the backing, in pieces  */
+	unsigned int   ext_nchunks;
 };
 
 /*
@@ -473,8 +484,12 @@ int  nvkvm_hostfile_discover_gpus(void);
 int  nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 				     __u32 *handle_id_out);
 int  nvkvm_virtio_uvm_external_back(unsigned int session_id, __u32 handle_id,
-				    __u64 gva, __u64 length, __u64 gpa_base,
+				    __u64 gva, __u64 length,
 				    const __u8 *gpu_uuids, __u32 n_gpus);
+int  nvkvm_virtio_uvm_external_map(unsigned int session_id, __u32 handle_id,
+				   __u64 gva,
+				   const struct nvkvm_uvm_ext_chunk *chunks,
+				   __u32 n_chunks);
 int  nvkvm_virtio_uvm_external_unback(unsigned int session_id, __u32 handle_id,
 				      __u64 gva, __u64 length);
 int  nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,

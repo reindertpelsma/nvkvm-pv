@@ -1002,12 +1002,21 @@ fail:
 /* ── Managed-memory fallback: back a UVM range with the guest's own RAM ──────
  *
  * libcuda's mmap of /dev/nvidia-uvm is not forwarded.  The guest module backs
- * the range with its own pages and sends the guest-physical base here; QEMU
- * publishes those SAME physical pages to the GPU as an external range at the
- * guest's VA.  The result is one set of pages seen three ways: by the guest CPU
- * through its own page tables, by QEMU through the RAM block, and by the GPU
- * through the external mapping.  That identity is what makes it shared memory
- * rather than a copy.
+ * the range with its own pages and sends their guest-physical extents here;
+ * QEMU publishes those SAME physical pages to the GPU as an external range at
+ * the guest's VA.  One set of pages seen three ways -- by the guest CPU through
+ * its page tables, by QEMU through the RAM block, by the GPU through the
+ * external mapping.  That identity is what makes it shared memory, not a copy.
+ *
+ * MANY CHUNKS, ONE RANGE.  A managed allocation is routinely hundreds of MB,
+ * while the largest physically contiguous block a guest can allocate is
+ * MAX_PAGE_ORDER -- 4 MB on x86_64.  The contiguity requirement is per
+ * DESCRIPTOR, not per range: UVM finds an external range by any address inside
+ * it (uvm_va_range_external_find -> uvm_va_range_find) and keeps a per-GPU
+ * range tree of sub-mappings (uvm_map_external.c:1131-1140), so one range is
+ * covered by many allocations.  Misalignment is not fatal either -- the mapping
+ * page size is negotiated from `pageSize | base | length | map_offset`
+ * (:931-940), so a smaller or oddly-placed chunk only costs GPU TLB coverage.
  *
  * WHY THIS DOES NOT WEAKEN U-3.  The guest-facing NVOS32 gate is untouched: a
  * guest ioctl carrying function 27 is still refused in
@@ -1021,12 +1030,26 @@ fail:
  */
 #define NVKVM_UVM_EXT_MAX 4096
 
+/* Ceiling on descriptors behind one managed range.  4 MB chunks x 1024 is a
+ * 4 GiB allocation, which is past anything this fallback should encourage given
+ * every byte is pinned guest RAM.  It also bounds the teardown loop and the
+ * number of RM objects one guest process can mint through this path. */
+#define NVKVM_UVM_EXT_MAX_DESC 1024
+
+struct nvkvm_uvm_ext_desc {
+	uint32_t h_memory;     /* OS-descriptor object under the admin client */
+	void    *mr_ref;       /* MemoryRegion reference held for its pages   */
+};
+
 struct nvkvm_uvm_ext_ent {
-	uint32_t handle_id;    /* 0 = free slot                            */
+	uint32_t handle_id;    /* 0 = free slot                              */
 	uint64_t gva;
 	uint64_t length;
-	uint32_t h_memory;     /* OS-descriptor object under the admin client */
-	void    *mr_ref;       /* MemoryRegion reference held for the pages   */
+	struct nvkvm_uvm_ext_desc *desc;
+	uint32_t n_desc;
+	uint32_t cap_desc;
+	uint32_t n_gpus;
+	uint8_t  gpu_uuid[NVKVM_UVM_MAX_REG_GPUS][16];
 };
 
 static struct nvkvm_uvm_ext_ent uvm_ext_tbl[NVKVM_UVM_EXT_MAX];
@@ -1040,7 +1063,7 @@ static pthread_mutex_t          uvm_ext_lock = PTHREAD_MUTEX_INITIALIZER;
 #define NVKVM_OS32_ATTR_COHERENCY_WRITE_BACK  (5u << 29)
 
 /* Allocate an OS-descriptor memory object over [hva, hva+len) in QEMU's own
- * address space, under QEMU's admin client.  Returns 0 and *h_out on success. */
+ * address space, under QEMU's admin client.  admin_lock held by the caller. */
 static int nvkvm_uvm_ext_alloc_descriptor(VirtIONvgpu *nv, void *hva,
 					  uint64_t len, uint32_t *h_out)
 {
@@ -1091,8 +1114,68 @@ static void nvkvm_uvm_ext_free_descriptor(VirtIONvgpu *nv, uint32_t h_memory)
 		      NVADM_IOWR(NV_ESC_RM_FREE, sizeof f), &f);
 }
 
-/* Tear the GPU mapping down first, then the pages.  Order is load-bearing: the
- * reverse leaves a live GPU mapping over memory the driver has unpinned. */
+/* Map one already-allocated descriptor at `base` inside the range.  admin_lock
+ * held.  Returns 0, or -errno with *nvstatus set when the driver refused. */
+static int nvkvm_uvm_ext_map_one(VirtIONvgpu *nv, int uvm_fd,
+				 struct nvkvm_uvm_ext_ent *e,
+				 uint64_t base, uint64_t len,
+				 uint32_t h_memory, uint32_t *nvstatus)
+{
+	const struct nvkvm_abi_profile *prof =
+		nv->abi ? nv->abi : nvkvm_abi_by_id(NVKVM_ABI_570);
+	uint32_t sz     = prof->uvm_map_ext_size;
+	uint32_t fd_off = prof->uvm_map_ext_fd_off;
+	/* perGpuAttributes[] follows {base,length,offset}; each entry is
+	 * NvProcessorUuid(16) + 5 x NvU32 = 36 bytes (uvm_types.h,
+	 * UvmGpuMappingAttributes).  gpuAttributesCount is the NvU64 just
+	 * before rmCtrlFd, so its offset comes from the profile rather than a
+	 * hardcoded array length -- that length is version-variant (256 on
+	 * V550).  Every attribute but the UUID stays zero, which is
+	 * ...TypeDefault throughout (nv_uvm_user_types.h:67,86,101,116,140):
+	 * "let UVM choose", the same thing libcuda asks for. */
+	const size_t attr_off = 24, attr_stride = 36;
+	char *m;
+	int rc = 0;
+
+	if (sz < 32 || fd_off < 8 || fd_off + 12 > sz ||
+	    attr_off + (size_t)e->n_gpus * attr_stride > (size_t)fd_off - 8)
+		return -EINVAL;
+
+	m = g_malloc0(sz);
+	memcpy(m + 0, &base, 8);
+	memcpy(m + 8, &len,  8);
+	/* map_offset is an offset into the ALLOCATION; each chunk has its own
+	 * descriptor covering exactly itself, so it is always zero here. */
+	for (uint32_t i = 0; i < e->n_gpus; i++)
+		memcpy(m + attr_off + i * attr_stride, e->gpu_uuid[i], 16);
+	{
+		uint64_t cnt = e->n_gpus;
+		memcpy(m + fd_off - 8, &cnt, 8);
+	}
+	{
+		int32_t  ctl = (int32_t)nv->admin_ctl_fd;
+		uint32_t hc  = nv->admin_hclient;
+		memcpy(m + fd_off,     &ctl, 4);
+		memcpy(m + fd_off + 4, &hc,  4);
+		memcpy(m + fd_off + 8, &h_memory, 4);
+	}
+
+	if (ioctl(uvm_fd, 33 /* UVM_MAP_EXTERNAL_ALLOCATION */, m) < 0) {
+		rc = -errno;
+	} else {
+		uint32_t st = 0;
+		memcpy(&st, m + sz - 4, 4);
+		if (st != 0) { *nvstatus = st; rc = -EINVAL; }
+	}
+	g_free(m);
+	return rc;
+}
+
+/* Tear the GPU mapping down first, then the pages it was over.  Order is
+ * load-bearing: the reverse leaves live GPU mappings over memory the driver has
+ * unpinned.  UVM_FREE destroys the external range and every sub-mapping in it
+ * (uvm_va_range.c:687-688) in one call, so the per-descriptor loop that follows
+ * only releases RM objects nothing points at any more. */
 static void nvkvm_uvm_ext_teardown(VirtIONvgpu *nv, int uvm_fd,
 				   struct nvkvm_uvm_ext_ent *e)
 {
@@ -1100,36 +1183,41 @@ static void nvkvm_uvm_ext_teardown(VirtIONvgpu *nv, int uvm_fd,
 		struct { uint64_t base, length; uint32_t rm_status; } fr;
 		memset(&fr, 0, sizeof fr);
 		fr.base = e->gva;
-		/* UVM_FREE destroys an external range (uvm_va_range.c:687-688);
-		 * length 0 means "the range starting here", as libcuda sends. */
 		ioctl(uvm_fd, 34 /* UVM_FREE */, &fr);
 	}
-	nvkvm_uvm_ext_free_descriptor(nv, e->h_memory);
-	nvkvm_gpa_range_put(e->mr_ref);
-	e->handle_id = 0;
-	e->gva = e->length = 0;
-	e->h_memory = 0;
-	e->mr_ref = NULL;
+	for (uint32_t i = 0; i < e->n_desc; i++) {
+		nvkvm_uvm_ext_free_descriptor(nv, e->desc[i].h_memory);
+		nvkvm_gpa_range_put(e->desc[i].mr_ref);
+	}
+	g_free(e->desc);
+	memset(e, 0, sizeof *e);
+}
+
+/* Find the live entry for (handle, gva).  uvm_ext_lock held. */
+static struct nvkvm_uvm_ext_ent *nvkvm_uvm_ext_find(uint32_t handle_id,
+						    uint64_t gva)
+{
+	for (int i = 0; i < NVKVM_UVM_EXT_MAX; i++)
+		if (uvm_ext_tbl[i].handle_id == handle_id &&
+		    uvm_ext_tbl[i].gva == gva)
+			return &uvm_ext_tbl[i];
+	return NULL;
 }
 
 int nvkvm_req_uvm_external_back(VirtIONvgpu *nv,
 				struct nvkvm_req_uvm_external_back *req,
 				struct nvkvm_resp_uvm_external_back *resp)
 {
-	uint64_t gva = req->gva, len = req->length, gpa = req->gpa_base;
+	uint64_t gva = req->gva, len = req->length;
 	struct nvkvm_handle *h;
-	void *hva = NULL, *ref = NULL;
-	uint32_t h_memory = 0;
-	int slot = -1, rc;
+	struct nvkvm_uvm_ext_ent *e = NULL;
+	int slot = -1;
 
 	resp->status = resp->nvstatus = 0;
 
-	if (!uvm_va_sane(gva, len) || !gpa || (gpa & 0xfffULL)) {
-		resp->status = EINVAL;
-		return 0;
-	}
-	/* No GPUs named means the driver would refuse anyway; say so here
-	 * rather than allocating a descriptor and unwinding it. */
+	if (!uvm_va_sane(gva, len)) { resp->status = EINVAL; return 0; }
+	/* No GPUs named means the later mappings would be refused anyway; say
+	 * so now rather than establishing a range nothing can use. */
 	if (req->n_gpus == 0 || req->n_gpus > NVKVM_UVM_MAX_REG_GPUS) {
 		resp->status = EINVAL;
 		return 0;
@@ -1139,42 +1227,30 @@ int nvkvm_req_uvm_external_back(VirtIONvgpu *nv,
 		resp->status = EBADF;
 		return 0;
 	}
-
-	/* Guest RAM only, whole range, one region -- rejects rather than clamps. */
-	rc = nvkvm_gpa_range_get(nv, gpa, len, &hva, &ref);
-	if (rc < 0) {
-		fprintf(stderr,
-			"nvkvm: UVM back: GPA 0x%llx+0x%llx is not a single "
-			"guest RAM range (%s) -- refused\n",
-			(unsigned long long)gpa, (unsigned long long)len,
-			strerror(-rc));
-		resp->status = (uint32_t)-rc;
-		return 0;
-	}
+	if (!uvm_va_have_room()) { resp->status = ENOMEM; return 0; }
 
 	pthread_mutex_lock(&uvm_ext_lock);
+	if (nvkvm_uvm_ext_find(req->handle_id, gva)) {
+		pthread_mutex_unlock(&uvm_ext_lock);
+		resp->status = EEXIST;
+		return 0;
+	}
 	for (int i = 0; i < NVKVM_UVM_EXT_MAX; i++)
 		if (!uvm_ext_tbl[i].handle_id) { slot = i; break; }
+	if (slot < 0) {
+		pthread_mutex_unlock(&uvm_ext_lock);
+		resp->status = ENOMEM;
+		return 0;
+	}
+	e = &uvm_ext_tbl[slot];
+	memset(e, 0, sizeof *e);
+	e->handle_id = req->handle_id;
+	e->gva       = gva;
+	e->length    = len;
+	e->n_gpus    = req->n_gpus;
+	memcpy(e->gpu_uuid, req->gpu_uuid, sizeof e->gpu_uuid);
 	pthread_mutex_unlock(&uvm_ext_lock);
-	if (slot < 0) { nvkvm_gpa_range_put(ref); resp->status = ENOMEM; return 0; }
 
-	pthread_mutex_lock(&nv->admin_lock);
-	if (nvkvm_admin_ensure(nv) < 0) {
-		pthread_mutex_unlock(&nv->admin_lock);
-		nvkvm_gpa_range_put(ref);
-		resp->status = ENODEV;
-		return 0;
-	}
-	rc = nvkvm_uvm_ext_alloc_descriptor(nv, hva, len, &h_memory);
-	pthread_mutex_unlock(&nv->admin_lock);
-	if (rc < 0) {
-		nvkvm_gpa_range_put(ref);
-		resp->status = (uint32_t)-rc;
-		return 0;
-	}
-
-	/* Publish to the GPU at the guest's VA.  Both calls go on the handle's
-	 * own UVM fd, i.e. into this guest process's va_space. */
 	{
 		struct { uint64_t base, length; uint32_t rm_status; } cr;
 		memset(&cr, 0, sizeof cr);
@@ -1182,104 +1258,150 @@ int nvkvm_req_uvm_external_back(VirtIONvgpu *nv,
 		if (ioctl(h->fd, 73 /* UVM_CREATE_EXTERNAL_RANGE */, &cr) < 0 ||
 		    cr.rm_status != 0) {
 			fprintf(stderr,
-				"nvkvm: UVM back: CREATE_EXTERNAL_RANGE 0x%llx+0x%llx "
-				"rmStatus=0x%x\n", (unsigned long long)gva,
+				"nvkvm: UVM back: CREATE_EXTERNAL_RANGE "
+				"0x%llx+0x%llx rmStatus=0x%x\n",
+				(unsigned long long)gva,
 				(unsigned long long)len, cr.rm_status);
 			resp->nvstatus = cr.rm_status;
 			resp->status   = EINVAL;
-			nvkvm_uvm_ext_free_descriptor(nv, h_memory);
-			nvkvm_gpa_range_put(ref);
-			return 0;
-		}
-	}
-	{
-		struct nvkvm_uvm_map_ext {
-			uint64_t base, length, offset;
-			uint8_t  per_gpu[NVKVM_UVM_BOUNCE_MIN];
-		} *m = g_malloc0(sizeof *m);
-		const struct nvkvm_abi_profile *prof =
-			nv->abi ? nv->abi : nvkvm_abi_by_id(NVKVM_ABI_570);
-		uint32_t sz = prof->uvm_map_ext_size;
-		uint32_t fd_off = prof->uvm_map_ext_fd_off;
-		int failed = 0;
-
-		m->base = gva; m->length = len; m->offset = 0;
-		/*
-		 * perGpuAttributes[] starts right after {base,length,offset} and
-		 * each entry is NvProcessorUuid(16) + 5 x NvU32 = 36 bytes
-		 * (uvm_types.h, UvmGpuMappingAttributes).  gpuAttributesCount is
-		 * the NvU64 immediately before rmCtrlFd, so it is derived from
-		 * the profile's fd offset rather than hardcoded -- the array
-		 * length is version-variant (256 entries on V550).
-		 *
-		 * Every attribute except the UUID is left zero, which is
-		 * UvmGpuMappingTypeDefault / CachingTypeDefault /
-		 * FormatTypeDefault / FormatElementBitsDefault /
-		 * CompressionTypeDefault (nv_uvm_user_types.h:67,86,101,116,140)
-		 * -- i.e. "let UVM choose", which is what libcuda asks for too.
-		 *
-		 * A count of 0 is NOT a shorthand for "all GPUs": the driver
-		 * rejects it outright (uvm_map_external.c:993-994).
-		 */
-		{
-			const size_t attr_off = 24, attr_stride = 36;
-			uint32_t n = req->n_gpus;
-			if (n > NVKVM_UVM_MAX_REG_GPUS) n = NVKVM_UVM_MAX_REG_GPUS;
-			if (attr_off + (size_t)n * attr_stride <= (size_t)fd_off - 8) {
-				for (uint32_t i = 0; i < n; i++)
-					memcpy((char *)m + attr_off + i * attr_stride,
-					       req->gpu_uuid[i], 16);
-				uint64_t cnt = n;
-				memcpy((char *)m + fd_off - 8, &cnt, 8);
-			}
-		}
-		if (fd_off + 12 <= sz) {
-			int32_t  ctl = (int32_t)nv->admin_ctl_fd;
-			uint32_t hc  = nv->admin_hclient, hm = h_memory;
-			memcpy((char *)m + fd_off,     &ctl, 4);
-			memcpy((char *)m + fd_off + 4, &hc,  4);
-			memcpy((char *)m + fd_off + 8, &hm,  4);
-		}
-		if (ioctl(h->fd, 33 /* UVM_MAP_EXTERNAL_ALLOCATION */, m) < 0)
-			failed = 1;
-		else {
-			uint32_t st = 0;
-			memcpy(&st, (char *)m + sz - 4, 4);
-			if (st != 0) { failed = 1; resp->nvstatus = st; }
-		}
-		g_free(m);
-		if (failed) {
-			struct { uint64_t base, length; uint32_t rm_status; } fr;
-			memset(&fr, 0, sizeof fr);
-			fr.base = gva;
-			ioctl(h->fd, 34 /* UVM_FREE */, &fr);
-			nvkvm_uvm_ext_free_descriptor(nv, h_memory);
-			nvkvm_gpa_range_put(ref);
-			resp->status = EINVAL;
+			pthread_mutex_lock(&uvm_ext_lock);
+			memset(e, 0, sizeof *e);
+			pthread_mutex_unlock(&uvm_ext_lock);
 			return 0;
 		}
 	}
 
-	/* U-6: the driver accepted the range, so record it.  This is the same
+	/* U-6: the driver accepted the range, so record it -- the same
 	 * narrowing-of-driver-state rule every other CREATE follows. */
 	if (!uvm_va_add(req->handle_id, gva, len))
-		fprintf(stderr, "nvkvm: WARN UVM VA table full — handle %u "
+		fprintf(stderr, "nvkvm: WARN UVM VA table full - handle %u "
 			"external range 0x%llx+0x%llx untracked (U-6)\n",
 			req->handle_id, (unsigned long long)gva,
 			(unsigned long long)len);
 
+	NVKVM_DBG("nvkvm: UVMEXTBACK handle=%u gva=0x%llx len=0x%llx\n",
+		  req->handle_id, (unsigned long long)gva,
+		  (unsigned long long)len);
+	return 0;
+}
+
+int nvkvm_req_uvm_external_map(VirtIONvgpu *nv,
+			       struct nvkvm_req_uvm_external_map *req,
+			       struct nvkvm_resp_uvm_external_map *resp)
+{
+	struct nvkvm_handle *h;
+	struct nvkvm_uvm_ext_ent *e;
+	uint32_t n = req->n_chunks;
+	uint32_t added = 0;
+	int rc = 0;
+
+	resp->status = resp->nvstatus = 0;
+
+	if (n == 0 || n > NVKVM_UVM_EXT_CHUNKS_PER_MSG) {
+		resp->status = EINVAL;
+		return 0;
+	}
+	h = nvkvm_handle_get(&nv->handles, req->handle_id);
+	if (!h || h->dev_id != NVKVM_DEV_UVM || h->fd < 0) {
+		resp->status = EBADF;
+		return 0;
+	}
+
 	pthread_mutex_lock(&uvm_ext_lock);
-	uvm_ext_tbl[slot].handle_id = req->handle_id;
-	uvm_ext_tbl[slot].gva       = gva;
-	uvm_ext_tbl[slot].length    = len;
-	uvm_ext_tbl[slot].h_memory  = h_memory;
-	uvm_ext_tbl[slot].mr_ref    = ref;
+	e = nvkvm_uvm_ext_find(req->handle_id, req->gva);
+	if (!e) {
+		pthread_mutex_unlock(&uvm_ext_lock);
+		resp->status = ENOENT;
+		return 0;
+	}
+	if (e->n_desc + n > NVKVM_UVM_EXT_MAX_DESC) {
+		pthread_mutex_unlock(&uvm_ext_lock);
+		fprintf(stderr,
+			"nvkvm: UVM map: range 0x%llx would need more than %u "
+			"descriptors - refusing\n",
+			(unsigned long long)req->gva,
+			(unsigned)NVKVM_UVM_EXT_MAX_DESC);
+		resp->status = E2BIG;
+		return 0;
+	}
+	if (e->n_desc + n > e->cap_desc) {
+		uint32_t cap = e->cap_desc ? e->cap_desc * 2 : 64;
+		while (cap < e->n_desc + n) cap *= 2;
+		e->desc = g_realloc(e->desc, (size_t)cap * sizeof *e->desc);
+		memset(e->desc + e->cap_desc, 0,
+		       (size_t)(cap - e->cap_desc) * sizeof *e->desc);
+		e->cap_desc = cap;
+	}
 	pthread_mutex_unlock(&uvm_ext_lock);
 
-	NVKVM_DBG("nvkvm: UVMEXTBACK handle=%u gva=0x%llx len=0x%llx "
-		  "gpa=0x%llx hMemory=0x%x\n", req->handle_id,
-		  (unsigned long long)gva, (unsigned long long)len,
-		  (unsigned long long)gpa, h_memory);
+	pthread_mutex_lock(&nv->admin_lock);
+	if (nvkvm_admin_ensure(nv) < 0) {
+		pthread_mutex_unlock(&nv->admin_lock);
+		resp->status = ENODEV;
+		return 0;
+	}
+
+	for (uint32_t i = 0; i < n; i++) {
+		uint64_t gpa  = req->chunk[i].gpa;
+		uint64_t off  = req->chunk[i].off;
+		uint64_t clen = req->chunk[i].len;
+		void *hva = NULL, *ref = NULL;
+		uint32_t h_memory = 0;
+
+		if (!clen || (clen & 0xfffULL) || (off & 0xfffULL) ||
+		    (gpa & 0xfffULL) || off + clen < off ||
+		    off + clen > e->length) {
+			rc = -EINVAL;
+			break;
+		}
+		/* Guest RAM only, whole chunk, one region - rejects rather than
+		 * clamps, which is also what makes the host VA contiguous. */
+		rc = nvkvm_gpa_range_get(nv, gpa, clen, &hva, &ref);
+		if (rc < 0) {
+			fprintf(stderr,
+				"nvkvm: UVM map: GPA 0x%llx+0x%llx is not a "
+				"single guest RAM range (%s) - refused\n",
+				(unsigned long long)gpa,
+				(unsigned long long)clen, strerror(-rc));
+			break;
+		}
+		rc = nvkvm_uvm_ext_alloc_descriptor(nv, hva, clen, &h_memory);
+		if (rc < 0) { nvkvm_gpa_range_put(ref); break; }
+
+		rc = nvkvm_uvm_ext_map_one(nv, h->fd, e, e->gva + off, clen,
+					   h_memory, &resp->nvstatus);
+		if (rc < 0) {
+			nvkvm_uvm_ext_free_descriptor(nv, h_memory);
+			nvkvm_gpa_range_put(ref);
+			break;
+		}
+		/* Recorded only once fully live, so a failure below cannot
+		 * leave a half-built descriptor in the list. */
+		e->desc[e->n_desc + added].h_memory = h_memory;
+		e->desc[e->n_desc + added].mr_ref   = ref;
+		added++;
+	}
+	e->n_desc += added;
+	pthread_mutex_unlock(&nv->admin_lock);
+
+	if (rc < 0) {
+		/*
+		 * Partial progress is not left behind.  The chunks that DID map
+		 * are recorded, so UNBACK -- or handle close -- unwinds all of
+		 * them through the one teardown path, rather than a second,
+		 * differently-ordered cleanup here.
+		 */
+		fprintf(stderr,
+			"nvkvm: UVM map: range 0x%llx failed after %u/%u chunks "
+			"(%s); range left for UNBACK to unwind\n",
+			(unsigned long long)req->gva, added, n, strerror(-rc));
+		resp->status = (uint32_t)-rc;
+		return 0;
+	}
+
+	NVKVM_DBG("nvkvm: UVMEXTMAP handle=%u gva=0x%llx +%u chunks "
+		  "(%u total)\n", req->handle_id,
+		  (unsigned long long)req->gva, n, e->n_desc);
 	return 0;
 }
 
@@ -1290,22 +1412,19 @@ int nvkvm_req_uvm_external_unback(VirtIONvgpu *nv,
 	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
 	int uvm_fd = (h && h->dev_id == NVKVM_DEV_UVM) ? h->fd : -1;
 	struct nvkvm_uvm_ext_ent e;
-	int found = 0;
+	struct nvkvm_uvm_ext_ent *p;
 
 	resp->status = 0;
 	pthread_mutex_lock(&uvm_ext_lock);
-	for (int i = 0; i < NVKVM_UVM_EXT_MAX; i++) {
-		if (uvm_ext_tbl[i].handle_id != req->handle_id ||
-		    uvm_ext_tbl[i].gva != req->gva)
-			continue;
-		e = uvm_ext_tbl[i];
-		uvm_ext_tbl[i].handle_id = 0;
-		uvm_ext_tbl[i].mr_ref    = NULL;
-		found = 1;
-		break;
+	p = nvkvm_uvm_ext_find(req->handle_id, req->gva);
+	if (!p) {
+		pthread_mutex_unlock(&uvm_ext_lock);
+		resp->status = ENOENT;
+		return 0;
 	}
+	e = *p;
+	memset(p, 0, sizeof *p);
 	pthread_mutex_unlock(&uvm_ext_lock);
-	if (!found) { resp->status = ENOENT; return 0; }
 
 	pthread_mutex_lock(&nv->admin_lock);
 	nvkvm_uvm_ext_teardown(nv, uvm_fd, &e);
@@ -1316,7 +1435,7 @@ int nvkvm_req_uvm_external_unback(VirtIONvgpu *nv,
 	return 0;
 }
 
-/* Drop every fallback range this UVM handle owns — its va_space is going away. */
+/* Drop every fallback range this UVM handle owns - its va_space is going away. */
 void nvkvm_uvm_ext_purge_handle(VirtIONvgpu *nv, uint32_t handle_id, int uvm_fd)
 {
 	for (;;) {
@@ -1326,8 +1445,7 @@ void nvkvm_uvm_ext_purge_handle(VirtIONvgpu *nv, uint32_t handle_id, int uvm_fd)
 		for (int i = 0; i < NVKVM_UVM_EXT_MAX; i++) {
 			if (uvm_ext_tbl[i].handle_id != handle_id) continue;
 			e = uvm_ext_tbl[i];
-			uvm_ext_tbl[i].handle_id = 0;
-			uvm_ext_tbl[i].mr_ref    = NULL;
+			memset(&uvm_ext_tbl[i], 0, sizeof uvm_ext_tbl[i]);
 			found = 1;
 			break;
 		}
@@ -1338,7 +1456,6 @@ void nvkvm_uvm_ext_purge_handle(VirtIONvgpu *nv, uint32_t handle_id, int uvm_fd)
 		pthread_mutex_unlock(&nv->admin_lock);
 	}
 }
-
 
 /*
  * Sum a per-pid VRAM metric (memPrivate + memSharedOwned) for the host process

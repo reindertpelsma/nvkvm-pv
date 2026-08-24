@@ -167,6 +167,7 @@ struct nvkvm_shm_ctrl {
                                               * the caller-local stub GEM handle            */
 #define NVKVM_REQ_UVM_EXTERNAL_BACK      32  /* back a managed range with guest RAM        */
 #define NVKVM_REQ_UVM_EXTERNAL_UNBACK    33  /* release one, before the pages go away      */
+#define NVKVM_REQ_UVM_EXTERNAL_MAP       34  /* map a batch of backing chunks into it      */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -280,42 +281,82 @@ struct nvkvm_resp_open_memory_handle {
 
 #define NVKVM_UVM_MAX_REG_GPUS      16   /* QEMU enforces; below kernel UVM_MAX_GPUS */
 
-/* ── UVM_EXTERNAL_BACK / _UNBACK ─────────────────────────────────────────────
+#define NVKVM_UVM_MAX_REG_GPUS      16   /* QEMU enforces; below kernel UVM_MAX_GPUS */
+
+/* Backing chunks carried per MAP message.  64 x 24B keeps the request small
+ * enough for the ordinary simple_req path; a big allocation just sends several. */
+#define NVKVM_UVM_EXT_CHUNKS_PER_MSG 64
+
+/* Guest-side ceiling on chunks behind one managed range.  Mirrors the host's
+ * NVKVM_UVM_EXT_MAX_DESC: at 4 MB a chunk this is a 4 GiB allocation, which is
+ * already more pinned guest RAM than this fallback should encourage. */
+#define NVKVM_UVM_EXT_MAX_CHUNKS 1024
+
+/* ── UVM_EXTERNAL_BACK / _MAP / _UNBACK ─────────────────────────────────────
  *
  * The managed-memory fallback.  libcuda's mmap of /dev/nvidia-uvm is not
  * forwarded; the guest module backs the range with its OWN pages and asks QEMU
  * to publish those same physical pages to the GPU.
  *
+ * Three messages, because one contiguous block is not enough.  A managed
+ * allocation is routinely hundreds of MB, while the largest physically
+ * contiguous block a guest can allocate is MAX_PAGE_ORDER (4 MB on x86_64).
+ * The constraint is really one contiguous extent per DESCRIPTOR, not per range:
+ * UVM looks an external range up by any address inside it
+ * (uvm_va_range_external_find -> uvm_va_range_find) and keeps a range tree of
+ * sub-mappings per GPU, so a range may be covered by many allocations.
+ *
+ *   BACK    establish the external range over the whole [gva, gva+length)
+ *   MAP     one batch of chunks; each gets its own descriptor and its own
+ *           mapping at gva + chunk.off
+ *   UNBACK  tear the whole thing down
+ *
  * `gva` is the guest's virtual address for the range.  It is used as a **GPU**
  * virtual address in the guest process's own RM VA space -- never as a host CPU
- * address.  QEMU derives the host address solely from `gpa_base`, which it
- * validates against the guest's own RAM before touching.
- *
- * `gpa_base` must be contiguous for `length`.  The guest module allocates the
- * pages, so it can guarantee that; QEMU asserts it rather than trusting it.
+ * address.  QEMU derives every host address it touches from a chunk's `gpa`,
+ * which it validates against the guest's own RAM before touching.
  */
 struct nvkvm_req_uvm_external_back {
-	__le64 gva;         /* the guest VA == the GPU VA to map at        */
+	__le64 gva;         /* the guest VA == the GPU VA of the range     */
 	__le64 length;
-	__le64 gpa_base;    /* guest-physical base of the backing pages    */
 	__le32 handle_id;   /* the UVM handle whose va_space receives it   */
 	__le32 session_id;
 	/*
 	 * The GPUs to map on.  UVM_MAP_EXTERNAL_ALLOCATION refuses
 	 * gpuAttributesCount == 0 outright (NV_ERR_INVALID_ARGUMENT,
-	 * uvm_map_external.c:993-994), so this is not optional -- and the
-	 * UUIDs must be ones registered in THIS va_space or the driver
-	 * answers NV_ERR_INVALID_DEVICE.  The guest already tracks exactly
-	 * that set from the UVM_REGISTER_GPU calls it forwarded, so it
-	 * supplies them rather than QEMU guessing.
+	 * uvm_map_external.c:993-994), and a UUID not registered in THIS
+	 * va_space gives NV_ERR_INVALID_DEVICE.  The guest already tracks
+	 * exactly that set from the UVM_REGISTER_GPU calls it forwarded.
 	 */
 	__le32 n_gpus;
+	__le32 reserved;
 	__u8   gpu_uuid[NVKVM_UVM_MAX_REG_GPUS][16];
 };
 
 struct nvkvm_resp_uvm_external_back {
 	__le32 status;      /* errno-style, 0 on success                   */
 	__le32 nvstatus;    /* NV_STATUS from the driver, 0 on success     */
+};
+
+/* One physically contiguous piece of the backing. */
+struct nvkvm_uvm_ext_chunk {
+	__le64 gpa;         /* guest-physical base, contiguous for len     */
+	__le64 off;         /* byte offset within the range                */
+	__le64 len;
+};
+
+struct nvkvm_req_uvm_external_map {
+	__le64 gva;         /* the range this batch belongs to             */
+	__le32 handle_id;
+	__le32 session_id;
+	__le32 n_chunks;
+	__le32 reserved;
+	struct nvkvm_uvm_ext_chunk chunk[NVKVM_UVM_EXT_CHUNKS_PER_MSG];
+};
+
+struct nvkvm_resp_uvm_external_map {
+	__le32 status;
+	__le32 nvstatus;
 };
 
 struct nvkvm_req_uvm_external_unback {
