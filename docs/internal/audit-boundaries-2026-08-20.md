@@ -33,8 +33,8 @@ guest kernel → guest process, VMM → anything.
 | A-2 | **critical** | lifetime-race | isolate → VMM | **fixed** — `SO_RCVTIMEO`; `shutdown()` before `pthread_join`, `close()` after |
 | A-3 | **critical** | uaf / cross-process | guest process → guest process | **fixed** — PTEs zapped before the extent is released; host-side quarantine as backstop |
 | A-4 | **high** | oob read (double-fetch) | guest process → guest kernel | **fixed** — writeback bounds the second-fetch size against the extension actually allocated |
-| A-5 | **high** | missing-validation | guest process → isolate | **fixed** — the ioctl size table is type-gated, matching the sanitizer |
-| A-6 | **high** | cross-isolate | guest process → isolate | **fixed** — isolate/session ownership checked on mmap, munmap and present |
+| A-5 | **high** | missing-validation | guest process → isolate | ⚠️ **PARTIAL — re-rated 2026-08-24.** Only the *guest-side* half landed, and guest code is not a control. The host-side reorder was never done, and a type-`'d'` record still bypasses every `'F'`-keyed gate. **See R-1 in [`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md).** |
+| A-6 | **high** | cross-isolate | guest process → isolate | **partial — re-rated 2026-08-24.** mmap/present check session+isolate; munmap now refuses a token the *named* isolate does not own, but `req->isolate_id` is guest-supplied with no session anchor on the wire — see the KNOWN GAP comment at `nvkvm_isolate_handlers.c:3605-3620` and P-4 |
 | A-7 | **high** | lost-wakeup | guest process → VMM | **fixed** — ENTER_LOOP moved to its own slot; a real one-at-a-time gate on the rest |
 | A-8 | ~~high~~ **medium** | blocking-under-lock | guest process → VMM | **partial** — deadlined; re-rated 2026-08-23, see §9 |
 | A-9 | ~~high~~ **medium** | lifetime-race | guest process → guest kernel | **open** — mitigated indirectly; re-rated 2026-08-23, see §9 |
@@ -42,12 +42,12 @@ guest kernel → guest process, VMM → anything.
 | A-11 | medium | fd-confusion | guest → isolate | **fixed** — the command was `0x3d06`; `53dc238` punts it (and `0x3d08`) off the ring and translates the fd. See §8 |
 | A-12 | medium | oob-map | guest kernel → VMM | **fixed** — handles record their size; offset+length checked overflow-safe |
 | A-17 | medium | allowlist-bypass | guest kernel → VMM | **fixed** — gates select a denied sentinel instead of being skipped |
-| A-18 | medium | missing-validation | guest kernel → VMM | **fixed** — geometry validated pre- and post-export against the real dma-buf size |
+| A-18 | medium | missing-validation | guest kernel → VMM | **partial — re-rated 2026-08-24.** Validated pre- and post-export, but the size check short-circuits when `lseek` returns ≤ 0 (`nvkvm_present_egl.c:1230-1237`) — the residual this document already disclosed in §4 |
 | A-19 | low | oob read | guest kernel → VMM | **fixed** — guard corrected to `>= 52` |
 | A-13 | medium | blocking-under-lock | guest process → VMM | **fixed** — EXIT sent outside `iso->lock`, `MSG_DONTWAIT` |
 | A-14 | medium | lock-order | guest kernel → VMM | **fixed** — the slot wait takes `iso->lock` for the snapshot and the re-check |
 | A-15 | medium | sandbox surface | isolate → host | **fixed** — `clone3` removed from the allowlist |
-| A-16 | low ×6 | refcount / leak / hardening | various | **partial** — four of the six fixed; see §5 for which, and for what is left |
+| A-16 | low ×6 | refcount / leak / hardening | various | **five of six done, one undetermined — resolved 2026-08-24.** Fixed: UVM handle-id offset, migration/mmap leaks (with the one documented residual), transaction-id leak, `nvkvm_ring_has_work`. Open by choice: unbounded pinning (no `RLIMIT_MEMLOCK` anywhere in `src/`). CANNOT DETERMINE: handle across a lock drop — not re-traced. See §5 |
 
 **Nothing found gives a guest arbitrary code execution on the host.** The two
 memory-safety breaks that cross a trust boundary (A-3, A-5) are both contained
@@ -226,6 +226,32 @@ and the hole is branch ordering. Requires `nv->graphics`; compute-only VMs are
 unaffected. Fix: make the guest's size table type-aware, and reorder the host
 gate so the non-`'F'` deny is evaluated before the per-type allowlists.
 
+> ⚠️ **RE-RATED PARTIAL, 2026-08-24. This was marked `fixed` and should not have
+> been.** Of the two halves prescribed above, only the first landed:
+> `nvkvm_ioctl_param_size` is now type-gated (`src/guest/nvkvm_ioctl.c:142-144`).
+> That is **guest code**, and the companion audit's method statement excludes guest
+> sanitisation as a security control — so the half that shipped is the half that
+> does not count. The host-side reorder was never done: the chain at
+> `src/qemu/nvkvm_isolate_handlers.c:2164 / 2189 / 2224` still evaluates `'d'`
+> first, NVKMS second, and the non-`'F'` deny last.
+>
+> The consequence is live and is written up as **R-1** in
+> [`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md): because *every*
+> host-side sanitiser keys on `_IOC_TYPE == 'F'` and the guest supplies the type, a
+> record with `_IOC_TYPE == 'd'` and `_IOC_NR == 0x41` passes the DRM allowlist,
+> skips fourteen gates — including the `memset` that `audit-guest-pointers.md` §3
+> calls the tree's **only** `ENFORCED` control, on the explicit claim that a guest
+> cannot skip it — and reopens G-2. Reordering alone does **not** close it (`'d'` is
+> a *recognised* type, so it never reaches the deny arm wherever that arm sits); the
+> fix is a cross-check between `_IOC_TYPE(req->cmd)` and the target handle's
+> `dev_id`, specified in R-1.3.
+>
+> Bounding it, and worth recording here because the bound is the good news: `0x4a`,
+> `0x27`, `0x2b`, `0x2a` and `0x34` are **absent** from the DRM allowlist, so U-3,
+> the A-1 OS-descriptor gate, the alloc-class allowlist, the control allowlist and
+> the DUP gate are **not** reachable this way. The exposed set is exactly four NRs:
+> `0x41`, `0x4f`, `0x54`, `0x57`.
+
 **A-12 (medium) — a memory handle's size is never recorded**, so no
 `(offset, length)` pair can be bounds-checked against the object. The existing
 guards correctly bound *length* against the window, but "length fits in the
@@ -363,6 +389,25 @@ Status added 2026-08-21; the wording of each item is as first written.
   through `READ_ONCE`.*
 
 ## 6. Sandbox surface (A-15 and hardening)
+
+> **STALE — all four items below are FIXED in code; reconciled 2026-08-24.** This
+> section was never updated and it *contradicts its own status table*, which has
+> recorded A-15 as fixed since 2026-08-21. "Doc says open, code says fixed" is the
+> direction nobody re-checks, so it is recorded explicitly rather than quietly
+> corrected:
+>
+> - **`clone3` (A-15)** — gone from the allowlist (`src/stub/nvkvm_stub.c:2940-2988`),
+>   and the `apply_seccomp()` comment no longer claims to block "fork"
+>   (`:3241-3246`, tagged F6-1). The table row was right; the prose below is not.
+> - **`umount2(".", MNT_DETACH)`** — return now checked and fail-closed
+>   (`src/qemu/nvkvm_isolate.c:357-358`, tagged R4-L2); the caller `_exit(126)`s.
+> - **The `sock_filter[96]` array** — `EMIT` is bound-checked and sets a fail-closed
+>   `overflow` flag (`src/stub/nvkvm_stub.c:2901-2907`, tagged F8-1); `apply_seccomp()`
+>   refuses on `overflow || n <= 0`. ~57 of 96 slots used.
+> - **`closefrom` fallback** — returns −1 rather than succeeding silently, and both
+>   call sites `_exit(126)` (`src/qemu/nvkvm_isolate.c:1826`, `:1940`).
+>
+> The wording below is left as first written, for the record.
 
 - **`clone3` remains in the seccomp allowlist but is never called after the
   filter is applied** — the only call site is the worker-spawn loop, which
@@ -518,3 +563,37 @@ recorded here because it was previously written down nowhere at all.
 
 It does not check that the slot being released was ever allocated. Same
 provenance as A-20: found by reading, recorded so it is not lost.
+
+**RECONCILED 2026-08-24 — still open on `main`** (`src/qemu/nvkvm_mmap_host.c:947-958`
+range-checks the slot and then pushes it onto the free stack unconditionally at
+`:953`). **Fixed on the unmerged `sec-easy-batch`** (`9daf4b6`): a per-slot
+`kvm_slot_live[]` bitmap under `kvm_slot_lock`, release refuses and logs a slot that
+is not live, alloc refuses an already-live free-list entry, and
+`kvm_remove_memory_region()` gains a range check. Pinned by
+`tests/unit/test_kvm_slot.c` (12 cases), extracted from the production source via
+`NVKVM_KVM_SLOT_POOL_BEGIN/_END` markers so the test cannot drift from the code.
+
+---
+
+## 10. Reconciliation, 2026-08-24
+
+A full two-sweep reconciliation of this document against `main` (`68a35c0`) is in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md). Summary of what it
+changed here:
+
+- **A-5** re-rated `fixed` → **PARTIAL**; the host-side half was never written, and
+  the live consequence is R-1 (HIGH).
+- **A-6**, **A-18** re-rated `fixed` → **partial**, each for a residual the code
+  already documents.
+- **A-16** resolved to five of six done, one (`handle across a lock drop`)
+  undetermined.
+- **§6** and the **A-15 table-vs-prose contradiction** resolved: all four items are
+  fixed in code; the prose was stale.
+- **A-21** confirmed open on `main`, fixed on `sec-easy-batch`.
+- Everything else — A-1, A-2, A-3, A-4, A-7, A-8 (partial), A-9 (open), A-10, A-11,
+  A-12, A-13, A-14, A-17, A-19, A-20 (open) — verified to match its recorded status.
+
+Note the **numbering hazard**: this document's A-1 and A-2 are *different findings*
+from `audit-guest-pointers.md`'s A-1 and A-2. A per-document prefix (`BD-` here,
+`GP-` there) is recommended in the reconciliation; the IDs are not being renumbered,
+because they appear in commit messages and code comments.
