@@ -150,7 +150,16 @@ $(DMASRC): dmabuf_source.c ../common/nvkvm_broker_proto.h
 	$(CC) $(CFLAGS) $(GBM_CFLAGS) $(if $(HAVE_X11),-DSRC_HAVE_X11,) \
 	      -o $@ $< $(LDFLAGS) $(GBM_LIBS) $(if $(HAVE_X11),$(shell $(PKG_CONFIG) --libs xcb xcb-dri3),)
 
-check: all
+# The UTF-8 validator is extracted from the source it lives in rather than
+# copied, so the test cannot quietly drift from the code it is testing.
+test/utf8_extracted.inc: nvkvm_broker.c
+	sed -n '/^static bool nb_utf8_ok/,/^}/p' $< > $@
+
+test-utf8: test/utf8_extracted.inc test/test_utf8.c
+	$(CC) $(CFLAGS) -I test -o $@ test/test_utf8.c
+
+check: all test-utf8
+	./test-utf8
 	bash selftest.sh
 
 install: $(BIN)

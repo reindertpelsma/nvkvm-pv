@@ -89,7 +89,59 @@ enum {
      * and when the display goes away.
      */
     NVKVM_BROKER_EV_CLOSE     = 14,
+    /*
+     * EV_CLIPBOARD — one fixed-size chunk of host clipboard text on its way to
+     * the guest.  See "Clipboard framing" below for why it is chunked rather
+     * than length-prefixed.
+     */
+    NVKVM_BROKER_EV_CLIPBOARD = 15,
 };
+
+/* ── Clipboard framing ───────────────────────────────────────────────────── *
+ *
+ * Clipboard content is the first VARIABLE-LENGTH thing this protocol carries,
+ * and docs/internal/audit-broker-client-2026-08-25.md names "no length field
+ * anywhere to lie about" as the reason framing cannot be overrun by
+ * construction.  Adding a length prefix would hand that property back.
+ *
+ * So it is not length-prefixed.  Every message stays EXACTLY the same size as
+ * every other message of its direction, and content is split into fixed chunks
+ * with an explicit end marker.  The reader still reads a constant number of
+ * bytes and never consults a client-supplied number to decide how much to read.
+ *
+ * `info` is not a length field in that sense: it says how much of an
+ * ALREADY-READ, fixed-size array is meaningful.  It is bounds-checked against
+ * the array's compile-time size, and a lie in it cannot move the read cursor,
+ * cannot allocate, and cannot reach past the struct.  The bound that matters --
+ * total size -- is enforced as a CHUNK COUNT the receiver keeps itself, never
+ * as a number the sender supplies.
+ *
+ * TEXT ONLY, UTF-8.  No images, no file lists, no arbitrary MIME: every one of
+ * those is a decoder in the privileged process.
+ */
+
+/* Meaningful bytes in this chunk, and the end-of-transfer marker, packed into
+ * one byte so `flags` can go on mirroring grab/focus state like every other
+ * packet -- an invariant worth more than the byte it costs. */
+#define NVKVM_BROKER_CLIP_NBYTES(info)  ((info) & 0x1fu)
+#define NVKVM_BROKER_CLIP_LAST          0x20u
+
+/* Payload bytes per message, each direction.  Chosen so the containing struct
+ * is exactly the size that direction already uses. */
+#define NVKVM_BROKER_CLIP_PKT_BYTES  15u   /* broker -> VMM, inside 24 */
+#define NVKVM_BROKER_CLIP_CMD_BYTES  27u   /* VMM -> broker, inside 40 */
+
+/*
+ * The hard cap on one clipboard transfer, both directions.  A paste is text a
+ * person selected; 16 KiB is far more than that and small enough that a
+ * transfer cannot fill the outbound ring.  Enforced as a chunk count on the
+ * receiving side of each direction.
+ */
+#define NVKVM_BROKER_CLIP_MAX_BYTES  16384u
+#define NVKVM_BROKER_CLIP_MAX_CHUNKS_PKT \
+    ((NVKVM_BROKER_CLIP_MAX_BYTES / NVKVM_BROKER_CLIP_PKT_BYTES) + 1u)
+#define NVKVM_BROKER_CLIP_MAX_CHUNKS_CMD \
+    ((NVKVM_BROKER_CLIP_MAX_BYTES / NVKVM_BROKER_CLIP_CMD_BYTES) + 1u)
 
 /*
  * EV_CLOSE.x — WHICH close the user asked for.  The broker asks the human and
@@ -172,6 +224,21 @@ struct nvkvm_broker_pkt {
  */
 #define NVKVM_BROKER_F_FULLSCREEN (1u << 2)
 
+/*
+ * EV_CLIPBOARD laid over the standard event packet.  Same 24 bytes, same
+ * `type`/`flags`/`seq` in the same places -- so a receiver that does not know
+ * this type still parses the header correctly and skips a whole, well-formed
+ * message.  Ordering is the stream's; `seq` is the usual monotonic counter, so
+ * a gap is already detectable.
+ */
+struct nvkvm_broker_clip_pkt {
+    uint16_t type;      /* NVKVM_BROKER_EV_CLIPBOARD                        */
+    uint16_t flags;     /* mirrored state, exactly as on every other packet */
+    uint32_t seq;       /* monotonic per connection                         */
+    uint8_t  info;      /* NVKVM_BROKER_CLIP_NBYTES / _LAST                 */
+    uint8_t  data[NVKVM_BROKER_CLIP_PKT_BYTES];
+};
+
 /* ── VMM → broker: commands ──────────────────────────────────────────────── */
 
 #define NVKVM_BROKER_CMD_SIZE      40u
@@ -198,7 +265,31 @@ enum {
      * actually took effect comes back as EV_SURFACE.
      */
     NVKVM_BROKER_CMD_WINDOW = 3,
+    /*
+     * CLIPBOARD — one fixed-size chunk of GUEST clipboard text.  Carries no
+     * fd.  Accepted only in a mode that permits guest->host, only while the
+     * window is focused, rate-limited, and capped by chunk count.
+     *
+     * The guest WRITING the host clipboard is the direction people
+     * underestimate: you copy in the guest, paste into a host terminal, and
+     * the guest planted something else.  That is why it is visible when it
+     * happens rather than silent.
+     */
+    NVKVM_BROKER_CMD_CLIPBOARD = 4,
+    /*
+     * CAPS — what the VMM can do, sent once after connecting.  `width` carries
+     * NVKVM_BROKER_CLIENT_* bits; every other field must be zero.
+     *
+     * It exists so "clipboard is enabled but nothing happens" can be told
+     * apart from "the guest has no clipboard agent".  Those have completely
+     * different fixes, and conflating them is how someone ends up turning the
+     * mode up to `full` believing the mode was the problem.
+     */
+    NVKVM_BROKER_CMD_CAPS = 5,
 };
+
+/* NVKVM_BROKER_CMD_CAPS `width` bits. */
+#define NVKVM_BROKER_CLIENT_CLIPBOARD (1u << 0)
 
 /*
  * Explicitly laid out so every field is naturally aligned and the struct is
@@ -216,6 +307,17 @@ struct nvkvm_broker_cmd {
     uint64_t modifier;  /* DRM_FORMAT_MOD_*                                24 */
     uint32_t seq;       /* client-side counter; advisory, logged only      32 */
     uint32_t reserved1; /* must be 0                                       36 */
+};
+
+/* CMD_CLIPBOARD laid over the standard command record: same 40 bytes, same
+ * `type` and `reserved0` in the same places. */
+struct nvkvm_broker_clip_cmd {
+    uint16_t type;      /* NVKVM_BROKER_CMD_CLIPBOARD */
+    uint16_t reserved0; /* must be 0                  */
+    uint32_t chunk;     /* 0-based; bounded by the receiver's own count */
+    uint32_t reserved1; /* must be 0                  */
+    uint8_t  info;      /* NVKVM_BROKER_CLIP_NBYTES / _LAST */
+    uint8_t  data[NVKVM_BROKER_CLIP_CMD_BYTES];
 };
 
 /*
@@ -242,6 +344,16 @@ _Static_assert(sizeof(struct nvkvm_broker_pkt) == NVKVM_BROKER_PKT_SIZE,
                "nvkvm_broker_pkt must be exactly 24 bytes");
 _Static_assert(sizeof(struct nvkvm_broker_cmd) == NVKVM_BROKER_CMD_SIZE,
                "nvkvm_broker_cmd must be exactly 40 bytes");
+/* The clipboard overlays MUST be the same size as what they overlay, or the
+ * "every message is fixed size" property is gone and the reader desynchronises
+ * on the first clipboard chunk. */
+_Static_assert(sizeof(struct nvkvm_broker_clip_pkt) == NVKVM_BROKER_PKT_SIZE,
+               "clip_pkt must be exactly the event packet size");
+_Static_assert(sizeof(struct nvkvm_broker_clip_cmd) == NVKVM_BROKER_CMD_SIZE,
+               "clip_cmd must be exactly the command size");
+_Static_assert(NVKVM_BROKER_CLIP_PKT_BYTES <= 0x1fu &&
+               NVKVM_BROKER_CLIP_CMD_BYTES <= 0x1fu,
+               "chunk payload must fit the 5-bit nbytes field");
 #endif
 
 #endif /* NVKVM_BROKER_PROTO_H */

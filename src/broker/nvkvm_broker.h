@@ -64,6 +64,28 @@ extern int nb_verbose;
 extern int nb_trace_frames;
 
 /* ── configuration (command line only; never anything a client sent) ─────── */
+/*
+ * CLIPBOARD MODES, NAMED BY DIRECTION.
+ *
+ * "copy-only" and similar are ambiguous about which way copying goes, and on a
+ * security setting a misread default is the whole problem.  The ladder is
+ * ordered by how much crosses, and `consent` is the recommended rung.
+ */
+#define NB_CLIP_OFF      0  /* nothing crosses.  The DEFAULT.               */
+#define NB_CLIP_G2H      1  /* guest may write the host clipboard; the host
+                             * clipboard is never readable by the guest      */
+#define NB_CLIP_CONSENT  2  /* G2H, plus host->guest ONLY on an explicit
+                             * paste trigger.  RECOMMENDED.                  */
+#define NB_CLIP_FULL     3  /* bidirectional automatic sync.  The risky one. */
+
+/* Keys that mean "paste" and so trigger a host->guest send. */
+#define NB_CLIP_MAX_TRIGGERS 8
+struct nb_clip_trigger {
+    unsigned code;              /* evdev key code                           */
+    bool     need_ctrl;
+    bool     need_shift;
+};
+
 struct nb_config {
     const char *socket_path;
     const char *backend;        /* "auto" | "x11" | "wayland" | "test"        */
@@ -82,6 +104,23 @@ struct nb_config {
     const char *socket_group;   /* chgrp the socket to this group, or NULL    */
     bool        no_peercred;    /* opt OUT of the credential allow-list       */
     int         socket_fd;      /* pre-bound listening fd, or -1              */
+
+    /*
+     * Clipboard.  DEFAULT OFF, deliberately.  Clipboard already needs opting
+     * in twice (QEMU's -chardev qemu-vdagent, and spice-vdagent in the guest),
+     * so a third gate costs little -- and it buys the property that matters:
+     * with `consent` as a default, what a system actually does would depend on
+     * whether vdagent happens to be installed, so you could not tell your
+     * clipboard posture by reading the broker's configuration.  With `off`,
+     * the flag IS the answer.
+     *
+     * The cost of a restrictive default is that friction pushes people to the
+     * least safe setting, so every dead end here names `consent` explicitly
+     * rather than leaving the reader to find the flag list.
+     */
+    int         clip_mode;
+    struct nb_clip_trigger clip_trigger[NB_CLIP_MAX_TRIGGERS];
+    int         n_clip_trigger;
     uid_t  allow_uid[NB_MAX_ALLOW_IDS];
     int    n_allow_uid;
     gid_t  allow_gid[NB_MAX_ALLOW_IDS];
@@ -159,6 +198,30 @@ struct nb_sink {
      * trying to burn the broker's CPU, not one trying to display. */
     uint64_t rate_ms;           /* start of the current 1s window          */
     unsigned rate_count;
+
+    /*
+     * CLIPBOARD, guest -> host.  Reassembled here rather than in a backend so
+     * the bounds live next to every other client-input bound.  `n` is a chunk
+     * count we keep ourselves; nothing the client sends decides how much we
+     * store.
+     */
+    char     clip_in[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    unsigned clip_in_len;
+    unsigned clip_in_chunks;
+    bool     clip_in_bad;       /* this transfer already failed; drain it   */
+    uint64_t clip_rate_ms;      /* separate 1s window for clipboard         */
+    unsigned clip_rate_count;
+    uint64_t clip_last_ms;      /* for the "guest changed your clipboard"
+                                 * notice, so a burst says it once          */
+    /* Each dead end is said ONCE per connection: a line per keystroke is
+     * noise, and noise is why nobody reads the line that mattered. */
+    bool     clip_told_off;
+    bool     clip_told_noclient;
+    bool     clip_told_noagent;
+    bool     clip_want_paste;   /* set by the core, consumed by the backend */
+    unsigned clip_held_key;     /* paste key held until content is queued   */
+    unsigned caps_seen;         /* what the client told us it can do        */
+    const struct nb_config *cfg;
     bool     focused;
     bool     pointer_in;
     bool     grabbed;
@@ -167,6 +230,9 @@ struct nb_sink {
     /* Modifier latch for the broker-owned hotkeys.  Tracked from the same key
      * stream the client sees, so the two cannot disagree about reality. */
     bool     ctrl_down, alt_down;
+    /* Latched like ctrl/alt: a paste chord needs it, and it must track reality
+     * even while unfocused, or the first chord after a focus change is missed. */
+    bool     shift_down;
 
     /* Which keys the CLIENT currently believes are down.  On focus loss we
      * synthesise a release for each: a grab that ends with keys latched down
@@ -226,6 +292,18 @@ bool nb_sink_has_client(const struct nb_sink *s);
  * while the guest holds the keyboard is incoherent, and it is the state a
  * stuck grab is least recoverable from. */
 void nb_sink_force_ungrab(struct nb_sink *s);
+/* Host clipboard text on its way to the guest, already size-checked.  Returns
+ * false if it could not be queued (ring pressure), so the caller can say so
+ * rather than let a paste silently produce nothing. */
+bool nb_sink_send_clipboard(struct nb_sink *s, const char *text, size_t len);
+/* A backend telling the core a paste trigger fired.  The core owns the policy:
+ * which mode we are in, whether anyone is connected, and what to say when the
+ * answer is no. */
+void nb_sink_paste_trigger(struct nb_sink *s);
+/* Release the paste keystroke held while the host selection was fetched.  Safe
+ * to call when nothing is held, and MUST be called on every path out of a
+ * fetch -- including failure -- or the key is swallowed. */
+void nb_sink_clip_release(struct nb_sink *s);
 void nb_sink_bye(struct nb_sink *s, int reason);
 
 /* ── session backends ────────────────────────────────────────────────────── */
@@ -273,6 +351,14 @@ struct nb_session_ops {
      * the later action wins, rather than leaving two modes fighting.
      */
     void (*dismiss_dialog)(struct nb_session *s);
+    /* Clipboard.  OPTIONAL -- NULL on a backend that has no selection, in
+     * which case clipboard is simply unavailable rather than half-working. */
+    int  (*set_clipboard)(struct nb_session *s, const char *text, size_t len);
+    void (*notify_clipboard)(struct nb_session *s);
+    /* Begin an asynchronous read of the host selection.  The backend calls
+     * nb_sink_send_clipboard() then nb_sink_clip_release() when it completes,
+     * and nb_sink_clip_release() alone if it fails. */
+    int  (*fetch_clipboard)(struct nb_session *s);
 };
 
 struct nb_session {
@@ -336,6 +422,10 @@ void nb_formats_log(const struct nb_formats *f, const char *what);
 void nb_placeholder_paint(uint32_t *px, unsigned w, unsigned h,
                           unsigned stride_px, const char *line1,
                           const char *line2);
+/* What a client reports it supports.  Today only the clipboard bit exists;
+ * a VMM with no clipboard agent must not be told to prepare a paste. */
+#define NB_CLIENT_HAS_CLIPBOARD (1u << 0)
+
 /* nb_config.scale_mode */
 #define NB_SCALE_NONE    0      /* 1:1, centred, no scaling at all           */
 #define NB_SCALE_STRETCH 1      /* fill the window, ignore aspect, distort   */

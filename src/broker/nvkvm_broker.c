@@ -47,6 +47,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -141,6 +142,11 @@ bool nb_sink_want_write(const struct nb_sink *s)
 {
     return s->client_fd >= 0 && s->tx_head != s->tx_tail;
 }
+
+/* Forward: the clipboard helpers are defined with the rest of the clipboard
+ * code, below the input path that uses them. */
+static bool nb_clip_is_trigger(const struct nb_sink *s, unsigned code);
+static uint64_t nb_now_ms(void);
 
 static unsigned nb_tx_used(const struct nb_sink *s)
 {
@@ -445,7 +451,7 @@ static void nb_release_all(struct nb_sink *s)
                     (int)c, 0, 0, 0);
         }
     }
-    s->ctrl_down = s->alt_down = false;
+    s->ctrl_down = s->alt_down = s->shift_down = false;
 }
 
 static void nb_set_grab(struct nb_sink *s, bool on)
@@ -494,6 +500,9 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
     if (code == KEY_LEFTALT || code == KEY_RIGHTALT) {
         s->alt_down = down;
     }
+    if (code == KEY_LEFTSHIFT || code == KEY_RIGHTSHIFT) {
+        s->shift_down = down;
+    }
 
     /* Hotkeys are the broker's, never the client's. */
     if (down && s->ctrl_down && s->alt_down &&
@@ -517,6 +526,27 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
             if (s->sess->ops->set_fullscreen(s->sess, s->fullscreen) != 0) {
                 s->fullscreen = !s->fullscreen;
             }
+        }
+        return;
+    }
+    /*
+     * PASTE TRIGGER.  The key is NOT forwarded here.
+     *
+     * The guest's paste handler runs the moment it sees the keystroke, so
+     * content that arrives afterwards finds stale or empty data.  Reading the
+     * host selection on Wayland is asynchronous (an offer, a pipe, a read), so
+     * the key is HELD and released by nb_sink_clip_release() once the content
+     * is queued -- or immediately, if nothing is going to be sent.
+     */
+    if (down && s->focused && nb_clip_is_trigger(s, code)) {
+        s->clip_held_key = code;
+        s->clip_want_paste = false;
+        nb_sink_paste_trigger(s);
+        if (!s->clip_want_paste) {
+            /* No content is coming: release it now so paste still behaves
+             * normally inside the guest (its own clipboard may well have
+             * something in it). */
+            nb_sink_clip_release(s);
         }
         return;
     }
@@ -639,6 +669,233 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
 {
     nb_emit(s, NVKVM_BROKER_EV_RELEASE, 0, 0,
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
+}
+
+/* ── clipboard ───────────────────────────────────────────────────────────── */
+
+/* Does this key, with the modifiers currently latched, mean "paste"? */
+static bool nb_clip_is_trigger(const struct nb_sink *s, unsigned code)
+{
+    const struct nb_config *cfg = s->cfg;
+    int i;
+
+    if (cfg->clip_mode == NB_CLIP_OFF && s->clip_told_off) {
+        /* Still recognised once, so the first attempt can explain itself;
+         * after that it is an ordinary key and belongs to the guest. */
+        return false;
+    }
+    for (i = 0; i < cfg->n_clip_trigger; i++) {
+        const struct nb_clip_trigger *t = &cfg->clip_trigger[i];
+
+        if (t->code == code && t->need_ctrl == s->ctrl_down &&
+            t->need_shift == s->shift_down) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Forward the keystroke that was held while the clipboard was fetched. */
+void nb_sink_clip_release(struct nb_sink *s)
+{
+    unsigned code = s->clip_held_key;
+
+    if (!code) {
+        return;
+    }
+    s->clip_held_key = 0;
+    s->clip_want_paste = false;
+    if (s->focused) {
+        bit_set(s->key_down, code, true);
+        nb_emit(s, NVKVM_BROKER_EV_KEY, (int)code, 1, 0, 0);
+    }
+}
+
+/*
+ * Queue host clipboard text as fixed-size chunks, then nothing else until the
+ * caller releases the held key -- so the guest has the content in hand before
+ * it is told to paste.
+ *
+ * Refuses rather than truncates on ring pressure: half a paste is worse than
+ * none, and a silent partial one is worse than either.
+ */
+bool nb_sink_send_clipboard(struct nb_sink *s, const char *text, size_t len)
+{
+    size_t off = 0;
+    unsigned chunks;
+
+    if (s->client_fd < 0) {
+        return false;
+    }
+    if (len > NVKVM_BROKER_CLIP_MAX_BYTES) {
+        nb_log("clipboard: %zu bytes is over the %u-byte cap; not sending",
+               len, NVKVM_BROKER_CLIP_MAX_BYTES);
+        return false;
+    }
+    chunks = (unsigned)(len / NVKVM_BROKER_CLIP_PKT_BYTES) + 1u;
+    if (nb_tx_used(s) + chunks + 4u >= NB_TXRING) {
+        nb_log("clipboard: the client is not draining; dropping this paste "
+               "rather than sending half of it");
+        return false;
+    }
+    do {
+        struct nvkvm_broker_clip_pkt cp;
+        size_t n = len - off;
+
+        if (n > NVKVM_BROKER_CLIP_PKT_BYTES) {
+            n = NVKVM_BROKER_CLIP_PKT_BYTES;
+        }
+        memset(&cp, 0, sizeof(cp));
+        cp.type  = NVKVM_BROKER_EV_CLIPBOARD;
+        cp.flags = (uint16_t)((s->grabbed ? NVKVM_BROKER_F_GRABBED : 0) |
+                              (s->focused ? NVKVM_BROKER_F_FOCUSED : 0) |
+                              (s->fullscreen ? NVKVM_BROKER_F_FULLSCREEN : 0));
+        cp.seq   = s->seq++;
+        cp.info  = (uint8_t)n;
+        if (off + n == len) {
+            cp.info |= NVKVM_BROKER_CLIP_LAST;
+        }
+        memcpy(cp.data, text + off, n);
+        memcpy(&s->tx[s->tx_head], &cp, sizeof(cp));
+        s->tx_head = (s->tx_head + 1u) % NB_TXRING;
+        off += n;
+    } while (off < len);
+    nb_log("clipboard: sent %zu bytes to the guest (%u chunks)", len, chunks);
+    return true;
+}
+
+/* Clipboard traffic gets its own 1s window: it must not be able to consume the
+ * general command budget, nor be starved by it. */
+#define NB_CLIP_MAX_PER_SEC 4000u
+
+static bool nb_clip_rate_exceeded(struct nb_sink *s)
+{
+    uint64_t now = nb_now_ms();
+
+    if (now - s->clip_rate_ms >= 1000u) {
+        s->clip_rate_ms = now;
+        s->clip_rate_count = 0;
+    }
+    return ++s->clip_rate_count > NB_CLIP_MAX_PER_SEC;
+}
+
+/*
+ * Strict UTF-8 validation.  Rejects overlong forms, surrogates and anything
+ * past U+10FFFF -- the classic ways a decoder downstream is made to disagree
+ * with the validator upstream.  Embedded NULs are rejected too: the host
+ * clipboard is a C string from here on.
+ */
+static bool nb_utf8_ok(const char *p, unsigned len)
+{
+    unsigned i = 0;
+
+    while (i < len) {
+        unsigned char c = (unsigned char)p[i];
+        unsigned need;
+        uint32_t cp;
+
+        if (c == 0) {
+            return false;
+        }
+        if (c < 0x80) { i++; continue; }
+        else if ((c & 0xe0) == 0xc0) { need = 1; cp = c & 0x1fu; }
+        else if ((c & 0xf0) == 0xe0) { need = 2; cp = c & 0x0fu; }
+        else if ((c & 0xf8) == 0xf0) { need = 3; cp = c & 0x07u; }
+        else { return false; }
+
+        /* Continuation bytes i+1 .. i+need must all exist. */
+        if (i + need >= len) {
+            return false;                       /* truncated sequence */
+        }
+        for (unsigned k = 1; k <= need; k++) {
+            unsigned char cc = (unsigned char)p[i + k];
+
+            if ((cc & 0xc0) != 0x80) {
+                return false;
+            }
+            cp = (cp << 6) | (cc & 0x3fu);
+        }
+        if ((need == 1 && cp < 0x80) ||
+            (need == 2 && cp < 0x800) ||
+            (need == 3 && cp < 0x10000)) {
+            return false;                       /* overlong */
+        }
+        if (cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) {
+            return false;                       /* out of range / surrogate */
+        }
+        i += need + 1;
+    }
+    return true;
+}
+
+static const char *nb_clip_mode_name(int m)
+{
+    switch (m) {
+    case NB_CLIP_OFF:     return "off";
+    case NB_CLIP_G2H:     return "guest-to-host";
+    case NB_CLIP_CONSENT: return "consent";
+    case NB_CLIP_FULL:    return "full";
+    default:              return "?";
+    }
+}
+
+/*
+ * A PASTE TRIGGER FIRED.  Everything that can go wrong here has a DIFFERENT
+ * fix, so each says so distinctly and once.
+ *
+ * A restrictive default only works if the dead end teaches.  "Nothing happened"
+ * sends people searching, and the setting they find first is `full`, because it
+ * is the one that obviously works -- which is worse than either default.  So
+ * every branch below names the next rung up the ladder, not the top of it.
+ */
+void nb_sink_paste_trigger(struct nb_sink *s)
+{
+    const struct nb_config *cfg = s->cfg;
+
+    if (cfg->clip_mode == NB_CLIP_OFF) {
+        if (!s->clip_told_off) {
+            s->clip_told_off = true;
+            nb_log("clipboard is disabled, so this paste sent nothing. "
+                   "--clipboard=consent allows host->guest paste on exactly "
+                   "this trigger, and nothing else. (off | guest-to-host | "
+                   "consent | full)");
+        }
+        return;
+    }
+    if (cfg->clip_mode == NB_CLIP_G2H) {
+        if (!s->clip_told_off) {
+            s->clip_told_off = true;
+            nb_log("clipboard mode is guest-to-host, which deliberately never "
+                   "lets the guest read the host clipboard. "
+                   "--clipboard=consent adds host->guest on this trigger.");
+        }
+        return;
+    }
+    if (!nb_sink_has_client(s)) {
+        if (!s->clip_told_noclient) {
+            s->clip_told_noclient = true;
+            nb_log("clipboard is enabled but no VM is connected, so there is "
+                   "nothing to paste into.");
+        }
+        return;
+    }
+    /*
+     * DISTINCT FROM THE ABOVE ON PURPOSE.  "The mode is off" and "the guest
+     * agent is missing" both look like nothing happening and have completely
+     * different fixes; conflating them is how someone ends up at `full`
+     * believing the mode was the problem.
+     */
+    if (!(s->caps_seen & NB_CLIENT_HAS_CLIPBOARD)) {
+        if (!s->clip_told_noagent) {
+            s->clip_told_noagent = true;
+            nb_log("clipboard is %s, but the VM has not reported a clipboard "
+                   "agent. The mode is not the problem: QEMU needs "
+                   "-chardev qemu-vdagent and the guest needs spice-vdagent "
+                   "running.", nb_clip_mode_name(cfg->clip_mode));
+        }
+        return;
+    }
+    s->clip_want_paste = true;      /* the backend reads the selection */
 }
 
 bool nb_sink_has_client(const struct nb_sink *s)
@@ -833,16 +1090,39 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     struct nb_buf_desc d;
     int r;
 
-    if (c->reserved0 != 0 || c->reserved1 != 0) {
+    /*
+     * reserved0 ONLY, and that is not a shortcut.
+     *
+     * This check used to cover reserved1 as well, which was correct while
+     * every command shared one layout.  CLIPBOARD does not: its payload runs
+     * to the end of the record, so the generic `reserved1` at offset 36
+     * ALIASES clipboard data bytes 23..26 -- and any chunk whose last four
+     * payload bytes were non-zero was rejected as a malformed header.  Found
+     * by the hostile-client harness, which sent 27 bytes of 'A'.
+     *
+     * reserved0 is at the same offset and means the same thing in BOTH
+     * layouts, so it stays here.  reserved1 belongs to the layouts that
+     * actually have it, and is checked in their own cases -- the alternative
+     * is a control keyed on a layout that is no longer universal, which is how
+     * A-1 and R-1 happened.
+     */
+    if (c->reserved0 != 0) {
         if (fd >= 0) {
             close(fd);
         }
-        nb_violation(s, "reserved fields are not zero");
+        nb_violation(s, "reserved0 is not zero");
         return;
     }
 
     switch (c->type) {
     case NVKVM_BROKER_CMD_ATTACH:
+        if (c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "ATTACH reserved1 is not zero");
+            return;
+        }
         if (fd < 0) {
             nb_violation(s, "ATTACH without an SCM_RIGHTS fd");
             return;
@@ -877,6 +1157,13 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         return;
 
     case NVKVM_BROKER_CMD_COMMIT:
+        if (c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "COMMIT reserved1 is not zero");
+            return;
+        }
         if (fd >= 0) {
             close(fd);
             nb_violation(s, "COMMIT carried an fd");
@@ -894,7 +1181,137 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         return;
 
+    case NVKVM_BROKER_CMD_CLIPBOARD: {
+        const struct nvkvm_broker_clip_cmd *cc =
+            (const struct nvkvm_broker_clip_cmd *)c;
+        unsigned n;
+
+        if (fd >= 0) {
+            close(fd);
+            nb_violation(s, "CLIPBOARD carried an fd");
+            return;
+        }
+        if (cc->reserved1 != 0) {
+            nb_violation(s, "CLIPBOARD reserved field is not zero");
+            return;
+        }
+        /*
+         * THE DIRECTION PEOPLE UNDERESTIMATE.  The obvious risk is the guest
+         * READING your clipboard; the sharper one is the guest WRITING it --
+         * you copy something in the guest, paste it into a host terminal, and
+         * what lands is not what you copied.  Hence: only in a mode that
+         * permits it, only while focused, rate-limited, capped, and SAID OUT
+         * LOUD when it happens.
+         */
+        /*
+         * STRUCTURE BEFORE POLICY.  A chunk claiming more bytes than it can
+         * hold is malformed however the broker is configured -- checking it
+         * after the mode and focus gates meant an unfocused client's malformed
+         * chunk was silently dropped instead of being flagged, so the same lie
+         * was a violation or not depending on where the pointer happened to
+         * be.
+         */
+        n = NVKVM_BROKER_CLIP_NBYTES(cc->info);
+        if (n > NVKVM_BROKER_CLIP_CMD_BYTES) {
+            nb_violation(s, "CLIPBOARD chunk claims more bytes than it has");
+            return;
+        }
+        if (s->cfg->clip_mode == NB_CLIP_OFF) {
+            if (!s->clip_told_off) {
+                s->clip_told_off = true;
+                nb_log("the VM offered clipboard content and clipboard is "
+                       "off, so it was discarded. --clipboard=guest-to-host "
+                       "or =consent would accept it.");
+            }
+            return;                 /* not a violation: a mode, not a lie */
+        }
+        if (!s->focused) {
+            s->clip_in_bad = true;  /* drain the rest of this transfer */
+            return;
+        }
+        if (nb_clip_rate_exceeded(s)) {
+            s->clip_in_bad = true;
+            return;
+        }
+        /*
+         * The cap is a CHUNK COUNT WE KEEP, not a size the client sends: it
+         * cannot be lied about because the client never states it.
+         */
+        if (++s->clip_in_chunks > NVKVM_BROKER_CLIP_MAX_CHUNKS_CMD ||
+            s->clip_in_len + n > NVKVM_BROKER_CLIP_MAX_BYTES) {
+            if (!s->clip_in_bad) {
+                nb_log("clipboard from the VM exceeds the %u-byte cap; "
+                       "discarding it", NVKVM_BROKER_CLIP_MAX_BYTES);
+            }
+            s->clip_in_bad = true;
+            return;
+        }
+        if (!s->clip_in_bad) {
+            memcpy(s->clip_in + s->clip_in_len, cc->data, n);
+            s->clip_in_len += n;
+        }
+        if (cc->info & NVKVM_BROKER_CLIP_LAST) {
+            unsigned len = s->clip_in_len;
+            bool bad = s->clip_in_bad;
+
+            s->clip_in_len = 0;
+            s->clip_in_chunks = 0;
+            s->clip_in_bad = false;
+            if (bad || len == 0) {
+                return;
+            }
+            s->clip_in[len] = '\0';
+            /* UTF-8 only.  A decoder in the privileged process is exactly what
+             * "text only" exists to avoid, so this validates rather than
+             * transcodes, and rejects anything it cannot vouch for. */
+            if (!nb_utf8_ok(s->clip_in, len)) {
+                nb_log("clipboard from the VM is not valid UTF-8; discarding");
+                return;
+            }
+            if (ss->ops->set_clipboard &&
+                ss->ops->set_clipboard(ss, s->clip_in, len) == 0) {
+                /* VISIBLE.  A guest silently replacing the host clipboard is
+                 * the attack; saying so is the control. */
+                nb_log("the VM put %u bytes on YOUR clipboard", len);
+                if (ss->ops->notify_clipboard) {
+                    ss->ops->notify_clipboard(ss);
+                }
+            }
+        }
+        return;
+    }
+
+    case NVKVM_BROKER_CMD_CAPS:
+        if (c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "CAPS reserved1 is not zero");
+            return;
+        }
+        if (fd >= 0) {
+            close(fd);
+            nb_violation(s, "CAPS carried an fd");
+            return;
+        }
+        if (c->height || c->stride || c->offset || c->fourcc || c->modifier) {
+            nb_violation(s, "CAPS carried other fields");
+            return;
+        }
+        s->caps_seen = c->width;
+        nb_log("the VM reports: clipboard agent %s",
+               (c->width & NVKVM_BROKER_CLIENT_CLIPBOARD) ? "present"
+                                                          : "absent");
+        return;
+
     case NVKVM_BROKER_CMD_WINDOW:
+        if (c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "WINDOW reserved1 is not zero");
+            return;
+        }
         if (fd >= 0) {
             close(fd);
             nb_violation(s, "WINDOW carried an fd");
@@ -1409,6 +1826,20 @@ static void usage(void)
 "                       window and distorts; none is 1:1, no scaling\n"
 "  --persist            keep the window when the VMM disconnects and wait\n"
 "                       for another (default: exit with it)\n"
+"  --clipboard MODE     off (default) | guest-to-host | consent | full\n"
+"                         off            nothing crosses\n"
+"                         guest-to-host  the guest may write YOUR clipboard;\n"
+"                                        it can never read it\n"
+"                         consent        the above, plus host->guest on an\n"
+"                                        explicit paste key.  RECOMMENDED\n"
+"                         full           bidirectional and automatic. The\n"
+"                                        guest sees everything you copy\n"
+"                       Text only, UTF-8, 16384 bytes max, rate limited\n"
+"                       both ways.  Needs QEMU -chardev qemu-vdagent and\n"
+"                       spice-vdagent in the guest as well\n"
+"  --clipboard-trigger LIST  keys that mean paste, replacing the default\n"
+"                       list (ctrl+v,ctrl+shift+v,shift+insert).  A paste\n"
+"                       chosen from a MENU cannot be caught this way\n"
 "  --trace-frames       log one line per commit: frame counter, dma-buf\n"
 "                       inode, cache slot, buffers the compositor still holds\n"
 "  --verbose\n"
@@ -1424,6 +1855,61 @@ static void usage(void)
 "A host resize never changes the guest's resolution -- it is scaled here.\n"
 "Going fullscreen does tell the guest, so it can render at the output's own\n"
 "resolution, which is what lets the compositor scan its buffer out directly.\n", stderr);
+}
+
+/*
+ * --clipboard-trigger "ctrl+v,ctrl+shift+v,shift+insert"
+ *
+ * Replaces the default list wholesale rather than adding to it, so what fires
+ * is exactly what is written and there is no invisible inherited entry.
+ */
+static int nb_parse_triggers(struct nb_config *c, const char *spec)
+{
+    char buf[256];
+    char *save = NULL, *tok;
+
+    if (strlen(spec) >= sizeof(buf)) {
+        nb_err("--clipboard-trigger is too long");
+        return -1;
+    }
+    snprintf(buf, sizeof(buf), "%s", spec);
+    c->n_clip_trigger = 0;
+
+    for (tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        struct nb_clip_trigger t = { 0, false, false };
+        char *plus = NULL, *part, *psave = NULL;
+
+        for (part = strtok_r(tok, "+", &psave); part;
+             part = strtok_r(NULL, "+", &psave)) {
+            (void)plus;
+            if (!strcasecmp(part, "ctrl"))       { t.need_ctrl = true; }
+            else if (!strcasecmp(part, "shift")) { t.need_shift = true; }
+            else if (!strcasecmp(part, "v"))     { t.code = KEY_V; }
+            else if (!strcasecmp(part, "insert")) { t.code = KEY_INSERT; }
+            else {
+                nb_err("--clipboard-trigger: '%s' is not a key this "
+                       "understands (ctrl, shift, v, insert)", part);
+                return -1;
+            }
+        }
+        if (t.code == 0) {
+            nb_err("--clipboard-trigger: '%s' names modifiers but no key",
+                   tok);
+            return -1;
+        }
+        if (c->n_clip_trigger >= NB_CLIP_MAX_TRIGGERS) {
+            nb_err("--clipboard-trigger: at most %d triggers",
+                   NB_CLIP_MAX_TRIGGERS);
+            return -1;
+        }
+        c->clip_trigger[c->n_clip_trigger++] = t;
+    }
+    if (c->n_clip_trigger == 0) {
+        nb_err("--clipboard-trigger: empty list (use --clipboard=off to "
+               "disable instead)");
+        return -1;
+    }
+    return 0;
 }
 
 static int add_user(struct nb_config *c, const char *name)
@@ -1509,6 +1995,13 @@ int main(int argc, char **argv)
     cfg.scale_mode = NB_SCALE_ASPECT;   /* preserve aspect, black bars */
     cfg.socket_mode = 0600;
     cfg.socket_fd = -1;
+    cfg.clip_mode = NB_CLIP_OFF;
+    /* CTRL+V, CTRL+SHIFT+V and SHIFT+INSERT: the three chords that mean paste
+     * to most people.  Replaceable wholesale with --clipboard-trigger. */
+    cfg.clip_trigger[0] = (struct nb_clip_trigger){ KEY_V, true, false };
+    cfg.clip_trigger[1] = (struct nb_clip_trigger){ KEY_V, true, true };
+    cfg.clip_trigger[2] = (struct nb_clip_trigger){ KEY_INSERT, false, true };
+    cfg.n_clip_trigger = 3;
     cfg.title = "nvkvm";
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -1559,6 +2052,20 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--socket-group")) { NEEDVAL();
             cfg.socket_group = v; }
         else if (!strcmp(a, "--no-peercred")) { cfg.no_peercred = true; }
+        else if (!strcmp(a, "--clipboard")) { NEEDVAL();
+            if (!strcmp(v, "off"))           { cfg.clip_mode = NB_CLIP_OFF; }
+            else if (!strcmp(v, "guest-to-host")) { cfg.clip_mode = NB_CLIP_G2H; }
+            else if (!strcmp(v, "consent"))  { cfg.clip_mode = NB_CLIP_CONSENT; }
+            else if (!strcmp(v, "full"))     { cfg.clip_mode = NB_CLIP_FULL; }
+            else {
+                nb_err("--clipboard must be off, guest-to-host, consent or "
+                       "full (got '%s'). `consent` is the recommended one.", v);
+                return 2;
+            } }
+        else if (!strcmp(a, "--clipboard-trigger")) { NEEDVAL();
+            if (nb_parse_triggers(&cfg, v) != 0) {
+                return 2;
+            } }
         else if (!strcmp(a, "--socket-fd")) { NEEDVAL();
             char *end = NULL;
             long n = strtol(v, &end, 10);
@@ -1694,6 +2201,7 @@ int main(int argc, char **argv)
     }
 
     nb_sink_init(&sink, sess);
+    sink.cfg = &cfg;   /* clipboard policy is config, read at every decision */
 
     /* Put something on the screen NOW.  Until a client attaches the surface
      * has no content, and a contentless window is indistinguishable from a

@@ -65,6 +65,7 @@
                                  * renamed to system/ in 10.0.               */
 #include "ui/console.h"
 #include "ui/input.h"
+#include "ui/clipboard.h"
 
 #include "nvkvm_display_relay.h"
 #include "nvkvm_inc/nvkvm_broker_proto.h"
@@ -116,6 +117,22 @@ typedef struct NvkvmRelay {
      * not work".  Holding one dma-buf fd costs one pinned scanout buffer and
      * makes the new window correct immediately.
      */
+    /*
+     * CLIPBOARD.  The broker becomes an ordinary QEMU clipboard peer -- the
+     * same mechanism GTK and SDL already use, with -chardev qemu-vdagent and
+     * stock spice-vdagent as the guest side.  Nothing is invented here beyond
+     * the two broker messages, and NOTHING is added to the virtio GPU
+     * transport: clipboard and GPU forwarding are unrelated concerns with
+     * different lifetimes, and coupling them would tie a text channel to the
+     * lifecycle of a display.
+     */
+    QemuClipboardPeer clip_peer;
+    bool        clip_registered;
+    char        clip_in[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    unsigned    clip_in_len;
+    unsigned    clip_in_chunks;
+    bool        clip_in_bad;
+
     int         last_fd;
     uint32_t    last_bw, last_bh, last_stride, last_fourcc;
     uint64_t    last_modifier;
@@ -214,6 +231,8 @@ static void relay_retry(void *opaque);
 static int  relay_connect(NvkvmRelay *r, const char *path, Error **errp);
 static void relay_readable(void *opaque);
 static void relay_replay(NvkvmRelay *r);
+static void relay_send_caps(NvkvmRelay *r);
+static void relay_clip_recv(NvkvmRelay *r, const struct nvkvm_broker_pkt *p);
 
 static void relay_close_bh(void *opaque)
 {
@@ -579,6 +598,9 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
     case NVKVM_BROKER_EV_POINTER:
     case NVKVM_BROKER_EV_HELLO:
         break;
+    case NVKVM_BROKER_EV_CLIPBOARD:
+        relay_clip_recv(r, p);
+        break;
     case NVKVM_BROKER_EV_CLOSE:
         /*
          * The user closed the display.  THE POLICY IS OURS, and this is the
@@ -797,6 +819,144 @@ static int relay_connect(NvkvmRelay *r, const char *path, Error **errp)
     return 0;
 }
 
+/* ── clipboard ───────────────────────────────────────────────────────────── */
+
+/*
+ * Tell the broker what we can do.  Re-sent on every (re)connect, because a
+ * restarted broker knows nothing -- the same rule as the geometry replay.
+ *
+ * The clipboard bit is what lets the broker tell "clipboard is off" apart from
+ * "there is no guest agent"; without it both look like nothing happening and
+ * the user is left to guess which knob to turn.
+ */
+static void relay_send_caps(NvkvmRelay *r)
+{
+    struct nvkvm_broker_cmd cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type  = NVKVM_BROKER_CMD_CAPS;
+    cmd.width = r->clip_registered ? NVKVM_BROKER_CLIENT_CLIPBOARD : 0;
+    (void)relay_send(r, &cmd, -1);
+}
+
+/* ── clipboard ───────────────────────────────────────────────────────────── */
+
+/* Guest -> host: chunk the guest's clipboard text out to the broker. */
+static void relay_clip_send(NvkvmRelay *r, const char *text, size_t len)
+{
+    size_t off = 0;
+    uint32_t chunk = 0;
+
+    if (r->sock < 0 || len == 0) {
+        return;
+    }
+    if (len > NVKVM_BROKER_CLIP_MAX_BYTES) {
+        RELAY_LOG("clipboard: the guest offered %zu bytes, over the %u cap; "
+                  "not forwarding it", len, NVKVM_BROKER_CLIP_MAX_BYTES);
+        return;
+    }
+    do {
+        struct nvkvm_broker_clip_cmd cc;
+        size_t n = len - off;
+
+        if (n > NVKVM_BROKER_CLIP_CMD_BYTES) {
+            n = NVKVM_BROKER_CLIP_CMD_BYTES;
+        }
+        memset(&cc, 0, sizeof(cc));
+        cc.type  = NVKVM_BROKER_CMD_CLIPBOARD;
+        cc.chunk = chunk++;
+        cc.info  = (uint8_t)n;
+        if (off + n == len) {
+            cc.info |= NVKVM_BROKER_CLIP_LAST;
+        }
+        memcpy(cc.data, text + off, n);
+        if (relay_send(r, (const struct nvkvm_broker_cmd *)&cc, -1) != 0) {
+            RELAY_LOG("clipboard: the broker socket would not take the "
+                      "guest's clipboard; dropped");
+            return;
+        }
+        off += n;
+    } while (off < len);
+}
+
+/* The guest's clipboard changed (vdagent -> ui/clipboard.c -> us). */
+static void relay_clip_notify(Notifier *notifier, void *data)
+{
+    NvkvmRelay *r = container_of(notifier, NvkvmRelay, clip_peer.notifier);
+    QemuClipboardNotify *notify = data;
+    QemuClipboardInfo *info;
+
+    if (!r || notify->type != QEMU_CLIPBOARD_UPDATE_INFO) {
+        return;
+    }
+    info = notify->info;
+    if (!info || info->owner == &r->clip_peer) {
+        return;                 /* our own update coming back around */
+    }
+    if (info->selection != QEMU_CLIPBOARD_SELECTION_CLIPBOARD) {
+        return;                 /* PRIMARY is not what a paste key means */
+    }
+    if (!info->types[QEMU_CLIPBOARD_TYPE_TEXT].available) {
+        return;                 /* text only, deliberately */
+    }
+    if (!info->types[QEMU_CLIPBOARD_TYPE_TEXT].data) {
+        /* Announced but not fetched yet; ask, and we are called again. */
+        qemu_clipboard_request(info, QEMU_CLIPBOARD_TYPE_TEXT);
+        return;
+    }
+    qemu_mutex_lock(&r->lock);
+    relay_clip_send(r, (const char *)info->types[QEMU_CLIPBOARD_TYPE_TEXT].data,
+                    info->types[QEMU_CLIPBOARD_TYPE_TEXT].size);
+    qemu_mutex_unlock(&r->lock);
+}
+
+/* Someone in QEMU wants the data behind a clipboard we announced.  We always
+ * hand over the whole text at announce time, so there is nothing to fetch. */
+static void relay_clip_request(QemuClipboardInfo *info, QemuClipboardType type)
+{
+    (void)info; (void)type;
+}
+
+/* Host -> guest: a chunk arrived from the broker. */
+static void relay_clip_recv(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
+{
+    const struct nvkvm_broker_clip_pkt *cp =
+        (const struct nvkvm_broker_clip_pkt *)p;
+    unsigned n = NVKVM_BROKER_CLIP_NBYTES(cp->info);
+
+    /* The broker is the trusted side of this socket, but "trusted" is not
+     * "unbounded": a bug over there must not become memory corruption here. */
+    if (n > NVKVM_BROKER_CLIP_PKT_BYTES) {
+        r->clip_in_bad = true;
+        n = 0;
+    }
+    if (++r->clip_in_chunks > NVKVM_BROKER_CLIP_MAX_CHUNKS_PKT ||
+        r->clip_in_len + n > NVKVM_BROKER_CLIP_MAX_BYTES) {
+        r->clip_in_bad = true;
+    }
+    if (!r->clip_in_bad && n) {
+        memcpy(r->clip_in + r->clip_in_len, cp->data, n);
+        r->clip_in_len += n;
+    }
+    if (!(cp->info & NVKVM_BROKER_CLIP_LAST)) {
+        return;
+    }
+    if (!r->clip_in_bad && r->clip_in_len && r->clip_registered) {
+        QemuClipboardInfo *info =
+            qemu_clipboard_info_new(&r->clip_peer,
+                                    QEMU_CLIPBOARD_SELECTION_CLIPBOARD);
+
+        qemu_clipboard_set_data(&r->clip_peer, info, QEMU_CLIPBOARD_TYPE_TEXT,
+                                r->clip_in_len, r->clip_in, true);
+        qemu_clipboard_info_unref(info);
+        RELAY_LOG("clipboard: %u bytes from the host are now the guest's "
+                  "clipboard", r->clip_in_len);
+    }
+    r->clip_in_len = 0;
+    r->clip_in_chunks = 0;
+    r->clip_in_bad = false;
+}
+
 /* ── reconnect ───────────────────────────────────────────────────────────── */
 
 static void relay_arm_retry_bh(void *opaque)
@@ -889,6 +1049,7 @@ static void relay_retry(void *opaque)
         return;
     }
     qemu_set_fd_handler(r->sock, relay_readable, NULL, r);
+    relay_send_caps(r);
     r->n_reconnects++;
     r->retry_ms = RELAY_RETRY_MIN_MS;
     r->retry_logged = false;
@@ -937,6 +1098,16 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
     r->con = con;
     r->retry_ms = RELAY_RETRY_MIN_MS;
     qemu_mutex_init(&r->lock);
+    /*
+     * Register as an ordinary clipboard peer.  If no vdagent chardev exists
+     * this simply never fires, which is the honest outcome -- and the broker
+     * is told so through CAPS rather than being left to infer it from silence.
+     */
+    r->clip_peer.name = "nvkvm-broker";
+    r->clip_peer.notifier.notify = relay_clip_notify;
+    r->clip_peer.request = relay_clip_request;
+    qemu_clipboard_peer_register(&r->clip_peer);
+    r->clip_registered = true;
     nvkvm_relay = r;
     if (relay_connect(r, nvkvm_relay_sock_path, &err) < 0) {
         /*
@@ -964,6 +1135,7 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
      * dpy_gl_scanout_dmabuf import this design exists to remove.
      */
     qemu_set_fd_handler(r->sock, relay_readable, NULL, r);
+    relay_send_caps(r);
     RELAY_LOG("broker mode active: this QEMU holds no display-server "
               "connection and imports nothing.");
 }

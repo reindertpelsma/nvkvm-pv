@@ -126,6 +126,85 @@ where it is used; they are wrong only in their lifetime.
 **Fix.** `window_established` reset in `nb_sink_attach()`; `nb_sink_detach()`
 now calls `ops->dismiss_dialog`, which also clears `close_asked`.
 
+## B-3 — The reserved-field check aliased clipboard payload bytes
+
+**Severity: medium (functional; a denial of the feature, not a breach).
+Status: fixed.** `nvkvm_broker.c`, `nb_handle_cmd()`.
+
+Found by re-running the harness against the clipboard surface, which is why it
+was re-run.
+
+`nb_handle_cmd()` opened with `if (c->reserved0 || c->reserved1)` — correct
+while every command shared one layout. `CMD_CLIPBOARD` does not: its payload
+runs to the end of the record, so the **generic `reserved1` at offset 36
+aliases clipboard data bytes 23..26**. Any chunk whose last four payload bytes
+were non-zero was rejected as a malformed header — a full 27-byte chunk of `A`
+failed, so any clipboard text longer than 23 bytes was unusable.
+
+This is the lesson from A-1/R-1 arriving a third time: **a control keyed on a
+layout that is no longer universal looks correct at every call site.** The
+check read fine; what changed underneath it was the assumption that there is
+only one layout.
+
+**Fix.** `reserved0` is at the same offset and means the same thing in both
+layouts, so it stays generic. `reserved1` moved into the cases that actually
+have it (`ATTACH`, `COMMIT`, `WINDOW`, `CAPS`).
+
+**Second, related fix.** The clipboard `nbytes` bound was checked *after* the
+mode and focus gates, so an unfocused client's malformed chunk was silently
+dropped rather than flagged — the same lie was a violation or not depending on
+where the pointer happened to be. Structural validation now precedes policy.
+
+---
+
+## Clipboard: what was attacked
+
+Clipboard is the largest thing a client can push at the privileged process and
+the first variable-length one, so it was attacked before it was believed.
+Broker verdicts from its own log, mode `consent`:
+
+| attack | result |
+|---|---|
+| `info` claiming 31 bytes in a 27-byte chunk | violation → disconnect |
+| non-zero `reserved1` | violation → disconnect |
+| an fd on `CMD_CLIPBOARD` | violation → disconnect |
+| 3,000 chunks (81,000 bytes) against the 16 KiB cap | *"exceeds the 16384-byte cap; discarding"*, link kept |
+| 2,000 chunks that never set `LAST` | bounded by chunk count, discarded, link kept |
+| lone continuation, overlong, surrogate, truncated, embedded NUL | all *"not valid UTF-8; discarding"* |
+| 20,009 transfers as fast as possible | clipboard rate limiter → disconnect |
+| a valid 32-byte transfer (full-width chunk + partial) | **reached the real host clipboard**, `wl-paste` confirms, and the broker said *"the VM put 32 bytes on YOUR clipboard"* |
+
+**Framing.** The no-length-field property is preserved: every message is still
+exactly 40 bytes (commands) or 24 (events), and `_Static_assert` enforces that
+the clipboard overlays are the same size as what they overlay — so a receiver
+that does not know the type still skips a whole, well-formed message. `info`
+says how much of an **already-read, fixed-size array** is meaningful; it is
+bounds-checked against that array's compile-time size, cannot move the read
+cursor, and cannot allocate. The total-size bound is a **chunk count the
+receiver keeps itself**, never a number the sender supplies.
+
+**UTF-8 validation** is unit-tested separately (`make check` runs
+`test/test_utf8.c`, 20 cases) against overlong forms, surrogates, out-of-range
+code points, 5-byte forms, truncation and embedded NULs. The test extracts the
+validator from the source with `sed` rather than copying it, so it cannot drift
+from the code it tests.
+
+**Modes.** `off` is the default and nothing crosses. `guest-to-host` never
+lets the guest read the host selection. `consent` adds host→guest only on an
+explicit trigger. `full` is documented as the risky one. Guest→host is
+additionally gated on **window focus**, rate-limited on its own 1-second
+window, capped, and **visible** — the title bar shows `THE VM CHANGED YOUR
+CLIPBOARD` for four seconds, because a guest silently replacing what you are
+about to paste into a host terminal is the actual attack in that direction.
+
+**Not covered for clipboard:** host→guest end to end with a real guest and
+`spice-vdagent` (the QEMU peer compiles and registers, and the broker's fetch
+path is exercised, but no guest paste was observed); the X11 backend has no
+clipboard implementation at all (`set_clipboard`/`fetch_clipboard` are NULL
+there, so clipboard is simply unavailable rather than half-working); and
+menu-driven Edit→Paste cannot be caught by a key trigger, which is a documented
+limitation rather than a bug.
+
 ---
 
 ## Examined and clean
