@@ -53,6 +53,16 @@ void nb_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 void nb_err(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 extern int nb_verbose;
 
+/*
+ * --trace-frames.  Logs one line per COMMIT: the client's frame counter, the
+ * dma-buf inode, the cache slot, and whether the compositor had released that
+ * buffer before it was handed back.  This exists because an intermittent
+ * "stale frame" is the one bug class you cannot fix by reading the code: the
+ * only way to tell a reorder from a buffer overwritten in flight is to watch
+ * buffer IDENTITY per frame, and identity is only knowable here.
+ */
+extern int nb_trace_frames;
+
 /* ── configuration (command line only; never anything a client sent) ─────── */
 struct nb_config {
     const char *socket_path;
@@ -99,6 +109,11 @@ struct nb_buf_desc {
     uint32_t width, height, stride, offset, fourcc;
     uint64_t modifier;
     uint32_t bpp;               /* bytes per pixel implied by fourcc          */
+    uint32_t seq;               /* the client's own frame counter (cmd.seq).
+                                 * ADVISORY — it comes from the untrusted VMM
+                                 * and is used for nothing but log lines, so a
+                                 * lie in it costs a confusing trace and
+                                 * nothing else.                              */
 };
 
 /* ── the policy core ─────────────────────────────────────────────────────── */
