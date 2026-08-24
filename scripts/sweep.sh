@@ -491,11 +491,11 @@ for i in d: print(i.get("id"))
 #      "success": false and still leave a live contract, so return values here
 #      are worth nothing.  The LISTING is the only evidence.
 destroy_verified() {
-    local id="$1" try
+    local id="$1"
     if is_protected "$id"; then
         warn "REFUSING to destroy protected instance $id"; return 1
     fi
-    for try in 1 2 3 4 5; do
+    for _ in 1 2 3 4 5; do
         yes | timeout 120 vastai destroy instance "$id" -y >/dev/null 2>&1
         sleep "$DESTROY_SETTLE"
         if ! live_instance_ids | grep -qx "$id"; then
@@ -698,7 +698,6 @@ PY
 # ---------------------------------------------------------------------------
 CUR_INSTANCE=""
 CUR_MACHINE=""
-CUR_GPU=""
 CUR_DPH=""
 CUR_HOST=""
 CUR_PORT=""
@@ -1006,7 +1005,7 @@ PY
 # ---------------------------------------------------------------------------
 VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""
 boot_and_validate() {
-    local drv="$1" gpu="$2" rc bundles G mod out booted=0 i
+    local drv="$1" gpu="$2" rc bundles G mod out booted=0
     VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""
 
     # The host-libs bundle is the HOST DRIVER's userspace and MUST be rebuilt
@@ -1045,7 +1044,7 @@ boot_and_validate() {
     # lock clears, then say so plainly if it still is not there.
     rsh_t 200 'systemctl stop unattended-upgrades 2>/dev/null; systemctl mask unattended-upgrades 2>/dev/null; true' >/dev/null 2>&1
     if ! rsh_t 120 'command -v sshpass >/dev/null' >/dev/null 2>&1; then
-        for i in 1 2 3 4 5 6 7 8; do
+        for _ in 1 2 3 4 5 6 7 8; do
             rsh_t 240 'DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshpass' >/dev/null 2>&1
             rsh_t 90 'command -v sshpass >/dev/null' >/dev/null 2>&1 && break
             sleep 15
@@ -1060,7 +1059,7 @@ boot_and_validate() {
     rsh_t 200 'systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --working-directory=/root/nvkvm bash scripts/run_test_vm.sh' >/dev/null 2>&1
 
     G='sshpass -p ubuntu ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 ubuntu@localhost'
-    for i in $(seq 1 30); do
+    for _ in $(seq 1 30); do
         out="$(rsh_t 90 "$G 'mountpoint -q /mnt/nvkvm && echo MOUNTED'" 2>/dev/null)"
         case "$out" in *MOUNTED*) booted=1; break ;; esac
         sleep 20
@@ -1248,7 +1247,7 @@ sweep_one_box() {
         return 2
     fi
     register_instance "$iid"     # registered BEFORE anything else touches it
-    CUR_INSTANCE="$iid"; CUR_MACHINE="$machine"; CUR_GPU="$gpu"; CUR_DPH="$dph"
+    CUR_INSTANCE="$iid"; CUR_MACHINE="$machine"; CUR_DPH="$dph"
     t_start="$(date +%s)"
     info "  instance $iid created and registered with the auto-destroy timer"
 
@@ -1731,7 +1730,7 @@ if [ "$GO" != 1 ]; then
     est=0
     for a in ${ARCHES//,/ }; do
         line="$(pick_offer "$a")" || { printf '    %-10s NO RENTABLE KVM OFFER under $%s/hr\n' "$a" "$MAX_DPH"; continue; }
-        IFS=$'\t' read -r oid mid gname odph ogeo oinet oadv <<<"$line"
+        IFS=$'\t' read -r _ mid gname odph ogeo _ _ <<<"$line"
         n="$(drivers_for_arch "$a" | wc -l)"
         hours="$(python3 -c "print(round(1.2 + 0.25 * $n, 2))")"
         c="$(python3 -c "print(round($odph * $hours, 2))")"
