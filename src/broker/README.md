@@ -414,13 +414,18 @@ compositor's call, and it will not tell you.
 This matters more than anything else in this document.
 
 It was originally written on a machine with **no GPU and no `/dev/dri` at
-all**. It has since been run on real hardware once: a rented KVM box with an
-**RTX 3090**, NVIDIA **580.105.08**, X.Org 1.21.1.4 driving the real **NVIDIA
-DDX** on a forced virtual head (`ConnectedMonitor "DFP-0"`) under KDE Plasma,
-and **sway 1.7 / wlroots 0.15** headless on the same GPU. That run is the
-source of everything marked *(hardware, RTX 3090)* below. **It has still never
-met a physical monitor**, which is exactly why the scanout question below is
-still open.
+all**. It has since been run on real hardware twice, both times on a rented KVM
+box with an **RTX 3090**, NVIDIA **580.105.08**, X.Org 1.21.1.4 driving the real
+**NVIDIA DDX** under KDE Plasma, and **sway 1.7** headless on the same GPU.
+
+- **First light** (test-tool dma-buf, no guest) is the source of everything
+  marked *(hardware, RTX 3090)* below.
+- **Second light** booted a **real Ubuntu 24.04 guest running weston on the
+  nvkvm KMS head** behind the broker, on both backends — see "Second light"
+  below and everything after it.
+
+**Neither run has met a physical monitor**, which is exactly why the scanout
+question below is *still* open after two attempts at it.
 
 ### First light — both backends, on real hardware
 
@@ -551,37 +556,148 @@ found**; each is described where it lives:
   instead of core `XGrabPointer`, which is left as a deliberate change rather
   than smuggled in.
 
+### Second light — a REAL GUEST, both backends (RTX 3090, 580.105.08)
+
+The line above this section used to end "no guest was booted". One has been.
+Rented KVM box, RTX 3090, NVIDIA **580.105.08**, X.Org **1.21.1.4** on the real
+NVIDIA DDX (`xserver-xorg-video-nvidia-580`) under KDE Plasma, and **sway 1.7**
+headless on the same GPU — the same stack as first light. Guest: **Ubuntu 24.04
+cloud image running weston 13 on the nvkvm KMS head**, `GL renderer: NVIDIA
+GeForce RTX 3090/PCIe/SSE2`, zero `llvmpipe` in its log.
+
+- **The guest's own frames reach the host screen on BOTH backends**, screenshot
+  on each. The guest flips `XR24` **1920x1080 pitch 7680 modifier
+  `0x0300000000606014`** — a real block-linear scanout bo, not a test
+  allocation — and it arrives through `nvkvm_req_present` →
+  `nvkvm_display_relay_submit` → the broker.
+- **Zero rejections.** One X11 session tallied **69 attach, 69 commit, 0
+  rejected** at teardown. Nothing in the validator had to be relaxed.
+- **`ARGB8888` is a non-question on this driver.** The NVIDIA DDX advertises
+  **26 (format, modifier) pairs** and they are `XR24` *and* `AR24` against the
+  same twelve block-linear modifiers. sway advertises **56** — the number the
+  `nb_formats_add()` fix predicts — covering `AB24`/`XB24`/`AR24`/`XR24`.
+- The X11 grab announces `GRAB IS PARTIAL`, sway `GRAB IS TOTAL`, as before.
+
+### Present mode with a real guest: COPY, and SKIP under load
+
+Read this with the caveat below, which is the same caveat as last time.
+
+- Windowed, KWin compositing on: **`COPY`**.
+- Fullscreen (`CTRL+ALT+F`), host CRTC forced to **1920x1080** so guest
+  resolution equals host resolution, and **KWin compositing suspended**
+  (`qdbus org.kde.KWin /Compositor active` → `false`): still **`COPY`**. This
+  was measured against a *freshly started* broker, so `last_mode == -1` and the
+  first guest frame logged its mode explicitly rather than being silently equal
+  to a previous one — that ambiguity is real and is worth avoiding deliberately.
+- With the guest continuously repainting, the mode **alternates `COPY` /
+  `SKIP`**. `SKIP` is Present telling you a frame was superseded before its
+  vblank; it is the first pacing signal this work has ever had from a real
+  guest, and no test client could produce it.
+- **`FLIP` is still unseen, and a rented box still cannot settle it.** This
+  head is `DP-0`, reported `connected` but with a physical size of **0mm x
+  0mm** — an EDID-less virtual connector on a VFIO-passed GPU, not a monitor.
+  It is a different flavour of the same "no real display" limitation that made
+  the previous run's forced DFP inconclusive. **The physical PC is still the
+  only place this question can be answered.**
+
+### Pacing, measured on a guest flipping at its own rate
+
+- The guest paces at a **steady ~60 fps**: consecutive `nvkvm present: flip`
+  kernel timestamps are **16.0–17.3 ms** apart.
+- **Do not count `dmesg` lines to get a frame rate.** `nvkvm_kms.c` logs the
+  flip with `pr_info_ratelimited`, whose default is 10 bursts per 5 s, so the
+  log shows exactly ten frames then a five-second hole. Read it as a *sample of
+  intervals*, not a *count*. A naive count reads 1.9 fps on a guest doing 60.
+- The relay's drop-on-`EAGAIN` path did **not** fire: no dropped-frame counter
+  ever surfaced at 60 fps into either backend. `EV_FRAME`/`EV_RELEASE` remain
+  carried-but-unused, as designed.
+
+### Input policy, exercised against a real guest
+
+Measured by reading the guest's own `/dev/input/event*` for the virtio devices
+while driving the host with `xdotool` — not by watching a cursor.
+
+- **`CTRL+ALT+G` toggles the grab**: `grab ON` on the broker, and QEMU logs the
+  same transition. Focus-gating holds: keys only flow once the window is focused.
+- **Keyboard capture works**: 288 bytes of `input_event` on the guest's
+  `QEMU Virtio Keyboard` without a grab, 480 bytes under one.
+- **Absolute pointer works, and is correctly suppressed under grab**: 216 bytes
+  on the `QEMU Virtio Tablet` when the pointer enters the window ungrabbed, and
+  **0 bytes** under grab. Note ABS is gated on `EnterNotify`, so a pointer that
+  was *already* inside when the session started never unsuppresses — leave the
+  window and come back before concluding ABS is broken.
+- **A real focus loss drops the grab by itself**, against a real guest:
+  `window inactive (input suspended)` then `grab off`, unasked.
+- **Mouse-look: the expectation is confirmed, not fixed.** With only
+  `virtio-tablet` present the guest has no relative device, so relative motion
+  under grab has nowhere to land. `relay_set_relative()` is untouched patch-0007
+  machinery and was not exercised further. Unchanged conclusion, now with a
+  guest behind it.
+
+### Trap: an X screen locker looks exactly like a broken input path
+
+Hours went into this, so it is written down. With the KDE session locked
+(`loginctl show-session N -p LockedHint` → `yes`), `kscreenlocker_greet` holds
+an X keyboard **and** pointer grab. The broker then still receives
+`FocusIn`/`FocusOut` — so QEMU dutifully logs `window active` / `window
+inactive` and everything looks alive — while **not one key or motion event
+arrives**, `CTRL+ALT+G` never fires, and the guest's evdev stays at zero bytes.
+It is indistinguishable from a dead input path unless you think to check the
+locker. Unlock and disable autolock before testing input.
+
+### The containerised VMM, with a real guest behind it
+
+podman **3.4.4**, rootless, `--userns=keep-id`, QEMU built
+`--disable-opengl --audio-drv-list=`.
+
+- **The sandbox is clean, checked from inside the running container**: no
+  `/tmp/.X11-unix`, no `wayland-*` socket, no `/dev/dri`. `/dev` holds only
+  `kvm`, the `nvidia*` nodes and the standard character devices; `/run/nvkvm`
+  holds `display.sock` and nothing else. The VMM runs as **uid 1000**.
+- **`DT_NEEDED` carries no X, GL, EGL, GBM, DRM or Wayland library** —
+  `readelf -d` lists glib/pixman/gnutls/png/z/udev/lzo2/dw/pulse/m/c and stops.
+  `-display help` in that build offers `none`, `dbus`, `nvkvm-broker`, and
+  **`egl-headless` is gone**. At runtime `/proc/<pid>/maps` shows only
+  `libX11`, `libX11-xcb` and `libxcb`, pulled in transitively by **libpulse**,
+  never by a display path — and no EGL, GL, GBM, libdrm or `libnvidia-*` at all.
+- **A real guest boots in it and the GPU comes up**: `nvkvm: probe called`,
+  `host NVIDIA driver 580.105.08`, `virtual KMS head ready (1920x1080, 1
+  connector/crtc)`, module loaded — from a sandboxed, unprivileged VMM.
+- **But no guest frame came out of the container**, and the reason is *not* the
+  container: the GPU command ring is never established under an **unprivileged**
+  QEMU, so the guest's compositor has no usable GPU and never flips. This was
+  **reproduced outside any container** by running the same QEMU as uid 1000 on
+  the bare host — identical failure. It is the already-documented "run QEMU as
+  root" limitation (`docs/internal/mint-guest-desktop.md`), orthogonal to the
+  broker, and it is what stands between this profile and a frame.
+- Related and worth knowing: a guest that builds its module on a
+  `security_model=mapped` 9p export **cannot** do so under an unprivileged
+  QEMU — the share is never written, the build never runs, and the module never
+  loads, with no error anywhere obvious. Baking `nvkvm-guest.ko` into the guest
+  image removes the share from the container profile entirely, which is both
+  the fix and the better isolation story.
+
 ### NOT verified — still needs the physical PC
 
-- **Direct scanout / unredirect: not established, and this box could not.**
-  Every `PresentCompleteNotify` reported `COPY`, fullscreen and windowed,
-  composited and with KWin compositing suspended — but the head was a *forced
-  virtual DFP with no monitor attached*, where a page flip may be impossible
-  for reasons that have nothing to do with the broker. Note also that
-  `PresentPixmap` targets the **content child window**, and the child is sized
-  to the guest buffer, so it can only ever cover the CRTC when the guest
-  resolution equals the host's. The X11 backend now logs the Present mode on
-  every change (`Present: FLIP` / `Present: COPY`), so on a real monitor this
-  is a one-glance answer rather than an investigation. Wayland offers no
-  equivalent signal — the compositor still will not tell you.
-- Whether a 32-bpp `ARGB8888` guest buffer imported as depth 24 renders
-  correctly (it should — a scanout's alpha is not composited) is untested.
-- Pacing under load, `EV_FRAME`/`EV_RELEASE` timing, and whether dropping on
-  `EAGAIN` produces acceptable smoothness: untested. Every hardware test above
-  drove frames from a test client, not from a guest flipping at its own rate.
+- **Direct scanout / unredirect: still not established.** See "Present mode
+  with a real guest" above: `COPY` fullscreen at matched resolution with the
+  host compositor suspended, but on an EDID-less `DP-0` (0mm x 0mm) on a
+  VFIO-passed GPU. Two rented boxes have now failed to answer this for the same
+  underlying reason — no real monitor. Note also that `PresentPixmap` targets
+  the **content child window**, sized to the guest buffer, so it can only ever
+  cover the CRTC when guest resolution equals the host's; that condition was
+  met here, and the answer was still `COPY`. Wayland offers no equivalent
+  signal — the compositor still will not tell you.
+- A guest frame **out of the containerised VMM**: blocked by the unprivileged
+  QEMU GPU-ring limitation above, not by the broker. Root-cause that, or run
+  the container's QEMU privileged, and this closes.
 - `keyboard-shortcuts-inhibit` was *advertised* by sway and announced as total;
   no compositor shortcut was actually fired at it to confirm it is inhibited.
-- `relay_set_relative()` — switching the guest to a relative pointing device on
-  grab — is **known not to work** in the equivalent GTK path (patch 0007), and
-  nothing here changes that: it is still `qemu_mouse_set()` over
-  `qmp_query_mice()`, unchanged. **Mouse-look in the guest is expected to still
-  be broken, and this hardware run neither fixed nor disproved that** — the
-  transport is now known good (GRAB packets reach QEMU from inside a
-  container), so what remains is the device switch and the guest side.
-- The whole end-to-end path with a real guest, a real isolate and a real
-  `nvkvm_req_present` relay. Everything above used a dma-buf allocated by a
-  test tool and handed over the same way the isolate hands one over; no guest
-  was booted.
+- `relay_set_relative()` / mouse-look: still broken, still unexercised beyond
+  confirming there is no relative device for it to target. See above.
+- A guest running a **game** — a fullscreen client taking a pointer lock and
+  driving the compositor hard — rather than weston plus a repainting test
+  client. SteamOS was the intended guest for this and was not reached.
 
 ### First things to try on the physical PC
 
