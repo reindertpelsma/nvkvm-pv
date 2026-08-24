@@ -89,6 +89,12 @@ typedef struct NvkvmRelay {
     size_t      rxlen;
 
     bool        grabbed;
+    /* An ACPI powerdown we asked for and the guest has not acted on.  Kept so
+     * a second close is answered with something rather than with silence --
+     * see the EV_CLOSE case. */
+    bool        powerdown_pending;
+    time_t      powerdown_at;
+    unsigned    powerdown_asks;
     uint64_t    n_sent, n_dropped;
     /* ATTACHed but the COMMIT could not be written.  A distinct failure from
      * n_dropped -- see the comment at the counter's only increment. */
@@ -506,17 +512,45 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
              * HOST_UI is exactly what a UI close button reports elsewhere in
              * QEMU, so this behaves like every other front-end's close.
              */
-            RELAY_LOG("the user chose to force the VM off");
+            RELAY_LOG("the user chose to force the VM off%s",
+                      r->powerdown_pending
+                          ? " after the guest ignored a powerdown" : "");
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
         } else {
             /*
              * The same thing as the power button on the case: the guest's own
-             * OS decides whether to shut down, prompt, or ignore it.  A guest
-             * that ignores ACPI keeps running with no display, and the broker
-             * is still there to reconnect to.
+             * OS decides whether to shut down, prompt, or ignore it.
+             *
+             * AND IT MAY IGNORE IT -- hung, or a modal dialog blocking
+             * shutdown.  Then the window just sits there, and a user clicking
+             * close again gets no sign that anything happened at all, which is
+             * a dead end in the most finished-looking part of the UI.  So a
+             * repeat ask is answered explicitly, and it is answered HERE
+             * because escalation is VM policy and the broker must not grow
+             * any: all it did was tell us the user asked again.
+             *
+             * It does NOT force on the second click.  Destroying a running
+             * machine on a double click is a worse failure than the one being
+             * fixed, and the user already has an explicit "force off" in front
+             * of them -- they need to be told it is the way out, not to have
+             * it happen to them.
              */
-            RELAY_LOG("the user closed the display: requesting an ACPI "
-                      "powerdown (the guest decides what to do with it)");
+            time_t now = time(NULL);
+
+            r->powerdown_asks++;
+            if (r->powerdown_pending) {
+                RELAY_LOG("the guest has NOT responded to the powerdown "
+                          "requested %llds ago (asked %u times). It may be "
+                          "hung, or showing a dialog that blocks shutdown. "
+                          "Choose FORCE OFF THE VM to stop it anyway.",
+                          (long long)(now - r->powerdown_at),
+                          r->powerdown_asks);
+            } else {
+                r->powerdown_pending = true;
+                r->powerdown_at = now;
+                RELAY_LOG("the user closed the display: requesting an ACPI "
+                          "powerdown (the guest decides what to do with it)");
+            }
             qemu_system_powerdown_request();
         }
         break;

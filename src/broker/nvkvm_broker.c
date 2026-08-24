@@ -872,7 +872,32 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             nb_err("WINDOW: %ux%u out of range — ignored", c->width, c->height);
             return;
         }
-        ss->ops->resize(ss, c->width, c->height);
+        /*
+         * A GUEST RE-MODE DOES NOT MOVE THE USER'S WINDOW.
+         *
+         * WINDOW is the one message where the guest legitimately drives
+         * geometry, and it is honoured EXACTLY ONCE: the first one sizes the
+         * window to whatever resolution the guest booted at, which is the only
+         * sensible initial size.  After that the window belongs to the user,
+         * and someone opening the guest's display settings changes the SOURCE
+         * the broker is scaling, not the window they arranged on their desk.
+         *
+         * That is the mirror of the rule in the other direction -- a host
+         * resize never re-modes the guest -- and without it the two rules
+         * fight: the guest re-modes, the window jumps, the window change is
+         * reported back, and the geometry oscillates.
+         *
+         * Nothing else is needed to adopt the new size: the next COMMIT
+         * carries a buffer with the new dimensions and the backend rescales it
+         * into the window it already has, per the active --scale mode.
+         */
+        if (!s->window_established) {
+            s->window_established = true;
+            ss->ops->resize(ss, c->width, c->height);
+        } else {
+            nb_log("the guest changed resolution to %ux%u: keeping the window "
+                   "and rescaling into it", c->width, c->height);
+        }
         return;
 
     default:

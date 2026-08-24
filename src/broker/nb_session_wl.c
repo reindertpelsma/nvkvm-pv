@@ -235,6 +235,12 @@ struct nb_wl {
     void                    *dlg_px;
     size_t                   dlg_sz;
     bool                     dlg_open;
+    /* We have already sent a close request and are still here.  The broker
+     * cannot know WHY -- that is the VMM's and the guest's business -- but
+     * "you already asked and the window is still open" is its own history and
+     * is worth saying, because the QEMU log where the reason appears is not
+     * something the person clicking the button can see. */
+    bool                     close_asked;
     bool                     ptr_on_dlg;
     int                      dlg_hover, dlg_press;
     int                      dlg_px_x, dlg_px_y;
@@ -1179,7 +1185,10 @@ static void dlg_paint(struct nb_wl *w)
         px[i * stride_px + NB_DLG_W - 1] = 0xff5a5a6eu;
     }
     nb_placeholder_text(px, NB_DLG_W, NB_DLG_H, stride_px, NB_DLG_PAD,
-                        NB_DLG_PAD, "CLOSE THE DISPLAY?", 2, 0xffffffffu);
+                        NB_DLG_PAD,
+                        w->close_asked ? "STILL RUNNING - ASK AGAIN?"
+                                       : "CLOSE THE DISPLAY?",
+                        2, w->close_asked ? 0xffffd080u : 0xffffffffu);
 
     for (i = 0; i < NB_DLG_N; i++) {
         int top = NB_DLG_PAD + NB_DLG_TITLE + NB_DLG_GAP +
@@ -1317,9 +1326,13 @@ static void dlg_choose(struct nb_wl *w, int choice)
 {
     switch (choice) {
     case 0:
-        nb_log("close: ACPI powerdown requested");
+        nb_log("close: ACPI powerdown requested%s",
+               w->close_asked ? " (again; the guest has not acted on the last "
+                                "one -- FORCE OFF is the way out)" : "");
         if (!nb_sink_close_request(w->sink, NVKVM_BROKER_CLOSE_POWERDOWN)) {
             w->quit = true;
+        } else {
+            w->close_asked = true;
         }
         break;
     case 1:

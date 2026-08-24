@@ -136,6 +136,12 @@ struct nb_sink {
     pid_t    client_pid;        /* from SO_PEERCRED, for log lines only       */
     uint32_t seq;
 
+    /*
+     * The window has been sized once from the guest's own resolution.  After
+     * that a guest re-mode changes the SOURCE, not the window -- see the
+     * WINDOW case in nb_handle_cmd().
+     */
+    bool     window_established;
     bool     focused;
     bool     pointer_in;
     bool     grabbed;
