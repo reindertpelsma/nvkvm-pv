@@ -76,6 +76,11 @@ static size_t rmstatus_off(unsigned long cmd, const char **name)
     case UVM_MAP_EXTERNAL_ALLOCATION: *name="MAP_EXTERNAL_ALLOCATION"; return offsetof(UVM_MAP_EXTERNAL_ALLOCATION_PARAMS, rmStatus);
     case UVM_UNMAP_EXTERNAL:          *name="UNMAP_EXTERNAL";          return offsetof(UVM_UNMAP_EXTERNAL_PARAMS, rmStatus);
     case UVM_ALLOC_SEMAPHORE_POOL:    *name="ALLOC_SEMAPHORE_POOL";    return offsetof(UVM_ALLOC_SEMAPHORE_POOL_PARAMS, rmStatus);
+    case UVM_CREATE_RANGE_GROUP:      *name="CREATE_RANGE_GROUP";      return offsetof(UVM_CREATE_RANGE_GROUP_PARAMS, rmStatus);
+    case UVM_DESTROY_RANGE_GROUP:     *name="DESTROY_RANGE_GROUP";     return offsetof(UVM_DESTROY_RANGE_GROUP_PARAMS, rmStatus);
+    /* SET_RANGE_GROUP is the one behind cuStreamAttachMemAsync, and its VA pair
+     * does NOT start at offset 0 -- rangeGroupId comes first.  See base_off(). */
+    case UVM_SET_RANGE_GROUP:         *name="SET_RANGE_GROUP";         return offsetof(UVM_SET_RANGE_GROUP_PARAMS, rmStatus);
     case UVM_REGISTER_CHANNEL:        *name="REGISTER_CHANNEL";        return offsetof(UVM_REGISTER_CHANNEL_PARAMS, rmStatus);
     case UVM_REGISTER_GPU_VASPACE:    *name="REGISTER_GPU_VASPACE";    return offsetof(UVM_REGISTER_GPU_VASPACE_PARAMS, rmStatus);
     case UVM_REGISTER_GPU:            *name="REGISTER_GPU";            return offsetof(UVM_REGISTER_GPU_PARAMS, rmStatus);
@@ -86,9 +91,26 @@ static size_t rmstatus_off(unsigned long cmd, const char **name)
     }
 }
 
-/* Cmds whose params begin with {base,length} -- true for every VA-carrying UVM
- * cmd in the schema.  Used only for logging. */
-static int has_base_len(unsigned long cmd)
+/* Byte offset of the {base,length} pair, or -1 if the cmd carries none.  Almost
+ * every VA-carrying UVM cmd starts with it; UVM_SET_RANGE_GROUP does not, which
+ * is why this returns an offset rather than a bool. */
+static long base_off(unsigned long cmd)
+{
+    if (cmd == UVM_SET_RANGE_GROUP)
+        return (long)offsetof(UVM_SET_RANGE_GROUP_PARAMS, requestedBase);
+    switch (cmd) {
+    case UVM_MIGRATE: case UVM_VALIDATE_VA_RANGE: case UVM_FREE:
+    case UVM_SET_PREFERRED_LOCATION: case UVM_UNSET_PREFERRED_LOCATION:
+    case UVM_SET_ACCESSED_BY: case UVM_UNSET_ACCESSED_BY:
+    case UVM_ENABLE_READ_DUPLICATION: case UVM_DISABLE_READ_DUPLICATION:
+    case UVM_CREATE_EXTERNAL_RANGE: case UVM_MAP_EXTERNAL_ALLOCATION:
+    case UVM_UNMAP_EXTERNAL: case UVM_ALLOC_SEMAPHORE_POOL:
+        return 0;
+    default: return -1;
+    }
+}
+
+static int has_base_len_unused(unsigned long cmd)
 {
     switch (cmd) {
     case UVM_MIGRATE: case UVM_VALIDATE_VA_RANGE: case UVM_FREE:
@@ -127,7 +149,11 @@ int ioctl(int fd, unsigned long req, ...)
     {
         unsigned long long base = 0, len = 0;
         unsigned st = 0;
-        if (arg && has_base_len(req)) { memcpy(&base, arg, 8); memcpy(&len, (char*)arg+8, 8); }
+        long bo = base_off(req);
+        if (arg && bo >= 0) {
+            memcpy(&base, (char *)arg + bo, 8);
+            memcpy(&len,  (char *)arg + bo + 8, 8);
+        }
         if (arg && off) memcpy(&st, (char *)arg + off, 4);
         fprintf(logf, "UVM cmd=%-4lu %-24s rc=%d rmStatus=0x%x base=0x%llx len=0x%llx%s\n",
                 req, name, rc, st, base, len, inject ? "   <<INJECTED" : "");

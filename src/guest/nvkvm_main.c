@@ -1214,6 +1214,55 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
+	 * ── Same treatment for UVM_SET_RANGE_GROUP ──────────────────────────
+	 *
+	 * This is what cuStreamAttachMemAsync() issues -- TRACED, not inferred:
+	 * an LD_PRELOAD of tools/uvm_ioctl_shim.c over a driver-API attach shows
+	 *     UVM cmd=31 SET_RANGE_GROUP rmStatus=0x1e base=<managed ptr> len=4MiB
+	 * i.e. NV_ERR_INVALID_ADDRESS naming exactly the fallback range, because
+	 * uvm_api_set_range_group() requires the interval to be covered by
+	 * MANAGED ranges with no gaps (uvm_range_group.c:322-346).  NVIDIA's own
+	 * cuda-samples UnifiedMemoryStreams does not survive the failure.
+	 *
+	 * Why answering it is accurate rather than a fake.  Range-group
+	 * membership is consumed by exactly one thing: migration policy --
+	 * the migratable masks (uvm_va_block.c:11322-11327, :12833), the
+	 * migrated_ranges lists (:4145-4148, :8300-8303), and UVM-Lite
+	 * preferred-location pinning (uvm_va_range.c:1060-1061, :1572-1588).
+	 * For a MIGRATABLE group the driver itself does nothing else: it assigns
+	 * the group and takes an explicit early exit before any page movement
+	 * (uvm_range_group.c:348-354).  For a NON-migratable group the promise
+	 * is "these pages will not move", which pinned sysmem satisfies by
+	 * construction.  Either way there is nothing left to do.
+	 *
+	 * And the one case where range groups carry real correctness meaning --
+	 * pre-Pascal UVM-Lite, where cudaMemAttachSingle governed whether the
+	 * CPU could touch managed memory during a kernel -- cannot arise here.
+	 * calc_uvm_lite_gpus_mask() keys on !faultable_processors
+	 * (uvm_va_range.c:1628-1632), and nvkvm's oldest supported architecture
+	 * is Turing, which is faultable.  Our backing lets the CPU touch the
+	 * range during kernels unconditionally, so the answer is MORE permissive
+	 * than the guarantee, never less.
+	 *
+	 * Scoped exactly as cmd 45 is: only a range THIS fd backed itself.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM && cmd == UVM_SET_RANGE_GROUP &&
+	    params_buf &&
+	    param_size >= sizeof(struct uvm_set_range_group_params)) {
+		struct uvm_set_range_group_params *p = params_buf;
+
+		if (nvkvm_mmap_range_is_ext_backed(ctx, p->base, p->length)) {
+			long sr = 0;
+			p->rm_status = 0;              /* NV_OK */
+			if (uparams &&
+			    copy_to_user(uparams, params_buf, param_size))
+				sr = -EFAULT;
+			kfree(params_buf);
+			return sr;
+		}
+	}
+
+	/*
 	 * State-machine Steps B+C: record UVM config + state-registration
 	 * cmds into ctx->uvm_state.  ALSO still forward each so the
 	 * kernel side stays functional — recording is additive between
