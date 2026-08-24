@@ -25,6 +25,7 @@
 #include "nvkvm_drm_allowlist.h"
 #include "nvkvm_nvkms_allowlist.h"
 #include "nvkvm_present_egl.h"
+#include "nvkvm_display_relay.h"
 
 /* ── Isolate mmap token table ────────────────────────────────────────────── */
 /*
@@ -1707,6 +1708,53 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 	NVKVM_DBG("nvkvm present: dma-buf fd=%d %ux%u size=%lld gem=0x%x\n",
 		  dmabuf_fd, req->width, req->height, (long long)sz,
 		  req->stub_handle);
+
+	/*
+	 * #112 BROKER MODE: with -display nvkvm-broker there is no QEMU display
+	 * at all.  Relay this same fd onward to the privileged broker over
+	 * SCM_RIGHTS instead of consuming it — QEMU forwards a descriptor it was
+	 * handed and touches no pixels, which is what lets a broker-mode QEMU run
+	 * with no EGL, no GL and no /dev/dri/renderD* (docs/internal/
+	 * display-broker-findings.md finding 7).
+	 *
+	 * Deliberately BEFORE nvkvm_present_submit(): that lives under
+	 * #if defined(CONFIG_OPENGL) && NVKVM_QEMU_GRAPHICS and is a stub that
+	 * returns false in a no-OpenGL build, so a relay placed after it would
+	 * still work — but a relay placed INSIDE that file would not exist at
+	 * all.  Keeping the call here keeps the broker path out of the OpenGL
+	 * gate, which is the whole point.
+	 *
+	 * The capture path (#107) is repeated in this branch rather than shared
+	 * with the fall-through below, because in broker mode we must not reach
+	 * that code: relay_submit has taken the fd.  This is the "display +
+	 * capture/NVENC" container profile — the one that still needs EGL and the
+	 * render node, and still needs no display server.
+	 */
+	if (nvkvm_display_relay_active()) {
+		const char *bcap = getenv("NVKVM_PRESENT_CAPTURE");
+
+		if (bcap) {
+			static unsigned bframe;
+			if ((bframe++ % 30) == 0) {
+				int cr = nvkvm_present_capture(dmabuf_fd,
+							       req->width,
+							       req->height,
+							       req->pitch,
+							       req->format,
+							       req->modifier,
+							       bcap);
+				if (cr < 0)
+					NVKVM_DBG("nvkvm present: capture rc=%d\n",
+						  cr);
+			}
+		}
+		if (nvkvm_display_relay_submit(nv, dmabuf_fd, req->width,
+					       req->height, req->pitch,
+					       req->format, req->modifier)) {
+			resp->status = 0;
+			return 0;
+		}
+	}
 
 	/*
 	 * #102: hand the frame to the live QEMU display window.  The console
