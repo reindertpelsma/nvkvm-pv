@@ -458,8 +458,27 @@ By default the VM is headless (`-display none`, serial on stdio) and you reach
 the guest over SSH. On a machine with a physical display you can instead watch
 and drive the guest's desktop in a real window.
 
-The window backends are not built by default — headless is the normal
-deployment, where GTK/SDL would only add build dependencies for a window nobody
+There are two ways to do that, and they differ in what QEMU ends up holding:
+
+| | window owned by | QEMU links | QEMU needs |
+|---|---|---|---|
+| **GTK/SDL** (below) | QEMU | GTK or SDL, EGL, GL | your X11 or Wayland socket |
+| **display broker** | a separate privileged process | nothing graphical | only a unix socket |
+
+Use the broker if you intend to confine the VMM at all — it is the difference
+between handing QEMU your display server and handing it a socket. QEMU relays
+the guest's dma-buf over that socket and imports nothing, so a broker-mode build
+needs no EGL, no GL, no `libnvidia-eglcore` and no `/dev/dri/renderD*` for
+display. Verified running at uid 1000 with an empty capability set. Setup, wire
+protocol and threat model: [`src/broker/README.md`](../../src/broker/README.md).
+
+The broker is also where fullscreen gets you **direct scanout** — on
+GNOME/Wayland the compositor scans the guest's own buffer out unmodified rather
+than compositing a copy of it.
+
+The GTK/SDL backends below are the simpler option when you are not sandboxing
+anything. They are not built by default — headless is the normal deployment,
+where GTK/SDL would only add build dependencies for a window nobody
 can see. Build them in once:
 
 ```bash

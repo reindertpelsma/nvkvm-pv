@@ -356,6 +356,15 @@ running it does not — launching a kernel is a write to memory the guest alread
 has mapped, and nvkvm is not in that path. What you pay for is the *number* of
 setup calls, which is why most numbers below are 1.00x and a few are not.
 
+**And the VMM does not have to hold your display.** A separate privileged
+process — the *display broker* — owns the window and the display-server
+connection; QEMU relays the guest's dma-buf to it over a unix socket and imports
+nothing. In that mode QEMU needs no EGL, no GL, no `libnvidia-eglcore` and no
+`/dev/dri/renderD*` for display, and no X11 or Wayland socket at all, so the
+socket is its only interface to your desktop. Verified by running it: QEMU at
+uid 1000 with an empty capability set, putting a Linux Mint desktop on a 4K
+monitor. [`src/broker/README.md`](src/broker/README.md).
+
 The request path end to end, the five hard problems it runs into, and what the
 boundary does with a guest pointer: [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
@@ -453,6 +462,15 @@ sustained compute or bandwidth.
 A full desktop runs on the GPU inside the guest and can be displayed and driven
 in a window on the host — including the stock Linux Mint Cinnamon desktop
 ([how](docs/howto/run.md#running-the-guest-desktop-in-a-window)).
+
+That window can be owned by QEMU, or by the **display broker** — a small
+privileged process that holds the display connection so the VMM does not have
+to. With `-display nvkvm-broker` the guest's buffer reaches the screen with no
+copy and QEMU links no graphics library at all. On GNOME/Wayland the compositor
+scans the guest's own buffer out directly when fullscreen
+(`wp_presentation` reports `KIND_ZERO_COPY`; the host DRM plane holds the
+guest's NVIDIA block-linear modifier, unscaled, covering the CRTC).
+[How to run it](src/broker/README.md).
 
 On an RTX 4070 the guest's display flips at 59.9 Hz and **every one of those
 frames reaches the host window: 60.0 swaps/s, zero dropped**, holding with a
@@ -633,6 +651,7 @@ container support, llvmpipe, bit-identical results.
 | [Guest kernels](docs/reference/guest-kernels.md) | Which guest kernels the module builds on, measured, and why the range is narrow |
 | [`.github/workflows/`](.github/workflows/) | What CI checks on every push, how a release is built and attested, and why each job exists |
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
+| [`src/broker/README.md`](src/broker/README.md) | The display broker: threat model, wire protocol, and running the VMM with no display-server connection |
 | [`SECURITY.md`](SECURITY.md) | Threat model, what is known broken, how to report a vulnerability |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | What is most useful to send, and three traps in the build |
 | [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
