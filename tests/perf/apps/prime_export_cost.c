@@ -89,8 +89,19 @@ static int open_nvidia_render(char *path, size_t plen)
         if (strcmp(base, "nvidia") != 0) {
             continue;
         }
+        /*
+         * Keep going if this one cannot be opened.  sysfs lists every render
+         * node the HOST has, but a container is typically given only the one
+         * GPU it rented -- on the box this was written against, sysfs showed
+         * renderD128..135 (all nvidia) while /dev/dri held only renderD135.
+         * Returning the first sysfs match unconditionally finds a node that
+         * does not exist and reports "no NVIDIA GPU" on a box with eight.
+         */
         snprintf(path, plen, "/dev/dri/renderD%d", n);
-        return open(path, O_RDWR | O_CLOEXEC);
+        int fd = open(path, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            return fd;
+        }
     }
     return -1;
 }
