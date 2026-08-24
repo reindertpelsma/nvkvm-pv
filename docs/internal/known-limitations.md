@@ -946,6 +946,15 @@ the differences are user-visible:
   results, an application built around per-stream attachment does not survive.
   If a managed-memory workload crashes here rather than merely running slowly,
   this is the first thing to check.
+- **A managed-memory *performance* benchmark becomes unusable, not merely slow.**
+  `cuda-samples/Samples/6_Performance/UnifiedMemoryPerf` produced no output at
+  all in ~9 minutes. It is not hung — the process sits in `Rl` burning CPU
+  (8m30s of CPU in 8m30s of wall clock) and the host logged 4,220 successful
+  BACK/MAP operations with no errors — it is simply running orders of magnitude
+  slower, which is what "every GPU access crosses PCIe, and every allocation
+  costs a round trip" adds up to on a benchmark designed to hammer both. Correct
+  results, unusable throughput. Anything whose working set is repeatedly touched
+  by the GPU should be expected to behave this way.
 - **The pages are pinned, and it gets worse with size.** The guest module holds
   them with `alloc_pages()` and the host pins the matching HVA range via the RM
   OS-descriptor (`pin_user_pages()`). A 1 GiB managed allocation therefore
