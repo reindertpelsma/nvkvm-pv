@@ -28,6 +28,14 @@ satisfying the driver, not the other way round.
 > (`MAP_FIXED`), so the NVIDIA driver sees valid mappings in `current->mm` when
 > processing ioctls.
 
+**"at the same GVA" stopped being true with U-9** (`docs/internal/audit-guest-pointers.md`).
+The isolate reserves a `PROT_NONE` guest-mapping window before it maps anything
+else and refuses any mapping outside it; QEMU picks the address inside that
+window and the guest's VA is kept only as an identity key. What the quote gets
+right is the part that matters — the driver still sees valid mappings in
+`current->mm` — and what it got wrong was implying the isolate's layout is the
+guest's to choose.
+
 ## Who opens what
 
 | device | opened by | why |

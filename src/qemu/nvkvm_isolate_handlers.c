@@ -40,7 +40,10 @@ struct nvkvm_iso_mmap_entry {
 	bool     used;
 	bool     stub_mirrored; /* true if isolate-side mmap was also installed */
 	uint32_t isolate_id;
-	uint64_t gva;        /* GVA mapped in the isolate */
+	uint64_t gva;        /* the GUEST's VA for this mapping (identity key,
+			      * never an address anything maps at) */
+	uint64_t stub_va;    /* U-9: where it actually lives in the isolate,
+			      * inside that isolate's guest-mapping window */
 	void    *qva;        /* QEMU host VA from mmap()  */
 	size_t   len;
 	int      kvm_slot;   /* KVM memory slot (-1 if none) */
@@ -52,6 +55,266 @@ struct nvkvm_iso_mmap_entry {
 static struct nvkvm_iso_mmap_entry iso_mmap_tbl[NVKVM_ISO_MMAP_MAX];
 static uint32_t iso_mmap_seq = 1;
 static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* ── U-9: the host side of the isolate's guest-mapping window ──────────────
+ *
+ * The stub reserves one PROT_NONE MAP_NORESERVE region before it maps
+ * anything else and refuses every guest-directed mapping outside it (see the
+ * long comment on stub_window_contains() in src/stub/nvkvm_stub.c).  This is
+ * the allocator that decides WHERE inside that region each mapping goes, and
+ * it lives here rather than in the stub for two reasons: the stub is
+ * freestanding with no allocator to speak of, and the decision is policy that
+ * belongs on the trusted side of the socket.
+ *
+ * Shape follows nvkvm_sparse_gpa_alloc() deliberately -- bump pointer plus a
+ * first-fit free list -- because it is the same problem one layer over.
+ *
+ * THE ONE THING THAT IS NOT A PLAIN ALLOCATION is the OS-descriptor case.
+ * The guest's page migration installs a registered range in NVKVM_MIG_CHUNK
+ * (2 MiB) pieces, one MMAP_ON_ISOLATE per chunk (src/guest/nvkvm_mmap.c), and
+ * RmAllocOsDescriptor then pins ONE contiguous range covering all of them.
+ * If those chunks land scattered through the window there is no single
+ * address to hand the driver, so the A-1 gate would refuse every registration
+ * above one chunk.  `run` reserves a contiguous span the first time a chunk
+ * arrives with no adjacent predecessor and hands the rest of that span to the
+ * chunks that follow, matched on guest-VA adjacency -- which is exactly how
+ * the migration loop emits them (cbase = start + coff, strictly increasing).
+ * Matching on the guest VA rather than on arrival order is what makes this
+ * survive two guest threads registering concurrently.
+ */
+/* NVKVM_WIN_ALLOC_BEGIN -- extracted verbatim into tests/unit by the
+ * win_alloc.inc rule.  Everything between the markers must stay pure: no
+ * locks, no RPC, no glib, so it compiles into a hosted test binary and the
+ * test pins the REAL allocator rather than a copy of it. */
+#define NVKVM_WIN_FREE_MAX   256
+#define NVKVM_WIN_RUN_MAX    64
+/* == the guest's NVKVM_MIG_MAX_RANGE, the largest range one call migrates. */
+#define NVKVM_WIN_RUN_SPAN   (2ULL << 30)
+
+struct nvkvm_win_ext { uint64_t off, len; };
+
+struct nvkvm_win_run {
+	bool     used;
+	uint64_t gva_end;   /* guest VA one past the last chunk placed */
+	uint64_t next;      /* window offset where the next chunk goes */
+	uint64_t end;       /* window offset one past this reservation */
+	uint64_t seq;       /* for LRU retirement */
+};
+
+struct nvkvm_iso_window {
+	bool     probed;    /* WINDOW_INFO answered (base may still be 0) */
+	uint64_t base, size, cur;
+	struct nvkvm_win_ext free[NVKVM_WIN_FREE_MAX];
+	uint32_t free_n;
+	struct nvkvm_win_run run[NVKVM_WIN_RUN_MAX];
+	uint64_t run_seq;
+};
+
+/* Caller holds iso_win_lock. */
+static void win_release_locked(struct nvkvm_iso_window *w,
+			       uint64_t off, uint64_t len)
+{
+	if (!len)
+		return;
+	/* Coalesce with the bump pointer when the extent is the tail, so a
+	 * map/unmap loop does not fragment the window one entry at a time. */
+	if (off + len == w->cur) {
+		w->cur = off;
+		return;
+	}
+	if (w->free_n < NVKVM_WIN_FREE_MAX) {
+		w->free[w->free_n].off = off;
+		w->free[w->free_n].len = len;
+		w->free_n++;
+		return;
+	}
+	/* Free list full: leak the extent rather than lose track of it.  The
+	 * window is 1 TiB against a 128 GiB ceiling on live mappings, so this
+	 * is a capacity note, not a correctness one. */
+	fprintf(stderr, "nvkvm: window free list full — leaking 0x%llx+0x%llx\n",
+		(unsigned long long)off, (unsigned long long)len);
+}
+
+/* Caller holds iso_win_lock.  Returns a window offset, or UINT64_MAX. */
+static uint64_t win_alloc_locked(struct nvkvm_iso_window *w, uint64_t len)
+{
+	if (!len || len > w->size)
+		return UINT64_MAX;
+	len = (len + 4095ULL) & ~4095ULL;
+	if (!len)                                   /* round-up wrap */
+		return UINT64_MAX;
+
+	uint32_t best = w->free_n;
+	for (uint32_t i = 0; i < w->free_n; i++) {
+		if (w->free[i].len >= len &&
+		    (best == w->free_n || w->free[i].len < w->free[best].len))
+			best = i;
+	}
+	if (best < w->free_n) {
+		uint64_t off = w->free[best].off;
+		if (w->free[best].len == len)
+			w->free[best] = w->free[--w->free_n];
+		else {
+			w->free[best].off += len;
+			w->free[best].len -= len;
+		}
+		return off;
+	}
+
+	uint64_t off = (w->cur + 4095ULL) & ~4095ULL;
+	if (off < w->cur || len > w->size - off)
+		return UINT64_MAX;
+	w->cur = off + len;
+	return off;
+}
+
+/*
+ * Place one mapping in the window.  Caller holds iso_win_lock.
+ *
+ * `gva` is the guest's VA for this mapping.  It is NEVER used as an address —
+ * it is the adjacency key that lets a migration's chunks stay contiguous, and
+ * the identity recorded in iso_mmap_tbl.  `contig` asks for the run
+ * treatment; only the memory-handle mirrors (the OS-descriptor migration) set
+ * it, because only they are later pinned as one range.
+ *
+ * Returns the window VA, or 0 on failure.  The three properties this must
+ * hold, and that tests/unit/test_stub_window.c checks against this exact
+ * source, are: every return value is inside [base, base+size); two live
+ * placements never overlap; and consecutive guest-VA-adjacent `contig`
+ * placements come back window-adjacent.
+ */
+static uint64_t win_place_locked(struct nvkvm_iso_window *w, uint64_t gva,
+				 uint64_t len, bool contig)
+{
+	uint64_t va = 0;
+
+	if (!w || !w->base || !w->size || !len)
+		return 0;
+
+	len = (len + 4095ULL) & ~4095ULL;
+	if (!len)                                   /* round-up wrap */
+		return 0;
+
+	if (contig && gva) {
+		struct nvkvm_win_run *r = NULL;
+		for (uint32_t i = 0; i < NVKVM_WIN_RUN_MAX; i++) {
+			if (w->run[i].used && w->run[i].gva_end == gva &&
+			    len <= w->run[i].end - w->run[i].next) {
+				r = &w->run[i];
+				break;
+			}
+		}
+		if (!r) {
+			/* Start a run: take a free slot, else retire the least
+			 * recently extended one (returning its unused tail). */
+			struct nvkvm_win_run *victim = NULL;
+			for (uint32_t i = 0; i < NVKVM_WIN_RUN_MAX; i++) {
+				if (!w->run[i].used) { victim = &w->run[i]; break; }
+				if (!victim || w->run[i].seq < victim->seq)
+					victim = &w->run[i];
+			}
+			if (victim->used)
+				win_release_locked(w, victim->next,
+						   victim->end - victim->next);
+			uint64_t span = NVKVM_WIN_RUN_SPAN;
+			if (span < len)
+				span = len;
+			uint64_t off = win_alloc_locked(w, span);
+			if (off == UINT64_MAX) {
+				victim->used = false;
+				return 0;
+			}
+			victim->used = true;
+			victim->next = off;
+			victim->end  = off + span;
+			r = victim;
+		}
+		va = w->base + r->next;
+		r->next   += len;
+		r->gva_end = gva + len;
+		r->seq     = ++w->run_seq;
+		/* Reservation exactly consumed — retire it so the slot is free
+		 * for the next registration. */
+		if (r->next >= r->end)
+			r->used = false;
+		return va;
+	}
+
+	uint64_t off = win_alloc_locked(w, len);
+	if (off != UINT64_MAX)
+		va = w->base + off;
+	return va;
+}
+/* NVKVM_WIN_ALLOC_END */
+
+/* Lazily allocated, indexed the same way the isolate table is. */
+static struct nvkvm_iso_window *iso_win[NVKVM_ISOLATE_MAX];
+static pthread_mutex_t iso_win_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Locking + one-shot window probe around win_place_locked().
+ */
+static uint64_t nvkvm_win_place(struct nvkvm_isolate_table *t,
+				uint32_t isolate_id, uint64_t gva,
+				uint64_t len, bool contig)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX || !len)
+		return 0;
+
+	pthread_mutex_lock(&iso_win_lock);
+	struct nvkvm_iso_window *w = iso_win[isolate_id % NVKVM_ISOLATE_MAX];
+	if (!w) {
+		w = g_new0(struct nvkvm_iso_window, 1);
+		iso_win[isolate_id % NVKVM_ISOLATE_MAX] = w;
+	}
+	if (!w->probed) {
+		uint64_t base = 0, size = 0;
+		/* Dropping the lock around the RPC would let two threads probe
+		 * at once; the probe is one round trip at isolate first use and
+		 * every caller here is already serialised behind the isolate's
+		 * own sync_cmd_lock, so hold it. */
+		if (nvkvm_isolate_window_info(t, isolate_id, &base, &size) == 0) {
+			w->base = base;
+			w->size = size;
+		}
+		w->probed = true;
+		if (!w->base || !w->size)
+			fprintf(stderr,
+				"nvkvm: isolate %u reported no guest-mapping "
+				"window — every mapping into it will be "
+				"refused (U-9)\n", isolate_id);
+	}
+	uint64_t va = win_place_locked(w, gva, len, contig);
+	pthread_mutex_unlock(&iso_win_lock);
+	return va;
+}
+
+/* Give a placed extent back.  Safe to call with a stub_va of 0. */
+static void nvkvm_win_unplace(uint32_t isolate_id, uint64_t stub_va,
+			      uint64_t len)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX ||
+	    !stub_va || !len)
+		return;
+	pthread_mutex_lock(&iso_win_lock);
+	struct nvkvm_iso_window *w = iso_win[isolate_id % NVKVM_ISOLATE_MAX];
+	if (w && w->base && stub_va >= w->base &&
+	    stub_va - w->base < w->size)
+		win_release_locked(w, stub_va - w->base,
+				   (len + 4095ULL) & ~4095ULL);
+	pthread_mutex_unlock(&iso_win_lock);
+}
+
+/* Forget an isolate's window entirely (isolate died / was reaped). */
+static void nvkvm_win_forget_isolate(uint32_t isolate_id)
+{
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return;
+	pthread_mutex_lock(&iso_win_lock);
+	g_free(iso_win[isolate_id % NVKVM_ISOLATE_MAX]);
+	iso_win[isolate_id % NVKVM_ISOLATE_MAX] = NULL;
+	pthread_mutex_unlock(&iso_win_lock);
+}
 
 /*
  * ── A-1: is [base, base+len) fully covered by ranges the host itself installed
@@ -93,11 +356,30 @@ static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
  * guest-supplied values that makes the pin land somewhere the host did not
  * install.
  */
-static bool iso_mmap_covers(uint32_t isolate_id, uint64_t base, uint64_t len)
+/*
+ * U-9 CHANGED THE OUTPUT, NOT THE QUESTION.  The chunks no longer live at the
+ * guest's own addresses -- they live wherever the window allocator put them --
+ * so covering the range is no longer enough: the caller needs the address in
+ * the ISOLATE that corresponds to the guest range, and that address has to be
+ * one contiguous run, because RmAllocOsDescriptor pins one range.  So the walk
+ * also carries the stub-side end forward and refuses a step that is not
+ * stub-adjacent to the previous one, and hands back the translated base.
+ *
+ * Note what this does NOT make redundant.  The window bounds WHERE a mapping
+ * may be; this table records WHAT was installed, for whom, and whether it is
+ * still live.  Inside the window a guest can still name another handle's
+ * extent, a freed extent, or a hole between two extents -- none of which the
+ * window can see.  Both checks are load-bearing; see U-9 in
+ * docs/internal/audit-guest-pointers.md.
+ */
+static bool iso_mmap_translate(uint32_t isolate_id, uint64_t base, uint64_t len,
+			       uint64_t *stub_base_out)
 {
-	uint64_t cur, end;
-	bool ok = false;
+	uint64_t cur, end, stub_base = 0, stub_next = 0;
+	bool ok = false, first = true;
 
+	if (stub_base_out)
+		*stub_base_out = 0;
 	if (!len || base + len < base)          /* zero, or u64 wrap */
 		return false;
 	end = base + len;
@@ -115,6 +397,8 @@ static bool iso_mmap_covers(uint32_t isolate_id, uint64_t base, uint64_t len)
 				continue;
 			if (e->isolate_id != isolate_id || !e->gva || !e->len)
 				continue;
+			if (!e->stub_va)                /* not window-placed */
+				continue;
 			e_end = e->gva + (uint64_t)e->len;
 			if (e_end < e->gva)             /* entry wraps: ignore */
 				continue;
@@ -125,6 +409,15 @@ static bool iso_mmap_covers(uint32_t isolate_id, uint64_t base, uint64_t len)
 		}
 		if (!hit)                               /* gap -- not covered */
 			break;
+		if (first) {
+			stub_base = hit->stub_va + (cur - hit->gva);
+			first     = false;
+		} else if (hit->stub_va != stub_next) {
+			/* Covered in the guest's address space but scattered in
+			 * the isolate's -- there is no single range to pin. */
+			break;
+		}
+		stub_next = hit->stub_va + (uint64_t)hit->len;
 		next = hit->gva + (uint64_t)hit->len;
 		if (next <= cur)                        /* defensive: no progress */
 			break;
@@ -135,10 +428,13 @@ static bool iso_mmap_covers(uint32_t isolate_id, uint64_t base, uint64_t len)
 		cur = next;
 	}
 	pthread_mutex_unlock(&iso_mmap_lock);
+	if (ok && stub_base_out)
+		*stub_base_out = stub_base;
 	return ok;
 }
 
-static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
+static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva,
+				uint64_t stub_va, void *qva,
 				size_t len, int kvm_slot, uint64_t gpa,
 				bool stub_mirrored, uint32_t handle_id)
 {
@@ -151,6 +447,7 @@ static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva, void *qva,
 			iso_mmap_tbl[tok].stub_mirrored = stub_mirrored;
 			iso_mmap_tbl[tok].isolate_id    = isolate_id;
 			iso_mmap_tbl[tok].gva           = gva;
+			iso_mmap_tbl[tok].stub_va       = stub_va;
 			iso_mmap_tbl[tok].qva           = qva;
 			iso_mmap_tbl[tok].len           = len;
 			iso_mmap_tbl[tok].kvm_slot      = kvm_slot;
@@ -2415,7 +2712,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				memcpy(&cls, (char *)param_buf + 12, 4);
 
 			if (!classifiable || cls == 0x71) {
-				uint64_t base = 0, limit = 0;
+				uint64_t base = 0, limit = 0, stub_base = 0;
 				bool     ok   = false;
 
 				if (classifiable && cls == 0x71 && param_buf &&
@@ -2428,10 +2725,11 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 					/* `limit` is size-1 and is guest-supplied,
 					 * so guard the +1 before using it; the
 					 * base+len wrap is checked inside
-					 * iso_mmap_covers(). */
+					 * iso_mmap_translate(). */
 					ok = base && limit != UINT64_MAX &&
-					     iso_mmap_covers(req->isolate_id,
-							     base, limit + 1);
+					     iso_mmap_translate(req->isolate_id,
+								base, limit + 1,
+								&stub_base);
 				}
 
 				if (!ok) {
@@ -2478,6 +2776,44 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 					resp->fault_addr = 0;
 					return 0;
 				}
+
+				/*
+				 * U-14 stops being an exception here.
+				 *
+				 * This pointer used to be forwarded verbatim,
+				 * on purpose: the stub MAP_FIXED'd the migrated
+				 * memfds at the guest's own VA, so
+				 * RmAllocOsDescriptor -> pin_user_pages() on
+				 * the stub's task found pages aliasing guest
+				 * userspace.  That made NVOS02.pMemory the one
+				 * guest pointer nvkvm knowingly handed to the
+				 * host driver, and ARCHITECTURE.md's invariant
+				 * had to be read with an asterisk.
+				 *
+				 * With the window, the chunks live at an
+				 * address the HOST chose, so the number RM
+				 * dereferences is now ours.  pMemory is IN-only
+				 * for this class — the guest gets back an
+				 * hMemory, never this field — so rewriting it
+				 * is invisible to the guest, and the physical
+				 * aliasing that makes the feature work is
+				 * untouched: same memfds, same pages, only a
+				 * different virtual address in a process the
+				 * guest cannot see.
+				 *
+				 * iso_mmap_translate() has already established
+				 * that [base, base+limit+1) is spanned by live
+				 * mirrored entries of THIS isolate AND that
+				 * they are contiguous in the window, so
+				 * stub_base names one pinnable range.
+				 */
+				memcpy((char *)param_buf + 24, &stub_base, 8);
+				NVKVM_DBG("nvkvm: OS_DESCRIPTOR gva=0x%llx -> "
+					  "window 0x%llx (+0x%llx) iso=%u\n",
+					  (unsigned long long)base,
+					  (unsigned long long)stub_base,
+					  (unsigned long long)(limit + 1),
+					  req->isolate_id);
 			}
 		}
 
@@ -3507,15 +3843,48 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	 * does require the stub mm to back the VA, we'll mirror it then.
 	 */
 	int ret = 0;
+	uint64_t stub_va = 0;
 	struct nvkvm_handle *hd = nvkvm_handle_get(&nv->handles, req->handle_id);
 	int do_stub_mirror = !hd || hd->dev_id != 1 /* NVKVM_DEV_UVM */;
 	if (do_stub_mirror) {
-		ret = nvkvm_isolate_mmap(&nv->isolates,
-					 req->isolate_id,
-					 req->handle_id,
-					 req->gva, len, req->offset,
-					 (int)req->prot,
-					 (int)req->map_flags);
+		/*
+		 * U-9: req->gva is the GUEST's address and is no longer where
+		 * this gets mapped.  It arrives off the virtqueue untouched
+		 * (nvkvm_mmap.c sets it to vma->vm_start), so MAP_FIXED'ing
+		 * there put an arbitrary guest-chosen address on top of
+		 * whatever the isolate had — its text, its stack, its job
+		 * blobs.  Now the window allocator picks the address and the
+		 * stub refuses anything outside its reservation; req->gva
+		 * survives only as the identity recorded in iso_mmap_tbl and
+		 * as the adjacency key that keeps a migration's 2 MiB chunks
+		 * contiguous.
+		 *
+		 * `contig` is set for memory handles because those are the
+		 * OS-descriptor migration's memfd chunks, and only they are
+		 * later pinned as one range by RmAllocOsDescriptor.
+		 */
+		bool contig = hd && hd->type == NVKVM_HANDLE_TYPE_MEMORY;
+		uint64_t place = nvkvm_win_place(&nv->isolates, req->isolate_id,
+						 req->gva, len, contig);
+		if (!place) {
+			fprintf(stderr,
+				"nvkvm: mmap_on_isolate: no room in isolate "
+				"%u's guest-mapping window (len=%lu)\n",
+				req->isolate_id, (unsigned long)len);
+			ret = -ENOMEM;
+		} else {
+			ret = nvkvm_isolate_mmap(&nv->isolates,
+						 req->isolate_id,
+						 req->handle_id,
+						 place, len, req->offset,
+						 (int)req->prot,
+						 (int)req->map_flags,
+						 &stub_va);
+			if (ret < 0)
+				nvkvm_win_unplace(req->isolate_id, place, len);
+			else if (!stub_va)
+				stub_va = place;
+		}
 	}
 
 	if (ret < 0) {
@@ -3538,7 +3907,7 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	}
 
 	/* Record for future MUNMAP_ON_ISOLATE */
-	uint32_t token = iso_mmap_alloc(req->isolate_id, req->gva, qva,
+	uint32_t token = iso_mmap_alloc(req->isolate_id, req->gva, stub_va, qva,
 					len, kvm_slot, gpa,
 					do_stub_mirror, req->handle_id);
 	if (token == 0) {
@@ -3549,9 +3918,12 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		 * can never munmap).  Mirrors the munmap/reap reclaim path.
 		 */
 		fprintf(stderr, "nvkvm: iso_mmap_tbl full — undoing mapping\n");
-		if (do_stub_mirror)
+		if (do_stub_mirror && stub_va) {
 			nvkvm_isolate_munmap(&nv->isolates, req->isolate_id,
-					     req->gva, (uint64_t)len);
+					     stub_va, (uint64_t)len);
+			nvkvm_win_unplace(req->isolate_id, stub_va,
+					  (uint64_t)len);
+		}
 		if (kvm_slot == NVKVM_IN_WINDOW_SLOT) {
 			if (qva != MAP_FAILED && qva)
 				nvkvm_window_restore_anon(qva, len);
@@ -3630,11 +4002,15 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 		return 0;
 	}
 
-	/* Tell the isolate to unmap the GVA range, but only if we mirrored
-	 * the mapping there in the first place. */
-	if (e.stub_mirrored)
-		nvkvm_isolate_munmap(&nv->isolates, e.isolate_id, e.gva,
+	/* Tell the isolate to unmap the range, but only if we mirrored the
+	 * mapping there in the first place.  U-9: the address is the WINDOW VA
+	 * we recorded at mmap time, not e.gva — the stub refuses anything
+	 * outside the window, so a guest address here would simply fail. */
+	if (e.stub_mirrored && e.stub_va) {
+		nvkvm_isolate_munmap(&nv->isolates, e.isolate_id, e.stub_va,
 				     (uint64_t)e.len);
+		nvkvm_win_unplace(e.isolate_id, e.stub_va, (uint64_t)e.len);
+	}
 
 	if (e.kvm_slot == NVKVM_IN_WINDOW_SLOT) {
 		/* In-window mapping: restore anonymous backing so the sparse
@@ -3767,6 +4143,10 @@ static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
 		pthread_mutex_lock(&iso_mmap_lock);
 	}
 	pthread_mutex_unlock(&iso_mmap_lock);
+	/* U-9: the isolate's address space is gone, so its window bookkeeping
+	 * describes nothing.  Dropping it here also means a recycled isolate id
+	 * re-probes rather than inheriting the dead isolate's window base. */
+	nvkvm_win_forget_isolate(isolate_id);
 	return reaped;
 }
 
@@ -4241,6 +4621,7 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 	 * Previously this allocation was never tracked or freed → unprivileged
 	 * guest realize churn exhausted the 128 GiB window (VM-wide GPU DoS). */
 	uint32_t mmap_token = iso_mmap_alloc(req->isolate_id, gpa,
+					     /*stub_va=*/0,
 					     /*qva=*/NULL, (size_t)len,
 					     NVKVM_IN_WINDOW_SLOT, gpa,
 					     /*stub_mirrored=*/false,

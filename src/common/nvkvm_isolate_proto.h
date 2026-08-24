@@ -56,6 +56,7 @@
 #define ISOLATE_CMD_PRESENT_EXPORT 14 /* PRIME_HANDLE_TO_FD a GEM; reply w/ dma-buf via SCM */
 #define ISOLATE_CMD_XISO_IMPORT  15   /* #110 cross-isolate: PRIME_FD_TO_HANDLE a dma-buf
 				       * (arrives via SCM_RIGHTS) → reply w/ GEM handle */
+#define ISOLATE_CMD_WINDOW_INFO  16   /* U-9: report the guest-mapping window's base+size */
 
 /* ── Response types (isolate → QEMU) ────────────────────────────────────── */
 
@@ -70,6 +71,30 @@
 #define ISOLATE_RESP_LOOP_EXITED 0x18  /* consumer loop drained + idled out  */
 #define ISOLATE_RESP_PRESENT_EXPORT 0x19 /* present export result + dma-buf via SCM */
 #define ISOLATE_RESP_XISO_IMPORT 0x1a    /* #110 cross-isolate import result + GEM handle */
+#define ISOLATE_RESP_WINDOW_INFO 0x1b    /* U-9: guest-mapping window base + size          */
+
+/* ── WINDOW_INFO (U-9) ───────────────────────────────────────────────────────
+ *
+ * The stub reserves one PROT_NONE MAP_NORESERVE region at startup, before it
+ * maps anything else, and refuses every guest-directed mapping that does not
+ * fall inside it.  QEMU's per-isolate window allocator needs the base to place
+ * mappings there, so it asks for it once, right after the isolate is up.
+ *
+ * The base is the stub's own ASLR draw and MUST NOT reach the guest: nothing
+ * QEMU returns over the virtqueue carries a stub VA (nvkvm_resp_mmap_on_isolate
+ * carries a token, a GPA and a length), and that is deliberate.
+ */
+struct isolate_cmd_window_info {
+	uint32_t type;        /* ISOLATE_CMD_WINDOW_INFO */
+	uint32_t reserved;
+};
+
+struct isolate_resp_window_info {
+	uint32_t type;        /* ISOLATE_RESP_WINDOW_INFO */
+	int32_t  retval;      /* 0 = ok, -errno if there is no window          */
+	uint64_t base;        /* window base VA in the isolate's address space */
+	uint64_t size;        /* window size in bytes                          */
+};
 
 /* ── RECEIVE_FD ──────────────────────────────────────────────────────────── */
 
@@ -132,10 +157,18 @@ struct isolate_cmd_interrupt {
 
 /* ── MMAP ────────────────────────────────────────────────────────────────── */
 
+/*
+ * U-9: this field used to be `gva` and used to be the GUEST's VA for its own
+ * /dev/nvidia* mapping, carried off the virtqueue and MAP_FIXED'd verbatim in
+ * the isolate.  It is now a host-chosen address inside the isolate's
+ * guest-mapping window (ISOLATE_CMD_WINDOW_INFO), and the stub refuses
+ * anything outside that window.  The rename is load-bearing: a field named
+ * `gva` holding a host VA is how a control gets applied to the wrong number.
+ */
 struct isolate_cmd_mmap {
 	uint32_t type;        /* ISOLATE_CMD_MMAP */
 	uint32_t handle_id;
-	uint64_t gva;         /* MAP_FIXED target address in isolate       */
+	uint64_t win_va;      /* MAP_FIXED target: must be inside the window */
 	uint64_t length;
 	uint64_t offset;      /* fd offset                                 */
 	uint32_t prot;
@@ -145,6 +178,7 @@ struct isolate_cmd_mmap {
 struct isolate_resp_mmap {
 	uint32_t type;        /* ISOLATE_RESP_MMAP */
 	int32_t  retval;      /* 0 = success, -errno on failure            */
+	uint64_t host_va;     /* address actually mapped (0 when retval<0) */
 };
 
 /* ── MUNMAP ──────────────────────────────────────────────────────────────── */
@@ -152,7 +186,7 @@ struct isolate_resp_mmap {
 struct isolate_cmd_munmap {
 	uint32_t type;        /* ISOLATE_CMD_MUNMAP */
 	uint32_t reserved;
-	uint64_t gva;
+	uint64_t win_va;      /* U-9: window VA, same rule as isolate_cmd_mmap */
 	uint64_t length;
 };
 

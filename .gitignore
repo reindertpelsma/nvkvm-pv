@@ -55,3 +55,9 @@ tests/unit/test_kvm_slot
 tests/unit/stub_sanitize.inc
 # likewise: the A-21 KVM slot pool, extracted from src/qemu/nvkvm_mmap_host.c
 tests/unit/kvm_slot_pool.inc
+
+# U-9 (tests/unit/test_stub_window.c): the compiled suite, plus the window gate
+# and the window allocator, extracted from real source at build time.
+tests/unit/test_stub_window
+tests/unit/stub_window.inc
+tests/unit/win_alloc.inc

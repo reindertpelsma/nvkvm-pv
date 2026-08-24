@@ -47,6 +47,7 @@ declare -A TALLY_SUITES=(
     [test_nvkms_allowlist]=618
     [test_stub_ptr_sanitize]=17
     [test_kvm_slot]=12
+    [test_stub_window]=27
 )
 
 # Suites with their own ad-hoc output.  Value is a line that must appear.
@@ -117,7 +118,7 @@ ISOLATE_KNOWN_FAIL=""
 # is environment-dependent, name it here WITH the reason.
 ISOLATE_ENV_DEPENDENT=""
 
-ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot mock_stub"
+ALL_BINARIES="test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window mock_stub"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }

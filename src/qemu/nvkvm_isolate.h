@@ -158,6 +158,11 @@ struct nvkvm_isolate {
 	bool        sync_done;
 	int         sync_error;     /* -errno or 0 */
 	int         sync_mmap_retval;
+	uint64_t    sync_mmap_host_va;  /* U-9: address the stub actually mapped */
+	/* U-9: guest-mapping window, learned once per isolate via
+	 * ISOLATE_CMD_WINDOW_INFO.  Reader fills before signaling. */
+	uint64_t    sync_win_base;
+	uint64_t    sync_win_size;
 	int         sync_open_fd;   /* fd received via SCM_RIGHTS for OPEN_DEVICE;
 	                             * -1 if none. Reader fills before signaling. */
 	/* REALIZE_UVM_FD response slots — reader fills before signaling. */
@@ -533,18 +538,33 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 			uint64_t *fault_addr_out);
 
 /*
- * Tell the isolate to mmap handle_id's fd at gva (MAP_FIXED).
+ * U-9: read the isolate's guest-mapping window (PROT_NONE reservation taken
+ * at stub startup).  Returns 0 and fills *base_out / *size_out on success.
+ * The base is the stub's own ASLR draw — it must never be handed to the guest.
+ */
+int nvkvm_isolate_window_info(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id,
+			      uint64_t *base_out, uint64_t *size_out);
+
+/*
+ * Tell the isolate to mmap handle_id's fd at win_va (MAP_FIXED).
+ *
+ * U-9: win_va is a HOST-chosen address inside that isolate's guest-mapping
+ * window, not the guest's VA.  The stub refuses anything outside the window,
+ * so passing a guest address here now fails closed rather than mapping over
+ * the isolate's own memory.  *stub_va_out (optional) receives the address the
+ * stub actually mapped.
  */
 int nvkvm_isolate_mmap(struct nvkvm_isolate_table *t,
 		       uint32_t isolate_id, uint32_t handle_id,
-		       uint64_t gva, uint64_t length, uint64_t offset,
-		       int prot, int map_flags);
+		       uint64_t win_va, uint64_t length, uint64_t offset,
+		       int prot, int map_flags, uint64_t *stub_va_out);
 
 /*
- * Tell the isolate to munmap [gva, gva+length).
+ * Tell the isolate to munmap [win_va, win_va+length).  Same rule as above.
  */
 int nvkvm_isolate_munmap(struct nvkvm_isolate_table *t,
-			 uint32_t isolate_id, uint64_t gva, uint64_t length);
+			 uint32_t isolate_id, uint64_t win_va, uint64_t length);
 
 /*
  * Send REALIZE_UVM_FD: stub opens /dev/nvidia-uvm, replays the recorded

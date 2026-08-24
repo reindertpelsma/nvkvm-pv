@@ -15,3 +15,8 @@ test_kvm_slot
 stub_sanitize.inc
 # Generated: the A-21 KVM slot pool extracted from src/qemu/nvkvm_mmap_host.c.
 kvm_slot_pool.inc
+
+# U-9: compiled suite + the two build-time extractions it pins.
+test_stub_window
+stub_window.inc
+win_alloc.inc

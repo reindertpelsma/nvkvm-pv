@@ -966,6 +966,7 @@ static void *isolate_reader_fn(void *arg)
 		struct isolate_resp_loop_exited     loop_exited;
 		struct isolate_resp_present_export  present_export;
 		struct isolate_resp_xiso_import     xiso_import;
+		struct isolate_resp_window_info     window_info;
 	} u;
 
 	for (;;) {
@@ -1039,7 +1040,24 @@ static void *isolate_reader_fn(void *arg)
 			break;
 
 		case ISOLATE_RESP_MMAP:
+			/* U-9: carry back the address the stub actually mapped
+			 * so the window allocator can record it.  Written under
+			 * sync_lock, like every other sync_* slot. */
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_mmap_host_va =
+				u.mmap.retval == 0 ? u.mmap.host_va : 0;
+			pthread_mutex_unlock(&iso->sync_lock);
 			reader_signal_sync(iso, 0, u.mmap.retval);
+			break;
+
+		case ISOLATE_RESP_WINDOW_INFO:
+			pthread_mutex_lock(&iso->sync_lock);
+			iso->sync_win_base = u.window_info.retval == 0
+					   ? u.window_info.base : 0;
+			iso->sync_win_size = u.window_info.retval == 0
+					   ? u.window_info.size : 0;
+			pthread_mutex_unlock(&iso->sync_lock);
+			reader_signal_sync(iso, u.window_info.retval, 0);
 			break;
 
 		case ISOLATE_RESP_IOCTL: {
@@ -2436,13 +2454,17 @@ static int sync_sendmsg_recv(struct nvkvm_isolate *iso, struct msghdr *msg)
  * Like sync_send_recv but returns the MMAP retval on success.
  */
 static int sync_send_recv_mmap(struct nvkvm_isolate *iso,
-				const void *cmd_buf, size_t cmd_size)
+				const void *cmd_buf, size_t cmd_size,
+				uint64_t *host_va_out)
 {
+	if (host_va_out)
+		*host_va_out = 0;
 	pthread_mutex_lock(&iso->sync_cmd_lock);   /* F3-1, see sync_send_recv */
 	pthread_mutex_lock(&iso->sync_lock);
-	iso->sync_done        = false;
-	iso->sync_error       = 0;
-	iso->sync_mmap_retval = 0;
+	iso->sync_done         = false;
+	iso->sync_error        = 0;
+	iso->sync_mmap_retval  = 0;
+	iso->sync_mmap_host_va = 0;
 
 	pthread_mutex_lock(&iso->write_lock);
 	ssize_t sr = sock_send_full(iso->sock_fd, cmd_buf, cmd_size);
@@ -2460,6 +2482,8 @@ static int sync_send_recv_mmap(struct nvkvm_isolate *iso,
 					    "MMAP never answered");
 	int result = rc ? rc
 		     : (iso->sync_error ? iso->sync_error : iso->sync_mmap_retval);
+	if (host_va_out && result == 0)
+		*host_va_out = iso->sync_mmap_host_va;
 	pthread_mutex_unlock(&iso->sync_lock);
 	pthread_mutex_unlock(&iso->sync_cmd_lock);
 	return result;
@@ -3474,11 +3498,43 @@ int nvkvm_isolate_ioctl(struct nvkvm_isolate_table *t,
 
 /* ── Mmap / munmap ──────────────────────────────────────────────────────── */
 
+/* U-9: ask the stub where its guest-mapping window is. */
+int nvkvm_isolate_window_info(struct nvkvm_isolate_table *t,
+			      uint32_t isolate_id,
+			      uint64_t *base_out, uint64_t *size_out)
+{
+	if (base_out) *base_out = 0;
+	if (size_out) *size_out = 0;
+	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
+		return -ENOENT;
+	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
+
+	pthread_mutex_lock(&iso->lock);
+	bool valid = iso->in_use && iso->id == isolate_id && iso->alive;
+	pthread_mutex_unlock(&iso->lock);
+	if (!valid)
+		return -ENOENT;
+
+	struct isolate_cmd_window_info cmd = {
+		.type = ISOLATE_CMD_WINDOW_INFO,
+	};
+	int rc = sync_send_recv(iso, &cmd, sizeof(cmd));
+	if (rc)
+		return rc;
+	pthread_mutex_lock(&iso->sync_lock);
+	if (base_out) *base_out = iso->sync_win_base;
+	if (size_out) *size_out = iso->sync_win_size;
+	pthread_mutex_unlock(&iso->sync_lock);
+	return 0;
+}
+
 int nvkvm_isolate_mmap(struct nvkvm_isolate_table *t,
 		       uint32_t isolate_id, uint32_t handle_id,
-		       uint64_t gva, uint64_t length, uint64_t offset,
-		       int prot, int map_flags)
+		       uint64_t win_va, uint64_t length, uint64_t offset,
+		       int prot, int map_flags, uint64_t *stub_va_out)
 {
+	if (stub_va_out)
+		*stub_va_out = 0;
 	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
 		return -ENOENT;
 	struct nvkvm_isolate *iso = &t->isolates[isolate_id % NVKVM_ISOLATE_MAX];
@@ -3492,17 +3548,17 @@ int nvkvm_isolate_mmap(struct nvkvm_isolate_table *t,
 	struct isolate_cmd_mmap cmd = {
 		.type      = ISOLATE_CMD_MMAP,
 		.handle_id = handle_id,
-		.gva       = gva,
+		.win_va    = win_va,
 		.length    = length,
 		.offset    = offset,
 		.prot      = (uint32_t)prot,
 		.map_flags = (uint32_t)map_flags,
 	};
-	return sync_send_recv_mmap(iso, &cmd, sizeof(cmd));
+	return sync_send_recv_mmap(iso, &cmd, sizeof(cmd), stub_va_out);
 }
 
 int nvkvm_isolate_munmap(struct nvkvm_isolate_table *t,
-			 uint32_t isolate_id, uint64_t gva, uint64_t length)
+			 uint32_t isolate_id, uint64_t win_va, uint64_t length)
 {
 	if (isolate_id == 0 || isolate_id >= NVKVM_ISOLATE_MAX)
 		return -ENOENT;
@@ -3516,7 +3572,7 @@ int nvkvm_isolate_munmap(struct nvkvm_isolate_table *t,
 
 	struct isolate_cmd_munmap cmd = {
 		.type   = ISOLATE_CMD_MUNMAP,
-		.gva    = gva,
+		.win_va = win_va,
 		.length = length,
 	};
 	return sync_send_recv(iso, &cmd, sizeof(cmd));
