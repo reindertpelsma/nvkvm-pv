@@ -1791,6 +1791,99 @@ static void nvkvm_xrm_prepare(VirtIONvgpu *nv,
 		nvkvm_xrm_materialise(nv, req->isolate_id, (uint32_t)hid);
 }
 
+/*
+ * ── R-1 ── does this command word's _IOC_TYPE match the device the handle was
+ * actually opened on?
+ *
+ * The whole gate chain in nvkvm_req_ioctl_on_isolate() branches on
+ * _IOC_TYPE(req->cmd) — the DRM NR allowlist on 'd', the NVKMS inner-cmdType
+ * allowlist on the exact NVKMS wrapper cmd, and the frontend NR allowlist, U-3,
+ * A-1, the alloc-class and control-cmd allowlists, the DUP_OBJECT source gate
+ * and the H-3 hClient gate on 'F'.  The stub then branches on the same field
+ * again (nvkvm_stub.c ptr_off, zero_nvos64_rights, clamp_inner_params_size, the
+ * embedded-fd translation, the RM_IDLE_CHANNELS memset).  And _IOC_TYPE is a
+ * field of a command word the GUEST composes, carried across the wire untouched
+ * (src/guest/nvkvm_virtio.c:1343), while the fd it lands on comes from
+ * req->handle_id — an independent guest-chosen value.  Nothing tied the two
+ * together, so branch selection was attacker-controlled.
+ *
+ * A guest could aim a type-'d' cmd at a /dev/nvidiactl handle: the 'd' branch
+ * runs the DRM allowlist (which admits nr 0x41, nvkvm_drm_allowlist.h:51),
+ * every 'F'-keyed gate is skipped, and the M-A non-'F' default-deny is never
+ * reached because 'd' IS a recognised type.  The NVIDIA frontend then dispatches
+ * on _IOC_NR while ignoring _IOC_TYPE entirely, so nr 0x41 executes as
+ * NV_ESC_RM_IDLE_CHANNELS.  VERIFIED in the vendor source rather than assumed:
+ * nvidia_ioctl() reads only _IOC_NR/_IOC_SIZE and switches on
+ * arg_cmd = _IOC_NR(cmd) — open-gpu-kernel-modules 580.159.04
+ * kernel-open/nvidia/nv.c:2404-2405 and :2501; on 610.43.02 the added
+ * nv_validate_ioctls() keys its table on (cmd & 0xFF) alone (:2421).  That
+ * reopens G-2 (src/abi/nvgpu.h:402-410): the stub writes a host VA at offset 8,
+ * which on NVOS30 is h_channel/num_channels, and p_clients/p_devices/p_channels
+ * reach the driver exactly as the guest wrote them, because the memset that
+ * clears [12,40) is 'F'-keyed.
+ *
+ * So key the decision on the real discriminator — the device this handle was
+ * opened on — rather than on a proxy the guest controls.  That is A-1's
+ * correction applied to branch selection itself.  One arm per device class,
+ * default deny.
+ *
+ * It also closes R-2, the reverse direction ('F' aimed at a render node).
+ * drm_ioctl() does reject a mismatched type outright — DRM_IOCTL_TYPE(cmd) !=
+ * DRM_IOCTL_BASE → -ENOTTY, Linux drivers/gpu/drm/drm_ioctl.c:840-841, and
+ * nvidia-drm routes through it (nv_drm_ioctl → drm_ioctl,
+ * nvidia-drm-drv.c:1765) — so R-2 was already inert.  But that is an
+ * out-of-tree control we do not own, and a symmetric check costs nothing.
+ *
+ * The mapping, taken from the tree and not from memory:
+ *   NVKVM_DEV_CTL / NVKVM_DEV_GPU(n)  → 'F'  (nvkvm_proto.h:96,98; the frontend
+ *        char devices — nvkvm_stub.c:1839-1858 maps these ids to
+ *        nvidiactl / nvidiaN)
+ *   NVKVM_DEV_DRM_RD(n)               → 'd'  (:99; dri/renderD128+n,
+ *        nvkvm_stub.c:1864-1874)
+ *   NVKVM_DEV_MODESET                 → the ONE NVKMS wrapper command
+ *        (:100, :110 — _IOWR('m',0,NvKmsIoctlParams)); matched on the full
+ *        command word, exactly as the NVKMS branch itself does
+ *   NVKVM_DEV_UVM                     → nothing here.  UVM ioctls are answered
+ *        and returned before this point, and a UVM command number is not an
+ *        _IO() encoding at all.  A UVM handle that reaches here (fd < 0, i.e.
+ *        broken) is denied, which is the right answer.
+ *   NVKVM_DEV_EVENTFD (0xFF)          → NOTHING, and this was the open question
+ *        R-1.3 raised.  eventfd_fops has no .unlocked_ioctl (fs/eventfd.c), so
+ *        every ioctl on one returns -ENOTTY; and nothing in the guest ever
+ *        opens a handle with this dev_id — the fd for NV01_EVENT_OS_EVENT is a
+ *        /dev/nvidia* fd, not a generic eventfd, and the guest rewrites it to
+ *        that ctx's handle_id (src/guest/nvkvm_main.c:2070-2098).  A guest can
+ *        still ASK for one (nvkvm_req_open_nvidia_handle does not restrict
+ *        dev_id), so the arm must exist.  It denies.
+ *
+ * TYPE_MEMORY handles must not be classified by dev_id at all: a memfd leaves
+ * the field at its zero init (nvkvm_handle.c:231), which is numerically
+ * NVKVM_DEV_CTL.  Require NVKVM_HANDLE_TYPE_NVIDIA explicitly.
+ *
+ * Extracted verbatim into tests/unit/ by an awk rule between the two marker
+ * comments below, so the test pins THIS code and cannot drift from it.  Do not
+ * reformat the markers.
+ */
+/* NVKVM_R1_TYPE_DEV_BEGIN */
+static bool nvkvm_ioctl_type_matches_dev(int handle_type, int dev_id,
+					 uint32_t cmd)
+{
+	unsigned ic_type = _IOC_TYPE(cmd);
+
+	if (handle_type != NVKVM_HANDLE_TYPE_NVIDIA)
+		return false;
+	if (dev_id == NVKVM_DEV_CTL ||
+	    (dev_id >= NVKVM_DEV_GPU(0) &&
+	     dev_id <= NVKVM_DEV_GPU(NV_MINOR_DEVICE_NUMBER_REGULAR_MAX)))
+		return ic_type == 'F';
+	if (dev_id >= NVKVM_DEV_DRM_RD(0) && dev_id < NVKVM_DEV_DRM_RD(16))
+		return ic_type == 'd';
+	if (dev_id == NVKVM_DEV_MODESET)
+		return cmd == NVKVM_NVKMS_IOCTL_CMD;
+	return false;
+}
+/* NVKVM_R1_TYPE_DEV_END */
+
 int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				struct nvkvm_req_ioctl_on_isolate *req,
 				struct nvkvm_resp_ioctl_on_isolate *resp,
@@ -2133,6 +2226,42 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	}
 
 	/*
+	 * ── R-1 ── bind the ioctl's _IOC_TYPE to the handle's REAL device
+	 * BEFORE the 'd' / NVKMS / 'F' chain below makes its decision.  The
+	 * rationale, the vendor-source verification and the full device→type
+	 * mapping are on nvkvm_ioctl_type_matches_dev() above this function.
+	 *
+	 * Hard refusal (-EPERM), not the RM-shaped "succeed with a status in the
+	 * params" signalling the alloc-class and A-1 gates use.  Those two sit
+	 * on paths a legitimate workload reaches, where userspace treats a hard
+	 * failure as fatal; a type/device mismatch is never legitimate, so there
+	 * is nothing to degrade gracefully into.  Reject, never clamp.
+	 */
+	{
+		struct nvkvm_handle *h =
+			nvkvm_handle_get(&nv->handles, req->handle_id);
+
+		if (!h || !nvkvm_ioctl_type_matches_dev(h->type, h->dev_id,
+							req->cmd)) {
+			unsigned ic_type = _IOC_TYPE(req->cmd);
+			fprintf(stderr,
+				"nvkvm: DENY ioctl cmd=0x%x type='%c' on handle %u "
+				"(dev_id=%d, handle type=%d) — _IOC_TYPE does not "
+				"match the handle's device (R-1)\n",
+				req->cmd,
+				(ic_type >= 0x20 && ic_type < 0x7f)
+					? (char)ic_type : '?',
+				req->handle_id,
+				h ? h->dev_id : -1, h ? h->type : -1);
+			resp->retval     = (uint64_t)(int64_t)(-EPERM);
+			resp->status     = 0;
+			resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
+			resp->fault_addr = 0;
+			return 0;
+		}
+	}
+
+	/*
 	 * M-A (audit 2026-05-30): default-deny any non-'F'-type cmd here.  UVM
 	 * handles (type 0) already returned in the schema block above; every
 	 * legitimate RM ioctl on nvidiactl/nvidia0 is _IOC_TYPE 'F'.  Without
@@ -2140,6 +2269,14 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * frontend allowlists below (they all guard on type=='F') and fall
 	 * straight through to the raw ioctl() in the stub — the kmd dispatches
 	 * on _IOC_NR, so that could reach a denied privileged escape.
+	 *
+	 * NOTE (R-1): this arm sits AFTER the 'd' and NVKMS branches, so it only
+	 * ever catches an UNRECOGNISED type; 'd' is recognised and never reaches
+	 * it, which is why A-5's "reorder the deny" half would not have closed
+	 * R-1 on its own.  What closes it is the type/dev_id cross-check above,
+	 * which runs before this whole chain and has already established that
+	 * the type matches the device.  This arm is now unreachable for a
+	 * correctly-classified handle and is kept as belt-and-braces.
 	 */
 	/*
 	 * NVKMS vblank-semaphore quota, set in the NVKMS branch below and acted
