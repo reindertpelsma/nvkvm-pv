@@ -935,17 +935,11 @@ the differences are user-visible:
   gets correct data. Visible beats silent, but code that checks these calls will
   see them fail.
 - **`cudaMemPrefetchAsync`** returns success and does nothing.
-- **Per-stream attach fails, and a real application dies on it.**
-  `cudaStreamAttachMemAsync(..., cudaMemAttachSingle)` returns
-  `cudaErrorInvalidValue`. It is backed by `UVM_SET_RANGE_GROUP`, which iterates
-  `uvm_va_range_managed_t` and so cannot see an external range
-  (`uvm_range_group.c:300-330`). Measured: NVIDIA's own
-  `cuda-samples/Samples/0_Introduction/UnifiedMemoryStreams` prints the error
-  twice and **dumps core**. This is the sharpest edge in the fallback — unlike
-  `cudaMemAdvise`, whose failure an application can ignore and still get correct
-  results, an application built around per-stream attachment does not survive.
-  If a managed-memory workload crashes here rather than merely running slowly,
-  this is the first thing to check.
+- **Per-stream attach works, by being answered locally** — see the faked-ioctls
+  section below. It initially failed (`cudaErrorInvalidValue`, and NVIDIA's
+  `UnifiedMemoryStreams` dumped core), which is what prompted the investigation
+  into whether the hint means anything against this backing. It does not, so it
+  is answered rather than forwarded.
 - **A managed-memory *performance* benchmark becomes unusable, not merely slow.**
   `cuda-samples/Samples/6_Performance/UnifiedMemoryPerf` produced no output at
   all in ~9 minutes. It is not hung — the process sits in `Rl` burning CPU
@@ -1446,6 +1440,50 @@ disable. Two properties keep this honest:
 - **It is scoped, never blanket.** `nvkvm_mmap_range_is_ext_backed()` requires
   exact containment in one range *this fd backed itself*. Cmd 45 against any
   other range is forwarded and fails honestly.
+
+### `UVM_SET_RANGE_GROUP` is answered locally on fallback ranges
+
+This is what `cudaStreamAttachMemAsync()` issues — **traced, not inferred**. An
+`LD_PRELOAD` of `tools/uvm_ioctl_shim.c` over a driver-API attach shows:
+
+```
+UVM cmd=23  CREATE_RANGE_GROUP  rc=0 rmStatus=0x0
+UVM cmd=31  SET_RANGE_GROUP     rc=0 rmStatus=0x1e base=<managed ptr> len=4MiB
+```
+
+`0x1e` is `NV_ERR_INVALID_ADDRESS`, naming exactly the fallback range, because
+`uvm_api_set_range_group()` requires the interval to be covered by **managed**
+ranges with no gaps (`uvm_range_group.c:322-346`).
+
+**Why answering it is accurate rather than a fake.** Range-group membership is
+consumed by exactly one thing — migration policy: the migratable masks
+(`uvm_va_block.c:11322-11327`, `:12833`), the `migrated_ranges` lists
+(`:4145-4148`, `:8300-8303`), and UVM-Lite preferred-location pinning
+(`uvm_va_range.c:1060-1061`, `:1572-1588`). For a **migratable** group the
+driver assigns the group and then takes an explicit early exit *before any page
+movement* (`uvm_range_group.c:348-354`). For a **non-migratable** group the
+promise is "these pages will not move", which pinned sysmem satisfies by
+construction. Either way there is nothing left to do.
+
+The one case where range groups carry real correctness meaning is pre-Pascal
+UVM-Lite, where `cudaMemAttachSingle` governed whether the CPU could touch
+managed memory during a kernel. It cannot arise here:
+`calc_uvm_lite_gpus_mask()` keys on `!faultable_processors`
+(`uvm_va_range.c:1628-1632`), and nvkvm's oldest supported architecture is
+Turing, which is faultable. And the difference runs the safe way — our backing
+lets the CPU touch the range during kernels unconditionally, so the answer is
+**more** permissive than the guarantee, never less.
+
+Scoped exactly as cmd 45: only a range *this fd* backed itself, exact
+containment, never blanket. A guest range we did not back still reaches the host
+and is refused.
+
+**Verified by results, not by completion.** `UnifiedMemoryStreams` prints "All
+Done!" and checks nothing, so its exit status is not evidence.
+`tests/…/attach_verify.cu` fills managed buffers on the CPU, attaches each to a
+stream with `cudaMemAttachSingle`, runs a kernel on that stream, and checks every
+element: 4 buffers × 1,048,576 elements, **0 mismatched**, for both
+`cudaMemAttachSingle` and `cudaMemAttachGlobal`.
 
 ### `NV0000_CTRL_CMD_GPU_GET_ID_INFO` drops the name
 
