@@ -20,7 +20,35 @@
 #   1  at least one check FAILed
 #   2  no failures, but at least one check was SKIPped without being
 #      declared via --allow-skip
-#   3  the harness itself could not run (no gcc, no /tmp, ...)
+#   3  the harness could not TEST -- no /tmp, or a whole phase had neither a
+#      compiler nor a prebuilt probe. See "UNTESTED" below.
+#
+# ---------------------------------------------------------------------------
+# RUNNING THIS WHERE THERE IS NO COMPILER  (--build-probes / --probe-dir)
+# ---------------------------------------------------------------------------
+#
+# 24 of the 30 checks are C probes compiled at run time, so on an image that
+# ships no toolchain -- the produced SteamOS image removes gcc and make after
+# building the guest module -- this suite could only ever check bring-up. It
+# reported "30 total: 5 PASS, 1 FAIL, 24 SKIP" on the real shipped artifact,
+# and that reads like a mostly-fine run. It was not a run at all: CUDA, Vulkan,
+# EGL and GL were never exercised.
+#
+# So build the probes once, where a compiler exists, and ship the binaries:
+#
+#     bash tests/validate.sh --build-probes /usr/local/lib/nvkvm/probes
+#     bash tests/validate.sh                     # finds them there by default
+#
+# The probes dlopen() everything (libcuda, libvulkan, libEGL) and link only
+# -ldl and -lm, so a prebuilt binary needs nothing at run time but libc. Build
+# them inside the image, against the image's own libc, at the point in the
+# build where the toolchain is still present and before it is removed.
+#
+# And when they are NOT there and no compiler is either, those checks are
+# recorded UNTESTED, not SKIP, and the run ends "VERDICT: CANNOT VALIDATE"
+# with exit 3. --allow-skip cannot silence an UNTESTED check: a run that was
+# structurally unable to test the thing must never resemble a run that tested
+# it and passed. That is the floor, not the fix; the fix is --build-probes.
 #
 # ---------------------------------------------------------------------------
 # DESIGN RULES (this suite exists because false greens cost this project days)
@@ -67,9 +95,19 @@ ALLOW_SKIP=""
 JSON_OUT=""
 KEEP_WORKDIR=0
 VERBOSE=0
+BUILD_PROBES=""          # --build-probes DIR: compile the probes there and stop
+PROBE_DIR="${NVKVM_PROBE_DIR:-}"   # --probe-dir DIR: use prebuilt probes from there
+SELFTEST=0
+
+# Where a prebuilt set is looked for when --probe-dir was not given. First hit
+# wins. The /usr/local path is the one an image build should populate.
+DEFAULT_PROBE_DIRS="/usr/local/lib/nvkvm/probes /usr/lib/nvkvm/probes"
+DEFAULT_PROBE_DIRS="$DEFAULT_PROBE_DIRS $(cd "$(dirname "$0")" 2>/dev/null && pwd)/probes"
 
 usage() {
-    sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+    # The whole leading comment block, not a hardcoded line range -- the range
+    # said 2,40 and would silently stop showing the options as the header grew.
+    awk 'NR>1 && !/^#/{exit} NR>1{sub(/^# ?/,""); print}' "$0"
     exit 0
 }
 
@@ -80,6 +118,9 @@ while [ $# -gt 0 ]; do
         --expect-cuda)    EXPECT_CUDA="$2";   shift 2 ;;
         --expect-abi)     EXPECT_ABI="$2";    shift 2 ;;
         --allow-skip)     ALLOW_SKIP="$ALLOW_SKIP,$2"; shift 2 ;;
+        --build-probes)   BUILD_PROBES="$2";  shift 2 ;;
+        --probe-dir)      PROBE_DIR="$2";     shift 2 ;;
+        --selftest)       SELFTEST=1;         shift ;;
         --json)           JSON_OUT="$2";      shift 2 ;;
         --keep)           KEEP_WORKDIR=1;     shift ;;
         -v|--verbose)     VERBOSE=1;          shift ;;
@@ -99,14 +140,23 @@ RESULT_DETAIL=()
 N_PASS=0
 N_FAIL=0
 N_SKIP=0
+# UNTESTED is NOT a third flavour of SKIP, and the distinction is the whole
+# point. SKIP means "this check decided not to run here" -- no Vulkan loader on
+# a headless box, say -- and an operator can accept that with --allow-skip.
+# UNTESTED means the suite was STRUCTURALLY UNABLE to test: no compiler and no
+# prebuilt probe, so nothing about CUDA/Vulkan/GL was observed at all. Nobody
+# may wave that away, because the resulting run carries no evidence whatsoever
+# about the thing it is named after.
+N_UNTESTED=0
 
-C_RESET=""; C_PASS=""; C_FAIL=""; C_SKIP=""; C_BOLD=""; C_DIM=""
+C_RESET=""; C_PASS=""; C_FAIL=""; C_SKIP=""; C_BOLD=""; C_DIM=""; C_UNT=""
 if [ -t 1 ]; then
     C_RESET=$'\033[0m'; C_PASS=$'\033[32m'; C_FAIL=$'\033[31m'
     C_SKIP=$'\033[33m'; C_BOLD=$'\033[1m';  C_DIM=$'\033[2m'
+    C_UNT=$'\033[35m'
 fi
 
-# record <name> <PASS|FAIL|SKIP> <detail...>
+# record <name> <PASS|FAIL|SKIP|UNTESTED> <detail...>
 record() {
     local name="$1" status="$2"; shift 2
     local detail="$*"
@@ -117,10 +167,173 @@ record() {
         PASS) N_PASS=$((N_PASS+1)); printf '  %s%-4s%s %-26s %s\n' "$C_PASS" PASS "$C_RESET" "$name" "$detail" ;;
         FAIL) N_FAIL=$((N_FAIL+1)); printf '  %s%-4s%s %-26s %s\n' "$C_FAIL" FAIL "$C_RESET" "$name" "$detail" ;;
         SKIP) N_SKIP=$((N_SKIP+1)); printf '  %s%-4s%s %-26s %s\n' "$C_SKIP" SKIP "$C_RESET" "$name" "$detail" ;;
+        UNTESTED) N_UNTESTED=$((N_UNTESTED+1)); printf '  %s%-8s%s %-26s %s\n' "$C_UNT" UNTESTED "$C_RESET" "$name" "$detail" ;;
     esac
 }
 
 section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET"; }
+
+# ---------------------------------------------------------------------------
+# the verdict
+# ---------------------------------------------------------------------------
+# Reads N_FAIL / N_UNTESTED / UNEXPECTED_SKIPS / N_PASS / TOTAL and returns the
+# suite's exit code. A function so --selftest can drive it with fabricated
+# counters -- the ordering below is the whole point of this suite and it is not
+# reachable on a machine with no GPU any other way.
+#
+# The ordering is deliberate. A real FAIL is the loudest thing and stays first.
+# But CANNOT VALIDATE outranks INCOMPLETE, and outranks PASS absolutely: a run
+# that could not test the thing must never be reportable as a run that tested it
+# and passed, whatever flags it was given. --allow-skip is deliberately not
+# consulted here -- it only ever moves a SKIP out of UNEXPECTED_SKIPS, and it
+# has no bearing at all on N_UNTESTED.
+verdict() {
+    if [ "$N_FAIL" -gt 0 ]; then
+        printf '\n %sVERDICT: FAIL%s (%d check(s) failed)\n' "$C_FAIL" "$C_RESET" "$N_FAIL"
+        return 1
+    fi
+    if [ "$N_UNTESTED" -gt 0 ]; then
+        printf '\n %sVERDICT: CANNOT VALIDATE%s (%d of %d checks were never attempted; %d passed)\n' \
+               "$C_UNT" "$C_RESET" "$N_UNTESTED" "$TOTAL" "$N_PASS"
+        printf ' This is not a pass with caveats. The suite was structurally unable to test\n'
+        printf ' %d of its %d checks, so it has no evidence about them either way.\n' "$N_UNTESTED" "$TOTAL"
+        return 3
+    fi
+    if [ -n "$UNEXPECTED_SKIPS" ]; then
+        printf '\n %sVERDICT: INCOMPLETE%s (no failures, but%s was skipped)\n' "$C_SKIP" "$C_RESET" "$UNEXPECTED_SKIPS"
+        return 2
+    fi
+    printf '\n %sVERDICT: PASS%s (all %d checks passed)\n' "$C_PASS" "$C_RESET" "$N_PASS"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# nvidia-smi's CUDA-version field
+# ---------------------------------------------------------------------------
+# There are FOUR distinct things the banner can be saying, and the old code
+# collapsed three of them into one FAIL, "could not parse 'CUDA Version:'":
+#
+#   value    the field is there with a version         -> PASS (compare if asked)
+#   na       the field is there and says N/A           -> depends on libcuda
+#   absent   the banner has no CUDA field at all       -> FAIL, and quote it
+#   (rc!=0)  nvidia-smi itself failed                  -> handled by the caller
+#
+# `N/A` is not a CUDA fault. nvidia-smi gets that number from NVML, whose
+# cudaDriverVersion query resolves libcuda.so.1; with no libcuda installed it
+# has nothing to report and prints N/A. The SteamOS `steamos` profile TRIMS
+# libcuda deliberately (steamos-nvidia-installer's tested trim set, which
+# nvkvm-steamos reuses verbatim) precisely because a gaming image does not need
+# it -- so on the shipped image `N/A` is the CORRECT answer and failing the run
+# for it reports a healthy guest as broken. That is the same defect class as the
+# false CLASS 4 in nvkvm-steamos's boot/TESTING.md, in the same week.
+#
+# But `N/A` WITH libcuda installed is a real fault, and stays a FAIL.
+#
+# smi_cuda_field <banner-text>  -> echoes "value <v>" | "na" | "absent"
+smi_cuda_field() {
+    local banner="$1" v
+    # Driver 610 renamed the banner fields: pre-610 prints
+    #   "Driver Version: 580.95.05   CUDA Version: 13.0"
+    # while 610+ prints
+    #   "KMD Version: 610.43.02      CUDA UMD Version: 13.3"
+    # Accept either spelling -- a hardcoded "CUDA Version:" silently fails to
+    # parse on 610 and would turn a healthy guest into a FAIL.
+    printf '%s\n' "$banner" | grep -qE 'CUDA (UMD )?Version:' || { printf 'absent\n'; return; }
+    v="$(printf '%s\n' "$banner" | sed -n 's/.*CUDA \(UMD \)\{0,1\}Version: *\([0-9][0-9.]*\).*/\2/p' | head -1)"
+    if [ -n "$v" ]; then printf 'value %s\n' "$v"; else printf 'na\n'; fi
+}
+
+# Is a CUDA driver library actually installed? If it is not, nvidia-smi having
+# nothing to say about CUDA is expected, not a failure.
+have_libcuda() {
+    ldconfig -p 2>/dev/null | grep -q 'libcuda\.so' && return 0
+    local d
+    for d in /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/local/lib; do
+        ls "$d"/libcuda.so.* >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# --selftest: exercise the pure parsing above against fixed banners.
+# ---------------------------------------------------------------------------
+# The rest of this suite needs a GPU. These functions do not, and they are the
+# ones that decide whether a healthy guest is reported as broken -- so they are
+# the ones worth pinning. Every case is a real banner shape, and the classifier
+# under test is the same text the live path calls; there is no second copy.
+if [ "$SELFTEST" = 1 ]; then
+    st_run=0; st_pass=0
+    st_chk() {   # <name> <expected> <banner>
+        local name="$1" want="$2" banner="$3" got
+        st_run=$((st_run+1))
+        got="$(smi_cuda_field "$banner")"
+        if [ "$got" = "$want" ]; then st_pass=$((st_pass+1)); printf '  PASS  %s\n' "$name"
+        else printf '  FAIL  %s: got "%s", wanted "%s"\n' "$name" "$got" "$want"; fi
+    }
+
+    # Real capture from a guest, README.md's walkthrough.
+    st_chk "pre-610 banner" "value 12.9" \
+'+-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 575.51.03              Driver Version: 575.51.03      CUDA Version: 12.9     |
+|   0  NVIDIA GeForce RTX 3060        Off |   00000000:00:07.0                            |
++-----------------------------------------------------------------------------------------+'
+
+    # 610 renamed both fields; tests/BOOT_MATRIX.md records 13.3 parsed here.
+    st_chk "610 KMD/CUDA-UMD banner" "value 13.3" \
+'| NVIDIA-SMI 610.43.02              KMD Version: 610.43.02      CUDA UMD Version: 13.3    |'
+
+    # THE regression: the field is present and says N/A. Must not be confused
+    # with "no field at all", and must not be parsed as a version.
+    st_chk "N/A is not a version" "na" \
+'| NVIDIA-SMI 570.133.20             Driver Version: 570.133.20    CUDA Version: N/A       |'
+
+    st_chk "N/A on a 610 banner" "na" \
+'| NVIDIA-SMI 610.43.02              KMD Version: 610.43.02      CUDA UMD Version: N/A     |'
+
+    # No CUDA field anywhere: a genuinely unexpected banner shape, and the only
+    # one that should still be a hard FAIL.
+    st_chk "no CUDA field at all" "absent" \
+'| NVIDIA-SMI 570.133.20             Driver Version: 570.133.20                            |
+|   0  NVIDIA GeForce RTX 4090        Off |   00000000:00:07.0                            |'
+
+    st_chk "empty banner" "absent" ""
+
+    # A version with a trailing field must not swallow it.
+    st_chk "trailing columns after the version" "value 12.4" \
+'| NVIDIA-SMI 550.54.14   Driver Version: 550.54.14   CUDA Version: 12.4    |'
+
+    st_verdict() {   # <name> <want-rc> <fail> <untested> <unexpected-skips>
+        local name="$1" want="$2" rc
+        N_FAIL="$3"; N_UNTESTED="$4"; UNEXPECTED_SKIPS="$5"
+        N_PASS=6; TOTAL=30
+        st_run=$((st_run+1))
+        verdict >/dev/null; rc=$?
+        if [ "$rc" = "$want" ]; then st_pass=$((st_pass+1)); printf '  PASS  %s\n' "$name"
+        else printf '  FAIL  %s: verdict returned %s, wanted %s\n' "$name" "$rc" "$want"; fi
+    }
+    printf '\n'
+    st_verdict "all clear -> 0"                       0 0  0 ""
+    st_verdict "a failure -> 1"                       1 1  0 ""
+    st_verdict "an undeclared skip -> 2"              2 0  0 " vk_compute_dispatch"
+    # THE property. 24 checks never attempted, nothing failed, and every skip
+    # declared acceptable: the run must still refuse to be a pass.
+    st_verdict "untested with no failures -> 3"       3 0 24 ""
+    st_verdict "untested outranks an undeclared skip" 3 0 24 " vk_compute_dispatch"
+    st_verdict "a real failure still outranks it"     1 3 24 ""
+
+    printf '\n%d/%d selftest cases passed\n' "$st_pass" "$st_run"
+    [ "$st_pass" = "$st_run" ] || exit 1
+    exit 0
+fi
+
+PROBE_RC=0
+# --build-probes is a build step, not a validation run: it wants the heredocs
+# and the compiler and nothing else. Silence the reporting so its output is the
+# three lines that matter.
+if [ -n "$BUILD_PROBES" ]; then
+    record()  { :; }
+    section() { :; }
+fi
 
 # has_result <name> -- true if the named check already recorded something
 has_result() {
@@ -137,6 +350,16 @@ skip_remaining() {
     local n
     for n in "$@"; do
         has_result "$n" || record "$n" SKIP "$reason"
+    done
+}
+
+# untested_remaining <reason> <name...> -- for checks the suite could not even
+# attempt. Used ONLY when there is neither a compiler nor a prebuilt probe.
+untested_remaining() {
+    local reason="$1"; shift
+    local n
+    for n in "$@"; do
+        has_result "$n" || record "$n" UNTESTED "$reason"
     done
 }
 
@@ -175,6 +398,59 @@ build() {
         return 1
     fi
     return 0
+}
+
+# Resolve where prebuilt probes live: --probe-dir / $NVKVM_PROBE_DIR if given,
+# else the first default directory that actually contains one.
+if [ -z "$PROBE_DIR" ]; then
+    for _d in $DEFAULT_PROBE_DIRS; do
+        if [ -x "$_d/cuda_probe" ] || [ -x "$_d/vk_probe" ] || [ -x "$_d/gl_probe" ]; then
+            PROBE_DIR="$_d"; break
+        fi
+    done
+fi
+PROBE_NOTE=""
+
+# provide_probe <name> <source> <ldflags...>
+#   0   $WORK/<name> is now a runnable probe
+#   1   it could not be built (a compiler exists; the compile failed)  -> SKIP
+#   127 there is no compiler AND no prebuilt binary                    -> UNTESTED
+#
+# A prebuilt binary is preferred over compiling: on an image that ships probes,
+# what runs is exactly what was validated at build time, and the run does not
+# depend on a toolchain being present at all.
+provide_probe() {
+    local out="$1" src="$2"; shift 2
+    if [ -n "$PROBE_DIR" ] && [ -x "$PROBE_DIR/$out" ]; then
+        if cp "$PROBE_DIR/$out" "$WORK/$out" && chmod +x "$WORK/$out"; then
+            PROBE_NOTE="prebuilt from $PROBE_DIR"
+            return 0
+        fi
+        echo "warning: $PROBE_DIR/$out is present but unusable; falling back to compiling" >&2
+    fi
+    if [ -z "$CC" ]; then return 127; fi
+    PROBE_NOTE="compiled here"
+    build "$out" "$src" "$@"
+}
+
+# The message every UNTESTED check carries. One place, so it cannot drift.
+NO_PROBE_REASON="no C compiler on PATH and no prebuilt probe (see --build-probes)"
+
+# --build-probes <dir>: compile the three probes into <dir> and stop. Called
+# where the toolchain exists -- an image build, before it strips gcc.
+BUILD_PROBES_DONE=0
+emit_probe() {   # <name> <source> <ldflags...>
+    local out="$1" src="$2"; shift 2
+    if [ -z "$CC" ]; then
+        echo "--build-probes needs a C compiler, and there is none on PATH." >&2
+        exit 3
+    fi
+    build "$out" "$src" "$@" || { echo "--build-probes: $src failed to compile" >&2; exit 3; }
+    mkdir -p "$BUILD_PROBES" || { echo "--build-probes: cannot create $BUILD_PROBES" >&2; exit 3; }
+    cp "$WORK/$out" "$BUILD_PROBES/$out" || exit 3
+    chmod 0755 "$BUILD_PROBES/$out"
+    printf ' built %s -> %s/%s (%s bytes)\n' "$out" "$BUILD_PROBES" "$out" "$(wc -c <"$BUILD_PROBES/$out")"
+    BUILD_PROBES_DONE=$((BUILD_PROBES_DONE+1))
 }
 
 # run_probe <binary> -- runs it, tees combined output, returns its exit code.
@@ -268,13 +544,9 @@ else
     else
         SMI_GPU="$("$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
         SMI_DRV="$("$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
-        # Driver 610 renamed the banner fields: pre-610 prints
-        #   "Driver Version: 580.95.05   CUDA Version: 13.0"
-        # while 610+ prints
-        #   "KMD Version: 610.43.02      CUDA UMD Version: 13.3"
-        # Accept either spelling -- a hardcoded "CUDA Version:" silently fails
-        # to parse on 610 and would turn a healthy guest into a FAIL.
-        SMI_CUDA="$(printf '%s\n' "$SMI_RAW" | sed -n 's/.*CUDA \(UMD \)\{0,1\}Version: *\([0-9.]*\).*/\2/p' | head -1)"
+        SMI_CUDA_FIELD="$(smi_cuda_field "$SMI_RAW")"
+        SMI_CUDA="${SMI_CUDA_FIELD#value }"
+        [ "$SMI_CUDA_FIELD" = "$SMI_CUDA" ] && SMI_CUDA=""
 
         if [ -z "$SMI_GPU" ]; then
             record nvidia_smi_gpu FAIL "nvidia-smi reported no GPU name"
@@ -292,13 +564,27 @@ else
             record nvidia_smi_driver PASS "$SMI_DRV"
         fi
 
-        if [ -z "$SMI_CUDA" ]; then
-            record nvidia_smi_cuda FAIL "could not parse 'CUDA Version:' out of nvidia-smi banner"
-        elif [ -n "$EXPECT_CUDA" ] && [ "$SMI_CUDA" != "$EXPECT_CUDA" ]; then
-            record nvidia_smi_cuda FAIL "got '$SMI_CUDA', expected '$EXPECT_CUDA'"
-        else
-            record nvidia_smi_cuda PASS "$SMI_CUDA"
-        fi
+        case "$SMI_CUDA_FIELD" in
+            absent)
+                # Quote what the banner ACTUALLY said, so the next person can
+                # see the shape instead of re-deriving it.
+                record nvidia_smi_cuda FAIL \
+                    "nvidia-smi's banner has no CUDA version field at all. Header line was: $(printf '%s\n' "$SMI_RAW" | sed -n '2p' | sed 's/  */ /g')" ;;
+            na)
+                if have_libcuda; then
+                    record nvidia_smi_cuda FAIL \
+                        "nvidia-smi reports 'CUDA Version: N/A' although libcuda is installed -- NVML cannot reach the CUDA driver"
+                else
+                    record nvidia_smi_cuda SKIP \
+                        "nvidia-smi reports N/A and no libcuda is installed; nothing to report (a CUDA-trimmed image, e.g. the SteamOS 'steamos' profile)"
+                fi ;;
+            *)
+                if [ -n "$EXPECT_CUDA" ] && [ "$SMI_CUDA" != "$EXPECT_CUDA" ]; then
+                    record nvidia_smi_cuda FAIL "got '$SMI_CUDA', expected '$EXPECT_CUDA'"
+                else
+                    record nvidia_smi_cuda PASS "$SMI_CUDA"
+                fi ;;
+        esac
     fi
 fi
 
@@ -1041,11 +1327,19 @@ static int probe_main(void) {
 int main(void) { int rc = probe_main(); fflush(NULL); _exit(rc); }
 NVKVM_CUDA_EOF
 
-if [ -z "$CC" ]; then
-    skip_remaining "no C compiler on PATH (install build-essential)" $CUDA_CHECKS
-elif ! build cuda_probe cuda_probe.c -ldl -lm; then
+if [ -n "$BUILD_PROBES" ]; then
+    emit_probe cuda_probe cuda_probe.c -ldl -lm
+else
+    provide_probe cuda_probe cuda_probe.c -ldl -lm; PROBE_RC=$?
+fi
+if [ -n "$BUILD_PROBES" ]; then
+    :
+elif [ "$PROBE_RC" = 127 ]; then
+    untested_remaining "$NO_PROBE_REASON" $CUDA_CHECKS
+elif [ "$PROBE_RC" != 0 ]; then
     skip_remaining "cuda_probe.c failed to compile (see compiler output above)" $CUDA_CHECKS
 else
+    printf ' %scuda_probe: %s%s\n' "$C_DIM" "$PROBE_NOTE" "$C_RESET"
     run_probe cuda_probe
     CUDA_RC=$?
     ingest "$WORK/cuda_probe.out"
@@ -1568,13 +1862,21 @@ static int probe_main(int argc, char **argv) {
 int main(int argc, char **argv) { int rc = probe_main(argc, argv); fflush(NULL); _exit(rc); }
 NVKVM_VK_EOF
 
-if [ -z "$CC" ]; then
-    skip_remaining "no C compiler on PATH" $VK_CHECKS
+if [ -n "$BUILD_PROBES" ]; then
+    emit_probe vk_probe vk_probe.c -ldl
+else
+    provide_probe vk_probe vk_probe.c -ldl; PROBE_RC=$?
+fi
+if [ -n "$BUILD_PROBES" ]; then
+    :
+elif [ "$PROBE_RC" = 127 ]; then
+    untested_remaining "$NO_PROBE_REASON" $VK_CHECKS
 elif [ "$SPV_OK" != 1 ]; then
     skip_remaining "$SPV_ERR" $VK_CHECKS
-elif ! build vk_probe vk_probe.c -ldl; then
+elif [ "$PROBE_RC" != 0 ]; then
     skip_remaining "vk_probe.c failed to compile (see compiler output above)" $VK_CHECKS
 else
+    printf ' %svk_probe: %s%s\n' "$C_DIM" "$PROBE_NOTE" "$C_RESET"
     run_probe vk_probe "$WORK/comp.spv"
     VK_RC=$?
     ingest "$WORK/vk_probe.out"
@@ -1950,11 +2252,22 @@ static int probe_main(void) {
 int main(void) { int rc = probe_main(); fflush(NULL); _exit(rc); }
 NVKVM_GL_EOF
 
-if [ -z "$CC" ]; then
-    skip_remaining "no C compiler on PATH" $GL_CHECKS
-elif ! build gl_probe gl_probe.c -ldl; then
+if [ -n "$BUILD_PROBES" ]; then
+    emit_probe gl_probe gl_probe.c -ldl
+else
+    provide_probe gl_probe gl_probe.c -ldl; PROBE_RC=$?
+fi
+if [ -n "$BUILD_PROBES" ]; then
+    printf '\n%d probe(s) written to %s\n' "$BUILD_PROBES_DONE" "$BUILD_PROBES"
+    printf 'Point a later run at them with --probe-dir %s, or install them at one of:\n  %s\n' \
+           "$BUILD_PROBES" "$DEFAULT_PROBE_DIRS"
+    exit 0
+elif [ "$PROBE_RC" = 127 ]; then
+    untested_remaining "$NO_PROBE_REASON" $GL_CHECKS
+elif [ "$PROBE_RC" != 0 ]; then
     skip_remaining "gl_probe.c failed to compile (see compiler output above)" $GL_CHECKS
 else
+    printf ' %sgl_probe: %s%s\n' "$C_DIM" "$PROBE_NOTE" "$C_RESET"
     run_probe gl_probe
     GL_RC=$?
     ingest "$WORK/gl_probe.out"
@@ -2002,12 +2315,21 @@ while [ $i -lt ${#RESULT_NAMES[@]} ]; do
 done
 
 TOTAL=${#RESULT_NAMES[@]}
-printf '\n %sTOTAL %d   PASS %d   FAIL %d   SKIP %d%s\n' "$C_BOLD" "$TOTAL" "$N_PASS" "$N_FAIL" "$N_SKIP" "$C_RESET"
+printf '\n %sTOTAL %d   PASS %d   FAIL %d   SKIP %d   UNTESTED %d%s\n' \
+       "$C_BOLD" "$TOTAL" "$N_PASS" "$N_FAIL" "$N_SKIP" "$N_UNTESTED" "$C_RESET"
 
 if [ -n "$UNEXPECTED_SKIPS" ]; then
     printf ' %sUNEXPECTED SKIPS:%s%s\n' "$C_SKIP" "$C_RESET" "$UNEXPECTED_SKIPS"
     printf '   (a skipped check is NOT a pass. Declare it with --allow-skip <name> only\n'
     printf '    if you have decided it is out of scope for this run.)\n'
+fi
+if [ "$N_UNTESTED" -gt 0 ]; then
+    printf '\n %s%d of %d checks were never attempted.%s\n' "$C_UNT" "$N_UNTESTED" "$TOTAL" "$C_RESET"
+    printf '   This run says NOTHING about them -- not that they work, not that they do\n'
+    printf '   not. There was no compiler and no prebuilt probe, so no CUDA, Vulkan, EGL\n'
+    printf '   or GL code ran at all. --allow-skip does not apply and cannot silence this.\n'
+    printf '   Fix it by building the probes where a toolchain exists and shipping them:\n'
+    printf '     bash %s --build-probes /usr/local/lib/nvkvm/probes\n' "$0"
 fi
 
 # --- optional JSON -----------------------------------------------------------
@@ -2017,7 +2339,8 @@ if [ -n "$JSON_OUT" ]; then
         printf '  "gpu": "%s",\n' "$SMI_GPU"
         printf '  "driver": "%s",\n' "$SMI_DRV"
         printf '  "cuda": "%s",\n' "$SMI_CUDA"
-        printf '  "pass": %d, "fail": %d, "skip": %d, "total": %d,\n' "$N_PASS" "$N_FAIL" "$N_SKIP" "$TOTAL"
+        printf '  "pass": %d, "fail": %d, "skip": %d, "untested": %d, "total": %d,\n' \
+               "$N_PASS" "$N_FAIL" "$N_SKIP" "$N_UNTESTED" "$TOTAL"
         printf '  "checks": [\n'
         i=0
         while [ $i -lt ${#RESULT_NAMES[@]} ]; do
@@ -2033,13 +2356,5 @@ if [ -n "$JSON_OUT" ]; then
     printf ' json     : %s\n' "$JSON_OUT"
 fi
 
-if [ "$N_FAIL" -gt 0 ]; then
-    printf '\n %sVERDICT: FAIL%s (%d check(s) failed)\n' "$C_FAIL" "$C_RESET" "$N_FAIL"
-    exit 1
-fi
-if [ -n "$UNEXPECTED_SKIPS" ]; then
-    printf '\n %sVERDICT: INCOMPLETE%s (no failures, but%s was skipped)\n' "$C_SKIP" "$C_RESET" "$UNEXPECTED_SKIPS"
-    exit 2
-fi
-printf '\n %sVERDICT: PASS%s (all %d checks passed)\n' "$C_PASS" "$C_RESET" "$N_PASS"
-exit 0
+verdict
+exit $?
