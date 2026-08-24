@@ -613,6 +613,18 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
 }
 
+bool nb_sink_close_request(struct nb_sink *s)
+{
+    if (!s || s->client_fd < 0) {
+        return false;           /* nobody to tell; the caller quits instead */
+    }
+    nb_log("the user closed the display; telling the VMM (it decides what "
+           "that means for the guest)");
+    nb_emit(s, NVKVM_BROKER_EV_CLOSE, 0, 0, 0, 0);
+    nb_sink_flush(s);
+    return true;
+}
+
 void nb_sink_bye(struct nb_sink *s, int reason)
 {
     nb_emit(s, NVKVM_BROKER_EV_BYE, reason, 0, 0, 0);
@@ -1248,6 +1260,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
+        else if (!strcmp(a, "--persist"))    { cfg.persist = true; }
         else if (!strcmp(a, "--scale")) { cfg.scale_mode = 1; }
         else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
@@ -1357,6 +1370,19 @@ int main(int argc, char **argv)
                 if (nb_sink_flush(&sink) < 0) {
                     nb_sink_detach(&sink, "write failed");
                 }
+            }
+            /*
+             * The VMM went away.  By default so do we: a broker window that
+             * outlives its VM shows nothing and still holds a window, a
+             * compositor connection and the hotkeys.  --persist keeps it and
+             * waits for another client, which is what makes a VMM restart --
+             * or a broker that was told to close and let QEMU shut the guest
+             * down gracefully -- survivable without restarting both.
+             */
+            if (sink.client_fd < 0 && !cfg.persist) {
+                nb_log("the client is gone; exiting (use --persist to keep "
+                       "the window and wait for another)");
+                break;
             }
         }
 

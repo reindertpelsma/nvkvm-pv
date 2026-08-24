@@ -70,6 +70,25 @@ enum {
                                      * broker sends no KEY/BTN/ABS/REL at all  */
     NVKVM_BROKER_EV_POINTER   = 12, /* x=1 pointer over the window, 0 not      */
     NVKVM_BROKER_EV_BYE       = 13, /* broker is going away; x=reason code     */
+    /*
+     * EV_CLOSE — THE USER CLOSED THE DISPLAY.  The X button, or the
+     * compositor's own close request (Alt+F4, a window-list close).
+     *
+     * It states a fact and requests nothing: the broker knows nothing about
+     * VMs and has no business deciding what closing a window means for one.
+     * The VMM applies its own policy -- an ACPI powerdown, a prompt, a
+     * snapshot, or nothing at all.
+     *
+     * DELIBERATELY NOT A DIALOG IN THE BROKER.  The broker is the privileged
+     * process holding the keyboard grab; putting dialog UI, hit-testing and
+     * the state machine behind it in there buys attack surface for a decision
+     * it cannot make anyway.
+     *
+     * The broker does NOT exit on sending this.  It exits when the client
+     * disconnects (or keeps the window with --persist), so the VMM decides how
+     * and when the display goes away.
+     */
+    NVKVM_BROKER_EV_CLOSE     = 14,
 };
 
 /*

@@ -60,6 +60,7 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
+#include "system/runstate.h"   /* qemu_system_powerdown_request */
 #include "ui/console.h"
 #include "ui/input.h"
 
@@ -476,6 +477,24 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
         break;
     case NVKVM_BROKER_EV_POINTER:
     case NVKVM_BROKER_EV_HELLO:
+        break;
+    case NVKVM_BROKER_EV_CLOSE:
+        /*
+         * The user closed the display.  THE POLICY IS OURS, and this is the
+         * only place in the system that has any business having one: the
+         * broker knows there is a window, we are the only party that knows
+         * there is a guest behind it.
+         *
+         * An ACPI powerdown, i.e. the same thing as pressing the power button
+         * on the case -- the guest's own OS decides whether to shut down, ask
+         * the user, or ignore it.  Not a `quit`: closing a window must not
+         * destroy a running machine's state without the guest getting a say.
+         * A guest that ignores ACPI keeps running with no display, and the
+         * broker is still there to reconnect to.
+         */
+        RELAY_LOG("the user closed the display: requesting an ACPI powerdown "
+                  "(the guest decides what to do with it)");
+        qemu_system_powerdown_request();
         break;
     case NVKVM_BROKER_EV_BYE:
         RELAY_LOG("the broker is going away (reason %d)", p->x);
