@@ -23,7 +23,7 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 | P-2 | **critical** | allowlist too permissive | guest process → host kernel | **fixed** — row dropped; see the EXCLUSIONS block in `nvkvm_ctrl_allowlist.h` |
 | P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (writable alias) + the stub is now a real static PIE; see below |
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
-| P-5 | high | design vs documentation | isolate → isolate | **open, needs a decision** |
+| P-5 | ~~high~~ **by design** | design vs documentation | isolate → isolate | **decided** — uid separation is not required; see below |
 | P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
 | P-7 | high | dev harness | guest → host root | **open, harness only** |
 | P-8 | high | process | — | **partly fixed** — see "the revert" |
@@ -291,8 +291,51 @@ Mitigating: distinct PID and mount namespaces still block naming or ptracing a
 peer. This is the removal of a layer the code claims, not a demonstrated
 cross-isolate takeover.
 
-**This needs a decision, not a patch** — either add UID to the default rung or
-stop claiming it. The comment should be corrected either way.
+~~**This needs a decision, not a patch** — either add UID to the default rung or
+stop claiming it. The comment should be corrected either way.~~
+
+### DECIDED, 2026-08-24 — uid separation is not required. Namespaces are the boundary.
+
+Recorded as a decision rather than left open. The maintainer's position, in
+their terms:
+
+> **Namespaces are the boundary.** In Docker, uid + chroot are already
+> sufficient, because no other namespace permits communication with any host
+> process.
+
+Read as a threat-model statement rather than a claim about DAC: what the
+isolate has to prevent is an isolate reaching a *host* process, and every
+channel by which one process reaches another — pids to signal or ptrace, mount
+paths, abstract and filesystem sockets, SysV IPC, the network — is severed by
+the namespace set the default rung already installs, before any uid check would
+be consulted. A shared euid is only exploitable through a channel that exists,
+and on this rung none does.
+
+So `NVKVM_ISO_LAYER_UID` stays the fallback rung, `nvkvm_iso_auto_select` keeps
+preferring `NS | SECCOMP`, and no code changes.
+
+**What was actually wrong here was the claim, and that half is already fixed.**
+`d28201e` ("docs: correct three claims the code makes about boundaries it does
+not have") rewrote the comment in `nvkvm_isolate_handlers.c`, which now reads:
+
+> `NOT uid-separated, whatever this comment used to say.` […] every isolate's
+> in-namespace root maps to the SAME host uid, QEMU's own. What separates them
+> is the user/pid/mount/net/ipc/uts namespaces plus seccomp, which is a real
+> boundary […] but is not a uid boundary. […] Do not reason about this layer as
+> though a DAC check were backing it up.
+
+That is exactly what this finding asked for, and it is the load-bearing part:
+the danger was never the missing uid, it was a reader trusting a DAC check that
+is not there.
+
+**What this decision does not cover.** P-5's second consequence stands and is
+not closed by it: RM's `osValidateClientTokens` rejects only when euid *and*
+pid both differ, so with a shared euid it does not separate isolates either.
+That matters for the "Suspected — cross-VM `hClient` blind spot" item in this
+document, which cites P-5 as the reason RM's own guard cannot be leaned on.
+Anything relying on RM to keep two isolates' client handles apart still needs
+its own check host-side; the decision above is that *nvkvm* need not add a uid
+layer, not that RM provides one.
 
 ---
 

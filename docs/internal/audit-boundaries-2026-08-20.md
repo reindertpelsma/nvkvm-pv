@@ -174,9 +174,12 @@ request itself carries. `MMAP_ON_ISOLATE` never checks the handle's
 `nvkvm_req_present` checks `session_id`, and `nvkvm_req_xiso_import` checks
 `session_has_isolate` for *both* pairings — so this is an omission, not a
 policy. The design note arguing QEMU should not do intra-VM policy also states
-QEMU's boundary is "cross-VM / host-process", and isolates *are* separate,
-uid-separated host processes; the stronger reading is the one its neighbours
-implement. Note that A-6 composes with A-3: it aims the same recycle-under-
+QEMU's boundary is "cross-VM / host-process", and isolates *are* separate host
+processes; the stronger reading is the one its neighbours implement. (This
+sentence said "uid-separated host processes" when written. They are not — see
+P-5 in [`audit-prerelease-2026-08-21.md`](audit-prerelease-2026-08-21.md),
+where that is now a recorded decision. The argument here does not depend on it:
+separate *processes* is enough to make this QEMU's boundary.) Note that A-6 composes with A-3: it aims the same recycle-under-
 live-PTE primitive at a victim rather than at yourself.
 
 **A-10 (medium) — the present import cache cannot tell isolates apart.**
