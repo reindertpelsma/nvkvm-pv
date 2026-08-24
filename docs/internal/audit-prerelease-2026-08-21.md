@@ -21,7 +21,7 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 |---|---|---|---|---|
 | P-1 | **critical** | fail-open validation | guest process → another guest process | **fixed** — `71a490f` |
 | P-2 | **critical** | allowlist too permissive | guest process → host kernel | **fixed** — row dropped; see the EXCLUSIONS block in `nvkvm_ctrl_allowlist.h` |
-| P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (the writable alias); see below |
+| P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (writable alias) + the stub is now a real static PIE; see below |
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
 | P-5 | high | design vs documentation | isolate → isolate | **open, needs a decision** |
 | P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
@@ -156,6 +156,105 @@ exec (`NVKVM_DEV_DIRFD` is 4 and `NVKVM_DRM_FD(k)` is 5+, both in
 `src/common/nvkvm_isolate_proto.h`), so it would be safe — but with the seal in
 place the residual is a read-only descriptor to a binary whose bytes are in the
 public source tree, which buys an attacker nothing.
+
+### `ET_EXEC`, not PIE — **FIXED**, the build now produces a genuine static PIE
+
+The finding was right and stayed right: `readelf -h nvkvm_stub` said
+`Type: EXEC`, entry `0x407584`, and four consecutive runs all mapped the image
+at `00400000-00401000`. No ASLR inside the isolate at all.
+
+By the time this was picked up the Makefile comment had already been corrected
+— it no longer claimed PIE, it explained at length that `-static -pie` emits
+`ET_EXEC` because GCC's spec lets `-static` win over `-pie`. So the "code and
+comment disagree" half was closed. What was still true is that the isolate is
+the containment boundary for every finding in
+[`audit-guest-pointers.md`](audit-guest-pointers.md), and several of those
+(U-1/U-2/U-4, and U-7 explicitly, which is rated on being *"a stepping stone"*
+for them) are rated on the attacker not knowing where things are. A fixed text
+base is worth spending a build change on rather than documenting.
+
+**The build change is two things, not one flag**, and the second is why this
+looked harder than it was:
+
+1. `-static-pie` — one word, not `-static -pie`. This alone links and produces
+   `ET_DYN`.
+2. `-DNVKVM_STUB_SELF_RELOC`, so that `apply_relocations()` in
+   `src/stub/nvkvm_stub.c` is compiled in and called as the first statement of
+   `main()`. Nothing else applies the `R_X86_64_RELATIVE` entries: `fexecve`
+   from a memfd means no dynamic linker, and `-nostdlib -ffreestanding` means
+   no `rcrt1.o`.
+
+The Makefile's previous comment said this second piece did not exist ("a
+self-relocation entry stub ... which `-nostdlib -ffreestanding` means we do not
+have"). It did exist — `apply_relocations()` has been in the tree all along.
+It was guarded on `NVKVM_STUB_EMBEDDED`, which is defined for **QEMU's** build
+of `nvkvm_isolate.c` (`scripts/build_qemu.sh --extra-cflags`) and has never
+been defined for the stub's own build in `src/stub/Makefile`. So the routine
+was dead code under a define that meant something else.
+
+**The one real obstacle, measured.** With `-static-pie` and the relocation
+routine compiled in, the stub still `SIGSEGV`d — *inside the relocation routine
+itself*:
+
+```
+Program received signal SIGSEGV, Segmentation fault.
+apply_relocations () at nvkvm_stub.c:3049
+#0  apply_relocations () at nvkvm_stub.c:3049
+#1  main (argc=2, argv=0x7fffffffdff8) at nvkvm_stub.c:3112
+```
+
+Cause: written as plain C, GCC loads the address of `_DYNAMIC` **from the GOT**
+— and that GOT slot is the only `R_X86_64_RELATIVE` entry in the entire image,
+i.e. the very relocation the function exists to apply:
+
+```
+Relocation section '.rela.dyn' contains 1 entry:
+  Offset          Info           Type              Sym. Value  Sym. Name + Addend
+000000009ff8  000000000008 R_X86_64_RELATIVE                     9ed0
+```
+
+The unrelocated slot still holds the link-time `0x9ed0`, so the first
+`dyn->d_tag` read faults. `volatile` does not help, and neither does
+`visibility("hidden")` — both were tried, both still emit the GOT load. The
+fix is to take the address with an explicit RIP-relative `lea`, which needs no
+relocation and so breaks the cycle. musl's `rcrt1.c` does the same thing for
+the same reason.
+
+**Verified, without hardware:**
+
+| | before | after |
+|---|---|---|
+| `readelf -h` | `Type: EXEC`, entry `0x407584` | `Type: DYN`, entry `0x7604` |
+| load base, 4 runs | `00400000` ×4 | `7b592c05f000`, `7c06ee98b000`, `72ec7e353000`, `720c54e9d000` |
+
+Load base measured from `/proc/<pid>/maps` on the real stub, spawned the way
+QEMU spawns it — `memfd_create(MFD_ALLOW_SEALING)`, write, `F_ADD_SEALS`
+(including `F_SEAL_WRITE`, i.e. with the fix above active), image parked at
+fd 3, `fexecve`, command socket on fd 0 — **with the seccomp filter on**, and
+against the stripped binary that actually ships. The stub reaches its socket
+wait in every case, so this is not "it links", it is "it runs".
+
+**Two regression guards**, because this claim was wrong in the Makefile for a
+long time and nothing caught it:
+
+- Going back to `-static -pie` now **fails the link**: `undefined reference to
+  '_DYNAMIC'`, because the `lea` has nothing to resolve against in a
+  non-dynamic image. Verified by doing it.
+- A `verify-pie` target runs `readelf -h` after every link and fails the build
+  if the type is not `DYN`. Verified by pointing it at the old `ET_EXEC`
+  binary, which it rejects.
+
+The guard matters in one direction more than the other: applying PIE
+relocations to an `ET_EXEC` link is not a harmless no-op, it is memory
+corruption (`r_offset` is an absolute vaddr there, so `base + r_offset` writes
+past the end of the image). The flag and the define have to move together, and
+both the Makefile and the source say so at the point of use.
+
+**Not verified without hardware:** that a PIE stub behaves identically once it
+is brokering real GPU ioctls. Nothing in the change is GPU-adjacent — it moves
+the text base and applies relocations before `main` does anything — and the
+stub survives spawn, seccomp and its socket wait, but a GPU run is the gate
+that has not been through.
 
 ---
 
