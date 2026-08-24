@@ -20,7 +20,7 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 | # | severity | class | direction | status |
 |---|---|---|---|---|
 | P-1 | **critical** | fail-open validation | guest process → another guest process | **fixed** — `71a490f` |
-| P-2 | **critical** | allowlist too permissive | guest process → host kernel | see below |
+| P-2 | **critical** | allowlist too permissive | guest process → host kernel | **fixed** — row dropped; see the EXCLUSIONS block in `nvkvm_ctrl_allowlist.h` |
 | P-3 | high | sandbox self-modification | isolate → isolate | see below |
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
 | P-5 | high | design vs documentation | isolate → isolate | **open, needs a decision** |
@@ -81,7 +81,7 @@ pairing at all beyond "different isolate". The dma-buf broker
 
 ---
 
-## P-2 — `0x20800513` in the ctrl allowlist
+## P-2 — FIXED — `0x20800513` in the ctrl allowlist
 
 `NV2080_CTRL_CMD_THERMAL_SYSTEM_EXECUTE_V2`, allowed with no justifying comment
 and **not present in gVisor nvproxy's set**, which that header otherwise tracks.
@@ -89,6 +89,14 @@ In the host driver it runs a guest-controlled `NvU32` loop over a fixed
 `instructionList[0x20]` **before the version check**, in a `NON_PRIVILEGED`
 control, with a second read/write loop at the same indices. nvkvm applies the
 allowlist and a 1 MiB aux cap and no per-command parameter validation.
+
+**FIXED — verified 2026-08-24.** The row is gone from the allowlist table;
+the only remaining mention of `0x20800513` in `src/` is the EXCLUSIONS block in
+`src/qemu/nvkvm_ctrl_allowlist.h`, which records why it must not come back —
+nvproxy emits it at 575.51.02, so a straight regeneration *will* re-add it. If a
+workload ever needs the command, the prescribed fix is a bounded per-command
+check (reject `instructionListSize > 0x20`) at the gate, **not** restoring the
+bare row.
 
 **Honest framing:** this is not a bare-metal divergence — a local unprivileged
 user on the host can call it too. The nvkvm delta is that it is a hand-added
