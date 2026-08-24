@@ -64,12 +64,42 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 #include "linux-dmabuf-v1-client-protocol.h"
 #include "pointer-constraints-unstable-v1-client-protocol.h"
 #include "relative-pointer-unstable-v1-client-protocol.h"
+#include "presentation-time-client-protocol.h"
+#include "viewporter-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
 #include "xdg-shell-client-protocol.h"
 
 /* Defined here rather than pulled from libdrm: with the DRM-lease design gone
  * this backend has no other reason to link libdrm, and one constant is not
  * worth a dependency. */
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
+
+#define NB_TB_H     28
+#define NB_TB_BTN   34          /* width of one button, from the right edge  */
+#define NB_CUR_N     5          /* arrow + four resize cursors            */
+#define NB_BORDER    8          /* px of grabbable edge outside the window */
+#define NB_TITLE_MAX ((size_t)48)
+/* Cursor slots: 0 arrow, 1 horizontal, 2 vertical, 3 NW-SE, 4 NE-SW. */
+#define NB_CUR_ARROW 0
+#define NB_CUR_EW    1
+#define NB_CUR_NS    2
+#define NB_CUR_NWSE  3
+#define NB_CUR_NESW  4
+
+static const uint32_t nb_bd_edge[8] = {
+    XDG_TOPLEVEL_RESIZE_EDGE_TOP,
+    XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM,
+    XDG_TOPLEVEL_RESIZE_EDGE_LEFT,
+    XDG_TOPLEVEL_RESIZE_EDGE_RIGHT,
+    XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT,
+    XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT,
+    XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT,
+    XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT,
+};
+static const int nb_bd_cursor[8] = {
+    NB_CUR_NS, NB_CUR_NS, NB_CUR_EW, NB_CUR_EW,
+    NB_CUR_NWSE, NB_CUR_NESW, NB_CUR_NESW, NB_CUR_NWSE,
+};
 
 struct nb_wl_buf {
     bool      valid;
@@ -111,6 +141,75 @@ struct nb_wl {
     struct zwp_relative_pointer_manager_v1           *relptr_mgr;
     struct zwp_relative_pointer_v1                   *relptr;
 
+    /* Window chrome.  Without this the toplevel is undecorated on Mutter:
+     * no title bar, no close button, no resize grips — and the --title we
+     * were given renders nowhere. */
+    struct zxdg_decoration_manager_v1     *deco_mgr;
+    struct zxdg_toplevel_decoration_v1    *deco;
+
+    /* Resize.  A surface's size is its buffer's size unless a viewport says
+     * otherwise; wp_viewporter is what decouples "the window the user
+     * dragged" from "the resolution the guest is scanning out". */
+    struct wp_viewporter *viewporter;
+    struct wp_viewport   *viewport;
+
+    /*
+     * wp_presentation is the ONLY way a Wayland client learns whether its
+     * buffer reached a hardware plane: the `presented` event carries
+     * KIND_ZERO_COPY, which is set exactly when the compositor scanned the
+     * client's own buffer out instead of compositing a copy of it.  That is
+     * the same question the X11 backend answers with Present: FLIP / COPY,
+     * and until this was wired up the Wayland side could not answer it at all.
+     */
+    struct wp_presentation *presentation;
+    int                     last_scanout;   /* -1 unknown, 0 copy, 1 zero-copy */
+
+    /* Client-side title bar.  A SUBSURFACE ABOVE the content, at negative y,
+     * so it never overlaps the guest's picture -- an occluded surface is not a
+     * scanout candidate, and the whole point of this backend is that it can
+     * be one. */
+    struct wl_subcompositor *subcomp;
+    struct wl_surface       *tb_surf;
+    struct wl_subsurface    *tb_sub;
+    struct wl_buffer        *tb_buf;
+    void                    *tb_px;
+    size_t                   tb_sz;
+    int                      tb_w;
+    bool                     ptr_on_tb;
+    bool                     tb_mapped;
+    int                      tb_hover;      /* button under the pointer, -1 */
+    int                      tb_press;      /* button held down, -1 for none */
+    /* Our own pointer cursor, for when the pointer is on our chrome.  Drawn
+     * here rather than loaded: libwayland-cursor would be a new dependency
+     * and a theme lookup, for one arrow that is only ever seen over a 28px
+     * bar. */
+    struct wl_surface       *cur_surf[NB_CUR_N];
+    struct wl_buffer        *cur_buf[NB_CUR_N];
+    void                    *cur_px[NB_CUR_N];
+    size_t                   cur_sz[NB_CUR_N];
+
+    /*
+     * RESIZE BORDERS.  A Wayland client has no window edges: the compositor
+     * draws no frame and the surface stops exactly where the content does, so
+     * there is nothing outside it to grab.  These eight surfaces ARE the
+     * edges -- invisible (a single transparent pixel stretched by a viewport),
+     * present only to take a pointer and turn a drag into
+     * xdg_toplevel_resize().
+     */
+    struct wl_surface    *bd_surf[8];
+    struct wl_subsurface *bd_sub[8];
+    struct wp_viewport   *bd_vp[8];
+    struct wl_buffer     *bd_buf;       /* one transparent pixel, shared */
+    void                 *bd_px;
+    int                   bd_hot;       /* border under the pointer, -1 none */
+    int                   fit_w, fit_h; /* aspect-fit size when scaling      */
+    int                   scale_mode;   /* 0 never, 1 always, 2 auto         */
+    bool                     maximized;
+    int                      tb_px_x, tb_px_y;   /* pointer, title-bar-local */
+    uint32_t                 last_serial;
+    char                     title[128];
+    bool                     quit;
+
     struct nb_formats formats;
 
     /* The sink is not reachable from Wayland callbacks otherwise.  NULL until
@@ -129,11 +228,32 @@ struct nb_wl {
     int      current;           /* index of the buffer the surface holds       */
     bool     frame_inflight;
 
+    /* THREE sizes, deliberately not one:
+     *   buf_w/buf_h   the guest's scanout buffer — the resolution it chose
+     *   win_w/win_h   what the compositor last configured for the window
+     *   surf_w/surf_h what the surface currently measures, which is win_*
+     *                 when a viewport is scaling and buf_* when it is not
+     * Conflating them is what makes a user's window drag turn into a guest
+     * mode switch, which is not what dragging a window means. */
+    int    buf_w, buf_h;
+    int    win_w, win_h;
     int    surf_w, surf_h;
+    uint32_t deco_mode;
     bool   grabbed;
     bool   fullscreen;
     bool   configured;
 };
+
+/* Forward: the title bar lives further down, but wl_commit sizes it. */
+static void tb_update(struct nb_wl *w, int width);
+/* Forward: the cursor is built lazily, on first entry to our own chrome. */
+static void cur_build(struct nb_wl *w);
+/* Forward: the invisible resize borders, laid out on every size change. */
+static void bd_build(struct nb_wl *w);
+static void bd_layout(struct nb_wl *w);
+static int  bd_index(const struct nb_wl *w, const struct wl_surface *s);
+/* Forward: presentation feedback is requested by wl_commit, defined below. */
+extern const struct wp_presentation_feedback_listener nb_pres_listener;
 
 /* ── buffers ─────────────────────────────────────────────────────────────── */
 
@@ -286,6 +406,7 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     struct nb_wl *w = s->priv;
     struct nb_wl_buf *sl;
     struct wl_callback *cb;
+    int new_w, new_h;
 
     if (w->pending < 0) {
         return -ENOENT;         /* COMMIT with nothing attached; not fatal */
@@ -302,7 +423,96 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         w->idle_wanted = false;
         w->idle_shown = false;
     }
-    wl_surface_attach(w->surf, sl->buf, 0, 0);
+    w->buf_w = (int)sl->w;
+    w->buf_h = (int)sl->h;
+    /*
+     * With a viewport the surface measures the WINDOW, not the buffer, and the
+     * compositor scales the guest's frame into it.  That is what makes the
+     * window resizable without the guest re-moding: dragging a window is a
+     * host gesture and has nothing to say about the resolution the guest chose
+     * to scan out.  Without wp_viewporter the surface is the buffer, as
+     * before, and the window is whatever size the guest picked.
+     */
+    if (w->viewport) {
+        if (w->win_w <= 0 || w->win_h <= 0) {
+            w->win_w = (int)sl->w;
+            w->win_h = (int)sl->h;
+            tb_update(w, w->win_w);
+        }
+        wl_surface_attach(w->surf, sl->buf, 0, 0);
+        /*
+         * SCALING POLICY.  A guest frame stretched to an arbitrary window is
+         * blurry -- it is a bitmap resample, and no compositor makes that
+         * look good.  So:
+         *
+         *   windowed   1:1, pixel-exact.  The window takes the guest's own
+         *              resolution and a drag on the edge snaps back to it.
+         *              Sharp, and honest about the fact that the guest owns
+         *              its resolution.
+         *   fullscreen scaled to fit, aspect preserved.  There is no "snap
+         *              back" available and a small picture centred in a large
+         *              black field is not what fullscreen is for.
+         *
+         * --scale forces scaling always, --no-scale forces 1:1 always.
+         *
+         * THE REAL FIX IS NOT HERE.  It is for the window size to reach the
+         * guest so it re-modes and renders at the right size in the first
+         * place.  That needs GraphicHwOps.ui_info on nvkvm's QemuConsole,
+         * which does not exist yet -- and the guest head's mode list stops at
+         * 1600x900 regardless.  Until both change, this is a choice between
+         * sharp-and-small and full-and-soft.
+         */
+        {
+            bool want = w->scale_mode == 1 ||
+                        (w->scale_mode == 2 && w->fullscreen);
+
+            if (!want) {
+                w->win_w = (int)sl->w;
+                w->win_h = (int)sl->h;
+            } else if (w->win_w > 0 && w->win_h > 0) {
+                long bw = (long)sl->w, bh = (long)sl->h;
+                long fw = (long)w->win_w * bh / bw;
+
+                if (fw <= w->win_h) {           /* fit by height */
+                    w->fit_w = (int)((long)w->win_h * bw / bh);
+                    w->fit_h = w->win_h;
+                } else {                        /* fit by width */
+                    w->fit_w = w->win_w;
+                    w->fit_h = (int)fw;
+                }
+            }
+        }
+        /*
+         * UNSET the destination when it would be 1:1.  A viewport that scales
+         * by exactly one is still a viewport, and a compositor deciding
+         * whether a surface can go straight to a hardware plane is entitled to
+         * refuse anything carrying one.  Since direct scanout is the whole
+         * reason this backend hands the guest's own buffer over untouched,
+         * do not spend it on a no-op scale.
+         */
+        {
+            bool want = w->scale_mode == 1 ||
+                        (w->scale_mode == 2 && w->fullscreen);
+            int dw = want ? w->fit_w : (int)sl->w;
+            int dh = want ? w->fit_h : (int)sl->h;
+
+            if (dw <= 0 || dh <= 0) {
+                dw = (int)sl->w;
+                dh = (int)sl->h;
+            }
+            if (dw == (int)sl->w && dh == (int)sl->h) {
+                wp_viewport_set_destination(w->viewport, -1, -1);
+            } else {
+                wp_viewport_set_destination(w->viewport, dw, dh);
+            }
+            new_w = dw;
+            new_h = dh;
+        }
+    } else {
+        wl_surface_attach(w->surf, sl->buf, 0, 0);
+        new_w = (int)sl->w;
+        new_h = (int)sl->h;
+    }
     wl_surface_damage_buffer(w->surf, 0, 0, (int32_t)sl->w, (int32_t)sl->h);
     /*
      * An opaque region is not cosmetic here: a compositor will not promote a
@@ -315,13 +525,21 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      * creating and destroying a protocol object every frame is traffic
      * for nothing.
      */
-    if ((int)sl->w != w->surf_w || (int)sl->h != w->surf_h) {
+    if (new_w != w->surf_w || new_h != w->surf_h) {
         struct wl_region *opaque = wl_compositor_create_region(w->comp);
 
         if (opaque) {
-            wl_region_add(opaque, 0, 0, (int32_t)sl->w, (int32_t)sl->h);
+            wl_region_add(opaque, 0, 0, new_w, new_h);
             wl_surface_set_opaque_region(w->surf, opaque);
             wl_region_destroy(opaque);
+        }
+    }
+    if (w->presentation) {
+        struct wp_presentation_feedback *fb =
+            wp_presentation_feedback(w->presentation, w->surf);
+
+        if (fb) {
+            wp_presentation_feedback_add_listener(fb, &nb_pres_listener, w);
         }
     }
     if (!w->frame_inflight) {
@@ -335,12 +553,241 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
 
     w->current = w->pending;
     w->pending = -1;
-    if ((int)sl->w != w->surf_w || (int)sl->h != w->surf_h) {
-        w->surf_w = (int)sl->w;
-        w->surf_h = (int)sl->h;
-        nb_sink_surface(sink, sl->w, sl->h);
+    if (new_w != w->surf_w || new_h != w->surf_h) {
+        w->surf_w = new_w;
+        w->surf_h = new_h;
+        nb_sink_surface(sink, (unsigned)new_w, (unsigned)new_h);
     }
     return 0;
+}
+
+/* ── the client-side title bar ───────────────────────────────────────────── */
+/*
+ * GNOME'S MUTTER DOES NOT ADVERTISE zxdg_decoration_manager_v1 AT ALL
+ * (verified on GNOME Shell 50.1, 2026-08-24): server-side decorations are not
+ * something it can be asked for, so a toplevel that draws none arrives bare --
+ * no title bar, no close button, and the --title nobody renders.  On a
+ * compositor that DOES offer the protocol we ask for server-side and use it;
+ * this is the fallback for the one every desktop Linux user is running.
+ *
+ * Placed at y = -NB_TB_H, so the bar sits ABOVE the content rather than on top
+ * of it.  That is not cosmetic: a subsurface overlapping the main surface
+ * occludes it, and an occluded surface cannot be promoted to a hardware plane.
+ * The whole reason this backend hands the guest's buffer over untouched is to
+ * stay a scanout candidate, and decorations must not spend that.
+ */
+         /* drawn characters of --title in the bar */
+
+/* Buttons, counted from the right: 0 = close, 1 = maximize, 2 = minimize.
+ * Returns -1 for "not on a button", i.e. somewhere to drag the window by. */
+static int tb_hit(const struct nb_wl *w, int x)
+{
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        if (x >= w->tb_w - (i + 1) * NB_TB_BTN &&
+            x <  w->tb_w - i * NB_TB_BTN) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void tb_drop(struct nb_wl *w)
+{
+    if (w->tb_buf) {
+        wl_buffer_destroy(w->tb_buf);
+        w->tb_buf = NULL;
+    }
+    if (w->tb_px) {
+        munmap(w->tb_px, w->tb_sz);
+        w->tb_px = NULL;
+        w->tb_sz = 0;
+    }
+    w->tb_w = 0;
+}
+
+static void tb_paint(struct nb_wl *w, int width)
+{
+    uint32_t *px = w->tb_px;
+    const uint32_t bg  = w->grabbed ? 0xff43301aU : 0xff1b2027U;
+    const uint32_t fg  = 0xffe6edf3U;
+    const uint32_t hot = 0xffffb454U;
+    const char *txt;
+    unsigned tw, scale = 2, x;
+
+    if (!px) {
+        return;
+    }
+    nb_placeholder_fill(px, (unsigned)width, NB_TB_H, (unsigned)width, bg);
+    /* one-pixel bottom rule, so the bar reads as chrome and not as content */
+    for (x = 0; x < (unsigned)width; x++) {
+        px[(size_t)(NB_TB_H - 1) * width + x] = 0xff2b3947U;
+    }
+
+    /*
+     * UNDER GRAB THE TITLE IS THE ONLY WAY OUT.  CTRL+ALT+G is the sole
+     * release gesture by design -- every other key is going to the guest -- so
+     * the bar says so, in the accent colour, for as long as the grab is held.
+     */
+    txt = w->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE" : w->title;
+    tw = nb_placeholder_text_w(txt, scale);
+    while (scale > 1 && tw > (unsigned)(width - 3 * NB_TB_BTN - 16)) {
+        scale--;
+        tw = nb_placeholder_text_w(txt, scale);
+    }
+    nb_placeholder_text(px, (unsigned)width, NB_TB_H, (unsigned)width,
+                        10, (NB_TB_H - 7 * scale) / 2, txt, scale,
+                        w->grabbed ? hot : fg);
+
+    /*
+     * Three buttons at the right, in the order every desktop puts them:
+     * minimize, maximize, close.  Drawn as pixels rather than glyphs -- they
+     * are not letters and the 5x7 font has no box-drawing in it.
+     */
+    {
+        int b;
+
+        for (b = 0; b < 3; b++) {
+            int cx = width - (b + 1) * NB_TB_BTN + (NB_TB_BTN - 11) / 2;
+            int cy = (NB_TB_H - 11) / 2;
+            int k;
+
+            if (cx < 0) {
+                continue;
+            }
+            /* Hover feedback.  Without it there is no way to tell a button
+             * from a decoration until you have already clicked it. */
+            if (b == w->tb_press) {
+                int hx0 = width - (b + 1) * NB_TB_BTN;
+                int hy, hx;
+
+                for (hy = 0; hy < NB_TB_H - 1; hy++) {
+                    for (hx = hx0; hx < hx0 + NB_TB_BTN && hx < width; hx++) {
+                        if (hx >= 0) {
+                            px[(size_t)hy * width + hx] =
+                                b == 0 ? 0xffe05a4aU : 0xff7d8c9bU;
+                        }
+                    }
+                }
+            } else if (b == w->tb_hover) {
+                int hx0 = width - (b + 1) * NB_TB_BTN;
+                int hy, hx;
+
+                for (hy = 0; hy < NB_TB_H - 1; hy++) {
+                    for (hx = hx0; hx < hx0 + NB_TB_BTN && hx < width; hx++) {
+                        if (hx >= 0) {
+                            px[(size_t)hy * width + hx] =
+                                b == 0 ? 0xffc0392bU : 0xff53606eU;
+                        }
+                    }
+                }
+            }
+            if (b == 0) {                       /* close: an X */
+                for (k = 0; k < 11; k++) {
+                    px[(size_t)(cy + k) * width + cx + k] = fg;
+                    px[(size_t)(cy + k) * width + cx + 10 - k] = fg;
+                }
+            } else if (b == 1) {                /* maximize: a box */
+                for (k = 0; k < 11; k++) {
+                    px[(size_t)cy * width + cx + k] = fg;
+                    px[(size_t)(cy + 10) * width + cx + k] = fg;
+                    px[(size_t)(cy + k) * width + cx] = fg;
+                    px[(size_t)(cy + k) * width + cx + 10] = fg;
+                }
+            } else {                            /* minimize: a rule */
+                for (k = 0; k < 11; k++) {
+                    px[(size_t)(cy + 9) * width + cx + k] = fg;
+                    px[(size_t)(cy + 10) * width + cx + k] = fg;
+                }
+            }
+        }
+    }
+}
+
+static void tb_update(struct nb_wl *w, int width)
+{
+    struct wl_shm_pool *pool;
+    size_t stride, sz;
+    void *px;
+    int fd;
+
+    if (!w->tb_surf || !w->shm) {
+        return;
+    }
+    /*
+     * NO CHROME IN FULLSCREEN.  Every other application hides its decorations
+     * there and so must this one -- and it is not only cosmetic: fullscreen is
+     * the state in which the content surface can reach a hardware plane, and a
+     * mapped subsurface hanging off it is one more reason for a compositor to
+     * decline.  Attaching a NULL buffer unmaps the bar outright.
+     */
+    if (w->fullscreen) {
+        if (w->tb_mapped) {
+            wl_surface_attach(w->tb_surf, NULL, 0, 0);
+            wl_surface_commit(w->tb_surf);
+            xdg_surface_set_window_geometry(w->xdg_surf, 0, 0,
+                                            w->win_w > 0 ? w->win_w : width,
+                                            w->win_h > 0 ? w->win_h : NB_TB_H);
+            wl_surface_commit(w->surf);
+            wl_display_flush(w->dpy);
+            w->tb_mapped = false;
+        }
+        return;
+    }
+    if (width <= 3 * NB_TB_BTN + 20) {
+        return;
+    }
+    if (width != w->tb_w) {
+        stride = (size_t)width * 4;
+        sz = stride * NB_TB_H;
+        fd = memfd_create("nvkvm-broker-titlebar", MFD_CLOEXEC);
+        if (fd < 0) {
+            return;
+        }
+        if (ftruncate(fd, (off_t)sz) < 0) {
+            close(fd);
+            return;
+        }
+        px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (px == MAP_FAILED) {
+            close(fd);
+            return;
+        }
+        pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+        close(fd);
+        if (!pool) {
+            munmap(px, sz);
+            return;
+        }
+        tb_drop(w);
+        w->tb_buf = wl_shm_pool_create_buffer(pool, 0, width, NB_TB_H,
+                                              (int32_t)stride,
+                                              WL_SHM_FORMAT_XRGB8888);
+        wl_shm_pool_destroy(pool);
+        if (!w->tb_buf) {
+            munmap(px, sz);
+            return;
+        }
+        w->tb_px = px;
+        w->tb_sz = sz;
+        w->tb_w  = width;
+    }
+    tb_paint(w, w->tb_w);
+    if (!w->tb_mapped) {
+        nb_log("title bar: mapped, %dx%d at the top of the window",
+               w->tb_w, NB_TB_H);
+    }
+    w->tb_mapped = true;
+    wl_surface_attach(w->tb_surf, w->tb_buf, 0, 0);
+    wl_surface_damage_buffer(w->tb_surf, 0, 0, w->tb_w, NB_TB_H);
+    wl_surface_commit(w->tb_surf);
+    /* The window is the content PLUS the bar sitting above it. */
+    xdg_surface_set_window_geometry(w->xdg_surf, 0, -NB_TB_H, w->tb_w,
+                                    (w->win_h > 0 ? w->win_h : NB_TB_H)
+                                    + NB_TB_H);
+    wl_surface_commit(w->surf);
+    wl_display_flush(w->dpy);
 }
 
 /* ── the idle placeholder ────────────────────────────────────────────────── */
@@ -425,8 +872,8 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
 static int wl_show_idle(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
-    int wd = w->surf_w > 0 ? w->surf_w : 1280;
-    int ht = w->surf_h > 0 ? w->surf_h : 800;
+    int wd = w->win_w > 0 ? w->win_w : (w->surf_w > 0 ? w->surf_w : 1280);
+    int ht = w->win_h > 0 ? w->win_h : (w->surf_h > 0 ? w->surf_h : 800);
     int r;
 
     w->idle_wanted = true;
@@ -450,6 +897,9 @@ static int wl_show_idle(struct nb_session *s)
         }
     }
     wl_surface_attach(w->surf, w->idle_buf, 0, 0);
+    if (w->viewport) {
+        wp_viewport_set_destination(w->viewport, wd, ht);
+    }
     wl_surface_damage_buffer(w->surf, 0, 0, wd, ht);
     wl_surface_commit(w->surf);
     wl_display_flush(w->dpy);
@@ -535,7 +985,41 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
                       struct wl_surface *s, wl_fixed_t x, wl_fixed_t y)
 {
     struct nb_wl *w = d;
-    (void)p; (void)serial; (void)s; (void)x; (void)y;
+    (void)x; (void)y;
+
+    w->last_serial = serial;
+    /*
+     * The title bar is a surface of ours too, and the pointer entering IT is
+     * not the pointer entering the guest.  Leave the host cursor alone there
+     * (the user is reaching for the close button and needs to see it) and
+     * forward nothing to the guest.
+     */
+    cur_build(w);
+    w->bd_hot = bd_index(w, s);
+    if (w->bd_hot >= 0) {
+        wl_pointer_set_cursor(p, serial, w->cur_surf[nb_bd_cursor[w->bd_hot]],
+                              6, 5);
+        return;
+    }
+    if (s && s == w->tb_surf) {
+        w->ptr_on_tb = true;
+        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        return;
+    }
+    w->ptr_on_tb = false;
+    /*
+     * HIDE THE HOST CURSOR over the guest's picture.  The guest composites its
+     * own cursor into the scanout it hands us (see wl_commit), so leaving the
+     * host one visible draws two, a few pixels apart, and the one that responds
+     * is not the one the user is looking at.
+     *
+     * A NULL surface here is the protocol's "no cursor", and its scope is
+     * exactly right by construction: set_cursor applies while the pointer is
+     * over OUR surface, and the title bar is the compositor's own surface, so
+     * the host cursor comes back on its own the moment the user reaches for
+     * the close button.  Nothing needs to special-case the decorations.
+     */
+    wl_pointer_set_cursor(p, serial, NULL, 0, 0);
     if (w->sink) {
         nb_sink_pointer(w->sink, true);
     }
@@ -544,6 +1028,19 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
                       struct wl_surface *s)
 {
     struct nb_wl *w = d;
+
+    if (bd_index(w, s) >= 0) {
+        w->bd_hot = -1;
+        return;
+    }
+    if (s && s == w->tb_surf) {
+        w->ptr_on_tb = false;
+        if (w->tb_hover != -1) {
+            w->tb_hover = -1;
+            tb_update(w, w->tb_w);
+        }
+        return;
+    }
     (void)p; (void)serial; (void)s;
     if (w->sink) {
         nb_sink_pointer(w->sink, false);
@@ -554,6 +1051,20 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
 {
     struct nb_wl *w = d;
     (void)p; (void)t;
+    if (w->bd_hot >= 0) {
+        return;                 /* chrome, not guest input */
+    }
+    if (w->ptr_on_tb) {
+        int was = w->tb_hover;
+
+        w->tb_px_x = wl_fixed_to_int(x);
+        w->tb_px_y = wl_fixed_to_int(y);
+        w->tb_hover = w->tb_w > 0 ? tb_hit(w, w->tb_px_x) : -1;
+        if (w->tb_hover != was) {
+            tb_update(w, w->tb_w);
+        }
+        return;                 /* chrome, not guest input */
+    }
     if (w->sink) {
         nb_sink_abs(w->sink, wl_fixed_to_int(x), wl_fixed_to_int(y),
                     (unsigned)w->surf_w, (unsigned)w->surf_h);
@@ -563,6 +1074,67 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
                        uint32_t t, uint32_t button, uint32_t state)
 {
     struct nb_wl *w = d;
+
+    w->last_serial = serial;
+    if (w->bd_hot >= 0) {
+        if (state && w->toplevel && w->seat) {
+            xdg_toplevel_resize(w->toplevel, w->seat, serial,
+                                nb_bd_edge[w->bd_hot]);
+            wl_display_flush(w->dpy);
+        }
+        return;
+    }
+    /*
+     * A click on the title bar is a window-management gesture, never guest
+     * input: the close box quits, anything else asks the compositor to move
+     * the window (xdg_toplevel_move is the only way a Wayland client can --
+     * it has no idea where its window is).
+     */
+    if (w->ptr_on_tb) {
+        /*
+         * PRESS ARMS, RELEASE ACTS -- and only if the release is over the
+         * same button.  Acting on press means a mis-click cannot be taken
+         * back, and "close" is not an action anyone should be able to trigger
+         * by accident on a window holding a running VM.  Dragging is the
+         * exception: a window move has to begin on press or there is nothing
+         * to drag.
+         */
+        int hit = w->tb_w > 0 ? tb_hit(w, w->tb_px_x) : -1;
+
+        if (state) {
+            w->tb_press = hit;
+            if (hit < 0 && w->toplevel && w->seat) {
+                xdg_toplevel_move(w->toplevel, w->seat, serial);
+            }
+            tb_update(w, w->tb_w);
+            wl_display_flush(w->dpy);
+            return;
+        }
+        if (w->tb_press >= 0 && hit == w->tb_press) {
+            switch (hit) {
+            case 0:
+                nb_log("title bar: close");
+                w->quit = true;
+                break;
+            case 1:
+                if (w->maximized) {
+                    xdg_toplevel_unset_maximized(w->toplevel);
+                } else {
+                    xdg_toplevel_set_maximized(w->toplevel);
+                }
+                break;
+            case 2:
+                xdg_toplevel_set_minimized(w->toplevel);
+                break;
+            default:
+                break;
+            }
+        }
+        w->tb_press = -1;
+        tb_update(w, w->tb_w);
+        wl_display_flush(w->dpy);
+        return;
+    }
     (void)p; (void)serial; (void)t;
     /* wl_pointer.button carries the evdev BTN_* code directly. */
     if (w->sink) {
@@ -673,6 +1245,8 @@ static void xdg_configure(void *d, struct xdg_surface *s, uint32_t serial)
     /* Do NOT commit a buffer here: the first real content arrives as an
      * ATTACH+COMMIT from the client.  An empty commit is enough to make the
      * surface exist. */
+    tb_update(w, w->win_w > 0 ? w->win_w : w->surf_w);
+    bd_layout(w);
     if (w->idle_wanted && w->current < 0) {
         wl_show_idle(w->sess);
     } else if (w->current < 0) {
@@ -687,9 +1261,83 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
                           int32_t ht, struct wl_array *states)
 {
     struct nb_wl *w = d;
-    (void)t; (void)states;
+    uint32_t *st;
+    bool was_fs = w->fullscreen;
+    (void)t;
 
-    if (wd > 0 && ht > 0 && (wd != w->surf_w || ht != w->surf_h)) {
+    /*
+     * BELIEVE THE COMPOSITOR, not our own request.  Fullscreen and maximized
+     * can both be entered without us asking (a compositor keybinding, a
+     * double-click on the bar we do not draw), and the title bar has to
+     * disappear in fullscreen however it was reached.
+     */
+    w->fullscreen = false;
+    w->maximized = false;
+    if (states) {
+        wl_array_for_each(st, states) {
+            if (*st == XDG_TOPLEVEL_STATE_FULLSCREEN) {
+                w->fullscreen = true;
+            } else if (*st == XDG_TOPLEVEL_STATE_MAXIMIZED) {
+                w->maximized = true;
+            }
+        }
+    }
+    if (was_fs != w->fullscreen) {
+        nb_log("window is %s", w->fullscreen ? "FULLSCREEN (chrome hidden)"
+                                             : "windowed");
+        tb_update(w, w->win_w > 0 ? w->win_w : w->surf_w);
+    }
+    if (wd <= 0 || ht <= 0) {
+        return;                 /* "pick your own size" */
+    }
+    /*
+     * xdg_toplevel.configure reports the size of the WINDOW GEOMETRY, and our
+     * geometry is the content PLUS the title bar (set_window_geometry with
+     * y = -NB_TB_H, height = win_h + NB_TB_H).  So the content is what is
+     * left after taking the bar back off.
+     *
+     * Feeding `ht` straight into win_h -- which is what this did first --
+     * makes the window grow by NB_TB_H on every configure: we ask for
+     * ht + NB_TB_H, the compositor obliges and tells us, we ask for
+     * ht + 2*NB_TB_H, and dragging the width alone was enough to run the
+     * height off the screen.  Observed 2026-08-24.
+     */
+    if (w->tb_mapped) {
+        ht -= NB_TB_H;
+    }
+    if (ht <= 0) {
+        ht = 1;
+    }
+    if (wd == w->win_w && ht == w->win_h) {
+        return;
+    }
+    w->win_w = wd;
+    w->win_h = ht;
+    tb_update(w, wd);
+    bd_layout(w);
+    /*
+     * The user dragged the window.  With a viewport that is purely a host-side
+     * scale: re-present the frame we already hold at the new destination and
+     * tell the client the surface changed size.  It is NOT a request for the
+     * guest to change resolution — the guest owns that, and conflating the two
+     * would make every window drag a mode switch.
+     */
+    if (w->viewport && w->current >= 0 &&
+        (w->scale_mode == 1 || (w->scale_mode == 2 && w->fullscreen))) {
+        if (wd == w->buf_w && ht == w->buf_h) {
+            wp_viewport_set_destination(w->viewport, -1, -1);
+        } else {
+            wp_viewport_set_destination(w->viewport, wd, ht);
+        }
+        wl_surface_damage_buffer(w->surf, 0, 0, w->buf_w, w->buf_h);
+        wl_surface_commit(w->surf);
+        wl_display_flush(w->dpy);
+    }
+    if (w->current < 0 && w->idle_wanted) {
+        wl_show_idle(w->sess);  /* repaint the placeholder at the new size */
+        return;
+    }
+    if (wd != w->surf_w || ht != w->surf_h) {
         w->surf_w = wd;
         w->surf_h = ht;
         if (w->sink) {
@@ -700,6 +1348,348 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
 static void top_close(void *d, struct xdg_toplevel *t) { (void)d; (void)t; }
 static const struct xdg_toplevel_listener top_listener = {
     .configure = top_configure, .close = top_close,
+};
+
+/* ── our own pointer cursor ──────────────────────────────────────────────── */
+/*
+ * A Wayland client owns the cursor image while the pointer is over its
+ * surfaces, and "owns" includes the case where it sets none: the cursor simply
+ * keeps whatever the last client set.  So hiding it over the guest's picture
+ * (which composites its own) means we MUST put it back over our own title bar,
+ * or it stays invisible -- including when the pointer arrives on the bar
+ * directly from outside the window, which never touches the content surface at
+ * all.
+ */
+
+
+static void cur_make(struct nb_wl *w, int slot, const char *const *art,
+                     int aw, int ah, int hx, int hy);
+
+static void cur_build(struct nb_wl *w)
+{
+    /* Plain arrow: 1 = black outline, 2 = white fill, space = transparent. */
+    static const char *const arrow[] = {
+        "1           ", "11          ", "121         ", "1221        ",
+        "12221       ", "122221      ", "1222221     ", "12222221    ",
+        "122222221   ", "1222222221  ", "12222222221 ", "122222111111",
+        "1221221     ", "121 1221    ", "11  1221    ", "1    1221   ",
+        "     1221   ", "      121   ", "      11    ",
+    };
+    /* Double-headed arrows for the resize edges. */
+    static const char *const ew[] = {
+        "   1     1   ", "  11     11  ", " 121     121 ",
+        "12222222222221", "121     121 ", "  11     11  ",
+        "   1     1   ",
+    };
+    static const char *const ns[] = {
+        "   1   ", "  111  ", " 12121 ", "1211121", "  121  ",
+        "  121  ", "  121  ", "  121  ", "1211121", " 12121 ",
+        "  111  ", "   1   ",
+    };
+    static const char *const nwse[] = {
+        "1111111    ", "1222211    ", "122211     ", "1221221    ",
+        "121 1221   ", "11   1221  ", "1     1221 ", "       122211",
+        "        11221", "         1221", "     1111111",
+    };
+    static const char *const nesw[] = {
+        "    1111111", "    1122221", "     112221", "    1221221",
+        "   1221 121", "  1221   11", " 1221     1", "112211      ",
+        "12211       ", "1221        ", "1111111     ",
+    };
+
+    if (w->cur_buf[NB_CUR_ARROW]) {
+        return;
+    }
+    cur_make(w, NB_CUR_ARROW, arrow, 12, 19, 0, 0);
+    cur_make(w, NB_CUR_EW,    ew,   14,  7, 7, 3);
+    cur_make(w, NB_CUR_NS,    ns,    7, 12, 3, 6);
+    cur_make(w, NB_CUR_NWSE,  nwse, 13, 11, 6, 5);
+    cur_make(w, NB_CUR_NESW,  nesw, 11, 11, 5, 5);
+}
+
+/*
+ * One cursor image, drawn rather than loaded.  libwayland-cursor plus an
+ * XCURSOR theme lookup would be a new dependency and a filesystem search, for
+ * five small bitmaps that are only ever seen over this broker's own chrome.
+ */
+static void cur_make(struct nb_wl *w, int slot, const char *const *art,
+                     int aw, int ah, int hx, int hy)
+{
+    struct wl_shm_pool *pool;
+    size_t stride = (size_t)aw * 4, sz = stride * (size_t)ah;
+    uint32_t *px;
+    int fd, x, y;
+
+    (void)hx; (void)hy;
+    if (!w->shm || !w->comp || slot < 0 || slot >= NB_CUR_N) {
+        return;
+    }
+    fd = memfd_create("nvkvm-broker-cursor", MFD_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    if (ftruncate(fd, (off_t)sz) < 0) {
+        close(fd);
+        return;
+    }
+    px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    for (y = 0; y < ah; y++) {
+        int len = (int)strlen(art[y]);
+
+        for (x = 0; x < aw; x++) {
+            char c = x < len ? art[y][x] : ' ';
+
+            px[(size_t)y * aw + x] = c == '1' ? 0xff000000U
+                                   : c == '2' ? 0xffffffffU
+                                   : 0x00000000U;
+        }
+    }
+    pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+    close(fd);
+    if (!pool) {
+        munmap(px, sz);
+        return;
+    }
+    w->cur_buf[slot] = wl_shm_pool_create_buffer(pool, 0, aw, ah,
+                                                 (int32_t)stride,
+                                                 WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    if (!w->cur_buf[slot]) {
+        munmap(px, sz);
+        return;
+    }
+    w->cur_px[slot] = px;
+    w->cur_sz[slot] = sz;
+    w->cur_surf[slot] = wl_compositor_create_surface(w->comp);
+    if (w->cur_surf[slot]) {
+        wl_surface_attach(w->cur_surf[slot], w->cur_buf[slot], 0, 0);
+        wl_surface_damage_buffer(w->cur_surf[slot], 0, 0, aw, ah);
+        wl_surface_commit(w->cur_surf[slot]);
+    }
+}
+
+/* ── resize borders ──────────────────────────────────────────────────────── */
+/*
+ * Eight invisible subsurfaces around the window -- four edges, four corners.
+ * They exist ONLY to receive a pointer: each is a single fully transparent
+ * pixel stretched to its rectangle by a viewport, with an empty opaque region
+ * (so it never occludes anything, and in particular never disqualifies the
+ * content surface from direct scanout) and a full input region.
+ *
+ * A press on one becomes xdg_toplevel_resize(), which is the only way a
+ * Wayland client can be resized by a drag: it does not know where its window
+ * is on screen, so it hands the gesture to the compositor along with the edge
+ * and the compositor does the rest.
+ */
+
+
+static void bd_geometry(const struct nb_wl *w, int i, int *x, int *y,
+                        int *bw, int *bh)
+{
+    int top = -(w->tb_mapped ? NB_TB_H : 0);
+    int ww = w->win_w > 0 ? w->win_w : 1;
+    int wh = (w->win_h > 0 ? w->win_h : 1) - top;
+    const int b = NB_BORDER;
+
+    switch (i) {
+    case 0: *x = 0;   *y = top - b; *bw = ww; *bh = b;  break;   /* top    */
+    case 1: *x = 0;   *y = top + wh; *bw = ww; *bh = b; break;   /* bottom */
+    case 2: *x = -b;  *y = top;     *bw = b;  *bh = wh; break;   /* left   */
+    case 3: *x = ww;  *y = top;     *bw = b;  *bh = wh; break;   /* right  */
+    case 4: *x = -b;  *y = top - b; *bw = b;  *bh = b;  break;
+    case 5: *x = ww;  *y = top - b; *bw = b;  *bh = b;  break;
+    case 6: *x = -b;  *y = top + wh; *bw = b; *bh = b;  break;
+    default:*x = ww;  *y = top + wh; *bw = b; *bh = b;  break;
+    }
+}
+
+static void bd_layout(struct nb_wl *w)
+{
+    int i, x, y, bw, bh;
+
+    if (!w->bd_buf) {
+        return;
+    }
+    /*
+     * UNMAP IN FULLSCREEN, like the title bar.  There is nothing to resize a
+     * fullscreen window by, and -- the reason that matters here -- fullscreen
+     * is the state in which the content surface can reach a hardware plane.
+     * Eight extra mapped subsurfaces hanging off it are eight more reasons
+     * for a compositor to decline, for chrome nobody can use.
+     */
+    if (w->fullscreen) {
+        for (i = 0; i < 8; i++) {
+            if (w->bd_surf[i]) {
+                wl_surface_attach(w->bd_surf[i], NULL, 0, 0);
+                wl_surface_commit(w->bd_surf[i]);
+            }
+        }
+        wl_surface_commit(w->surf);
+        wl_display_flush(w->dpy);
+        return;
+    }
+    for (i = 0; i < 8; i++) {
+        if (!w->bd_surf[i]) {
+            continue;
+        }
+        bd_geometry(w, i, &x, &y, &bw, &bh);
+        if (bw <= 0 || bh <= 0) {
+            continue;
+        }
+        wl_subsurface_set_position(w->bd_sub[i], x, y);
+        if (w->bd_vp[i]) {
+            wp_viewport_set_destination(w->bd_vp[i], bw, bh);
+        }
+        wl_surface_attach(w->bd_surf[i], w->bd_buf, 0, 0);
+        wl_surface_damage_buffer(w->bd_surf[i], 0, 0, 1, 1);
+        wl_surface_commit(w->bd_surf[i]);
+    }
+    wl_surface_commit(w->surf);
+    wl_display_flush(w->dpy);
+}
+
+static void bd_build(struct nb_wl *w)
+{
+    struct wl_shm_pool *pool;
+    uint32_t *px;
+    int fd, i;
+
+    if (w->bd_buf || !w->shm || !w->subcomp || !w->viewporter) {
+        return;
+    }
+    fd = memfd_create("nvkvm-broker-border", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, 4) < 0) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        return;
+    }
+    px = mmap(NULL, 4, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) {
+        close(fd);
+        return;
+    }
+    *px = 0x00000000U;                  /* fully transparent */
+    pool = wl_shm_create_pool(w->shm, fd, 4);
+    close(fd);
+    if (!pool) {
+        munmap(px, 4);
+        return;
+    }
+    w->bd_buf = wl_shm_pool_create_buffer(pool, 0, 1, 1, 4,
+                                          WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    if (!w->bd_buf) {
+        munmap(px, 4);
+        return;
+    }
+    w->bd_px = px;
+    for (i = 0; i < 8; i++) {
+        struct wl_region *none;
+
+        w->bd_surf[i] = wl_compositor_create_surface(w->comp);
+        if (!w->bd_surf[i]) {
+            continue;
+        }
+        w->bd_sub[i] = wl_subcompositor_get_subsurface(w->subcomp,
+                                                       w->bd_surf[i], w->surf);
+        w->bd_vp[i] = wp_viewporter_get_viewport(w->viewporter, w->bd_surf[i]);
+        if (w->bd_sub[i]) {
+            wl_subsurface_place_below(w->bd_sub[i], w->surf);
+            wl_subsurface_set_desync(w->bd_sub[i]);
+        }
+        none = wl_compositor_create_region(w->comp);
+        if (none) {
+            wl_surface_set_opaque_region(w->bd_surf[i], none);
+            wl_region_destroy(none);
+        }
+    }
+    nb_log("resize borders: %d px of grabbable edge around the window",
+           NB_BORDER);
+}
+
+static int bd_index(const struct nb_wl *w, const struct wl_surface *s)
+{
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if (w->bd_surf[i] == s) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* ── presentation feedback: FLIP or COPY ─────────────────────────────────── */
+static void pres_discarded(void *d, struct wp_presentation_feedback *f)
+{
+    (void)d;
+    wp_presentation_feedback_destroy(f);
+}
+static void pres_sync_output(void *d, struct wp_presentation_feedback *f,
+                             struct wl_output *o)
+{ (void)d; (void)f; (void)o; }
+static void pres_presented(void *d, struct wp_presentation_feedback *f,
+                           uint32_t tv_sec_hi, uint32_t tv_sec_lo,
+                           uint32_t tv_nsec, uint32_t refresh,
+                           uint32_t sh, uint32_t sl, uint32_t flags)
+{
+    struct nb_wl *w = d;
+    int zc = (flags & WP_PRESENTATION_FEEDBACK_KIND_ZERO_COPY) ? 1 : 0;
+
+    (void)tv_sec_hi; (void)tv_sec_lo; (void)tv_nsec; (void)sh; (void)sl;
+    wp_presentation_feedback_destroy(f);
+    if (zc != w->last_scanout) {
+        w->last_scanout = zc;
+        /*
+         * Deliberately worded like the X11 backend's line, because it is the
+         * same fact: FLIP means the guest's own buffer is on a hardware plane
+         * and nothing copied it.
+         */
+        nb_log("Present: %s%s  (refresh %u.%03u ms)",
+               zc ? "FLIP" : "COPY",
+               zc ? " - the guest's buffer is scanned out directly"
+                  : " - the compositor is compositing it",
+               refresh / 1000000, (refresh % 1000000) / 1000);
+    }
+}
+const struct wp_presentation_feedback_listener nb_pres_listener = {
+    .sync_output = pres_sync_output,
+    .presented   = pres_presented,
+    .discarded   = pres_discarded,
+};
+
+/* ── decorations ─────────────────────────────────────────────────────────── */
+/*
+ * A Wayland toplevel has no chrome unless somebody draws it.  With neither
+ * client-side decorations nor a server-side request the window arrives bare:
+ * no title bar, no close button, nothing to drag a corner by — and the title
+ * we set is never rendered anywhere, so --title looks broken.  We ask the
+ * compositor to decorate, and we BELIEVE ITS ANSWER rather than the request:
+ * a compositor is allowed to reply client-side, and then a chrome-less window
+ * is what the user gets and they should be told why.
+ */
+static void deco_configure(void *d, struct zxdg_toplevel_decoration_v1 *dec,
+                           uint32_t mode)
+{
+    struct nb_wl *w = d;
+    (void)dec;
+
+    if (mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE) {
+        nb_log("window decorations: server-side (title bar, close, resize)");
+    } else {
+        nb_log("window decorations: the compositor insists on CLIENT-side, "
+               "and this broker draws none — expect a bare window with no "
+               "title bar and no resize grips.");
+    }
+    w->deco_mode = mode;
+}
+static const struct zxdg_toplevel_decoration_v1_listener deco_listener = {
+    .configure = deco_configure,
 };
 
 /* ── registry ────────────────────────────────────────────────────────────── */
@@ -715,6 +1705,14 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
     } else if (!strcmp(iface, wl_seat_interface.name) && !w->seat) {
         w->seat = BIND(wl_seat_interface, 5);
         wl_seat_add_listener(w->seat, &seat_listener, w);
+    } else if (!strcmp(iface, zxdg_decoration_manager_v1_interface.name)) {
+        w->deco_mgr = BIND(zxdg_decoration_manager_v1_interface, 1);
+    } else if (!strcmp(iface, wl_subcompositor_interface.name)) {
+        w->subcomp = BIND(wl_subcompositor_interface, 1);
+    } else if (!strcmp(iface, wp_presentation_interface.name)) {
+        w->presentation = BIND(wp_presentation_interface, 1);
+    } else if (!strcmp(iface, wp_viewporter_interface.name)) {
+        w->viewporter = BIND(wp_viewporter_interface, 1);
     } else if (!strcmp(iface, wl_shm_interface.name) && !w->shm) {
         w->shm = BIND(wl_shm_interface, 1);
     } else if (!strcmp(iface, xdg_wm_base_interface.name)) {
@@ -814,8 +1812,50 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
     if (wl_display_dispatch_pending(w->dpy) < 0) {
         return -EIO;
     }
+    if (w->quit) {
+        /* The close box.  Same shape as the display going away: main() says
+         * goodbye to the client and tears the session down. */
+        return -ECONNRESET;
+    }
     return 0;
 }
+
+/*
+ * The compositor answers a grab request with events, not with a return code,
+ * and nothing here used to listen for them.  A capability that advertises
+ * true and then silently declines is exactly the failure this project keeps
+ * finding, so both objects are now listened to and every transition is
+ * logged: what was requested, and what the compositor actually did with it.
+ */
+static void inhibitor_active(void *d, struct zwp_keyboard_shortcuts_inhibitor_v1 *i)
+{
+    (void)d; (void)i;
+    nb_log("grab: shortcuts inhibitor ACTIVE — compositor bindings "
+           "(Super, Alt+Tab, ...) now reach the guest");
+}
+static void inhibitor_inactive(void *d, struct zwp_keyboard_shortcuts_inhibitor_v1 *i)
+{
+    (void)d; (void)i;
+    nb_log("grab: shortcuts inhibitor INACTIVE — the compositor keeps its own "
+           "bindings; they will NOT reach the guest");
+}
+static const struct zwp_keyboard_shortcuts_inhibitor_v1_listener inhibitor_listener = {
+    .active = inhibitor_active, .inactive = inhibitor_inactive,
+};
+
+static void lockptr_locked(void *d, struct zwp_locked_pointer_v1 *l)
+{
+    (void)d; (void)l;
+    nb_log("grab: pointer LOCKED to the window");
+}
+static void lockptr_unlocked(void *d, struct zwp_locked_pointer_v1 *l)
+{
+    (void)d; (void)l;
+    nb_log("grab: pointer lock RELEASED by the compositor");
+}
+static const struct zwp_locked_pointer_v1_listener lockptr_listener = {
+    .locked = lockptr_locked, .unlocked = lockptr_unlocked,
+};
 
 static int wl_set_grab(struct nb_session *s, bool on)
 {
@@ -824,16 +1864,32 @@ static int wl_set_grab(struct nb_session *s, bool on)
     if (w->grabbed == on) {
         return 0;
     }
+    nb_log("grab %s: requesting%s%s%s", on ? "ON" : "off",
+           w->inhibit_mgr ? " shortcuts-inhibit" : " (no shortcuts-inhibit)",
+           w->constraints  ? " pointer-lock"     : " (no pointer-lock)",
+           w->relptr_mgr   ? " relative-pointer" : " (no relative-pointer)");
     if (on) {
+        if (!w->ptr) {
+            nb_log("grab: no wl_pointer on this seat — neither the pointer "
+                   "lock nor relative motion can be requested at all");
+        }
         if (w->inhibit_mgr && !w->inhibitor) {
             w->inhibitor =
                 zwp_keyboard_shortcuts_inhibit_manager_v1_inhibit_shortcuts(
                     w->inhibit_mgr, w->surf, w->seat);
+            if (w->inhibitor) {
+                zwp_keyboard_shortcuts_inhibitor_v1_add_listener(
+                    w->inhibitor, &inhibitor_listener, w);
+            }
         }
         if (w->constraints && w->ptr && !w->lock) {
             w->lock = zwp_pointer_constraints_v1_lock_pointer(
                 w->constraints, w->surf, w->ptr, NULL,
                 ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+            if (w->lock) {
+                zwp_locked_pointer_v1_add_listener(w->lock, &lockptr_listener,
+                                                   w);
+            }
         }
         if (w->relptr_mgr && w->ptr && !w->relptr) {
             w->relptr = zwp_relative_pointer_manager_v1_get_relative_pointer(
@@ -856,6 +1912,16 @@ static int wl_set_grab(struct nb_session *s, bool on)
         }
     }
     w->grabbed = on;
+    /* The bar is the only thing on screen that can say how to get out. */
+    tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
+    /*
+     * Flush NOW.  Everything above is a queued request, and the only other
+     * flush in this backend is the POLLOUT path, which does not run until the
+     * compositor socket has something to say.  Without this the grab is issued
+     * on the wire whenever the next frame happens to flush — which on an idle
+     * guest is "eventually", and looks exactly like a grab that does nothing.
+     */
+    wl_display_flush(w->dpy);
     return 0;
 }
 
@@ -894,6 +1960,53 @@ static void wl_close_session(struct nb_session *s)
         wl_buf_destroy(w, i);
     }
     wl_idle_drop(w);
+    tb_drop(w);
+    for (i = 0; i < NB_CUR_N; i++) {
+        if (w->cur_buf[i]) {
+            wl_buffer_destroy(w->cur_buf[i]);
+        }
+        if (w->cur_px[i]) {
+            munmap(w->cur_px[i], w->cur_sz[i]);
+        }
+        if (w->cur_surf[i]) {
+            wl_surface_destroy(w->cur_surf[i]);
+        }
+    }
+    for (i = 0; i < 8; i++) {
+        if (w->bd_vp[i]) {
+            wp_viewport_destroy(w->bd_vp[i]);
+        }
+        if (w->bd_sub[i]) {
+            wl_subsurface_destroy(w->bd_sub[i]);
+        }
+        if (w->bd_surf[i]) {
+            wl_surface_destroy(w->bd_surf[i]);
+        }
+    }
+    if (w->bd_buf) {
+        wl_buffer_destroy(w->bd_buf);
+        w->bd_buf = NULL;
+    }
+    if (w->bd_px) {
+        munmap(w->bd_px, 4);
+        w->bd_px = NULL;
+    }
+    if (w->tb_sub) {
+        wl_subsurface_destroy(w->tb_sub);
+        w->tb_sub = NULL;
+    }
+    if (w->tb_surf) {
+        wl_surface_destroy(w->tb_surf);
+        w->tb_surf = NULL;
+    }
+    if (w->viewport) {
+        wp_viewport_destroy(w->viewport);
+        w->viewport = NULL;
+    }
+    if (w->deco) {
+        zxdg_toplevel_decoration_v1_destroy(w->deco);
+        w->deco = NULL;
+    }
     if (w->dpy) {
         wl_display_flush(w->dpy);
         wl_display_disconnect(w->dpy);
@@ -913,6 +2026,14 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     w->surf_h = (int)cfg->win_h;
     w->pending = -1;
     w->current = -1;
+    w->last_scanout = -1;
+    /* 0 is a valid button index, so "none" has to be spelled -1 explicitly:
+     * a calloc'd struct would otherwise open with the close button drawn as
+     * hovered AND held. */
+    w->tb_hover = -1;
+    w->tb_press = -1;
+    w->bd_hot = -1;
+    w->scale_mode = cfg->scale_mode;
 
     w->dpy = wl_display_connect(NULL);
     if (!w->dpy) {
@@ -968,8 +2089,97 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     xdg_toplevel_add_listener(w->toplevel, &top_listener, w);
     xdg_toplevel_set_title(w->toplevel, cfg->title);
     xdg_toplevel_set_app_id(w->toplevel, "nvkvm-display-broker");
+    if (w->deco_mgr) {
+        w->deco = zxdg_decoration_manager_v1_get_toplevel_decoration(
+            w->deco_mgr, w->toplevel);
+        if (w->deco) {
+            zxdg_toplevel_decoration_v1_add_listener(w->deco, &deco_listener,
+                                                     w);
+            zxdg_toplevel_decoration_v1_set_mode(
+                w->deco, ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        }
+    } else {
+        nb_log("no zxdg_decoration_manager_v1: the window will have no title "
+               "bar, no close button and no resize grips, and --title will "
+               "render nowhere.  That is the compositor's choice, not a bug "
+               "here.");
+    }
+    /*
+     * --title is the base title, and it is the user's to choose.  Clamped to
+     * NB_TITLE_MAX drawn characters: the bar has three buttons on the right
+     * and a fixed-width font, and a title long enough to run under them is
+     * worse than a truncated one.
+     */
+    {
+        const char *t = cfg->title && *cfg->title ? cfg->title : "nvkvm";
+
+        if (strlen(t) > NB_TITLE_MAX) {
+            snprintf(w->title, sizeof(w->title), "%.*s...",
+                     (int)NB_TITLE_MAX - 3, t);
+            nb_log("--title truncated to %zu characters: \"%s\"",
+                   NB_TITLE_MAX, w->title);
+        } else {
+            snprintf(w->title, sizeof(w->title), "%s", t);
+        }
+    }
+    /*
+     * Draw our own title bar when -- and only when -- the compositor will not.
+     * Mutter does not implement zxdg_decoration_manager_v1 (GNOME Shell 50.1,
+     * verified 2026-08-24), so on GNOME this is the only way the window gets a
+     * title, buttons, or anything to drag it by.
+     */
+    if (!w->deco_mgr && w->subcomp && w->shm) {
+        w->tb_surf = wl_compositor_create_surface(w->comp);
+        if (w->tb_surf) {
+            struct wl_region *op = wl_compositor_create_region(w->comp);
+
+            w->tb_sub = wl_subcompositor_get_subsurface(w->subcomp,
+                                                        w->tb_surf, w->surf);
+            if (w->tb_sub) {
+                /*
+                 * ABOVE the content, at negative y, NOT overlapping it.  The
+                 * guest's picture stays whole -- the window is simply
+                 * NB_TB_H taller than the guest's resolution, which is what
+                 * a title bar is -- and, because nothing occludes the content
+                 * surface, it remains a direct-scanout candidate even while
+                 * windowed.  An overlay bar would forfeit that for chrome.
+                 */
+                wl_subsurface_set_position(w->tb_sub, 0, -NB_TB_H);
+                wl_subsurface_place_above(w->tb_sub, w->surf);
+                wl_subsurface_set_desync(w->tb_sub);
+                nb_log("drawing a client-side title bar (%d px): this "
+                       "compositor offers no server-side decorations",
+                       NB_TB_H);
+            }
+            if (op) {
+                wl_region_add(op, 0, 0, 1 << 20, NB_TB_H);
+                wl_surface_set_opaque_region(w->tb_surf, op);
+                wl_region_destroy(op);
+            }
+        }
+    }
+    bd_build(w);
+    if (cfg->fullscreen) {
+        /*
+         * Asking at startup, before the first configure, is the only way to
+         * get a fullscreen window without a keystroke -- which is what makes
+         * the direct-scanout question measurable from a script instead of
+         * from somebody's fingers.
+         */
+        xdg_toplevel_set_fullscreen(w->toplevel, NULL);
+        w->fullscreen = true;
+        nb_log("starting fullscreen (--fullscreen)");
+    }
+    if (w->viewporter) {
+        w->viewport = wp_viewporter_get_viewport(w->viewporter, w->surf);
+    } else {
+        nb_log("no wp_viewporter: the window is fixed at the guest's own "
+               "resolution and cannot be resized independently of it");
+    }
+    w->win_w = w->surf_w;
+    w->win_h = w->surf_h;
     wl_surface_commit(w->surf);
-    wl_display_roundtrip(w->dpy);
+    wl_display_roundtrip(w->dpy);   /* configure, and the decoration mode */
 
     s->width = (uint32_t)w->surf_w;
     s->height = (uint32_t)w->surf_h;

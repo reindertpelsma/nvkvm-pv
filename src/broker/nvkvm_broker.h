@@ -64,6 +64,13 @@ struct nb_config {
     int    n_allow_uid;
     gid_t  allow_gid[NB_MAX_ALLOW_IDS];
     int    n_allow_gid;
+    /* Start the window fullscreen, rather than waiting for CTRL+ALT+F.
+     * Direct scanout is only possible fullscreen, so a measurement of it
+     * should not depend on somebody pressing a key. */
+    bool fullscreen;
+    /* 0 = never scale the guest frame, 1 = always scale it to the window,
+     * 2 = auto: 1:1 windowed, scaled to fit in fullscreen.  Default 2. */
+    int  scale_mode;
 };
 
 /* ── a validated buffer description ──────────────────────────────────────── */
@@ -257,5 +264,12 @@ void nb_formats_log(const struct nb_formats *f, const char *what);
 void nb_placeholder_paint(uint32_t *px, unsigned w, unsigned h,
                           unsigned stride_px, const char *line1,
                           const char *line2);
+/* The same 5x7 font, for the client-side title bar.  Uppercase-only. */
+unsigned nb_placeholder_text_w(const char *s, unsigned scale);
+void nb_placeholder_fill(uint32_t *px, unsigned w, unsigned h,
+                         unsigned stride_px, uint32_t argb);
+void nb_placeholder_text(uint32_t *px, unsigned w, unsigned h,
+                         unsigned stride_px, unsigned x, unsigned y,
+                         const char *s, unsigned scale, uint32_t argb);
 
 #endif /* NVKVM_BROKER_H */

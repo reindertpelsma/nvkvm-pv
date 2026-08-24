@@ -28,6 +28,7 @@
 #define GH 7                    /* glyph height, px */
 
 /* Rows top to bottom, five columns each, concatenated. '#' is ink. */
+static const char *nb_glyph(char c);
 static const char *nb_glyph(char c)
 {
     switch (c) {
@@ -72,7 +73,11 @@ static const char *nb_glyph(char c)
     case ':': return "....." ".##.." ".##.." "....." ".##.." ".##.." ".....";
     case '/': return "....#" "....#" "...#." "..#.." ".#..." "#...." "#....";
     case '_': return "....." "....." "....." "....." "....." "....." "#####";
-    default:  return NULL;      /* space, and anything we have no glyph for */
+    default:
+        if (c >= 'a' && c <= 'z') {
+            return nb_glyph((char)(c - 'a' + 'A'));
+        }
+        return NULL;            /* space, and anything we have no glyph for */
     }
 }
 
@@ -191,4 +196,35 @@ void nb_placeholder_paint(uint32_t *px, unsigned w, unsigned h,
         draw_text(px, w, h, stride_px, w > tw ? (w - tw) / 2 : 0,
                   y1 + GH * s1 + 6 * s2, line2, s2, ink2);
     }
+}
+
+
+/* ── the same font, for anyone else who needs one line of text ──────────── */
+/*
+ * The title bar (nb_session_wl.c) needs exactly what this file already has: a
+ * fill, a text width and a text blit, with no font library anywhere near the
+ * broker.  Exported rather than duplicated.
+ */
+unsigned nb_placeholder_text_w(const char *s, unsigned scale)
+{
+    return text_w(s, scale);
+}
+
+void nb_placeholder_fill(uint32_t *px, unsigned w, unsigned h,
+                         unsigned stride_px, uint32_t argb)
+{
+    unsigned x, y;
+
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            px[(size_t)y * stride_px + x] = argb;
+        }
+    }
+}
+
+void nb_placeholder_text(uint32_t *px, unsigned w, unsigned h,
+                         unsigned stride_px, unsigned x, unsigned y,
+                         const char *s, unsigned scale, uint32_t argb)
+{
+    draw_text(px, w, h, stride_px, x, y, s, scale, argb);
 }

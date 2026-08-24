@@ -1209,6 +1209,7 @@ int main(int argc, char **argv)
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.backend = "auto";
+    cfg.scale_mode = 2;   /* 1:1 windowed, fit in fullscreen */
     cfg.title = "nvkvm";
     cfg.win_w = 1920;
     cfg.win_h = 1080;
@@ -1243,6 +1244,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--allow-group")) { NEEDVAL();
             if (add_group(&cfg, v)) { return 2; } }
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
+        else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
+        else if (!strcmp(a, "--scale")) { cfg.scale_mode = 1; }
+        else if (!strcmp(a, "--no-scale")) { cfg.scale_mode = 0; }
         else if (!strcmp(a, "-h") || !strcmp(a, "--help")) { usage(); return 0; }
         else { nb_err("unknown argument: %s", a); usage(); return 2; }
 #undef NEEDVAL
