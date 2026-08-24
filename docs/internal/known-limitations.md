@@ -910,6 +910,49 @@ currently allow.
 >
 > Full measurements and the option analysis: [UVM VA decoupling](uvm-va-decoupling.md).
 
+### Managed memory is pinned, non-migrating, and cannot oversubscribe
+
+The fallback backs a managed range with guest RAM the guest module allocates,
+and publishes those same physical pages to the GPU as a UVM **external** range.
+That makes `cudaMallocManaged` correct and coherent — one set of pages, seen by
+the guest CPU, by QEMU and by the GPU — but it is **not** unified memory, and
+the differences are user-visible:
+
+- **No migration.** Pages never move to VRAM. Every GPU access crosses PCIe.
+  For a GPU-heavy kernel over a large managed buffer this is the difference
+  between VRAM bandwidth and host bandwidth, and it is the first thing to
+  suspect if a `cudaMallocManaged` workload is inexplicably slow here. Real UVM
+  would migrate on fault; `UVM_MIGRATE` fails on an external range
+  (`NV_ERR_INVALID_ADDRESS`, `uvm_migrate.c:1159-1163`).
+- **No oversubscription.** Real UVM lets a managed allocation exceed VRAM and
+  pages it in and out. The fallback cannot: the allocation is guest RAM, bounded
+  by guest RAM, and there is no eviction path. An application sized to rely on
+  oversubscribing VRAM will fail to allocate rather than run slowly.
+- **`cudaMemAdvise` returns `invalid argument`.** `SET_PREFERRED_LOCATION`,
+  `SET_ACCESSED_BY` and read-duplication are all managed-only
+  (`uvm_policy.c:429`). Measured: the failures are visible to the application
+  and do not affect correctness — an app that ignores the return value still
+  gets correct data. Visible beats silent, but code that checks these calls will
+  see them fail.
+- **`cudaMemPrefetchAsync`** returns success and does nothing.
+- **The pages are pinned.** The guest module holds them with `alloc_pages()` and
+  the host pins the matching HVA range via the RM OS-descriptor
+  (`pin_user_pages()`). That is in tension with **ballooning** and with **live
+  migration** of the VM: those pages cannot be reclaimed or moved for as long as
+  the managed allocation lives. nvkvm does not support live migration anyway,
+  but the balloon interaction is real and is why a large managed footprint
+  should be treated as a hard reservation of guest RAM.
+- **One contiguous block per allocation.** QEMU turns one GPA into one host VA
+  range for the descriptor, so the backing must be physically contiguous. The
+  guest module allocates it with `alloc_pages()`, and anything the buddy
+  allocator cannot satisfy in a single block above `MAX_PAGE_ORDER` is refused
+  rather than silently split — `cuMemAllocManaged` fails instead of returning
+  memory the GPU cannot address.
+
+`cuda_micro` case 6 is named `uvm_migrate` and measures a GPU↔CPU cycle. It
+still passes, but under the fallback there is no migration happening, so the
+number it reports stops meaning what its name says.
+
 ### Reserving the UVM sub-window costs the sparse window 16 GiB
 
 The per-mmap UVM memslots need GPAs the big sparse memslot does not cover, so
@@ -1334,6 +1377,34 @@ passes its own guest VA, so the lookup always returns
 `NV_ERR_OBJECT_NOT_FOUND`. The guest saves the caller's values and fakes success
 on the response path (`src/guest/nvkvm_main.c:1305-1339`). The mapping still
 works — it is installed through the GPA window, not through that kernel record.
+
+### `UVM_DISABLE_READ_DUPLICATION` is answered locally on fallback ranges
+
+`libcuda` issues cmd 45 on a freshly created managed range, **inside**
+`cuMemAllocManaged`, and treats its failure as fatal to the allocation.
+Measured on an RTX 4060 / 580.95.05 by injecting `NV_ERR_INVALID_ADDRESS` into
+one command at a time: 45 alone turns `cuMemAllocManaged` into
+`CUDA_ERROR_INVALID_VALUE` with a NULL pointer, while the same injection into
+51 / 42 / 43 / 44 / 46 / 47 is tolerated and the data still verifies.
+
+A managed-memory fallback range is an **external** range host-side, and read
+duplication is a managed-only policy — `read_duplication_set()` goes through
+`uvm_api_range_type_check()`, which returns `UVM_API_RANGE_TYPE_INVALID` for a
+non-managed range and hence `NV_ERR_INVALID_ADDRESS`
+(`uvm_policy.c:59-106`, `:877-879`). Forwarding it therefore cannot succeed.
+
+The guest answers it instead (`src/guest/nvkvm_main.c`, before the UVM state
+recording). What the answer asserts is *"read duplication is not enabled on this
+range"*, which for an external range is simply true: there is nothing to
+disable. Two properties keep this honest:
+
+- **It is guest-side.** The guest is untrusted anyway, so an answer it
+  synthesises grants it nothing it did not already have. QEMU fabricating a
+  driver response would be a different thing entirely — a trusted component
+  inventing kernel results — and is deliberately not what happens here.
+- **It is scoped, never blanket.** `nvkvm_mmap_range_is_ext_backed()` requires
+  exact containment in one range *this fd backed itself*. Cmd 45 against any
+  other range is forwarded and fails honestly.
 
 ### `NV0000_CTRL_CMD_GPU_GET_ID_INFO` drops the name
 

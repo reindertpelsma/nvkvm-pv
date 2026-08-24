@@ -1168,6 +1168,52 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	}
 
 	/*
+	 * ── Managed-memory fallback: answer UVM_DISABLE_READ_DUPLICATION ────
+	 *
+	 * libcuda issues cmd 45 on a freshly created managed range, INSIDE
+	 * cuMemAllocManaged, and treats its failure as fatal to the allocation.
+	 * Measured: injecting NV_ERR_INVALID_ADDRESS into 45 alone makes
+	 * cuMemAllocManaged return CUDA_ERROR_INVALID_VALUE with a NULL pointer,
+	 * while the same injection into 51/42/43/44/46/47 is tolerated and the
+	 * data still comes out correct.
+	 *
+	 * A fallback range is an EXTERNAL range host-side, and read duplication
+	 * is a managed-only policy: uvm_api_disable_read_duplication() ->
+	 * read_duplication_set() -> uvm_api_range_type_check(), which returns
+	 * UVM_API_RANGE_TYPE_INVALID for a non-managed range and therefore
+	 * NV_ERR_INVALID_ADDRESS (uvm_policy.c:59-106, :877-879).
+	 *
+	 * So we answer it here instead of forwarding.  What the answer asserts
+	 * is "read duplication is not enabled on this range", and for an
+	 * external range that is simply true -- there is no duplication to
+	 * disable.  This is the same shape as the two existing faked-successful
+	 * ioctls (NV_ESC_RM_UPDATE_DEVICE_MAPPING_INFO / NV_ESC_RM_UNMAP_MEMORY,
+	 * nvkvm_main.c response path), and it lives HERE, in the untrusted
+	 * guest, on purpose: a guest-side answer grants nothing the guest did
+	 * not already have, whereas QEMU fabricating a driver response would be
+	 * a trusted component inventing kernel results.
+	 *
+	 * Scoped, never blanket: only for a range THIS fd backed itself.  Any
+	 * other range is forwarded and fails honestly.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM && cmd == UVM_DISABLE_READ_DUPLICATION &&
+	    params_buf &&
+	    param_size >= sizeof(struct uvm_enable_read_duplication_params)) {
+		struct uvm_enable_read_duplication_params *p = params_buf;
+
+		if (nvkvm_mmap_range_is_ext_backed(ctx, p->requested_base,
+						   p->length)) {
+			long sr = 0;
+			p->rm_status = 0;              /* NV_OK */
+			if (uparams &&
+			    copy_to_user(uparams, params_buf, param_size))
+				sr = -EFAULT;
+			kfree(params_buf);
+			return sr;
+		}
+	}
+
+	/*
 	 * State-machine Steps B+C: record UVM config + state-registration
 	 * cmds into ctx->uvm_state.  ALSO still forward each so the
 	 * kernel side stays functional — recording is additive between

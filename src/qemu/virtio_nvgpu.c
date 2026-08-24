@@ -845,6 +845,14 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_close_handle,
 			    nvkvm_resp_close_handle,
 			    nvkvm_req_close_handle)
+		ISOLATE_REQ(NVKVM_REQ_UVM_EXTERNAL_BACK,
+			    nvkvm_req_uvm_external_back,
+			    nvkvm_resp_uvm_external_back,
+			    nvkvm_req_uvm_external_back)
+		ISOLATE_REQ(NVKVM_REQ_UVM_EXTERNAL_UNBACK,
+			    nvkvm_req_uvm_external_unback,
+			    nvkvm_resp_uvm_external_unback,
+			    nvkvm_req_uvm_external_unback)
 		ISOLATE_REQ(NVKVM_REQ_CREATE_ISOLATE,
 			    nvkvm_req_create_isolate,
 			    nvkvm_resp_create_isolate,
@@ -1118,6 +1126,60 @@ static char *nvkvm_get_isolate_mode_active(Object *obj, Error **errp)
 	VirtIONvgpu *nv = VIRTIO_NVGPU(obj);
 	return g_strdup(nv->isolate_mode_active ? nv->isolate_mode_active
 					        : "unknown");
+}
+
+/*
+ * GPA → host VA, for guest RAM only.
+ *
+ * The managed-memory fallback backs a range with the guest's OWN pages and asks
+ * the GPU to DMA them, so QEMU has to turn a guest-physical base into something
+ * pin_user_pages() can take.  This is the only place nvkvm resolves an
+ * arbitrary GPA, and it is deliberately strict:
+ *
+ *   - the range must resolve to a single MemoryRegion that IS RAM.  MMIO, a
+ *     device BAR, or a hole all fail here rather than being clamped to whatever
+ *     part happened to be valid.
+ *   - the WHOLE length must fit inside that one region, which is also what
+ *     makes the host VA contiguous for `length` -- the property the descriptor
+ *     needs.  A short match is a rejection, not a partial success.
+ *
+ * The guest supplies the GPA, so this is guest-influenced input; what bounds it
+ * is that a GPA can only ever name the guest's own memory.  That is the same
+ * trust class as any virtio descriptor, and unlike a guest-supplied host VA
+ * (U-6/U-15) there is no address here that could name QEMU's own mappings.
+ *
+ * A reference is taken on the region so the mapping cannot be pulled out from
+ * under a live GPU mapping; nvkvm_gpa_range_put() drops it.
+ */
+int nvkvm_gpa_range_get(VirtIONvgpu *nv, uint64_t gpa, uint64_t len,
+			void **hva_out, void **ref_out)
+{
+	MemoryRegionSection sec;
+
+	if (!hva_out || !ref_out || !len)
+		return -EINVAL;
+	if (gpa + len < gpa)                    /* wrap */
+		return -EINVAL;
+
+	sec = memory_region_find(get_system_memory(), (hwaddr)gpa, (uint64_t)len);
+	if (!sec.mr)
+		return -EFAULT;
+	if (!memory_region_is_ram(sec.mr) || memory_region_is_rom(sec.mr) ||
+	    (uint64_t)int128_get64(sec.size) < len) {
+		memory_region_unref(sec.mr);
+		return -EFAULT;
+	}
+
+	*hva_out = (char *)memory_region_get_ram_ptr(sec.mr) +
+		   (size_t)sec.offset_within_region;
+	*ref_out = sec.mr;                      /* reference already held */
+	return 0;
+}
+
+void nvkvm_gpa_range_put(void *ref)
+{
+	if (ref)
+		memory_region_unref((MemoryRegion *)ref);
 }
 
 static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)

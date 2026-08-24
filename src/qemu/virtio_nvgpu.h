@@ -403,6 +403,7 @@ typedef struct VirtIONvgpu {
 	int                 admin_ctl_fd;   /* /dev/nvidiactl (QEMU's process) */
 	int                 admin_gpu_fd;   /* /dev/nvidia0                    */
 	uint32_t            admin_hclient;
+	uint32_t            admin_hdevice;  /* parent for OS-descriptor allocs  */
 	uint32_t            admin_hsubdev;
 	int                 admin_state;    /* 0 untried, 1 ready, -1 failed   */
 
@@ -486,6 +487,15 @@ int nvkvm_req_open_memory_handle(VirtIONvgpu *nv,
 int nvkvm_req_close_handle(VirtIONvgpu *nv,
 			    struct nvkvm_req_close_handle *req,
 			    struct nvkvm_resp_close_handle *resp);
+int nvkvm_req_uvm_external_back(VirtIONvgpu *nv,
+				struct nvkvm_req_uvm_external_back *req,
+				struct nvkvm_resp_uvm_external_back *resp);
+int nvkvm_req_uvm_external_unback(VirtIONvgpu *nv,
+				  struct nvkvm_req_uvm_external_unback *req,
+				  struct nvkvm_resp_uvm_external_unback *resp);
+/* Drop every fallback-backed range this UVM handle owns (its va_space is
+ * going away).  Tears the GPU mapping down before the pages, never after. */
+void nvkvm_uvm_ext_purge_handle(VirtIONvgpu *nv, uint32_t handle_id, int uvm_fd);
 int nvkvm_req_create_isolate(VirtIONvgpu *nv,
 			      struct nvkvm_req_create_isolate *req,
 			      struct nvkvm_resp_create_isolate *resp);
@@ -621,6 +631,15 @@ void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session);
 uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv);
 VirtIONvgpu *nvkvm_get_global_device(void);
 void nvkvm_mmap_win_alloc(VirtIONvgpu *nv, size_t length, uint64_t *gpa_out);
+
+/* GPA → host VA for guest RAM (managed-memory fallback).  Strict: the range
+ * must resolve to ONE MemoryRegion that is RAM and must fit inside it, so a
+ * success also guarantees the host VA is contiguous for `length`.  Takes a
+ * reference on the region; release with nvkvm_gpa_range_put().  Defined in
+ * virtio_nvgpu.c because it needs the real QEMU memory API. */
+int  nvkvm_gpa_range_get(VirtIONvgpu *nv, uint64_t gpa, uint64_t len,
+			 void **hva_out, void **ref_out);
+void nvkvm_gpa_range_put(void *ref);
 
 /*
  * KVM memory-slot pool — one freelist+watermark shared by every code path

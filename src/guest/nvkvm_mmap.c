@@ -269,6 +269,182 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 	return 0;
 }
 
+/*
+ * Does a recorded UVM intent cover exactly this mapping?
+ *
+ * UVM_ALLOC_SEMAPHORE_POOL names its VA in the ioctl and is mmap'd afterwards
+ * at that same VA (uvm.c's va_range_type_expects_mmap() is true for
+ * SEMAPHORE_POOL and DEVICE_P2P, false for MANAGED).  Those mappings must keep
+ * going down the forwarding path -- the range already exists in the host
+ * va_space and the fd it was created on is the live one.
+ *
+ * A managed range has no such ioctl: mmap itself creates it.  So "no matching
+ * intent" is precisely "this is a managed allocation", which is the one case
+ * the fallback handles.
+ */
+static bool nvkvm_uvm_mmap_has_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
+				      unsigned long len)
+{
+	struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+	struct nvkvm_uvm_mapping_intent *m;
+	bool found = false;
+
+	if (!st)
+		return false;
+	mutex_lock(&st->lock);
+	list_for_each_entry(m, &st->intents, list) {
+		if (m->base == gva && m->length == len) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&st->lock);
+	return found;
+}
+
+/*
+ * Managed-memory fallback.
+ *
+ * Do NOT forward this mmap.  UVM's managed range would be created in QEMU's
+ * address space at a VA the guest chose, which is the design that gave us the
+ * U-15 layout oracle and a cross-process collision.  Instead:
+ *
+ *   1. allocate the backing pages HERE, contiguous in guest-physical space
+ *   2. map them into the caller's VMA at the VA libcuda asked for
+ *   3. ask QEMU to publish those same physical pages to the GPU as a UVM
+ *      external range based at that VA
+ *
+ * The result is one set of pages with three views -- guest CPU, host RAM block,
+ * GPU -- rather than a copy.  The guest VA is used as a GPU virtual address in
+ * this process's own RM VA space and never as a host address; QEMU derives
+ * every host address it touches from the GPA below.
+ *
+ * What this is NOT: real unified memory.  There is no migration to VRAM and no
+ * oversubscription -- see docs/internal/known-limitations.md.
+ */
+static int nvkvm_mmap_request_uvm_fallback(struct nvkvm_fd_ctx *ctx,
+					   struct vm_area_struct *vma)
+{
+	unsigned long vma_len = vma->vm_end - vma->vm_start;
+	__u64 gva = vma->vm_start;
+	struct nvkvm_mmap_region *region;
+	struct page *pages;
+	unsigned int order;
+	__u64 gpa;
+	int ret;
+
+	/*
+	 * Contiguity is a requirement, not a hope: QEMU turns one GPA into one
+	 * host VA range for the descriptor, so a scattered allocation could not
+	 * be described.  alloc_pages() gives physical contiguity by
+	 * construction; anything the buddy allocator cannot satisfy in one
+	 * block is refused here rather than silently split.
+	 */
+	order = get_order(vma_len);
+	if (order > MAX_PAGE_ORDER) {
+		pr_warn_ratelimited(
+			"nvkvm: managed alloc of %lu bytes exceeds the largest "
+			"contiguous block this guest can allocate (order %u > %u); "
+			"refusing rather than splitting\n",
+			vma_len, order, (unsigned int)MAX_PAGE_ORDER);
+		return -ENOMEM;
+	}
+
+	pages = alloc_pages(GFP_KERNEL | __GFP_ZERO | __GFP_COMP, order);
+	if (!pages)
+		return -ENOMEM;
+	gpa = (__u64)page_to_phys(pages);
+
+	region = kzalloc(sizeof(*region), GFP_KERNEL);
+	if (!region) {
+		__free_pages(pages, order);
+		return -ENOMEM;
+	}
+
+	/*
+	 * Publish to the GPU BEFORE installing the PTEs.  If the host refuses,
+	 * the caller must not be left holding a mapping the GPU cannot see --
+	 * cuMemAllocManaged failing is recoverable, a pointer that faults on the
+	 * GPU is not.
+	 */
+	{
+		/*
+		 * The GPUs this va_space has registered.  Passing none would be
+		 * refused by the driver (gpuAttributesCount == 0 ->
+		 * NV_ERR_INVALID_ARGUMENT), and passing a GPU that is not
+		 * registered here gives NV_ERR_INVALID_DEVICE -- so the set has
+		 * to come from the state we recorded off UVM_REGISTER_GPU.
+		 */
+		struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+		struct nvkvm_uvm_gpu_reg *g;
+		__u8 uuids[NVKVM_UVM_MAX_REG_GPUS][16];
+		__u32 n = 0;
+
+		if (st) {
+			mutex_lock(&st->lock);
+			list_for_each_entry(g, &st->registered_gpus, list) {
+				if (n >= NVKVM_UVM_MAX_REG_GPUS)
+					break;
+				memcpy(uuids[n], g->gpu_uuid, 16);
+				n++;
+			}
+			mutex_unlock(&st->lock);
+		}
+		if (!n) {
+			pr_warn_ratelimited(
+				"nvkvm: managed alloc at 0x%llx with no GPU "
+				"registered on this UVM fd -- refusing\n",
+				(unsigned long long)gva);
+			kfree(region);
+			__free_pages(pages, order);
+			return -ENODEV;
+		}
+		ret = nvkvm_virtio_uvm_external_back(
+			(unsigned int)ctx->session->id, ctx->handle_id, gva,
+			(__u64)vma_len, gpa, &uuids[0][0], n);
+	}
+	if (ret) {
+		kfree(region);
+		__free_pages(pages, order);
+		return ret;
+	}
+
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	/* Ordinary RAM: write-back, like every other UVM/nvidiactl mapping. */
+	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+
+	ret = remap_pfn_range(vma, vma->vm_start, (unsigned long)(gpa >> PAGE_SHIFT),
+			      vma_len, vma->vm_page_prot);
+	if (ret) {
+		nvkvm_virtio_uvm_external_unback((unsigned int)ctx->session->id,
+						 ctx->handle_id, gva,
+						 (__u64)vma_len);
+		kfree(region);
+		__free_pages(pages, order);
+		return ret;
+	}
+	nvkvm_force_range_wb(vma->vm_mm, vma->vm_start, vma->vm_end);
+
+	region->mmap_token = 0;          /* no isolate mapping to release */
+	region->handle_id  = ctx->handle_id;
+	region->gpa_base   = (unsigned long)gpa;
+	region->length     = vma_len;
+	region->offset     = (__u64)vma->vm_pgoff << PAGE_SHIFT;
+	region->vma        = vma;
+	region->ext_backed = true;
+	region->ext_gva    = gva;
+	region->ext_pages  = pages;
+	region->ext_order  = order;
+
+	spin_lock(&ctx->mmap_lock);
+	list_add_tail(&region->list, &ctx->mmap_regions);
+	spin_unlock(&ctx->mmap_lock);
+
+	vma->vm_ops          = &nvkvm_vm_ops;
+	vma->vm_private_data = region;
+	return 0;
+}
+
 static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
 					  struct vm_area_struct *vma);
 
@@ -293,6 +469,16 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * realize-on-existing-fd refactor lands (the current fresh-fd
 	 * design loses the RM↔UVM bindings the original fd built up). */
 	(void)nvkvm_mmap_request_uvm_realize;
+
+	/*
+	 * A UVM mmap with no matching intent is libcuda creating a MANAGED
+	 * range -- the one thing forwarding cannot do safely.  Everything else
+	 * on this fd (semaphore pools, device-P2P) named its VA in an ioctl
+	 * first and keeps the forwarding path.
+	 */
+	if (ctx->dev_id == NVKVM_DEV_UVM &&
+	    !nvkvm_uvm_mmap_has_intent(ctx, vma->vm_start, vma_len))
+		return nvkvm_mmap_request_uvm_fallback(ctx, vma);
 
 	return nvkvm_mmap_request_isolate(ctx, vma);
 }
@@ -1134,6 +1320,36 @@ void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx)
 		nvkvm_cpu_page_release(cp, isolate_id);
 }
 
+/*
+ * Is [base, base+len) inside a range this fd backed with its own pages?
+ *
+ * Deliberately narrow: exact containment in ONE region, and only regions this
+ * very fd created.  It is the scoping for the cmd-45 answer in
+ * nvkvm_uvm_local_answer(), and a blanket "yes" there would be a lie about
+ * ranges we know nothing about.
+ */
+bool nvkvm_mmap_range_is_ext_backed(struct nvkvm_fd_ctx *ctx, __u64 base,
+				    __u64 len)
+{
+	struct nvkvm_mmap_region *r;
+	bool found = false;
+
+	if (!len || base + len < base)
+		return false;
+	spin_lock(&ctx->mmap_lock);
+	list_for_each_entry(r, &ctx->mmap_regions, list) {
+		if (!r->ext_backed)
+			continue;
+		if (base >= r->ext_gva &&
+		    base + len <= r->ext_gva + (__u64)r->length) {
+			found = true;
+			break;
+		}
+	}
+	spin_unlock(&ctx->mmap_lock);
+	return found;
+}
+
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 {
 	struct nvkvm_mmap_region *region, *tmp;
@@ -1155,7 +1371,20 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 	 * simple_req uses).
 	 */
 	list_for_each_entry_safe(region, tmp, &to_free, list) {
-		if (region->handle_id && isolate_id) {
+		/*
+		 * Fallback-backed ranges: tell the host to drop the GPU mapping
+		 * BEFORE the pages go.  The host tears the external range down
+		 * first and only then releases the descriptor, so at no point is
+		 * there a live GPU mapping over memory we have freed.  The
+		 * __free_pages() below is therefore ordered after this call, not
+		 * merely near it.
+		 */
+		if (region->ext_backed) {
+			nvkvm_virtio_uvm_external_unback(
+				(unsigned int)(ctx->session ? ctx->session->id : 0),
+				region->handle_id, region->ext_gva,
+				(__u64)region->length);
+		} else if (region->handle_id && isolate_id) {
 			struct {
 				struct nvkvm_hdr                   hdr;
 				struct nvkvm_req_munmap_on_isolate req;
@@ -1175,6 +1404,9 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 			}
 		}
 		list_del(&region->list);
+		/* Only now, with the GPU mapping provably gone. */
+		if (region->ext_backed && region->ext_pages)
+			__free_pages(region->ext_pages, region->ext_order);
 		kfree(region);
 	}
 }

@@ -367,6 +367,45 @@ struct nvos32_parameters {
 	__u8       data[144];         /* 40..183  union (AllocSize/Info/...)    */
 };
 
+/*
+ * NVOS32 union arm for function 27 (NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR).
+ *
+ * Overlays nvos32_parameters.data[].  Field order and the two NV_ALIGN_BYTES(8)
+ * members are taken from the driver SDK header (ogkm 580.159.04
+ * src/common/sdk/nvidia/inc/nvos.h:865-876), not transcribed from memory:
+ *
+ *     NvHandle hMemory;  NvU32 type;  NvU32 flags;  NvU32 attr;  NvU32 attr2;
+ *     NvP64 descriptor NV_ALIGN_BYTES(8);  NvU64 limit NV_ALIGN_BYTES(8);
+ *     NvU32 descriptorType;
+ *
+ * The 4-byte hole before `descriptor` is the alignment padding, spelled out
+ * rather than left implicit so the offsets are checkable by eye against the SDK.
+ *
+ * NOTE ON U-3.  This struct exists so QEMU can compose the call ITSELF, over
+ * host pages QEMU owns.  It does NOT relax the guest-facing gate: NVOS32 from
+ * the guest stays default-denied to function 2 (ALLOC_SIZE) in
+ * nvkvm_req_ioctl_on_isolate().  `descriptor` is an address in the CALLER'S
+ * address space handed straight to pin_user_pages(), which is exactly why a
+ * guest must never be able to name it.
+ */
+struct nvos32_alloc_os_desc {
+	nvhandle_t h_memory;         /* 0  [IN/OUT] */
+	__u32      type;             /* 4  [IN]  */
+	__u32      flags;            /* 8  [IN]  */
+	__u32      attr;             /* 12 [IN]  */
+	__u32      attr2;            /* 16 [IN]  */
+	__u32      _pad0;            /* 20       alignment before descriptor */
+	__u64      descriptor;       /* 24 [IN]  NvP64 — host VA            */
+	__u64      limit;            /* 32 [IN]  size - 1                   */
+	__u32      descriptor_type;  /* 40 [IN]  */
+	__u32      _pad1;            /* 44       */
+};
+
+/* NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR (nvos.h:644) and the descriptor-type
+ * selector for a plain virtual address in the caller's address space. */
+#define NVKVM_NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR 27u
+#define NVKVM_NVOS32_DESCRIPTOR_TYPE_VIRTUAL       0u
+
 /* ── NV_ESC_RM_MAP_MEMORY_DMA ────────────────────────────────────────────── */
 
 struct nvos46_parameters {

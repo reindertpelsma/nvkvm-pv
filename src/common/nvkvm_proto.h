@@ -165,6 +165,8 @@ struct nvkvm_shm_ctrl {
 #define NVKVM_REQ_XISO_IMPORT            31  /* #110 cross-isolate dma-buf: broker a bo from
                                               * the owner isolate into the caller's; returns
                                               * the caller-local stub GEM handle            */
+#define NVKVM_REQ_UVM_EXTERNAL_BACK      32  /* back a managed range with guest RAM        */
+#define NVKVM_REQ_UVM_EXTERNAL_UNBACK    33  /* release one, before the pages go away      */
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 
@@ -274,6 +276,58 @@ struct nvkvm_req_open_memory_handle {
 struct nvkvm_resp_open_memory_handle {
 	__le32 handle_id;
 	__le32 status;
+};
+
+#define NVKVM_UVM_MAX_REG_GPUS      16   /* QEMU enforces; below kernel UVM_MAX_GPUS */
+
+/* ── UVM_EXTERNAL_BACK / _UNBACK ─────────────────────────────────────────────
+ *
+ * The managed-memory fallback.  libcuda's mmap of /dev/nvidia-uvm is not
+ * forwarded; the guest module backs the range with its OWN pages and asks QEMU
+ * to publish those same physical pages to the GPU.
+ *
+ * `gva` is the guest's virtual address for the range.  It is used as a **GPU**
+ * virtual address in the guest process's own RM VA space -- never as a host CPU
+ * address.  QEMU derives the host address solely from `gpa_base`, which it
+ * validates against the guest's own RAM before touching.
+ *
+ * `gpa_base` must be contiguous for `length`.  The guest module allocates the
+ * pages, so it can guarantee that; QEMU asserts it rather than trusting it.
+ */
+struct nvkvm_req_uvm_external_back {
+	__le64 gva;         /* the guest VA == the GPU VA to map at        */
+	__le64 length;
+	__le64 gpa_base;    /* guest-physical base of the backing pages    */
+	__le32 handle_id;   /* the UVM handle whose va_space receives it   */
+	__le32 session_id;
+	/*
+	 * The GPUs to map on.  UVM_MAP_EXTERNAL_ALLOCATION refuses
+	 * gpuAttributesCount == 0 outright (NV_ERR_INVALID_ARGUMENT,
+	 * uvm_map_external.c:993-994), so this is not optional -- and the
+	 * UUIDs must be ones registered in THIS va_space or the driver
+	 * answers NV_ERR_INVALID_DEVICE.  The guest already tracks exactly
+	 * that set from the UVM_REGISTER_GPU calls it forwarded, so it
+	 * supplies them rather than QEMU guessing.
+	 */
+	__le32 n_gpus;
+	__u8   gpu_uuid[NVKVM_UVM_MAX_REG_GPUS][16];
+};
+
+struct nvkvm_resp_uvm_external_back {
+	__le32 status;      /* errno-style, 0 on success                   */
+	__le32 nvstatus;    /* NV_STATUS from the driver, 0 on success     */
+};
+
+struct nvkvm_req_uvm_external_unback {
+	__le64 gva;
+	__le64 length;
+	__le32 handle_id;
+	__le32 session_id;
+};
+
+struct nvkvm_resp_uvm_external_unback {
+	__le32 status;
+	__le32 reserved;
 };
 
 /* ── CLOSE_HANDLE ────────────────────────────────────────────────────────── */
@@ -620,7 +674,6 @@ struct nvkvm_resp_munmap {
 #define NVKVM_UVM_REALIZE_MODE_EXTERNAL      2
 #define NVKVM_UVM_REALIZE_MODE_CREATE_RANGE  3
 
-#define NVKVM_UVM_MAX_REG_GPUS      16   /* QEMU enforces; below kernel UVM_MAX_GPUS */
 #define NVKVM_UVM_MAX_VA_SPACES     16
 #define NVKVM_UVM_MAX_RANGE_GROUPS  16
 

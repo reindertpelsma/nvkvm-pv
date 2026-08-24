@@ -124,6 +124,19 @@ struct nvkvm_mmap_region {
 	unsigned long length;
 	__u64    offset;           /* fd offset at which we were mapped     */
 	struct vm_area_struct *vma; /* NULL after munmap                   */
+	/*
+	 * Managed-memory fallback.  Set when this region is NOT a forwarded
+	 * device mapping but guest pages we allocated ourselves and published
+	 * to the GPU as a UVM external range (NVKVM_REQ_UVM_EXTERNAL_BACK).
+	 *
+	 * `ext_pages` is the compound allocation backing it; it must outlive
+	 * the GPU mapping, so it is freed only after the host has unbacked.
+	 */
+	bool           ext_backed;
+	__u64          ext_gva;    /* the GPU VA it was published at; the vma
+				    * may already be gone at teardown time  */
+	struct page   *ext_pages;
+	unsigned int   ext_order;
 };
 
 /*
@@ -459,6 +472,11 @@ void nvkvm_hostfile_exit(void);
 int  nvkvm_hostfile_discover_gpus(void);
 int  nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 				     __u32 *handle_id_out);
+int  nvkvm_virtio_uvm_external_back(unsigned int session_id, __u32 handle_id,
+				    __u64 gva, __u64 length, __u64 gpa_base,
+				    const __u8 *gpu_uuids, __u32 n_gpus);
+int  nvkvm_virtio_uvm_external_unback(unsigned int session_id, __u32 handle_id,
+				      __u64 gva, __u64 length);
 int  nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
 				      int shm_slot, __u32 size);
 int  nvkvm_virtio_read_memory_handle(__u32 handle_id, __u64 offset,
@@ -500,6 +518,8 @@ static inline bool nvkvm_file_is_ours(struct file *f)
 extern const struct vm_operations_struct nvkvm_vm_ops;
 int  nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx);
+bool nvkvm_mmap_range_is_ext_backed(struct nvkvm_fd_ctx *ctx, __u64 base,
+				    __u64 len);
 int  nvkvm_efault_resolve(struct nvkvm_fd_ctx *ctx, __u64 fault_addr);
 void nvkvm_cpu_pages_reap_stale(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_refresh(struct nvkvm_fd_ctx *ctx);

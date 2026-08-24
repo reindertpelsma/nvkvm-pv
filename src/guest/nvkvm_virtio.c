@@ -1424,6 +1424,57 @@ int nvkvm_virtio_open_memory_handle(unsigned int session_id, __u64 size,
 	return ret;
 }
 
+/*
+ * Managed-memory fallback: ask QEMU to publish guest pages we allocated to the
+ * GPU as a UVM external range at `gva`.
+ *
+ * `gva` travels as a GPU virtual address, not a host one -- QEMU derives every
+ * host address it touches from `gpa_base`, which it validates against this VM's
+ * own RAM.  See the U-3 note on nvkvm_req_uvm_external_back().
+ */
+int nvkvm_virtio_uvm_external_back(unsigned int session_id, __u32 handle_id,
+				   __u64 gva, __u64 length, __u64 gpa_base,
+				   const __u8 *gpu_uuids, __u32 n_gpus)
+{
+	struct {
+		struct nvkvm_hdr                        hdr;
+		struct nvkvm_req_uvm_external_back      req;
+	} msg = {};
+	__u64 retval = 0;
+
+	msg.req.gva        = cpu_to_le64(gva);
+	msg.req.length     = cpu_to_le64(length);
+	msg.req.gpa_base   = cpu_to_le64(gpa_base);
+	msg.req.handle_id  = cpu_to_le32(handle_id);
+	msg.req.session_id = cpu_to_le32(session_id);
+	if (n_gpus > NVKVM_UVM_MAX_REG_GPUS)
+		n_gpus = NVKVM_UVM_MAX_REG_GPUS;
+	msg.req.n_gpus = cpu_to_le32(n_gpus);
+	if (gpu_uuids && n_gpus)
+		memcpy(msg.req.gpu_uuid, gpu_uuids, (size_t)n_gpus * 16);
+
+	return simple_req(NVKVM_REQ_UVM_EXTERNAL_BACK, &msg, sizeof(msg),
+			  &retval);
+}
+
+int nvkvm_virtio_uvm_external_unback(unsigned int session_id, __u32 handle_id,
+				     __u64 gva, __u64 length)
+{
+	struct {
+		struct nvkvm_hdr                        hdr;
+		struct nvkvm_req_uvm_external_unback    req;
+	} msg = {};
+	__u64 retval = 0;
+
+	msg.req.gva        = cpu_to_le64(gva);
+	msg.req.length     = cpu_to_le64(length);
+	msg.req.handle_id  = cpu_to_le32(handle_id);
+	msg.req.session_id = cpu_to_le32(session_id);
+
+	return simple_req(NVKVM_REQ_UVM_EXTERNAL_UNBACK, &msg, sizeof(msg),
+			  &retval);
+}
+
 int nvkvm_virtio_write_memory_handle(__u32 handle_id, __u64 offset,
 				     int shm_slot, __u32 size)
 {
