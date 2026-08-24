@@ -416,6 +416,84 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
     }
 }
 
+/*
+ * THE ONE PLACE THE VIEWPORT DESTINATION IS DECIDED.
+ *
+ * It used to be decided in two -- once in wl_commit() for a new frame, once in
+ * top_configure() for a resize -- and the two disagreed in exactly one case,
+ * which is the case a user hits constantly:
+ *
+ *   top_configure() only touched the viewport when SCALING WAS WANTED
+ *   (scale_mode 1, or scale_mode 2 while fullscreen).  Leaving fullscreen
+ *   clears w->fullscreen, so the condition went false and the destination was
+ *   left AT THE FULLSCREEN SIZE.  The frame stayed 3840x2160 while the window
+ *   frame shrank, so the guest's desktop spilled across the whole screen with
+ *   the host visible in a strip down the side.
+ *
+ * Entering and leaving fullscreen are the same operation with different
+ * numbers, so they now run the same code.  A destination that equals the
+ * buffer is UNSET rather than set 1:1, because a viewport scaling by exactly
+ * one is still a viewport and a compositor deciding whether a surface may go
+ * straight to a hardware plane is entitled to refuse anything carrying one.
+ *
+ * Returns the resulting surface size in out_w / out_h.
+ */
+static void wl_viewport_apply(struct nb_wl *w, int bw, int bh,
+                              int *out_w, int *out_h)
+{
+    bool want = w->scale_mode == 1 || (w->scale_mode == 2 && w->fullscreen);
+    int dw, dh;
+
+    if (bw <= 0 || bh <= 0) {
+        bw = w->win_w > 0 ? w->win_w : 1;
+        bh = w->win_h > 0 ? w->win_h : 1;
+    }
+
+    if (!want) {
+        /*
+         * 1:1, pixel-exact.  The window takes the guest's own resolution and a
+         * drag on the edge snaps back to it -- sharp, and honest about the
+         * fact that the guest owns its resolution.  Snapping win_* here is
+         * what makes set_window_geometry (in tb_update) agree with the surface
+         * we are about to commit.
+         */
+        w->win_w = bw;
+        w->win_h = bh;
+        dw = bw;
+        dh = bh;
+    } else if (w->win_w > 0 && w->win_h > 0) {
+        /* Fit to the window, aspect preserved. */
+        long fw = (long)w->win_w * bh / bw;
+
+        if (fw <= w->win_h) {           /* fit by height */
+            dw = (int)((long)w->win_h * bw / bh);
+            dh = w->win_h;
+        } else {                        /* fit by width */
+            dw = w->win_w;
+            dh = (int)fw;
+        }
+    } else {
+        dw = bw;
+        dh = bh;
+    }
+    if (dw <= 0 || dh <= 0) {
+        dw = bw;
+        dh = bh;
+    }
+    w->fit_w = dw;
+    w->fit_h = dh;
+
+    if (w->viewport) {
+        if (dw == bw && dh == bh) {
+            wp_viewport_set_destination(w->viewport, -1, -1);
+        } else {
+            wp_viewport_set_destination(w->viewport, dw, dh);
+        }
+    }
+    *out_w = dw;
+    *out_h = dh;
+}
+
 static int wl_commit(struct nb_session *s, struct nb_sink *sink)
 {
     struct nb_wl *w = s->priv;
@@ -494,73 +572,23 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
         }
         wl_surface_attach(w->surf, sl->buf, 0, 0);
         /*
-         * SCALING POLICY.  A guest frame stretched to an arbitrary window is
-         * blurry -- it is a bitmap resample, and no compositor makes that
-         * look good.  So:
+         * SCALING POLICY, applied by wl_viewport_apply() so that a new frame
+         * and a resize can never disagree about it:
          *
-         *   windowed   1:1, pixel-exact.  The window takes the guest's own
-         *              resolution and a drag on the edge snaps back to it.
-         *              Sharp, and honest about the fact that the guest owns
-         *              its resolution.
-         *   fullscreen scaled to fit, aspect preserved.  There is no "snap
-         *              back" available and a small picture centred in a large
-         *              black field is not what fullscreen is for.
+         *   windowed   1:1, pixel-exact.  Sharp, and the window snaps to the
+         *              guest's own resolution.
+         *   fullscreen scaled to fit, aspect preserved.
          *
          * --scale forces scaling always, --no-scale forces 1:1 always.
          *
          * THE REAL FIX IS NOT HERE.  It is for the window size to reach the
          * guest so it re-modes and renders at the right size in the first
-         * place.  That needs GraphicHwOps.ui_info on nvkvm's QemuConsole,
-         * which does not exist yet -- and the guest head's mode list stops at
-         * 1600x900 regardless.  Until both change, this is a choice between
-         * sharp-and-small and full-and-soft.
+         * place -- which is now wired: GraphicHwOps.ui_info on nvkvm's
+         * QemuConsole carries EV_SURFACE down to the guest head, and the head
+         * offers the host's size as its preferred mode.  This remains the
+         * fallback for a guest that declines to re-mode.
          */
-        {
-            bool want = w->scale_mode == 1 ||
-                        (w->scale_mode == 2 && w->fullscreen);
-
-            if (!want) {
-                w->win_w = (int)sl->w;
-                w->win_h = (int)sl->h;
-            } else if (w->win_w > 0 && w->win_h > 0) {
-                long bw = (long)sl->w, bh = (long)sl->h;
-                long fw = (long)w->win_w * bh / bw;
-
-                if (fw <= w->win_h) {           /* fit by height */
-                    w->fit_w = (int)((long)w->win_h * bw / bh);
-                    w->fit_h = w->win_h;
-                } else {                        /* fit by width */
-                    w->fit_w = w->win_w;
-                    w->fit_h = (int)fw;
-                }
-            }
-        }
-        /*
-         * UNSET the destination when it would be 1:1.  A viewport that scales
-         * by exactly one is still a viewport, and a compositor deciding
-         * whether a surface can go straight to a hardware plane is entitled to
-         * refuse anything carrying one.  Since direct scanout is the whole
-         * reason this backend hands the guest's own buffer over untouched,
-         * do not spend it on a no-op scale.
-         */
-        {
-            bool want = w->scale_mode == 1 ||
-                        (w->scale_mode == 2 && w->fullscreen);
-            int dw = want ? w->fit_w : (int)sl->w;
-            int dh = want ? w->fit_h : (int)sl->h;
-
-            if (dw <= 0 || dh <= 0) {
-                dw = (int)sl->w;
-                dh = (int)sl->h;
-            }
-            if (dw == (int)sl->w && dh == (int)sl->h) {
-                wp_viewport_set_destination(w->viewport, -1, -1);
-            } else {
-                wp_viewport_set_destination(w->viewport, dw, dh);
-            }
-            new_w = dw;
-            new_h = dh;
-        }
+        wl_viewport_apply(w, (int)sl->w, (int)sl->h, &new_w, &new_h);
     } else {
         wl_surface_attach(w->surf, sl->buf, 0, 0);
         new_w = (int)sl->w;
@@ -1168,8 +1196,16 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
         if (w->tb_press >= 0 && hit == w->tb_press) {
             switch (hit) {
             case 0:
+                /*
+                 * Report it and keep running.  The VMM owns the policy -- it
+                 * is the only party that knows there is a guest here and what
+                 * closing its display should do to it.  If nobody is connected
+                 * there is no policy to defer to, so we simply quit.
+                 */
                 nb_log("title bar: close");
-                w->quit = true;
+                if (!nb_sink_close_request(w->sink)) {
+                    w->quit = true;
+                }
                 break;
             case 1:
                 if (w->maximized) {
@@ -1363,31 +1399,46 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
     if (ht <= 0) {
         ht = 1;
     }
-    if (wd == w->win_w && ht == w->win_h) {
+    /*
+     * A configure that changes nothing is worth skipping -- but ONLY if the
+     * fullscreen state did not change too.  Leaving fullscreen back onto a
+     * window that already happened to be this size still has to re-run the
+     * geometry below, because the scaling policy is keyed on `fullscreen`, not
+     * on the size.  Returning here on that edge is how the stale-viewport bug
+     * would survive the fix for it.
+     */
+    if (wd == w->win_w && ht == w->win_h && was_fs == w->fullscreen) {
         return;
     }
     w->win_w = wd;
     w->win_h = ht;
-    tb_update(w, wd);
-    bd_layout(w);
     /*
-     * The user dragged the window.  With a viewport that is purely a host-side
-     * scale: re-present the frame we already hold at the new destination and
-     * tell the client the surface changed size.  It is NOT a request for the
-     * guest to change resolution — the guest owns that, and conflating the two
-     * would make every window drag a mode switch.
+     * The window changed -- dragged, maximised, or fullscreened and back.  All
+     * of those are the same operation with different numbers, so they run the
+     * same code as a new frame does: wl_viewport_apply() decides the
+     * destination, and it is called UNCONDITIONALLY rather than only when
+     * scaling is wanted, because "scaling is no longer wanted" is precisely
+     * the transition that has to reset the destination.
+     *
+     * It is NOT a request for the guest to change resolution -- the guest owns
+     * that, and conflating the two would make every window drag a mode switch.
+     * The guest learns the window size through ui_info instead, and decides.
      */
-    if (w->viewport && w->current >= 0 &&
-        (w->scale_mode == 1 || (w->scale_mode == 2 && w->fullscreen))) {
-        if (wd == w->buf_w && ht == w->buf_h) {
-            wp_viewport_set_destination(w->viewport, -1, -1);
-        } else {
-            wp_viewport_set_destination(w->viewport, wd, ht);
-        }
+    if (w->viewport && w->current >= 0) {
+        int dw, dh;
+
+        wl_viewport_apply(w, w->buf_w, w->buf_h, &dw, &dh);
         wl_surface_damage_buffer(w->surf, 0, 0, w->buf_w, w->buf_h);
         wl_surface_commit(w->surf);
-        wl_display_flush(w->dpy);
+        wd = dw;
+        ht = dh;
     }
+    /* AFTER the viewport, because wl_viewport_apply() may snap win_* back to
+     * the buffer size in the 1:1 case and set_window_geometry has to agree
+     * with the surface we just committed. */
+    tb_update(w, w->win_w);
+    bd_layout(w);
+    wl_display_flush(w->dpy);
     if (w->current < 0 && w->idle_wanted) {
         wl_show_idle(w->sess);  /* repaint the placeholder at the new size */
         return;
@@ -1400,7 +1451,22 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
         }
     }
 }
-static void top_close(void *d, struct xdg_toplevel *t) { (void)d; (void)t; }
+/*
+ * xdg_toplevel.close -- the compositor asking us to go away (Alt+F4, a close
+ * from a window list, a session ending).  Same meaning as our own X button and
+ * therefore the same path: this used to be a no-op, so those gestures did
+ * nothing at all.
+ */
+static void top_close(void *d, struct xdg_toplevel *t)
+{
+    struct nb_wl *w = d;
+
+    (void)t;
+    nb_log("the compositor asked the window to close");
+    if (!nb_sink_close_request(w->sink)) {
+        w->quit = true;
+    }
+}
 static const struct xdg_toplevel_listener top_listener = {
     .configure = top_configure, .close = top_close,
 };
