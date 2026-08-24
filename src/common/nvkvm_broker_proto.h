@@ -92,6 +92,14 @@ enum {
 };
 
 /*
+ * EV_CLOSE.x — WHICH close the user asked for.  The broker asks the human and
+ * reports the answer; what each one MEANS is still entirely the VMM's, which
+ * is what keeps VM policy out of the privileged process.
+ */
+#define NVKVM_BROKER_CLOSE_POWERDOWN 0  /* graceful: the guest OS decides     */
+#define NVKVM_BROKER_CLOSE_FORCE     1  /* stop the machine now               */
+
+/*
  * Capability bits reported in HELLO (w1).  These describe what the backend on
  * THIS session can actually do, so a client — and a human reading the broker's
  * startup log — learns the truth before a grab is attempted, not during.

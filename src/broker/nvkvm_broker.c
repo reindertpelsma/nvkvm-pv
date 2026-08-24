@@ -613,14 +613,15 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
             (uint32_t)buf_id, (uint32_t)(buf_id >> 32));
 }
 
-bool nb_sink_close_request(struct nb_sink *s)
+bool nb_sink_close_request(struct nb_sink *s, int action)
 {
     if (!s || s->client_fd < 0) {
         return false;           /* nobody to tell; the caller quits instead */
     }
-    nb_log("the user closed the display; telling the VMM (it decides what "
-           "that means for the guest)");
-    nb_emit(s, NVKVM_BROKER_EV_CLOSE, 0, 0, 0, 0);
+    nb_log("the user closed the display (%s); telling the VMM, which decides "
+           "what that means for the guest",
+           action == NVKVM_BROKER_CLOSE_FORCE ? "force off" : "ACPI powerdown");
+    nb_emit(s, NVKVM_BROKER_EV_CLOSE, action, 0, 0, 0);
     nb_sink_flush(s);
     return true;
 }

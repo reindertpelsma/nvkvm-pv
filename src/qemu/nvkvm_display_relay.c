@@ -60,7 +60,8 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
-#include "system/runstate.h"   /* qemu_system_powerdown_request */
+#include "sysemu/runstate.h"   /* qemu_system_powerdown_request.  QEMU 9.2 path;
+                                 * renamed to system/ in 10.0.               */
 #include "ui/console.h"
 #include "ui/input.h"
 
@@ -492,9 +493,26 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
          * A guest that ignores ACPI keeps running with no display, and the
          * broker is still there to reconnect to.
          */
-        RELAY_LOG("the user closed the display: requesting an ACPI powerdown "
-                  "(the guest decides what to do with it)");
-        qemu_system_powerdown_request();
+        if (p->x == NVKVM_BROKER_CLOSE_FORCE) {
+            /*
+             * The user explicitly chose to stop the machine, having been
+             * offered the graceful option and declined it.  SHUTDOWN_CAUSE_
+             * HOST_UI is exactly what a UI close button reports elsewhere in
+             * QEMU, so this behaves like every other front-end's close.
+             */
+            RELAY_LOG("the user chose to force the VM off");
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_UI);
+        } else {
+            /*
+             * The same thing as the power button on the case: the guest's own
+             * OS decides whether to shut down, prompt, or ignore it.  A guest
+             * that ignores ACPI keeps running with no display, and the broker
+             * is still there to reconnect to.
+             */
+            RELAY_LOG("the user closed the display: requesting an ACPI "
+                      "powerdown (the guest decides what to do with it)");
+            qemu_system_powerdown_request();
+        }
         break;
     case NVKVM_BROKER_EV_BYE:
         RELAY_LOG("the broker is going away (reason %d)", p->x);

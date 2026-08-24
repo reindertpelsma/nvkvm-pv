@@ -563,8 +563,17 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
              */
             if (cm->type == x->a_wm_proto &&
                 cm->data.data32[0] == x->a_wm_delete) {
-                nb_log("the window manager asked the window to close");
-                if (!nb_sink_close_request(sink)) {
+                /*
+                 * No confirmation overlay on this backend yet -- the Wayland
+                 * one draws its own, and the equivalent here is a second
+                 * override-redirect window plus its own hit-testing.  Until
+                 * that exists, take the graceful choice, which is the same
+                 * default the Wayland dialog offers on Enter.
+                 */
+                nb_log("the window manager asked the window to close: "
+                       "requesting an ACPI powerdown");
+                if (!nb_sink_close_request(sink,
+                                           NVKVM_BROKER_CLOSE_POWERDOWN)) {
                     x->quit = true;
                 }
             }

@@ -76,6 +76,23 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 
 #define NB_TB_H     28
 #define NB_TB_BTN   34          /* width of one button, from the right edge  */
+
+/* The close-confirmation overlay. */
+#define NB_DLG_W     560
+#define NB_DLG_BTN_H  40
+#define NB_DLG_GAP     8
+#define NB_DLG_PAD    18
+#define NB_DLG_N       4        /* acpi / force / display-only / cancel       */
+#define NB_DLG_TITLE  26
+#define NB_DLG_H  (NB_DLG_PAD * 2 + NB_DLG_TITLE + NB_DLG_GAP + \
+                   NB_DLG_N * (NB_DLG_BTN_H + NB_DLG_GAP))
+
+static const char *const nb_dlg_label[NB_DLG_N] = {
+    "SHUT DOWN THE GUEST (ACPI)",
+    "FORCE OFF THE VM",
+    "CLOSE THE DISPLAY ONLY",
+    "CANCEL",
+};
 #define NB_CUR_N     5          /* arrow + four resize cursors            */
 #define NB_BORDER    8          /* px of grabbable edge outside the window */
 #define NB_TITLE_MAX ((size_t)48)
@@ -182,6 +199,26 @@ struct nb_wl {
     struct wl_subcompositor *subcomp;
     struct wl_surface       *tb_surf;
     struct wl_subsurface    *tb_sub;
+    /*
+     * THE CLOSE CONFIRMATION.  A subsurface above the content, drawn with the
+     * same shm + 5x7 font the title bar and placeholder already use -- no
+     * toolkit, no new dependency, and the hit-testing is the same shape as the
+     * title bar's three buttons.
+     *
+     * It does NOT decide anything about the VM.  Three of its four choices
+     * send a message and let QEMU act; the fourth (close the display only) is
+     * purely local to the broker and touches no guest.  The privileged process
+     * still holds no VM policy -- it asks the human which message to send.
+     */
+    struct wl_surface       *dlg_surf;
+    struct wl_subsurface    *dlg_sub;
+    struct wl_buffer        *dlg_buf;
+    void                    *dlg_px;
+    size_t                   dlg_sz;
+    bool                     dlg_open;
+    bool                     ptr_on_dlg;
+    int                      dlg_hover, dlg_press;
+    int                      dlg_px_x, dlg_px_y;
     struct wl_buffer        *tb_buf;
     void                    *tb_px;
     size_t                   tb_sz;
@@ -887,6 +924,222 @@ static void tb_update(struct nb_wl *w, int width)
     wl_display_flush(w->dpy);
 }
 
+/* ── the close confirmation ──────────────────────────────────────────────── */
+/*
+ * WHY THIS IS IN THE PRIVILEGED PROCESS AT ALL, stated plainly because the
+ * original design said it should not be.
+ *
+ * The objection to a dialog in the broker was that the broker holds the
+ * keyboard grab and knows nothing about VMs, so it must not DECIDE what
+ * closing a window does to one.  It still does not.  Each choice below either
+ * selects which fixed-size message to send -- QEMU decides what a powerdown or
+ * a force-off means -- or does something purely local to the broker's own
+ * window.  What is new is drawing and hit-testing, and the title bar's three
+ * buttons already do both, so this is not a new class of code in here.
+ *
+ * The alternative, a helper process spawned to draw it, buys isolation for the
+ * drawing but costs a process, an IPC and a way for the dialog to disagree
+ * with the window it belongs to.  Not worth it for four rectangles.
+ */
+static int dlg_hit(const struct nb_wl *w, int x, int y)
+{
+    int i;
+
+    if (x < NB_DLG_PAD || x >= NB_DLG_W - NB_DLG_PAD) {
+        return -1;
+    }
+    for (i = 0; i < NB_DLG_N; i++) {
+        int top = NB_DLG_PAD + NB_DLG_TITLE + NB_DLG_GAP +
+                  i * (NB_DLG_BTN_H + NB_DLG_GAP);
+
+        if (y >= top && y < top + NB_DLG_BTN_H) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void dlg_paint(struct nb_wl *w)
+{
+    uint32_t *px = w->dlg_px;
+    unsigned stride_px = NB_DLG_W;
+    int i;
+
+    if (!px) {
+        return;
+    }
+    nb_placeholder_fill(px, NB_DLG_W, NB_DLG_H, stride_px, 0xff1c1c22u);
+    /* A border, so it reads as a thing on top rather than a hole in the guest. */
+    for (i = 0; i < NB_DLG_W; i++) {
+        px[i] = 0xff5a5a6eu;
+        px[(NB_DLG_H - 1) * stride_px + i] = 0xff5a5a6eu;
+    }
+    for (i = 0; i < NB_DLG_H; i++) {
+        px[i * stride_px] = 0xff5a5a6eu;
+        px[i * stride_px + NB_DLG_W - 1] = 0xff5a5a6eu;
+    }
+    nb_placeholder_text(px, NB_DLG_W, NB_DLG_H, stride_px, NB_DLG_PAD,
+                        NB_DLG_PAD, "CLOSE THE DISPLAY?", 2, 0xffffffffu);
+
+    for (i = 0; i < NB_DLG_N; i++) {
+        int top = NB_DLG_PAD + NB_DLG_TITLE + NB_DLG_GAP +
+                  i * (NB_DLG_BTN_H + NB_DLG_GAP);
+        int bw = NB_DLG_W - 2 * NB_DLG_PAD;
+        uint32_t bg;
+        unsigned tw;
+        int x, y;
+
+        bg = (i == w->dlg_press) ? 0xff4a4a64u
+           : (i == w->dlg_hover) ? 0xff3c3c50u
+                                 : 0xff2e2e3au;
+        for (y = top; y < top + NB_DLG_BTN_H; y++) {
+            for (x = NB_DLG_PAD; x < NB_DLG_PAD + bw; x++) {
+                px[y * (int)stride_px + x] = bg;
+            }
+        }
+        tw = nb_placeholder_text_w(nb_dlg_label[i], 2);
+        nb_placeholder_text(px, NB_DLG_W, NB_DLG_H, stride_px,
+                            (unsigned)(NB_DLG_PAD + (bw - (int)tw) / 2),
+                            (unsigned)(top + (NB_DLG_BTN_H - 14) / 2),
+                            nb_dlg_label[i], 2,
+                            i == 1 ? 0xffff9090u : 0xffe8e8f0u);
+    }
+}
+
+static void dlg_hide(struct nb_wl *w)
+{
+    if (!w->dlg_open) {
+        return;
+    }
+    w->dlg_open = false;
+    w->dlg_hover = w->dlg_press = -1;
+    w->ptr_on_dlg = false;
+    if (w->dlg_surf) {
+        wl_surface_attach(w->dlg_surf, NULL, 0, 0);
+        wl_surface_commit(w->dlg_surf);
+        wl_surface_commit(w->surf);
+        wl_display_flush(w->dpy);
+    }
+    nb_log("close: dismissed");
+}
+
+static void dlg_commit(struct nb_wl *w)
+{
+    if (!w->dlg_surf || !w->dlg_buf) {
+        return;
+    }
+    dlg_paint(w);
+    /* Centre it on the window as the compositor last configured it. */
+    if (w->dlg_sub) {
+        int cw = w->win_w > 0 ? w->win_w : NB_DLG_W;
+        int ch = w->win_h > 0 ? w->win_h : NB_DLG_H;
+
+        wl_subsurface_set_position(w->dlg_sub, (cw - NB_DLG_W) / 2,
+                                   (ch - NB_DLG_H) / 2);
+    }
+    wl_surface_attach(w->dlg_surf, w->dlg_buf, 0, 0);
+    wl_surface_damage_buffer(w->dlg_surf, 0, 0, NB_DLG_W, NB_DLG_H);
+    wl_surface_commit(w->dlg_surf);
+    wl_surface_commit(w->surf);
+    wl_display_flush(w->dpy);
+}
+
+static void dlg_show(struct nb_wl *w)
+{
+    struct wl_shm_pool *pool;
+    size_t stride, sz;
+    int fd;
+
+    if (w->dlg_open) {
+        return;
+    }
+    if (!w->shm || !w->subcomp || !w->comp) {
+        w->quit = true;         /* no way to ask; the old behaviour */
+        return;
+    }
+    if (!w->dlg_surf) {
+        w->dlg_surf = wl_compositor_create_surface(w->comp);
+        if (!w->dlg_surf) {
+            w->quit = true;
+            return;
+        }
+        w->dlg_sub = wl_subcompositor_get_subsurface(w->subcomp, w->dlg_surf,
+                                                     w->surf);
+        if (!w->dlg_sub) {
+            w->quit = true;
+            return;
+        }
+        wl_subsurface_place_above(w->dlg_sub, w->surf);
+        wl_subsurface_set_desync(w->dlg_sub);
+    }
+    if (!w->dlg_buf) {
+        stride = (size_t)NB_DLG_W * 4;
+        sz = stride * NB_DLG_H;
+        fd = memfd_create("nvkvm-broker-close", MFD_CLOEXEC);
+        if (fd < 0) {
+            w->quit = true;
+            return;
+        }
+        if (ftruncate(fd, (off_t)sz) < 0) {
+            close(fd);
+            w->quit = true;
+            return;
+        }
+        w->dlg_px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (w->dlg_px == MAP_FAILED) {
+            w->dlg_px = NULL;
+            close(fd);
+            w->quit = true;
+            return;
+        }
+        w->dlg_sz = sz;
+        pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+        if (pool) {
+            w->dlg_buf = wl_shm_pool_create_buffer(pool, 0, NB_DLG_W,
+                                                   NB_DLG_H, (int32_t)stride,
+                                                   WL_SHM_FORMAT_ARGB8888);
+            wl_shm_pool_destroy(pool);
+        }
+        close(fd);
+        if (!w->dlg_buf) {
+            w->quit = true;
+            return;
+        }
+    }
+    w->dlg_open = true;
+    w->dlg_hover = w->dlg_press = -1;
+    nb_log("close: asking what to do (ACPI / force off / display only / cancel)");
+    dlg_commit(w);
+}
+
+/* One of the four choices was taken. */
+static void dlg_choose(struct nb_wl *w, int choice)
+{
+    switch (choice) {
+    case 0:
+        nb_log("close: ACPI powerdown requested");
+        if (!nb_sink_close_request(w->sink, NVKVM_BROKER_CLOSE_POWERDOWN)) {
+            w->quit = true;
+        }
+        break;
+    case 1:
+        nb_log("close: force off requested");
+        if (!nb_sink_close_request(w->sink, NVKVM_BROKER_CLOSE_FORCE)) {
+            w->quit = true;
+        }
+        break;
+    case 2:
+        /* Purely local: the VM is not told and keeps running.  The socket
+         * closes, and a broker started again on the same path reattaches. */
+        nb_log("close: closing the display only; the VM keeps running");
+        w->quit = true;
+        break;
+    default:
+        break;
+    }
+    dlg_hide(w);
+}
+
 /* ── the idle placeholder ────────────────────────────────────────────────── */
 /*
  * The surface has no content until the client's first ATTACH+COMMIT, so an
@@ -1057,6 +1310,29 @@ static void kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
 {
     struct nb_wl *w = d;
     (void)k; (void)serial; (void)time;
+
+    /*
+     * MODAL.  While the confirmation is up, no key reaches the guest --
+     * including the hotkeys, which nb_sink_key() would otherwise interpret.
+     * A dialog the guest can type through is not a dialog.
+     */
+    if (w->dlg_open) {
+        if (state != WL_KEYBOARD_KEY_STATE_PRESSED) {
+            return;
+        }
+        switch (key) {
+        case KEY_ESC:
+            dlg_hide(w);
+            break;
+        case KEY_ENTER:
+        case KEY_KPENTER:
+            dlg_choose(w, 0);   /* the graceful one is the default */
+            break;
+        default:
+            break;
+        }
+        return;
+    }
     /* wl_keyboard.key carries the evdev code directly — no translation. */
     if (w->sink) {
         nb_sink_key(w->sink, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -1098,6 +1374,13 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
                               6, 5);
         return;
     }
+    if (s && s == w->dlg_surf) {
+        w->ptr_on_dlg = true;
+        w->ptr_on_tb = false;
+        wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+        return;
+    }
+    w->ptr_on_dlg = false;
     if (s && s == w->tb_surf) {
         w->ptr_on_tb = true;
         wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
@@ -1151,6 +1434,17 @@ static void ptr_motion(void *d, struct wl_pointer *p, uint32_t t,
     if (w->bd_hot >= 0) {
         return;                 /* chrome, not guest input */
     }
+    if (w->ptr_on_dlg) {
+        int was = w->dlg_hover;
+
+        w->dlg_px_x = wl_fixed_to_int(x);
+        w->dlg_px_y = wl_fixed_to_int(y);
+        w->dlg_hover = dlg_hit(w, w->dlg_px_x, w->dlg_px_y);
+        if (w->dlg_hover != was) {
+            dlg_commit(w);
+        }
+        return;                 /* the overlay, not guest input */
+    }
     if (w->ptr_on_tb) {
         int was = w->tb_hover;
 
@@ -1173,6 +1467,30 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
     struct nb_wl *w = d;
 
     w->last_serial = serial;
+    if (w->ptr_on_dlg) {
+        /* PRESS ARMS, RELEASE ACTS, same rule as the title bar: none of these
+         * four is an action anyone should trigger by a mis-click. */
+        int hit = dlg_hit(w, w->dlg_px_x, w->dlg_px_y);
+
+        if (state) {
+            w->dlg_press = hit;
+            dlg_commit(w);
+            return;
+        }
+        if (w->dlg_press >= 0 && hit == w->dlg_press) {
+            int choice = w->dlg_press;
+
+            w->dlg_press = -1;
+            dlg_choose(w, choice);
+            return;
+        }
+        w->dlg_press = -1;
+        dlg_commit(w);
+        return;
+    }
+    if (w->dlg_open) {
+        return;                 /* modal: nothing outside it reaches the guest */
+    }
     if (w->bd_hot >= 0) {
         if (state && w->toplevel && w->seat) {
             /* Logged with the serial because a compositor SILENTLY IGNORES a
@@ -1223,9 +1541,7 @@ static void ptr_button(void *d, struct wl_pointer *p, uint32_t serial,
                  * there is no policy to defer to, so we simply quit.
                  */
                 nb_log("title bar: close");
-                if (!nb_sink_close_request(w->sink)) {
-                    w->quit = true;
-                }
+                dlg_show(w);
                 break;
             case 1:
                 if (w->maximized) {
@@ -1483,9 +1799,7 @@ static void top_close(void *d, struct xdg_toplevel *t)
 
     (void)t;
     nb_log("the compositor asked the window to close");
-    if (!nb_sink_close_request(w->sink)) {
-        w->quit = true;
-    }
+    dlg_show(w);
 }
 static const struct xdg_toplevel_listener top_listener = {
     .configure = top_configure, .close = top_close,

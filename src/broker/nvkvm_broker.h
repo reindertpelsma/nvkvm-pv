@@ -184,7 +184,7 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id);
  * client decides what that means for the VM.  Returns false when nobody is
  * connected, in which case the caller should just quit -- there is no policy
  * to defer to. */
-bool nb_sink_close_request(struct nb_sink *s);
+bool nb_sink_close_request(struct nb_sink *s, int action);
 void nb_sink_bye(struct nb_sink *s, int reason);
 
 /* ── session backends ────────────────────────────────────────────────────── */
