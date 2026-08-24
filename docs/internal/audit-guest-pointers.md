@@ -13,7 +13,7 @@ the rest are open. Read this table before the detail.
 | U-4 | CRITICAL | **fixed** — inner-pointer marshalling fails closed |
 | U-5 | HIGH | **fixed** — the declared size is clamped to the aux blob on both stub paths (`nvkvm_stub.c`, `clamp_inner_params_size`); pinned by `tests/unit/test_stub_ptr_sanitize.c` |
 | U-6 | HIGH | **fixed** — per-handle UVM VA-range ownership table; `semaphoreAddress` zeroed unconditionally |
-| U-7 | HIGH | **fixed** — `pRightsRequested` zeroed unconditionally on both paths (`nvkvm_frontend.c`, `zero_nvos64_rights` in `nvkvm_stub.c`) |
+| U-7 | HIGH | **fixed** — but on ONE live path, not two. `zero_nvos64_rights` in `nvkvm_stub.c` is live and unit-pinned; the `nvkvm_frontend.c` half is correct as written and **unreachable** (see DEAD-1, reconciled 2026-08-24) |
 | U-8 | MEDIUM | **open** — blocked on the ogkm struct layout, see the note in its section |
 | U-9 | MEDIUM | **fixed** — the isolate now reserves a `PROT_NONE` guest-mapping window before it maps anything else and refuses every mapping outside it (`stub_window_contains`); pinned by `tests/unit/test_stub_window.c` |
 | U-10 | MEDIUM | **fixed** — offset 16 decided from the cmd, offset 32 zeroed (`nvkvm_stub.c`) |
@@ -127,16 +127,38 @@ established in that isolate**. Every legitimate OS-descriptor range gets there
 through the guest's page-migration path
 (`src/guest/nvkvm_ioctl.c:409-440`), which installs it via `mmap_on_isolate` —
 so QEMU already knows all of them, in `iso_mmap_tbl`, flagged `stub_mirrored`.
-`iso_mmap_covers()` requires full containment in **one** such entry, deliberately
-not a union (same reasoning as `uvm_va_covers()`).
+`iso_mmap_translate()` requires full containment in ranges the host installed —
+and both halves of that sentence have been corrected since it was first written.
 
-**Updated by U-9 (2026-08-24).** The function is now `iso_mmap_translate()`: the chunks no longer
-live at the guest's addresses, so covering the guest range is not enough — it also carries the
-window-side end forward, refuses a step that is not window-adjacent to the previous one, and hands
-back the translated base, which the gate writes into `NVOS02.pMemory`. The ownership property is
-unchanged; what is added is that the answer is now an address rather than a yes/no, and that a
-range which is contiguous in the guest but scattered in the isolate is refused rather than pinned
-piecemeal. Anything else is refused
+**CORRECTED 2026-08-24 — it is a union walk, not a single entry.** This sentence
+originally read *"`iso_mmap_covers()` requires full containment in **one** such entry,
+deliberately not a union (same reasoning as `uvm_va_covers()`)"*. That described a
+version of the function which was superseded before it ever shipped. The code does a
+deliberate **union walk** over adjacent host-installed chunks
+(`src/qemu/nvkvm_isolate_handlers.c:390-425`), because the migration path installs a
+registration in `NVKVM_MIG_CHUNK` (2 MiB) pieces — one `mmap_on_isolate`, and
+therefore one table entry, per chunk — so single-entry containment refused every
+`cudaHostRegister` above 2 MiB. The 2 MiB probe that "verified" the single-entry
+version was exactly one chunk and sailed straight past the bug; it was found and fixed
+on hardware the same day. The function's own comment records this (`:331-346`). The
+security property is unchanged: full, unbroken coverage by `stub_mirrored` ranges **of
+this isolate** only, with any gap failing closed — deliberately not "overlaps some
+entry", which would authorise the uncovered remainder. The contrast with U-6's
+`uvm_va_covers()` survives, but for the opposite reason to the one the original
+sentence gave: `uvm_va_covers()` refuses unions because there the ranges are distinct
+driver objects, whereas here the chunks are one registration the host itself split.
+
+**Updated by U-9 (2026-08-24) — it now translates rather than answering yes/no.** The
+function is `iso_mmap_translate()` (`:375`): the chunks no longer live at the guest's
+addresses — they live wherever the window allocator put them — so covering the guest
+range is no longer enough. The same walk also carries the window-side end forward,
+refuses a step that is not window-adjacent to the previous one (`:415-421`), and hands
+back the translated base, which the gate writes into `NVOS02.pMemory` (`:2810`). The
+ownership property is unchanged; what is added is that the answer is an address rather
+than a yes/no, and that a range which is contiguous in the guest but scattered in the
+isolate is refused rather than pinned piecemeal. The two checks are independent and
+both load-bearing: the window bounds *where* a mapping may be, while this table records
+*what* was installed, for whom, and whether it is still live. Anything else is refused
 before `nvkvm_isolate_ioctl()`, never clamped, and logged the way the U-3 gate
 logs.
 
@@ -271,6 +293,32 @@ sends these request types)". `handle_ioctl` at `:360` — the function containin
 `static` and has no other reference.
 
 The file is still compiled and linked (`scripts/build_qemu.sh:169`), which is why it looks alive.
+
+> **EXTENDED 2026-08-24 — the dead region is bigger than this section says, and it
+> advertises security invariants.** `handle_ioctl()` was removed with A-1's fix, so
+> `nvkvm_dispatch_ioctl()` now has **zero** callers — and the call graph does not stop
+> there. Every exported function of **`src/qemu/nvkvm_frontend.c`** —
+> `nvkvm_handle_rm_alloc` (`:86`), `_rm_free` (`:225`), `_rm_control` (`:322`),
+> `_rm_dup_object` (`:380`), `_register_fd` (`:409`), `_alloc_os_event` (`:436`),
+> `_free_os_event` (`:471`), `_simple_ioctl` (`:482`) — is called **only** from
+> `nvkvm_dispatch.c:165-417`. So all 562 lines are dead at runtime, while the file's
+> header (`:18-22`) states three security invariants as though they executed:
+> per-client object-graph verification, `NV01_ROOT_CLIENT` privilege checking, and
+> cross-session handle isolation. None of them runs.
+>
+> This matters for **U-7**, whose write-up below says the fix landed "on both paths":
+> the `nvkvm_frontend.c` half is in this dead region. The finding is still closed —
+> the `nvkvm_stub.c` half is live and unit-pinned — but the evidence is one path, not
+> two.
+>
+> Counting this one, **four** security fixes are now known to have landed in
+> `nvkvm_dispatch.c` and been dead: the `IDLE_CHANNELS` neutralisation
+> (`src/stub/nvkvm_stub.c:1470-1472`), the MAP/UNMAP VA table
+> (`src/qemu/nvkvm_isolate_handlers.c:1560-1564`), `p_memory = 0` (A-1), and U-7's
+> `pRightsRequested` zeroing. Recorded as **DEAD-1** in
+> [`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md), with the
+> recommendation to unlink both files from the QEMU build rather than keep labelling
+> them.
 So the reassuring comment at `nvkvm_dispatch.c:383-392` — *"the boundary (not the untrusted guest)
 must ensure no guest pointer is ever forwarded"* — decorates code that never runs, and the
 `IDLE_CHANNELS` overflow hardening beneath it (`:393-403`, the 64-bit math and the 4096 cap) is
@@ -360,7 +408,11 @@ this one.
 **`ENFORCED` total across the whole boundary: one.** `NV_ESC_RM_IDLE_CHANNELS`
 (`src/stub/nvkvm_stub.c:1280-1283`) — an unconditional
 `memset(param_buf + 12, 0, 28)` gated only on `_IOC_TYPE=='F' && _IOC_NR==0x41 && param_size >= 40`,
-none of which a guest can use to skip it. That is what enforcement looks like, and it is the only
+~~none of which a guest can use to skip it~~ **— WRONG, corrected 2026-08-24: the
+guest supplies `_IOC_TYPE`, and `0x41` is also `DRM_COMMAND_BASE + 0x01`, which the
+DRM allowlist admits. A record with `_IOC_TYPE == 'd'` skips this memset and every
+other `'F'`-keyed sanitiser. See R-1 in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md).** That is what enforcement looks like, and it is the only
 instance of it in the tree. (It exists because this exact hole was found on the live path after the
 fact — see `nvkvm_stub.c:1269-1279`.)
 
@@ -1082,6 +1134,16 @@ that property against the real allocator source
 (`tests/unit/test_stub_window.c`, "a 16 MiB registration lands contiguously" and the interleaved
 case), but the end-to-end `cudaHostRegister` path needs a GPU.
 
+**CORRECTED 2026-08-24.** The paragraph above predates A-1's fix and is now only
+half true. `hClass == 0x71` on nr 0x27 **is** gated — by `iso_mmap_covers()`
+(`nvkvm_isolate_handlers.c:2410-2459`), which is A-1's ownership test rather than a
+class allowlist, so U-14's deliberate exception survives. Every *other* `hClass` on
+nr 0x27 is still ungated, because `nvkvm_alloc_class_allowed()` is still called only
+under `if (nr == 0x2b)` (`:2484`). That leaves the allowlist's other deliberate
+exclusion — privileged memory `0x3f` — unreachable as a check on the nr 0x27 route:
+the same structural mismatch A-1 was, one class over. Recorded as **R-3** in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md).
+
 ---
 
 ## 5. RM_ALLOC classes (89)
@@ -1256,3 +1318,48 @@ the driver's is ground truth about the kernel's — and any place they are confl
 is a heap bug waiting for a struct to grow. This is the same root cause as the
 version-keyed ABI table (`docs/reference/abi-profiles.md`): NVIDIA changes struct
 sizes between driver releases, and anything assuming otherwise breaks silently.
+
+---
+
+## Reconciliation, 2026-08-24
+
+A full two-sweep reconciliation of this document against `main` (`68a35c0`) is in
+[`audit-reconcile-2026-08-24.md`](audit-reconcile-2026-08-24.md). What it changed
+here:
+
+- **§3's `ENFORCED` claim was wrong** in its most load-bearing clause. The one
+  enforced control *can* be skipped, by choosing `_IOC_TYPE == 'd'`. That is **R-1**,
+  rated HIGH, and it is the reconciliation's headline finding. It also re-rates A-5
+  in `audit-boundaries-2026-08-20.md` from `fixed` to `partial`.
+- **§2's dead-code region extends to all of `nvkvm_frontend.c`** (DEAD-1), which
+  advertises three security invariants that never execute — and which is where U-7's
+  second "path" lives.
+- **A-1's mechanism description was stale** — it described single-entry containment;
+  the code deliberately does a union walk over host-installed chunks. Security
+  property unchanged.
+- **U-14's "`hClass` is not gated for nr 0x27" is now half true** — `0x71` is gated
+  by A-1; every other class is not, which leaves the `0x3f` exclusion unreachable on
+  that route (**R-3**).
+- **U-7** re-stated as fixed on one live path rather than two.
+- Verified unchanged and correct: U-1, U-2, U-3, U-4, U-5, U-6, U-10, U-12, U-15,
+  A-1 (the gate itself), A-2. Verified still open at `68a35c0`: U-8, U-9, U-11, U-13.
+
+  **Superseded for two of those four by later merges.** This sweep read the tree at
+  `68a35c0`; it was merged forward onto `65aa69f`, which had since taken
+  `stub-window` (**U-9**, U-14, `iso_mmap_translate`) and `sec-easy-batch`
+  (**U-13**, P-3, P-5, P-7, A-21). Per the entries above, **U-9 is FIXED** — the
+  isolate-side mmap no longer takes a raw guest VA — and **U-13 is CLOSED as not
+  exploitable**. **U-8 and U-11 remain open**, and are the two to carry forward.
+
+**Numbering hazard.** This document's **A-1** (the OS-descriptor pin) and **A-2**
+(the missing session gate on `ioctl_on_isolate`) are *different findings* from
+`audit-boundaries-2026-08-20.md`'s A-1 (blocking-under-lock) and A-2
+(lifetime-race). Four findings, two numbers. The reconciliation recommends a
+per-document prefix — `GP-` here, `BD-` there — applied to new references only. The
+IDs are deliberately **not** being renumbered: they appear in commit messages
+(`b26c56f`, `ac87dfa`) and in code comments — at `65aa69f`,
+`nvkvm_isolate_handlers.c:77`, `:320`, `:2671`, `:2739` (a runtime `DENY … (A-1)`
+log string), `:3264`, `:3269`, and `nvkvm_mmap_host.c:915` onward for the boundaries
+doc's A-21. A rename breaks every one of those with no mechanical way to fix history,
+so the prefixes are for **new** findings only. Until then, a bare `A-n` in prose means
+*the A-n of the document it appears in*.
