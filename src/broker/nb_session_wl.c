@@ -242,6 +242,7 @@ struct nb_wl {
      * something the person clicking the button can see. */
     bool                     close_asked;
     bool                     ptr_on_dlg;
+    bool                     ptr_on_content;   /* over the guest's picture */
     int                      dlg_hover, dlg_press;
     int                      dlg_px_x, dlg_px_y;
     struct wl_buffer        *tb_buf;
@@ -341,6 +342,8 @@ struct nb_wl {
 static void tb_update(struct nb_wl *w, int width);
 /* Forward: the cursor is built lazily, on first entry to our own chrome. */
 static void cur_build(struct nb_wl *w);
+/* Forward: hide or show the host cursor over the content, per what is on it. */
+static void cur_apply(struct nb_wl *w, uint32_t serial);
 /* Forward: the invisible resize borders, laid out on every size change. */
 static void bd_build(struct nb_wl *w);
 /* Forward: the letterbox bars, sized from the content rect wl_viewport_apply
@@ -746,6 +749,12 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
 
     sl->held = true;
     sl->commits++;
+    if (w->current < 0) {
+        /* First guest frame after the placeholder: the guest draws the cursor
+         * from here on, so ours has to go even though the pointer never left. */
+        w->current = w->pending;
+        cur_apply(w, w->last_serial);
+    }
     w->current = w->pending;
     w->pending = -1;
     if (new_w != w->surf_w || new_h != w->surf_h) {
@@ -1041,6 +1050,28 @@ static void frac_scale(void *d, struct wp_fractional_scale_v1 *f,
 static const struct wp_fractional_scale_v1_listener frac_listener = {
     .preferred_scale = frac_scale,
 };
+
+/*
+ * The host cursor over the CONTENT surface, hidden or shown by what is
+ * actually on it.  Called on pointer entry and again whenever the content
+ * changes underneath a pointer that is already inside -- the placeholder
+ * appearing or the guest's first frame arriving sends no enter event, so
+ * without this the cursor keeps whatever state it had.
+ */
+static void cur_apply(struct nb_wl *w, uint32_t serial)
+{
+    if (!w->ptr || !w->ptr_on_content) {
+        return;
+    }
+    cur_build(w);
+    if (w->current >= 0) {
+        /* Guest content: it composites its own cursor, so ours must go. */
+        wl_pointer_set_cursor(w->ptr, serial, NULL, 0, 0);
+    } else {
+        /* The placeholder.  Nothing is drawing a cursor into it. */
+        wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
+    }
+}
 
 /* ── the letterbox background ────────────────────────────────────────────── */
 static void bg_build(struct nb_wl *w)
@@ -1467,6 +1498,7 @@ static int wl_show_idle(struct nb_session *s)
     wl_surface_commit(w->surf);
     wl_display_flush(w->dpy);
     w->current = -1;
+    cur_apply(w, w->last_serial);   /* placeholder now: give the cursor back */
     if (!w->idle_shown) {
         nb_log("no client yet: showing the placeholder (%dx%d)", wd, ht);
         w->idle_shown = true;
@@ -1583,6 +1615,7 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
     cur_build(w);
     w->bd_hot = bd_index(w, s);
     if (w->bd_hot >= 0) {
+        w->ptr_on_content = false;
         wl_pointer_set_cursor(p, serial, w->cur_surf[nb_bd_cursor[w->bd_hot]],
                               6, 5);
         return;
@@ -1590,29 +1623,38 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
     if (s && s == w->dlg_surf) {
         w->ptr_on_dlg = true;
         w->ptr_on_tb = false;
+        w->ptr_on_content = false;
         wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
         return;
     }
     w->ptr_on_dlg = false;
     if (s && s == w->tb_surf) {
         w->ptr_on_tb = true;
+        w->ptr_on_content = false;
         wl_pointer_set_cursor(p, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
         return;
     }
     w->ptr_on_tb = false;
     /*
-     * HIDE THE HOST CURSOR over the guest's picture.  The guest composites its
-     * own cursor into the scanout it hands us (see wl_commit), so leaving the
-     * host one visible draws two, a few pixels apart, and the one that responds
-     * is not the one the user is looking at.
+     * HIDE THE HOST CURSOR over the guest's picture -- but ONLY over the
+     * guest's picture.  The guest composites its own cursor into the scanout it
+     * hands us (see wl_commit), so leaving the host one visible draws two, a
+     * few pixels apart, and the one that responds is not the one the user is
+     * looking at.
      *
-     * A NULL surface here is the protocol's "no cursor", and its scope is
-     * exactly right by construction: set_cursor applies while the pointer is
-     * over OUR surface, and the title bar is the compositor's own surface, so
-     * the host cursor comes back on its own the moment the user reaches for
-     * the close button.  Nothing needs to special-case the decorations.
+     * THE PLACEHOLDER IS NOT THE GUEST.  Nothing is compositing a cursor into
+     * it, so hiding the host one there just leaves the window with no pointer
+     * at all -- which is what happens before a VM connects, exactly when a
+     * person is most likely to be moving the mouse around wondering whether
+     * the thing is alive.
+     *
+     * A NULL surface is the protocol's "no cursor", and its scope is right by
+     * construction: set_cursor applies while the pointer is over OUR surface,
+     * and the title bar is a different surface of ours that sets its own, so
+     * the arrow returns on its own at the window chrome.
      */
-    wl_pointer_set_cursor(p, serial, NULL, 0, 0);
+    w->ptr_on_content = true;
+    cur_apply(w, serial);
     if (w->sink) {
         nb_sink_pointer(w->sink, true);
     }
@@ -1621,6 +1663,8 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
                       struct wl_surface *s)
 {
     struct nb_wl *w = d;
+
+    w->ptr_on_content = false;
 
     if (bd_index(w, s) >= 0) {
         w->bd_hot = -1;
