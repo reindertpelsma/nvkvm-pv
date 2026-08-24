@@ -112,17 +112,37 @@ measurement and domain traps that have each cost this project real time.
 `scripts/run_test_vm.sh` and `scripts/run_remote_test.sh` are a **development
 harness only**. Point them at a guest you trust completely, and nothing else.
 
-`run_test_vm.sh` exports the whole repository to the guest over 9p
-**read-write**:
+`run_test_vm.sh` exports the whole repository to the guest over 9p. Since
+2026-08-24 that export is **read-only by default** and read-write only on an
+explicit, self-naming opt-in:
 
 ```
+# default
+-virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped,readonly=on
+
+# NVKVM_DEV_HARNESS_INSECURE_RW=1
 -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped
 ```
 
 The guest mounts that at `/mnt/nvkvm` and *builds its kernel module on it*,
-which is why the export is writable and why making it read-only is not a
-one-line change — the build would have to move to a guest-local copy or an
-overlay first.
+which is why a writable export is wanted at all, and why making it read-only
+unconditionally is not a one-line change — the build would have to move to a
+guest-local copy or an overlay first.
+
+The capability is kept on purpose: **for testing this does not have to be
+secure.** What it must not be is silent. So the writable export is opt-in, it
+prints a banner naming the guest-root → host-root path every time it is
+enabled, and the read-only default prints a note saying which flag turns it on
+and why you should think first. `run_remote_test.sh` forwards the flag verbatim
+to the remote host, so the remote side is gated the same way and is not a back
+door around it.
+
+Everything except the in-guest module build works read-only — booting,
+benchmarking, driver bring-up, demos — so the intended shape is: set the flag
+for the boot that builds the module, drop it for everything after.
+
+**The rest of this section describes what the flag re-arms.** It is all still
+true when it is set.
 
 The consequence is a direct guest-root → host-root path, and it is short:
 
@@ -140,9 +160,13 @@ guest→host boundary is the thing the rest of this project is about, and it doe
 not depend on 9p. But do not benchmark, fuzz, or demo against an untrusted guest
 image with this harness, and do not leave it running on a shared machine.
 
-If you need a harness that survives an untrusted guest: drop the writable repo
-export, ship the built artefacts in instead (a read-only export, a virtio-blk
-image, or `scp` into the guest), and stop having any host-side script execute a
+None of this is a supported configuration, and it is not meant to become one.
+It is a development harness, and the flag name says so.
+
+If you need a harness that survives an untrusted guest: leave
+`NVKVM_DEV_HARNESS_INSECURE_RW` unset, ship the built artefacts in instead (the
+read-only export you get by default, a virtio-blk image, or `scp` into the
+guest), and stop having any host-side script execute a
 path the guest can write.
 
 ## Security

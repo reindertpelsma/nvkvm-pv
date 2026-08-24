@@ -25,7 +25,7 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
 | P-5 | ~~high~~ **by design** | design vs documentation | isolate → isolate | **decided** — uid separation is not required; see below |
 | P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
-| P-7 | high | dev harness | guest → host root | **open, harness only** |
+| P-7 | high | dev harness | guest → host root | **gated** — opt-in behind `NVKVM_DEV_HARNESS_INSECURE_RW`; see below |
 | P-8 | high | process | — | **partly fixed** — see "the revert" |
 | P-9 | medium | shell quoting | — | build correctness |
 | P-10 | medium–high | liveness ×3 | isolate → VMM | see below |
@@ -393,6 +393,65 @@ execution on the host"* — it does **not** contradict `SECURITY.md`, which
 disclaims that boundary. The guest builds its module on that share, so
 read-only is not a one-line fix. It is a development harness and must never be
 pointed at an untrusted guest.
+
+### GATED, 2026-08-24 — the capability is kept, but it is now opt-in and loud
+
+**The decision, in the maintainer's terms: for testing it does not have to be
+secure.** So the capability is not removed. What changes is that it can no
+longer happen implicitly — the objection was never "a dev harness is
+insecure", it was that `sudo bash scripts/run_test_vm.sh` looked like a
+supported way to run the thing.
+
+`scripts/run_test_vm.sh` now exports the repo **read-only** by default, and
+read-write only under
+
+```
+NVKVM_DEV_HARNESS_INSECURE_RW=1
+```
+
+The flag name is the documentation: it says dev, it says harness, and it says
+insecure, so it cannot be set by someone who thinks they are configuring a
+supported deployment.
+
+When it is set, the script prints a banner before QEMU starts, naming the
+three-step guest-root → host-root path from this finding verbatim and stating
+that this is not a sandbox and not a supported configuration. When it is not
+set, it prints a shorter note saying the export is read-only, which flag turns
+it on, and why to read the banner first — so the failure mode is a clear
+message, not a mysterious `EROFS` in a cloud-init log.
+
+`scripts/run_remote_test.sh` forwards the flag verbatim to the remote host on
+both spawn sites, defaulting to `0`. Otherwise the remote path — which is the
+half of this finding that actually completes the exploit, since `restart` is
+what runs the rewritten script as host root — would have been a back door
+around the gate.
+
+**Why read-only default rather than refusing to launch.** Refusing outright
+was considered and rejected: the writable share is how the guest builds
+`nvkvm-guest.ko` on first boot, which is the harness's main job, so a hard
+refusal would only teach people to set the flag permanently without reading
+it. Read-only keeps every *other* use — boot, benchmark, driver bring-up,
+demo, the whole of `docs/howto/run.md` after the module exists — working with
+no host-write path at all, and confines the flag to the one boot that needs it.
+
+**Verified** by running `scripts/run_test_vm.sh` with `$QEMU_BIN` pointed at a
+script that prints its argv, in both modes:
+
+| | rendered `-virtfs` | banner |
+|---|---|---|
+| default | `local,path=…,mount_tag=nvkvm_src,security_model=mapped,readonly=on` | read-only note |
+| `…INSECURE_RW=1` | `local,path=…,mount_tag=nvkvm_src,security_model=mapped` | the guest-root → host-root banner |
+
+Both scripts pass `bash -n`. Documented as dev-only in `CONTRIBUTING.md`
+("The dev VM harness is not a sandbox"), `README.md`, `docs/howto/run.md` and
+`docs/howto/build.md` — the last two because the in-guest `make` now fails on a
+default launch, and that has to read as a missing flag rather than a broken
+guest.
+
+**Still true, and deliberately so:** with the flag set this is exactly the
+finding above, unchanged. The gate makes the configuration explicit; it does
+not make it safe, and nothing here should be read as making the harness
+suitable for an untrusted guest.
 
 ---
 

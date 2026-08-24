@@ -31,6 +31,11 @@ The `fstab` line matters: `runcmd` runs **once per instance**, so without it any
 later boot of the same image comes up with `/mnt/nvkvm` empty — no module
 source, no staging script, no test suite (`scripts/setup_guest.sh:96-103`).
 
+The `make` line needs `/mnt/nvkvm` to be **writable**, which it is not unless
+the VM was launched with `NVKVM_DEV_HARNESS_INSECURE_RW=1` — see
+[Launch](#3-launch). On a read-only export this step fails and the module never
+loads, which looks like a broken guest rather than a missing flag.
+
 Packages installed: `build-essential git python3 linux-headers-virtual`.
 Login is `ubuntu` / `ubuntu` with passwordless sudo.
 
@@ -69,6 +74,19 @@ required and which merely degrade a capability, are in
 ```bash
 sudo bash scripts/run_test_vm.sh
 ```
+
+The repo 9p export is **read-only** by default. The first-boot module build
+(above) writes to it, so a first boot — and any later in-guest rebuild — needs:
+
+```bash
+sudo NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
+```
+
+which prints a banner explaining what it re-arms: a writable export is a
+guest-root → host-root path (`scripts/run_test_vm.sh`, top-of-file banner, and
+[CONTRIBUTING.md](../../CONTRIBUTING.md#the-dev-vm-harness-is-not-a-sandbox)).
+Everything else — booting, benchmarking, driver bring-up, demos — works
+read-only, so set the flag for the build boot and drop it again afterwards.
 
 Prefers `/opt/qemu-nvkvm/bin/qemu-system-x86_64`, falls back to system QEMU with
 a warning, or honours `$QEMU_BIN` (`scripts/run_test_vm.sh:29-40`). Extra
