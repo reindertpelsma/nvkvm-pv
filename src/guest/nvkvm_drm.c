@@ -41,6 +41,10 @@
 #include <linux/scatterlist.h>
 
 #include "nvkvm.h"
+/* GET_DEV_INFO's params struct is version-keyed — four measured layouts across
+ * 515..610, two of them produced by INSERTING a field in the middle.  The
+ * struct definition and the per-version offset table both live there. */
+#include "nvkvm_drm_abi.h"
 
 #define NVKVM_PCI_VENDOR_NVIDIA 0x10de
 
@@ -396,12 +400,22 @@ bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
 }
 
 /* Param structs — sizes must match the host nvidia-drm-ioctl.h exactly so the
- * DRM core copies the right number of bytes in/out. */
-struct drm_nvidia_get_dev_info_params {       /* 36 bytes, all scalars */
-	__u32 gpu_id, mig_device, primary_index, supports_alloc;
-	__u32 generic_page_kind, page_kind_generation, sector_layout;
-	__u32 supports_sync_fd, supports_semsurf;
-};
+ * DRM core copies the right number of bytes in/out.
+ *
+ * (drm_nvidia_get_dev_info_params is NOT here: it is the one struct on this
+ * list whose layout moves between driver versions, so it lives in
+ * nvkvm_drm_abi.h next to the per-version offset table that decodes it.  Every
+ * other struct below was swept against all 216 OGKM tags 515.43.04..610.57.04
+ * and is byte-identical at every tag it exists at — see tests/unit/
+ * test_drm_devinfo.c, which pins that sweep.) */
+
+/* NVKVM_DRM_PARAM_STRUCTS_BEGIN — everything down to the matching _END marker
+ * is extracted verbatim by tests/unit/Makefile into drm_param_structs.inc and
+ * compiled by test_drm_devinfo.c, which static-asserts every size and offset
+ * against the vendor headers.  Keep this block free of kernel-only API (it is
+ * plain __u32/__u64/__s32 struct definitions) or the extraction stops
+ * compiling.  Lose a marker and the .inc comes back empty, which fails the
+ * build rather than quietly testing nothing. */
 
 /* Semaphore-surface fence ioctls (render-path sync, #84). Sizes/layout MUST
  * match host nvidia-drm-ioctl.h so the DRM core copies the right byte count. */
@@ -490,6 +504,7 @@ struct drm_nvidia_gem_import_nvkms_memory_params { /* 32 bytes */
 	__u32 handle;               /* OUT GEM handle in the stub's DRM file */
 	__u32 __pad;
 };
+/* NVKVM_DRM_PARAM_STRUCTS_END */
 
 /*
  * GEM_IDENTIFY_OBJECT (0x0e): NVIDIA's EGL/gbm calls this right after
@@ -562,35 +577,61 @@ static int nvkvm_drm_forward(struct drm_file *file, unsigned int cmd, void *data
  * must be told about ITS OWN nodes.  Our KMS head lives on this same drm_device
  * (DRIVER_MODESET above), so dev->primary->index is exactly the card the guest
  * has.  It also stops a host DRM minor number leaking into the guest.
+ *
+ * BOTH of those writes land at a VERSION-DEPENDENT offset.  This struct has
+ * four measured layouts across 515..610 and two of the boundaries were made by
+ * inserting a field in the middle, so a hardcoded struct puts them on the wrong
+ * fields on every host outside the branch it was captured from — see
+ * nvkvm_drm_abi.h for what that looked like from the outside (a guest that
+ * silently ran on llvmpipe, both directions of the mistake).  Index by the
+ * version-keyed offsets instead, and forward exactly the byte count the host
+ * driver's own struct has.
  */
 static int nvkvm_drm_fwd_get_dev_info(struct drm_device *dev, void *data,
 				      struct drm_file *file)
 {
-	struct drm_nvidia_get_dev_info_params *p = data;
-	int r = nvkvm_drm_forward(file,
-				  DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x03,
-					   struct drm_nvidia_get_dev_info_params),
-				  data);
+	unsigned major = 0, minor = 0, patch = 0, primary_index;
+	struct nvkvm_drm_devinfo_layout lay;
+	u8 *p = data;
+	int r;
 
-	if (r == 0 && dev && dev->primary)
-		p->primary_index = dev->primary->index;
+	nvkvm_abi_parse_version(nvkvm.driver_version, &major, &minor, &patch);
+	lay = nvkvm_drm_devinfo_layout_for_version(major, minor);
+	if (!lay.known)
+		pr_warn_once("nvkvm: host driver version \"%s\" not parseable; assuming the 575+ GET_DEV_INFO layout\n",
+			     nvkvm.driver_version);
+
+	/* Forward with the HOST's size, not sizeof(the widest struct).  The DRM
+	 * core's bounce buffer is max(caller _IOC_SIZE, the 36-byte registered
+	 * size), so it is always >= lay.size and every offset below is in
+	 * bounds; the core copies back only the caller's own _IOC_SIZE. */
+	r = nvkvm_drm_forward(file,
+			      _IOC(_IOC_READ | _IOC_WRITE, DRM_IOCTL_BASE,
+				   NVKVM_DRM_COMMAND_BASE + 0x03, lay.size),
+			      data);
+	if (r)
+		return r;
+
 	/*
-	 * Do NOT advertise sync-fd support.  SEMSURF_FENCE_CREATE returns its
-	 * sync fd in an OUT field (fd@16) that we forward verbatim, so the
-	 * guest receives the HOST's descriptor number -- meaningless in the
-	 * guest process.  Cross-boundary sync-fd passback is unimplemented
-	 * (see nvkvm_drm_fwd_semsurf_fence_create).
+	 * Rewrite primary_index to OUR card minor and clear supports_sync_fd
+	 * (SEMSURF_FENCE_CREATE returns its sync fd in an OUT field we forward
+	 * verbatim, so the guest would receive the HOST's descriptor number;
+	 * cross-boundary sync-fd passback is unimplemented -- see
+	 * nvkvm_drm_fwd_semsurf_fence_create.  Claiming the capability anyway is
+	 * what actually broke graphics: libnvidia-egl-wayland took the sync-fd
+	 * presentation path, waited on a fence that could never signal, and
+	 * every GL client hung on its first eglSwapBuffers -- glmark2 sat on
+	 * scene 1 with 0 CPU time indefinitely, while the same weston+glmark2 on
+	 * the host scored 21571).
 	 *
-	 * Claiming the capability anyway is what actually broke graphics:
-	 * libnvidia-egl-wayland took the sync-fd presentation path, waited on
-	 * a fence that could never signal, and every GL client hung on its
-	 * first eglSwapBuffers -- glmark2 sat on scene 1 with 0 CPU time
-	 * indefinitely, while the same weston+glmark2 on the host scored
-	 * 21571.  Reporting 0 makes it pick a path we can actually service.
+	 * Both writes are version-keyed; nvkvm_drm_devinfo_fixup() is shared
+	 * with tests/unit/test_drm_devinfo.c so the offsets it uses are pinned.
 	 */
-	if (r == 0)
-		p->supports_sync_fd = 0;
-	return r;
+	primary_index = *(__u32 *)(p + lay.primary_index_off);
+	if (dev && dev->primary)
+		primary_index = (unsigned)dev->primary->index;
+	nvkvm_drm_devinfo_fixup(lay, p, primary_index);
+	return 0;
 }
 NVKVM_DRM_FWD(dmabuf_supported, DRM_IO(NVKVM_DRM_COMMAND_BASE + 0x0f))
 /*
