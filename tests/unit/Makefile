@@ -36,7 +36,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
+all: test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot
 
 test_dispatch: $(DISPATCH_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(DISPATCH_SRCS) $(LDFLAGS)
@@ -85,6 +85,19 @@ stub_sanitize.inc: ../../src/stub/nvkvm_stub.c
 test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
 	$(CC) $(CFLAGS) -I. -o $@ test_stub_ptr_sanitize.c
 
+# A-21.  nvkvm_mmap_host.c needs QEMU's osdep.h and the whole VirtIONvgpu
+# world, so the KVM slot pool is EXTRACTED from it between explicit markers
+# rather than linked -- same technique as stub_sanitize.inc above, same
+# reason: a copied allocator drifts from the real one and then the test is
+# green about the wrong code.  The block is deliberately self-contained (no
+# QEMU headers, no NVKVM_DBG) so this extraction stays possible.  Lose the
+# markers and the .inc comes back empty, which fails the link.
+kvm_slot_pool.inc: ../../src/qemu/nvkvm_mmap_host.c
+	awk '/NVKVM_KVM_SLOT_POOL_BEGIN/,/NVKVM_KVM_SLOT_POOL_END/' $< > $@
+
+test_kvm_slot: test_kvm_slot.c kvm_slot_pool.inc
+	$(CC) $(CFLAGS) -I. -o $@ test_kvm_slot.c $(LDFLAGS)
+
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
 # runtime until 2026-08-21, and the note that used to sit here blamed "isolate
@@ -94,7 +107,7 @@ test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize
+run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot
 	./test_dispatch
 	./test_frontend
 	./test_handle
@@ -104,6 +117,7 @@ run: test_dispatch test_frontend test_handle test_isolate test_tables test_open_
 	./test_ctrl_gate
 	./test_nvkms_allowlist
 	./test_stub_ptr_sanitize
+	./test_kvm_slot
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -116,4 +130,4 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_kvm_slot kvm_slot_pool.inc

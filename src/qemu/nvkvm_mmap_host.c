@@ -911,6 +911,42 @@ void *nvkvm_gpa_to_vmm_va(VirtIONvgpu *nv, uint64_t gpa, size_t size)
  * KVM's internal LRU has a chance to age out stale EPT entries before
  * the same slot number is reused.
  */
+/*
+ * ── A-21 (docs/internal/audit-boundaries-2026-08-20.md §9) ─────────────────
+ * nvkvm_kvm_slot_release() checked the RANGE of the slot and nothing else: it
+ * never checked that the slot it is handed was ever allocated.  So a slot
+ * released twice — or a slot number that was simply never handed out — was
+ * pushed onto the freelist as many times as it was released.
+ *
+ * What that buys an attacker who can cause one: the freelist holds N copies of
+ * one slot number, so the next N nvkvm_kvm_slot_alloc() calls return the SAME
+ * KVM memslot to N unrelated mappings.  Each of them then calls
+ * KVM_SET_USER_MEMORY_REGION on that slot with its own GPA and its own host
+ * VA, and the last writer wins: the earlier mapping's GPA silently loses its
+ * backing, and the memslot now points a guest physical range at a host VA
+ * belonging to a DIFFERENT isolate's device memory.  That is cross-isolate
+ * memory aliasing arranged entirely through the slot allocator, without
+ * touching any of the ownership gates above it.  Teardown then compounds it:
+ * whichever mapping unmaps first deletes the slot the other still believes it
+ * owns, and releases the number again.
+ *
+ * So: a per-slot live bit, and FAIL CLOSED on anything that does not match —
+ * reject and log, never clamp, never "fix up" the count.  Same shape as the
+ * A-1 and U-3 gates in nvkvm_isolate_handlers.c: an unexpected input here is
+ * not a value to be repaired, it is a caller bug or an attack, and continuing
+ * is how the aliasing above happens.
+ *
+ * The bit is also checked on the ALLOC side.  Belt and braces: if a slot ever
+ * reaches the freelist twice by some route this does not anticipate, the
+ * second hand-out is refused rather than silently duplicated.
+ */
+/* NVKVM_KVM_SLOT_POOL_BEGIN — everything down to _END is extracted verbatim
+ * by tests/unit/Makefile into kvm_slot_pool.inc and compiled into
+ * test_kvm_slot, so the A-21 gates are pinned against THIS code and cannot
+ * drift away from a copy.  Keep the block self-contained: no QEMU headers, no
+ * NVKVM_DBG, nothing that will not compile in a hosted test binary.  If the
+ * markers are lost the extraction comes back empty and the test fails to link,
+ * which is the failure mode we want. */
 #define NVKVM_KVM_SLOT_BASE   64
 #define NVKVM_KVM_SLOT_COUNT  448      /* 64..511 inclusive */
 
@@ -919,11 +955,26 @@ static int             kvm_slot_water = NVKVM_KVM_SLOT_BASE; /* next never-used 
 static int             kvm_slot_free_head;                   /* freelist top  */
 static int             kvm_slot_free_stack[NVKVM_KVM_SLOT_COUNT];
 
+/* A-21: kvm_slot_live[slot - BASE] is true iff the slot is currently owned by
+ * a caller.  Indexed by slot number, NOT by freelist position.  All access
+ * under kvm_slot_lock. */
+static bool            kvm_slot_live[NVKVM_KVM_SLOT_COUNT];
+
 /* Diagnostics — read+printed under kvm_slot_lock. */
 static int             kvm_slot_in_use;        /* live slots */
 static int             kvm_slot_in_use_peak;   /* watermark of live slots */
 static uint64_t        kvm_slot_alloc_count;   /* lifetime allocs */
 static uint64_t        kvm_slot_free_count;    /* lifetime frees  */
+static uint64_t        kvm_slot_reject_count;  /* A-21 refusals   */
+
+/* True iff `slot` is inside the pool this allocator owns.  Everything below
+ * the base belongs to QEMU's static regions — RAM, BIOS, virtio BARs — and
+ * must never be touched from here.  In particular slot 0 is guest RAM. */
+static inline bool kvm_slot_in_pool(int slot)
+{
+	return slot >= NVKVM_KVM_SLOT_BASE &&
+	       slot <  NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT;
+}
 
 int nvkvm_kvm_slot_alloc(void)
 {
@@ -935,7 +986,26 @@ int nvkvm_kvm_slot_alloc(void)
 		   NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT) {
 		slot = kvm_slot_water++;
 	}
+	/*
+	 * A-21: never hand out a slot that is already live.  Reachable only if
+	 * the freelist has been corrupted, which is exactly the state the
+	 * release-side check exists to prevent — so if we are here, refuse and
+	 * say so rather than aliasing two mappings onto one memslot.  The
+	 * duplicate is dropped, not pushed back: putting it on the freelist
+	 * again is how it would come round a third time.
+	 */
+	if (slot >= 0 && (!kvm_slot_in_pool(slot) ||
+			  kvm_slot_live[slot - NVKVM_KVM_SLOT_BASE])) {
+		kvm_slot_reject_count++;
+		pthread_mutex_unlock(&kvm_slot_lock);
+		fprintf(stderr,
+			"nvkvm: DENY kvm slot alloc — freelist returned slot "
+			"%d which is already live; refusing to alias it "
+			"(A-21)\n", slot);
+		return -1;
+	}
 	if (slot >= 0) {
+		kvm_slot_live[slot - NVKVM_KVM_SLOT_BASE] = true;
 		kvm_slot_alloc_count++;
 		if (++kvm_slot_in_use > kvm_slot_in_use_peak)
 			kvm_slot_in_use_peak = kvm_slot_in_use;
@@ -946,12 +1016,60 @@ int nvkvm_kvm_slot_alloc(void)
 
 void nvkvm_kvm_slot_release(int slot)
 {
-	if (slot < NVKVM_KVM_SLOT_BASE ||
-	    slot >= NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT)
+	/*
+	 * A-21, gate 1 of 2 — range.  This one existed; what it did not do is
+	 * say anything when it fired.  A slot outside the pool reaching here
+	 * means a caller passed a sentinel it should have filtered
+	 * (NVKVM_IN_WINDOW_SLOT is -2, "no memslot"), or a stored kvm_slot was
+	 * never initialised — the g_new0 zero, which is guest RAM's memslot.
+	 * Silence is how that stays invisible.
+	 */
+	if (!kvm_slot_in_pool(slot)) {
+		pthread_mutex_lock(&kvm_slot_lock);
+		kvm_slot_reject_count++;
+		pthread_mutex_unlock(&kvm_slot_lock);
+		fprintf(stderr,
+			"nvkvm: DENY kvm slot release %d — outside the pool "
+			"[%d,%d) (A-21)\n", slot, NVKVM_KVM_SLOT_BASE,
+			NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT);
 		return;
+	}
+
 	pthread_mutex_lock(&kvm_slot_lock);
-	if (kvm_slot_free_head < NVKVM_KVM_SLOT_COUNT)
+	/*
+	 * A-21, gate 2 of 2 — ownership.  This is the one that was missing.
+	 * Reject a slot that is not currently allocated: a double release, or
+	 * a slot number that was never handed out at all.  FAIL CLOSED — the
+	 * slot stays out of the freelist.  Leaking one memslot number out of
+	 * 448 is a bounded, observable cost; putting it in twice aliases two
+	 * mappings onto one memslot, which is not.
+	 */
+	if (!kvm_slot_live[slot - NVKVM_KVM_SLOT_BASE]) {
+		kvm_slot_reject_count++;
+		pthread_mutex_unlock(&kvm_slot_lock);
+		fprintf(stderr,
+			"nvkvm: DENY kvm slot release %d — not allocated "
+			"(double release or never handed out) (A-21)\n", slot);
+		return;
+	}
+	kvm_slot_live[slot - NVKVM_KVM_SLOT_BASE] = false;
+
+	/*
+	 * With the ownership gate above, free_head + in_use can never exceed
+	 * NVKVM_KVM_SLOT_COUNT, so the freelist cannot overflow.  Keep the
+	 * bound anyway and shout if it is ever hit: it would mean the live
+	 * bitmap and the freelist have diverged, and a silent drop there is a
+	 * slow leak nobody would find.
+	 */
+	if (kvm_slot_free_head < NVKVM_KVM_SLOT_COUNT) {
 		kvm_slot_free_stack[kvm_slot_free_head++] = slot;
+	} else {
+		kvm_slot_reject_count++;
+		fprintf(stderr,
+			"nvkvm: kvm slot freelist full at %d releasing slot "
+			"%d — bitmap and freelist have diverged (A-21)\n",
+			kvm_slot_free_head, slot);
+	}
 	kvm_slot_free_count++;
 	if (kvm_slot_in_use > 0)
 		kvm_slot_in_use--;
@@ -969,6 +1087,17 @@ void nvkvm_kvm_slot_stats(int *in_use, int *peak,
 	if (frees)  *frees  = kvm_slot_free_count;
 	pthread_mutex_unlock(&kvm_slot_lock);
 }
+
+/* A-21 refusal count, for the unit test and for anyone reading the logs. */
+uint64_t nvkvm_kvm_slot_rejects(void)
+{
+	uint64_t n;
+	pthread_mutex_lock(&kvm_slot_lock);
+	n = kvm_slot_reject_count;
+	pthread_mutex_unlock(&kvm_slot_lock);
+	return n;
+}
+/* NVKVM_KVM_SLOT_POOL_END */
 
 static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 				 bool readonly, int *slot_out)
@@ -1028,6 +1157,25 @@ static int kvm_add_memory_region(uint64_t gpa, void *hva, size_t length,
 
 static void kvm_remove_memory_region(int slot)
 {
+	/*
+	 * A-21: check before the ioctl, not only inside the release.  size=0
+	 * DELETES the named memslot, so issuing this for a slot outside our
+	 * pool removes one of QEMU's — slot 0 is guest RAM, and 0 is what a
+	 * g_new0'd struct nvkvm_mmap_region carries in kvm_slot until
+	 * nvkvm_mmap_map_to_guest fills it in.  Every teardown path here is
+	 * written `if (kvm_slot >= 0)`, which passes 0 straight through.  Not
+	 * reachable today (a region only reaches a session's list after
+	 * map_to_guest has set a real slot or -1), but it is one refactor away
+	 * and the failure is a VM whose RAM stops existing.
+	 */
+	if (!kvm_slot_in_pool(slot)) {
+		fprintf(stderr,
+			"nvkvm: DENY kvm memslot removal %d — outside the pool "
+			"[%d,%d); refusing to delete a slot we do not own "
+			"(A-21)\n", slot, NVKVM_KVM_SLOT_BASE,
+			NVKVM_KVM_SLOT_BASE + NVKVM_KVM_SLOT_COUNT);
+		return;
+	}
 	struct nvkvm_kvm_mem_region region = {
 		.slot         = (uint32_t)slot,
 		.memory_size  = 0,  /* size=0 removes the slot */

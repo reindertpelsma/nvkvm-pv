@@ -212,7 +212,7 @@ struct kernel_sigaction {
 
 /* ELF types for self-relocation come from <linux/elf.h> (included above);
  * the DT_/R_X86_64_RELATIVE constants live in <linux/elf.h> too. */
-#ifdef NVKVM_STUB_EMBEDDED
+#ifdef NVKVM_STUB_SELF_RELOC
 #  ifndef R_X86_64_RELATIVE
 #    define R_X86_64_RELATIVE 8
 #  endif
@@ -3019,27 +3019,47 @@ static long apply_seccomp(void)
 
 /*
  * apply_relocations() processes R_X86_64_RELATIVE entries in the dynamic
- * section.  Only needed for the NVKVM_STUB_EMBEDDED build path, where the
- * stub binary is loaded via fexecve() from a memfd and there is no dynamic
- * linker to handle RELA entries.  Disk-loaded execution lets the kernel
- * dynamic linker handle relocations before we run.
+ * section.  This is what makes the stub a genuine static PIE: `-static-pie`
+ * emits an ET_DYN image whose RELATIVE relocations nothing applies for us --
+ * there is no dynamic linker on this path (fexecve from a memfd) and
+ * `-nostdlib -ffreestanding` means there is no rcrt1.o either.  So we are the
+ * self-relocation entry stub, and we must run before ANY global-data access.
  *
- * In freestanding mode there are no C runtime constructors, so we call this
- * from main() before any global-data access matters.
+ * NVKVM_STUB_SELF_RELOC is set by src/stub/Makefile in lockstep with
+ * `-static-pie`.  The two MUST move together: in an ET_EXEC link `r_offset` is
+ * an absolute vaddr, so `base + r_offset` would write at 0x400000 + 0x40xxxx
+ * -- off the end of the image.  Applying these relocations to a non-PIE link
+ * is not a no-op, it is memory corruption.  Renamed from the old
+ * NVKVM_STUB_EMBEDDED spelling, which meant something else entirely (QEMU
+ * embedding nvkvm_stub_bin.h, src/qemu/nvkvm_isolate.c) and was never actually
+ * defined for this file's own build -- so this function was dead code.
  */
-#ifdef NVKVM_STUB_EMBEDDED
+#ifdef NVKVM_STUB_SELF_RELOC
 extern char __ehdr_start[];
 extern char _DYNAMIC[] __attribute__((weak));
 
 __attribute__((no_sanitize_address))
 static void apply_relocations(void)
 {
-	/* If the linker resolved the weak _DYNAMIC, it points at our dynamic
-	 * section.  If unresolved (-no-pie build with no DT_*), it is 0 — but
-	 * the compiler "knows" the symbol exists, so we route through a
-	 * volatile pointer to defeat the constant-fold and produce a real
-	 * load that may legitimately return 0. */
-	Elf64_Dyn *volatile dynp = (Elf64_Dyn *)_DYNAMIC;
+	/*
+	 * Take the address of _DYNAMIC with an explicit RIP-relative lea.
+	 *
+	 * MEASURED: writing this as plain C (`(Elf64_Dyn *)_DYNAMIC`, volatile
+	 * or not, weak or weak+hidden) makes GCC load the address from the GOT
+	 * -- and that GOT slot is the ONE R_X86_64_RELATIVE entry in the whole
+	 * image, the very relocation this function exists to apply.  The
+	 * unrelocated slot still holds the link-time 0x9ed0, so the first
+	 * `dyn->d_tag` read faults:
+	 *
+	 *   Program received signal SIGSEGV
+	 *   #0  apply_relocations () at nvkvm_stub.c:3049
+	 *   #1  main (argc=2, ...) at nvkvm_stub.c:3112
+	 *
+	 * A `lea` needs no relocation at all, which breaks the cycle.  This is
+	 * the same trick musl's rcrt1.c uses for the same reason.
+	 */
+	Elf64_Dyn *dynp;
+	__asm__ volatile ("leaq _DYNAMIC(%%rip), %0" : "=r" (dynp));
 	if (!dynp) return;
 	unsigned long base = (unsigned long)__ehdr_start;
 	Elf64_Dyn *dyn = dynp;
@@ -3062,7 +3082,7 @@ static void apply_relocations(void)
 		}
 	}
 }
-#endif /* NVKVM_STUB_EMBEDDED */
+#endif /* NVKVM_STUB_SELF_RELOC */
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
@@ -3108,7 +3128,9 @@ int main(int argc, char **argv)
 	 */
 	int want_seccomp = 1;
 
-#ifdef NVKVM_STUB_EMBEDDED
+	/* MUST be the first statement: until this runs, every global in the
+	 * image still holds its link-time value (see apply_relocations). */
+#ifdef NVKVM_STUB_SELF_RELOC
 	apply_relocations();
 #endif
 	for (int i = 1; i < argc && argv && argv[i]; i++) {

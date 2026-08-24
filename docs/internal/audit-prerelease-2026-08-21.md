@@ -21,11 +21,11 @@ relay landed on 2026-08-21 with the NCCL shared-memory fix.
 |---|---|---|---|---|
 | P-1 | **critical** | fail-open validation | guest process → another guest process | **fixed** — `71a490f` |
 | P-2 | **critical** | allowlist too permissive | guest process → host kernel | **fixed** — row dropped; see the EXCLUSIONS block in `nvkvm_ctrl_allowlist.h` |
-| P-3 | high | sandbox self-modification | isolate → isolate | see below |
+| P-3 | high | sandbox self-modification | isolate → isolate | **fixed** — `073ece8` (writable alias) + the stub is now a real static PIE; see below |
 | P-4 | high | missing ownership check | guest kernel → VMM | see below |
-| P-5 | high | design vs documentation | isolate → isolate | **open, needs a decision** |
+| P-5 | ~~high~~ **by design** | design vs documentation | isolate → isolate | **decided** — uid separation is not required; see below |
 | P-6 | high | version drift in a gate | guest process → host NVKMS | **fixed** — `6bd8df6`, `76831d3` |
-| P-7 | high | dev harness | guest → host root | **open, harness only** |
+| P-7 | high | dev harness | guest → host root | **gated** — opt-in behind `NVKVM_DEV_HARNESS_INSECURE_RW`; see below |
 | P-8 | high | process | — | **partly fixed** — see "the revert" |
 | P-9 | medium | shell quoting | — | build correctness |
 | P-10 | medium–high | liveness ×3 | isolate → VMM | see below |
@@ -119,6 +119,143 @@ ASLR.
 
 Fix is one line — `close(3)` in the stub, or seal before exec.
 
+### The writable alias — **FIXED, `073ece8`**, and this entry had gone stale
+
+`073ece8` ("isolate: seal the stub memfd so the stub can't rewrite its own
+text") took the seal option, which is strictly stronger than `close(3)`: the
+seal binds **every** holder of the fd, so it survives a stub that forgets to
+close, a `dup`, and an fd inherited by anything the stub later spawns.
+`src/qemu/nvkvm_isolate.c`, in the embedded-stub spawn path, now:
+
+- creates the memfd with `MFD_CLOEXEC | MFD_ALLOW_SEALING`;
+- `write(2)`s the image (never `mmap`s it, which is what lets `F_SEAL_WRITE`
+  take — the seal is refused while a writable mapping is outstanding);
+- applies `F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE` **before**
+  `fork`/`fexecve`, while the image is still the parent's alone;
+- **fails closed** if the seal does not take — it logs *"refusing to spawn
+  isolate: could not seal stub memfd"* and returns the errno rather than
+  spawning an isolate that can rewrite itself.
+
+After the seal, `mmap(PROT_WRITE, MAP_SHARED, 3, 0)` returns `EPERM` for every
+holder, forever, and `F_SEAL_SEAL` stops the set being reopened. Neither
+`F_SEAL_WRITE` nor `F_SEAL_SEAL` affects `execve`, so the `fexecve` of fd 3 is
+unchanged.
+
+The **on-disk** spawn path (`NVKVM_STUB_PATH`) was never affected: it
+`open(stub_path, O_RDONLY | O_CLOEXEC)`s the binary, so there is no writable
+descriptor to seal.
+
+Verified in this tree: the seal is applied at `nvkvm_isolate.c` before the
+`nvkvm_isolate_spawn(mode)` call, and reproduced end to end against the real
+stub through the exact production sequence — `memfd_create(MFD_ALLOW_SEALING)`,
+write, `F_ADD_SEALS`, park at fd 3, `fexecve` — which still starts a working
+stub with the seccomp filter on.
+
+`close(3)` in the stub was **not** added on top. Nothing else uses fd 3 after
+exec (`NVKVM_DEV_DIRFD` is 4 and `NVKVM_DRM_FD(k)` is 5+, both in
+`src/common/nvkvm_isolate_proto.h`), so it would be safe — but with the seal in
+place the residual is a read-only descriptor to a binary whose bytes are in the
+public source tree, which buys an attacker nothing.
+
+### `ET_EXEC`, not PIE — **FIXED**, the build now produces a genuine static PIE
+
+The finding was right and stayed right: `readelf -h nvkvm_stub` said
+`Type: EXEC`, entry `0x407584`, and four consecutive runs all mapped the image
+at `00400000-00401000`. No ASLR inside the isolate at all.
+
+By the time this was picked up the Makefile comment had already been corrected
+— it no longer claimed PIE, it explained at length that `-static -pie` emits
+`ET_EXEC` because GCC's spec lets `-static` win over `-pie`. So the "code and
+comment disagree" half was closed. What was still true is that the isolate is
+the containment boundary for every finding in
+[`audit-guest-pointers.md`](audit-guest-pointers.md), and several of those
+(U-1/U-2/U-4, and U-7 explicitly, which is rated on being *"a stepping stone"*
+for them) are rated on the attacker not knowing where things are. A fixed text
+base is worth spending a build change on rather than documenting.
+
+**The build change is two things, not one flag**, and the second is why this
+looked harder than it was:
+
+1. `-static-pie` — one word, not `-static -pie`. This alone links and produces
+   `ET_DYN`.
+2. `-DNVKVM_STUB_SELF_RELOC`, so that `apply_relocations()` in
+   `src/stub/nvkvm_stub.c` is compiled in and called as the first statement of
+   `main()`. Nothing else applies the `R_X86_64_RELATIVE` entries: `fexecve`
+   from a memfd means no dynamic linker, and `-nostdlib -ffreestanding` means
+   no `rcrt1.o`.
+
+The Makefile's previous comment said this second piece did not exist ("a
+self-relocation entry stub ... which `-nostdlib -ffreestanding` means we do not
+have"). It did exist — `apply_relocations()` has been in the tree all along.
+It was guarded on `NVKVM_STUB_EMBEDDED`, which is defined for **QEMU's** build
+of `nvkvm_isolate.c` (`scripts/build_qemu.sh --extra-cflags`) and has never
+been defined for the stub's own build in `src/stub/Makefile`. So the routine
+was dead code under a define that meant something else.
+
+**The one real obstacle, measured.** With `-static-pie` and the relocation
+routine compiled in, the stub still `SIGSEGV`d — *inside the relocation routine
+itself*:
+
+```
+Program received signal SIGSEGV, Segmentation fault.
+apply_relocations () at nvkvm_stub.c:3049
+#0  apply_relocations () at nvkvm_stub.c:3049
+#1  main (argc=2, argv=0x7fffffffdff8) at nvkvm_stub.c:3112
+```
+
+Cause: written as plain C, GCC loads the address of `_DYNAMIC` **from the GOT**
+— and that GOT slot is the only `R_X86_64_RELATIVE` entry in the entire image,
+i.e. the very relocation the function exists to apply:
+
+```
+Relocation section '.rela.dyn' contains 1 entry:
+  Offset          Info           Type              Sym. Value  Sym. Name + Addend
+000000009ff8  000000000008 R_X86_64_RELATIVE                     9ed0
+```
+
+The unrelocated slot still holds the link-time `0x9ed0`, so the first
+`dyn->d_tag` read faults. `volatile` does not help, and neither does
+`visibility("hidden")` — both were tried, both still emit the GOT load. The
+fix is to take the address with an explicit RIP-relative `lea`, which needs no
+relocation and so breaks the cycle. musl's `rcrt1.c` does the same thing for
+the same reason.
+
+**Verified, without hardware:**
+
+| | before | after |
+|---|---|---|
+| `readelf -h` | `Type: EXEC`, entry `0x407584` | `Type: DYN`, entry `0x7604` |
+| load base, 4 runs | `00400000` ×4 | `7b592c05f000`, `7c06ee98b000`, `72ec7e353000`, `720c54e9d000` |
+
+Load base measured from `/proc/<pid>/maps` on the real stub, spawned the way
+QEMU spawns it — `memfd_create(MFD_ALLOW_SEALING)`, write, `F_ADD_SEALS`
+(including `F_SEAL_WRITE`, i.e. with the fix above active), image parked at
+fd 3, `fexecve`, command socket on fd 0 — **with the seccomp filter on**, and
+against the stripped binary that actually ships. The stub reaches its socket
+wait in every case, so this is not "it links", it is "it runs".
+
+**Two regression guards**, because this claim was wrong in the Makefile for a
+long time and nothing caught it:
+
+- Going back to `-static -pie` now **fails the link**: `undefined reference to
+  '_DYNAMIC'`, because the `lea` has nothing to resolve against in a
+  non-dynamic image. Verified by doing it.
+- A `verify-pie` target runs `readelf -h` after every link and fails the build
+  if the type is not `DYN`. Verified by pointing it at the old `ET_EXEC`
+  binary, which it rejects.
+
+The guard matters in one direction more than the other: applying PIE
+relocations to an `ET_EXEC` link is not a harmless no-op, it is memory
+corruption (`r_offset` is an absolute vaddr there, so `base + r_offset` writes
+past the end of the image). The flag and the define have to move together, and
+both the Makefile and the source say so at the point of use.
+
+**Not verified without hardware:** that a PIE stub behaves identically once it
+is brokering real GPU ioctls. Nothing in the change is GPU-adjacent — it moves
+the text base and applies relocations before `main` does anything — and the
+stub survives spawn, seccomp and its socket wait, but a GPU run is the gate
+that has not been through.
+
 ---
 
 ## P-4 — two handlers accept the caller's self-declared identity
@@ -154,8 +291,51 @@ Mitigating: distinct PID and mount namespaces still block naming or ptracing a
 peer. This is the removal of a layer the code claims, not a demonstrated
 cross-isolate takeover.
 
-**This needs a decision, not a patch** — either add UID to the default rung or
-stop claiming it. The comment should be corrected either way.
+~~**This needs a decision, not a patch** — either add UID to the default rung or
+stop claiming it. The comment should be corrected either way.~~
+
+### DECIDED, 2026-08-24 — uid separation is not required. Namespaces are the boundary.
+
+Recorded as a decision rather than left open. The maintainer's position, in
+their terms:
+
+> **Namespaces are the boundary.** In Docker, uid + chroot are already
+> sufficient, because no other namespace permits communication with any host
+> process.
+
+Read as a threat-model statement rather than a claim about DAC: what the
+isolate has to prevent is an isolate reaching a *host* process, and every
+channel by which one process reaches another — pids to signal or ptrace, mount
+paths, abstract and filesystem sockets, SysV IPC, the network — is severed by
+the namespace set the default rung already installs, before any uid check would
+be consulted. A shared euid is only exploitable through a channel that exists,
+and on this rung none does.
+
+So `NVKVM_ISO_LAYER_UID` stays the fallback rung, `nvkvm_iso_auto_select` keeps
+preferring `NS | SECCOMP`, and no code changes.
+
+**What was actually wrong here was the claim, and that half is already fixed.**
+`d28201e` ("docs: correct three claims the code makes about boundaries it does
+not have") rewrote the comment in `nvkvm_isolate_handlers.c`, which now reads:
+
+> `NOT uid-separated, whatever this comment used to say.` […] every isolate's
+> in-namespace root maps to the SAME host uid, QEMU's own. What separates them
+> is the user/pid/mount/net/ipc/uts namespaces plus seccomp, which is a real
+> boundary […] but is not a uid boundary. […] Do not reason about this layer as
+> though a DAC check were backing it up.
+
+That is exactly what this finding asked for, and it is the load-bearing part:
+the danger was never the missing uid, it was a reader trusting a DAC check that
+is not there.
+
+**What this decision does not cover.** P-5's second consequence stands and is
+not closed by it: RM's `osValidateClientTokens` rejects only when euid *and*
+pid both differ, so with a shared euid it does not separate isolates either.
+That matters for the "Suspected — cross-VM `hClient` blind spot" item in this
+document, which cites P-5 as the reason RM's own guard cannot be leaned on.
+Anything relying on RM to keep two isolates' client handles apart still needs
+its own check host-side; the decision above is that *nvkvm* need not add a uid
+layer, not that RM provides one.
 
 ---
 
@@ -213,6 +393,65 @@ execution on the host"* — it does **not** contradict `SECURITY.md`, which
 disclaims that boundary. The guest builds its module on that share, so
 read-only is not a one-line fix. It is a development harness and must never be
 pointed at an untrusted guest.
+
+### GATED, 2026-08-24 — the capability is kept, but it is now opt-in and loud
+
+**The decision, in the maintainer's terms: for testing it does not have to be
+secure.** So the capability is not removed. What changes is that it can no
+longer happen implicitly — the objection was never "a dev harness is
+insecure", it was that `sudo bash scripts/run_test_vm.sh` looked like a
+supported way to run the thing.
+
+`scripts/run_test_vm.sh` now exports the repo **read-only** by default, and
+read-write only under
+
+```
+NVKVM_DEV_HARNESS_INSECURE_RW=1
+```
+
+The flag name is the documentation: it says dev, it says harness, and it says
+insecure, so it cannot be set by someone who thinks they are configuring a
+supported deployment.
+
+When it is set, the script prints a banner before QEMU starts, naming the
+three-step guest-root → host-root path from this finding verbatim and stating
+that this is not a sandbox and not a supported configuration. When it is not
+set, it prints a shorter note saying the export is read-only, which flag turns
+it on, and why to read the banner first — so the failure mode is a clear
+message, not a mysterious `EROFS` in a cloud-init log.
+
+`scripts/run_remote_test.sh` forwards the flag verbatim to the remote host on
+both spawn sites, defaulting to `0`. Otherwise the remote path — which is the
+half of this finding that actually completes the exploit, since `restart` is
+what runs the rewritten script as host root — would have been a back door
+around the gate.
+
+**Why read-only default rather than refusing to launch.** Refusing outright
+was considered and rejected: the writable share is how the guest builds
+`nvkvm-guest.ko` on first boot, which is the harness's main job, so a hard
+refusal would only teach people to set the flag permanently without reading
+it. Read-only keeps every *other* use — boot, benchmark, driver bring-up,
+demo, the whole of `docs/howto/run.md` after the module exists — working with
+no host-write path at all, and confines the flag to the one boot that needs it.
+
+**Verified** by running `scripts/run_test_vm.sh` with `$QEMU_BIN` pointed at a
+script that prints its argv, in both modes:
+
+| | rendered `-virtfs` | banner |
+|---|---|---|
+| default | `local,path=…,mount_tag=nvkvm_src,security_model=mapped,readonly=on` | read-only note |
+| `…INSECURE_RW=1` | `local,path=…,mount_tag=nvkvm_src,security_model=mapped` | the guest-root → host-root banner |
+
+Both scripts pass `bash -n`. Documented as dev-only in `CONTRIBUTING.md`
+("The dev VM harness is not a sandbox"), `README.md`, `docs/howto/run.md` and
+`docs/howto/build.md` — the last two because the in-guest `make` now fails on a
+default launch, and that has to read as a missing flag rather than a broken
+guest.
+
+**Still true, and deliberately so:** with the flag set this is exactly the
+finding above, unchanged. The gate makes the configuration explicit; it does
+not make it safe, and nothing here should be read as making the harness
+suitable for an untrusted guest.
 
 ---
 

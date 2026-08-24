@@ -24,6 +24,18 @@
 # do not fuzz, benchmark or demo an untrusted guest image with it, and do not
 # leave it running on a shared machine. See CONTRIBUTING.md, "The dev VM
 # harness is not a sandbox".
+#
+# The capability is DELIBERATE and is kept: for testing, this does not have to
+# be secure. What it must not be is implicit. So since 2026-08-24 the writable
+# export is OPT-IN, behind
+#
+#     NVKVM_DEV_HARNESS_INSECURE_RW=1
+#
+# and it prints a banner naming the guest-root -> host-root path whenever it is
+# on. Unset, the repo is exported READ-ONLY: the VM boots, the guest reads the
+# tree, and in-guest module builds fail on a read-only /mnt/nvkvm with a
+# message pointing back here. Nobody gets the writable share by accident, and
+# nobody who has it can claim they were not told.
 # ############################################################################
 #
 # This starts a QEMU VM with:
@@ -110,12 +122,62 @@ if [ -n "${NVKVM_SHARE_DIR:-}" ] && [ -d "${NVKVM_SHARE_DIR}" ]; then
     SHARE_ARG="-virtfs local,path=${NVKVM_SHARE_DIR},mount_tag=nvkvm_data,security_model=passthrough"
 fi
 
+# ── P-7: the repo export is READ-ONLY unless explicitly opted in ─────────
+# See the banner at the top of this file for the whole path. Short version:
+# guest root writes scripts/run_test_vm.sh on this share, and the next
+# `run_remote_test.sh restart` runs it on the host as root.
+#
+# Refusing outright was rejected: the writable share is how the guest builds
+# nvkvm-guest.ko, it is the harness's main job, and a hard refusal would only
+# teach people to set the flag without reading it. Read-only by default keeps
+# every non-build use (boot, benchmark, demo, driver bring-up) working with no
+# host-write path at all, and makes the writable case an explicit, named,
+# loudly-announced choice.
+if [ "${NVKVM_DEV_HARNESS_INSECURE_RW:-0}" = "1" ]; then
+    REPO_9P_MODE="read-write  (NVKVM_DEV_HARNESS_INSECURE_RW=1)"
+    REPO_9P_RO=""
+    cat >&2 <<'INSECURE'
+
+  ############################################################################
+  #  NVKVM_DEV_HARNESS_INSECURE_RW=1 — THE REPO IS EXPORTED TO THE GUEST
+  #  READ-WRITE. THIS GIVES GUEST ROOT A PATH TO HOST ROOT:
+  #
+  #    1. guest root edits any file under /mnt/nvkvm — say
+  #       scripts/run_test_vm.sh;
+  #    2. scripts/run_remote_test.sh restart runs that script ON THE HOST,
+  #       AS ROOT;
+  #    3. that is the whole exploit. No race, no timing.
+  #
+  #  This is a DEVELOPMENT HARNESS. It is not a supported configuration and
+  #  it is not a sandbox. Point it at a guest image you trust completely and
+  #  nothing else: do not fuzz it, do not demo an untrusted image on it, and
+  #  do not leave it running on a shared machine.
+  ############################################################################
+
+INSECURE
+else
+    REPO_9P_MODE="READ-ONLY   (set NVKVM_DEV_HARNESS_INSECURE_RW=1 for read-write)"
+    REPO_9P_RO=",readonly=on"
+    cat >&2 <<'SAFE'
+
+  NOTE: the repo 9p export is READ-ONLY. Building nvkvm-guest.ko inside the
+  guest writes to that share and will fail. To allow it, re-run with
+
+      NVKVM_DEV_HARNESS_INSECURE_RW=1
+
+  and read the banner it prints first: a writable export hands guest root a
+  path to host root. Every other use of this harness works read-only.
+
+SAFE
+fi
+
 echo "Starting nvkvm test VM..."
 
 echo "QEMU         : $QEMU"
 echo "Disk image   : $IMG"
 echo "Seed ISO     : ${SEED:-(none)}"
 echo "Repo (9p)    : $REPO_ROOT  →  guest:/mnt/nvkvm  (tag: nvkvm_src)"
+echo "Repo access  : $REPO_9P_MODE"
 echo "SSH          : ssh ubuntu@localhost -p $SSH_PORT"
 echo ""
 
@@ -258,10 +320,11 @@ exec "$QEMU" \
     `# No BARs/DMA; all GPU I/O still flows through virtio-nvgpu forwarding.` \
     -device nvkvm-gpu,addr=7 \
     \
-    `# READ-WRITE export of the whole repo. Guest root can rewrite any script` \
-    `# here, including ones the HOST later runs as root (run_remote_test.sh` \
-    `# restart). Dev harness only -- see the banner at the top of this file.` \
-    -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped \
+    `# Export of the whole repo. READ-ONLY unless NVKVM_DEV_HARNESS_INSECURE_RW=1,` \
+    `# because read-write lets guest root rewrite any script here, including` \
+    `# ones the HOST later runs as root (run_remote_test.sh restart). Dev` \
+    `# harness only -- see the banner at the top of this file.` \
+    -virtfs local,path="$REPO_ROOT",mount_tag=nvkvm_src,security_model=mapped$REPO_9P_RO \
     $HOSTLIBS_ARG \
     $SHARE_ARG \
     \
