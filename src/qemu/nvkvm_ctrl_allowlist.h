@@ -129,7 +129,19 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x20800406u,
 	0x20800407u,
 	0x20800802u,
-	0x2080110bu,
+	0x2080110bu,	/* NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS.  Carries an NvP64
+			 * pRunlistPreemptEvent at params offset 16 that nvkvm
+			 * forwards VERBATIM -- no rewrite reaches inside the aux
+			 * blob for this cmd.  Safe anyway: the handler's first
+			 * statement rejects the whole control with
+			 * NV_ERR_INSUFFICIENT_PERMISSIONS when the field is
+			 * non-NULL and privLevel < RS_PRIV_LEVEL_KERNEL, which no
+			 * ioctl client can ever be (escape.c:375 caps it at
+			 * USER_ROOT).  Verified 515 through 610.  See U-13 in
+			 * docs/internal/audit-guest-pointers.md -- including why a
+			 * defensive clear here would be a downgrade.  NOTE: its
+			 * hClientList[64] at offset 24 is a separate, still-open
+			 * question (the cross-VM hClient blind spot). */
 	0x20801201u,
 	0x20801210u,
 	0x20801218u,

@@ -19,7 +19,7 @@ the rest are open. Read this table before the detail.
 | U-10 | MEDIUM | **fixed** — offset 16 decided from the cmd, offset 32 zeroed (`nvkvm_stub.c`) |
 | U-11 | MEDIUM | open |
 | U-12 | MEDIUM | **fixed** — `szName` cleared host-side via `aux_clear_ptr` (`nvkvm_stub.c`) |
-| U-13 | UNKNOWN | open |
+| U-13 | ~~UNKNOWN~~ **not exploitable** | **closed** — RM refuses the whole control if the pointer is non-NULL and the client is not kernel-privileged. Traced 2026-08-24, evidence below |
 | U-14 | by design | documented for completeness |
 | A-1 | **CRITICAL** | **fixed** — `NV_ESC_RM_ALLOC_MEMORY` + `hClass 0x71` pinned arbitrary stub memory; now gated on host-installed ranges |
 | A-2 | not a control | the missing session gate on `ioctl_on_isolate` — analysed below, deliberately not added |
@@ -874,12 +874,80 @@ doing it, and guest code is not a security control.
 
 ---
 
-### U-13 — OPEN — UNKNOWN severity — `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` (0x2080110b) `pRunlistPreemptEvent`
+### U-13 — CLOSED 2026-08-24 — NOT EXPLOITABLE — `NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS` (0x2080110b) `pRunlistPreemptEvent`
 
 `NvP64`, documented in the header as "KEVENT handle for Async HW runlist preemption". It is not in
 `embedded_param_copy.c`, which suggests RM treats it as an opaque handle rather than a user pointer —
 but I could not follow it to a definite consume-or-ignore in the open tree. Allowlisted, unhandled
 host-side. Listing it as `UNENFORCED` with severity `UNKNOWN` rather than dropping it.
+
+**Traced. The severity is not UNKNOWN, it is none, and the reason is a check in the driver.**
+
+Reachability, in the order it has to be established:
+
+1. **Is the command allowlisted?** Yes — `src/qemu/nvkvm_ctrl_allowlist.h:132`, a bare
+   `0x2080110bu` with no justifying comment. Neither rule-based passthrough admits it
+   (`0x110b & 0x8000 == 0`, and `cmd >> 16` is `0x2080`, not `0x2081`), so the explicit row is the
+   only thing letting it through. So it does **not** close as unreachable here.
+
+2. **Does nvkvm's pointer rewrite reach the field's offset?** No. The generic rewrite (U-2) replaces
+   `NVOS54.params` at outer offset 16 with the address of the stub's aux blob; it does nothing to
+   fields *inside* that blob. Everything inside is per-command, and in `src/stub/nvkvm_stub.c` the
+   per-command list is exactly `0x101`, `0x202`, `0x3d05`, `0x3d06`/`0x3d08` and `0x80170d`, plus the
+   `nvkvm_ctrl_list_entry_size()` InfoList family. `0x2080110b` is in none of them, so the guest's
+   64 bits at aux offset 16 are forwarded to RM **verbatim**. (Offset confirmed by compiling the
+   struct: `pRunlistPreemptEvent@16`, `hClientList@24`, `hChannelList@280`, `sizeof == 536`.)
+
+3. **Does the driver dereference it?** **No — it refuses the entire control first.**
+   `subdeviceCtrlCmdFifoDisableChannels_IMPL`, `src/nvidia/src/kernel/gpu/fifo/kernel_fifo_ctrl.c`,
+   opens with:
+
+   ```c
+   // Validate use of pRunlistPreemptEvent to allow use by Kernel clients only
+   if ((pDisableChannelParams->pRunlistPreemptEvent != NULL) &&
+       (pCallContext->secInfo.privLevel < RS_PRIV_LEVEL_KERNEL))
+   {
+       return NV_ERR_INSUFFICIENT_PERMISSIONS;
+   }
+   ```
+
+   It is the first statement of the handler, before the `NV_RM_RPC_CONTROL` forward and before any
+   use of the field. And no ioctl client can satisfy it: the escape path sets
+   `secInfo.privLevel = osIsAdministrator() ? RS_PRIV_LEVEL_USER_ROOT : RS_PRIV_LEVEL_USER`
+   (`src/nvidia/arch/nvalloc/unix/src/escape.c:375`), and `RS_PRIV_LEVEL_KERNEL` is the **largest**
+   value of the enum (`src/common/sdk/nvidia/inc/nvsecurityinfo.h:36-38`, ordered `USER`,
+   `USER_ROOT`, `KERNEL`). `RS_PRIV_LEVEL_KERNEL` is set only for RM-internal contexts
+   (`rmapi/deprecated_context.c:184`), never for anything arriving through `/dev/nvidiactl`. The
+   stub is an ordinary userspace RM client, so a non-NULL value there is a guaranteed
+   `NV_ERR_INSUFFICIENT_PERMISSIONS`, not a dereference.
+
+   The `NV_RM_RPC_CONTROL` forward that follows copies `pParams` to GSP **as data**, so the pointer
+   value crosses as bytes and is not dereferenced there either.
+
+**Checked across the whole version span nvkvm supports**, because a guard that appeared late would
+close nothing on the older branches. Byte-identical at **515.105.01, 575.51.03, 580.95.05,
+580.159.04 and 610.43.02** — i.e. present since the first open-source release, comfortably before
+535, the oldest driver nvkvm supports.
+
+**No code change.** A defensive `aux_clear_ptr(job.aux_buf, job.aux_size, 16)` on `inner_cmd ==
+0x2080110b` was considered — it is the U-12 treatment and it would cost nothing on the live path,
+since a legitimate userspace caller must pass NULL anyway. It was **not** added, deliberately:
+clearing the field would convert a request RM *refuses* into one it *accepts*, silently changing the
+driver's verdict for a hostile caller. U-7's clear does not have that property (the field there is
+one the driver would otherwise happily dereference); this one does. Where the driver's own check is
+unconditional, first-statement, and present in every supported version, masking it is a downgrade,
+not hardening.
+
+**Not closed by this**, and it is a different field in the same struct: the *"Suspected — cross-VM
+`hClient` blind spot"* item in
+[`audit-prerelease-2026-08-21.md`](audit-prerelease-2026-08-21.md) cites `0x2080110b`'s
+`hClientList[64]` (offset 24, above) as a second client handle the per-VM gate does not see, because
+that gate reads param offset 0 only. That is a handle-scoping question, not a pointer-dereference
+one, and it stays open. U-13 was only ever about `pRunlistPreemptEvent`.
+
+**An UNKNOWN that turns out to be nothing is a result.** Recorded in full so the next reader does
+not re-derive it — the work here was three greps and a struct offset, and it had been sitting open
+for the want of them.
 
 ---
 
@@ -1020,7 +1088,9 @@ from a corrupted isolate is the whole point of the seccomp filter, which has not
 - **`pOsEvent` on classes 0x00f1 / 0x00fd, and `pOsPidInfo` on class 0x0000** (§5) — consuming code
   outside the sparse checkout, or apparently RM-internal.
 - **Whether `NVOS32.data.HwAlloc.bindResultFunc` is consumed** by the Linux RM path (U-3).
-- **`pRunlistPreemptEvent`** (U-13).
+- ~~**`pRunlistPreemptEvent`** (U-13).~~ **Settled 2026-08-24** — RM rejects the whole control with
+  `NV_ERR_INSUFFICIENT_PERMISSIONS` before touching the field, for every client that is not
+  kernel-privileged, in every driver version from 515 to 610. See U-13 above.
 - **The seccomp filter itself.** Assumed effective; not read line-by-line. Since it is what bounds
   every severity rating in this report, it should be the next thing audited.
   **Done 2026-08-20** — see [`audit-boundaries-2026-08-20.md`](audit-boundaries-2026-08-20.md) §6.
