@@ -359,15 +359,21 @@ drivers_for_arch() {
         *)        die "unknown --preset '$PRESET' (want: boundary, matrix)" 3 ;;
     esac
 
-    while IFS=$'\t' read -r ver alts why; do
+    # '|' and not $'\t': tab is IFS *whitespace*, so bash collapses runs of it
+    # and an EMPTY alternates column vanishes, shifting `why` into `alts` and
+    # leaving the caller comparing an ABI profile against a sentence.  Every
+    # DRIVER_PRESET_BOUNDARY row has alternates, which is why this never showed
+    # up offline; --drivers rows and the matrix rows for versions with no
+    # substitute (575.51.03) do not.
+    while IFS='|' read -r ver alts why; do
         [ -z "$ver" ] && continue
         maj="${ver%%.*}"
         [ "$maj" -lt "$floor" ] 2>/dev/null && continue
         if [ -n "$DRIVERS_REQ" ]; then
             case ",$DRIVERS_REQ," in *",$ver,"*) ;; *) continue ;; esac
         fi
-        printf '%s\t%s\t%s\t%s\n' "$ver" "$alts" "$(abi_expected "$ver")" "$why"
-    done <<<"$rows"
+        printf '%s|%s|%s|%s\n' "$ver" "$alts" "$(abi_expected "$ver")" "$why"
+    done <<<"$(printf '%s\n' "$rows" | tr '\t' '|')"
 
     # An explicitly requested version that is in no preset is still honoured --
     # otherwise --drivers would silently do nothing, which is the class of
@@ -378,7 +384,7 @@ drivers_for_arch() {
             printf '%s\n' "$rows" | cut -f1 | grep -qx "$d" && continue
             maj="${d%%.*}"
             [ "$maj" -lt "$floor" ] 2>/dev/null && continue
-            printf '%s\t%s\t%s\t%s\n' "$d" "" "$(abi_expected "$d")" "explicitly requested with --drivers"
+            printf '%s|%s|%s|%s\n' "$d" "" "$(abi_expected "$d")" "explicitly requested with --drivers"
         done
     fi
 }
@@ -535,6 +541,16 @@ reconcile() {
             [ -z "$id" ] && continue
             if printf '%s\n' "$live" | grep -qx "$id"; then leaked="$leaked $id"; fi
         done < <(grep -oE '^[0-9]+' "$REGISTRY" 2>/dev/null | sort -u)
+    fi
+    if [ -n "$leaked" ] && [ "$KEEP" = 1 ]; then
+        # --keep means "leave it up on purpose".  Calling that a leak and
+        # exiting 4 would make the exit code that means "go destroy something
+        # by hand" fire on every deliberate run, which is how a real leak later
+        # gets ignored.
+        info "kept alive on purpose (--keep):$leaked"
+        info "  the auto-destroy timer (pid ${TIMER_PID:-?}) still holds them; destroy with:"
+        for id in $leaked; do info "    yes | vastai destroy instance $id -y"; done
+        return 0
     fi
     if [ -n "$leaked" ]; then
         LEAK_SUSPECTED=1
@@ -912,8 +928,28 @@ DRIVER_DETAIL=""
 DRIVER_ACTUAL=""
 install_driver() {
     local ver="$1" arch="$2" logfile="$3" alts="$4" want_abi="$5"
-    local vetted="" a out
+    local vetted="" a out lic
     DRIVER_DETAIL=""; DRIVER_ACTUAL=""
+
+    # MODULE FLAVOUR, not just version.  sweep_matrix.install_driver() has a
+    # fast path -- "cur == ver, nothing to do" -- that compares only the
+    # version string.  On Blackwell and datacenter Hopper the PROPRIETARY
+    # module of the right version cannot bind to the GPU at all:
+    #     NVRM: ... requires use of the NVIDIA open kernel modules.
+    #     NVRM: GPU ...: RmInitAdapter failed! (0x22:0x56:884)
+    # and the box then looks like it has no GPU.  Measured on an RTX 5060 with
+    # the vast image's preinstalled 575.51.03, 2026-08-24.  So on an
+    # open-module architecture, force a real install unless the LOADED module
+    # is the open one; the open module reports "Dual MIT/GPL", the proprietary
+    # one "NVIDIA".
+    if arch_needs_open_module "$arch"; then
+        lic="$(rsh_t 90 'modinfo nvidia 2>/dev/null | awk "/^license:/{print \$2, \$3}"' 2>/dev/null | tr -d '\r')"
+        case "$lic" in
+            *MIT*|*GPL*) ;;
+            *) info "    $arch needs the OPEN kernel module; loaded module reports license='${lic:-none}'"
+               info "    -> forcing a real install rather than trusting the version match" ;;
+        esac
+    fi
 
     for a in ${alts//,/ }; do
         [ -z "$a" ] && continue
@@ -1259,7 +1295,7 @@ sweep_one_box() {
 # ---------------------------------------------------------------------------
 sweep_drivers_on_box() {
     local arch="$1" gpu="$2" iid="$3" machine="$4" logdir="$5"
-    local drv alts prof why cur0 todo tested=0 smi actual abi_ok t0 t1 dur applicable
+    local drv alts prof why cur0 todo tested=0 smi actual abi_ok t0 t1 dur applicable nvrm
 
     todo="$(drivers_for_arch "$arch")"
     if [ -z "$todo" ]; then
@@ -1281,7 +1317,7 @@ sweep_drivers_on_box() {
     # consecutive driver failures and points the investigation at NVIDIA.
     #
     # It does NOT count toward --min-drivers: it is not a chosen version.
-    if [ "$CONTROL" = 1 ] && [ -n "$cur0" ] && ! printf '%s\n' "$todo" | cut -f1 | grep -qx "$cur0"; then
+    if [ "$CONTROL" = 1 ] && [ -n "$cur0" ] && ! printf '%s\n' "$todo" | cut -d"|" -f1 | grep -qx "$cur0"; then
         info "  control run on the preinstalled $cur0 (free, before any purge)"
         boot_and_validate "$cur0" "$gpu"
         say "    nvkvm: host driver $cur0 → ABI profile ${VR_ABI:-?}   [control]"
@@ -1301,13 +1337,13 @@ sweep_drivers_on_box() {
     # image's driver is DKMS-managed, so the first .run install purges it for
     # good.  If a preinstalled version is ALSO a row in the driver set, that row
     # must be measured first or it becomes untestable after the purge.
-    if [ -n "$cur0" ] && printf '%s\n' "$todo" | cut -f1 | grep -qx "$cur0"; then
-        todo="$( { printf '%s\n' "$todo" | awk -F'\t' -v c="$cur0" '$1==c'
-                   printf '%s\n' "$todo" | awk -F'\t' -v c="$cur0" '$1!=c'; } )"
+    if [ -n "$cur0" ] && printf '%s\n' "$todo" | cut -d"|" -f1 | grep -qx "$cur0"; then
+        todo="$( { printf '%s\n' "$todo" | awk -F'|' -v c="$cur0" '$1==c'
+                   printf '%s\n' "$todo" | awk -F'|' -v c="$cur0" '$1!=c'; } )"
         info "  $cur0 is both preinstalled and in the driver set -- testing it first, before any purge"
     fi
 
-    while IFS=$'\t' read -r drv alts prof why; do
+    while IFS='|' read -r drv alts prof why; do
         [ -z "$drv" ] && continue
         if stop_requested; then
             warn "  STOP requested ($STOP_FILE) -- ending this box cleanly"
@@ -1344,6 +1380,26 @@ sweep_drivers_on_box() {
         case "$(printf '%s' "$smi" | tr 'a-z' 'A-Z')" in
             *NVIDIA*|*GEFORCE*|*RTX*|*QUADRO*|*TESLA*) ;;
             *)
+                # "No devices were found" has TWO causes and they must not share
+                # a status.  A driver older than the silicon is a documented
+                # exclusion; a module of the WRONG FLAVOUR is a fixable harness
+                # problem that has to move the exit code, or a Blackwell box
+                # reports a shortfall with no hint that -m=kernel-open was all
+                # it needed -- and, being terminal, is never retried on resume.
+                nvrm="$(rsh_t 90 'dmesg 2>/dev/null | grep -aiE "requires use of the NVIDIA open kernel modules|RmInitAdapter failed" | tail -3' 2>/dev/null | tr -d '\r')"
+                case "$nvrm" in
+                    *"open kernel modules"*)
+                        warn "    $actual is loaded but is the WRONG MODULE FLAVOUR for this GPU:"
+                        warn "    the silicon requires the OPEN kernel module (-m=kernel-open)."
+                        warn "    This is NOT 'the driver predates the GPU' -- it is fixable and UNTESTED."
+                        BOX_UNTESTED=$(( BOX_UNTESTED + 1 ))
+                        emit "$(jrec arch "$arch" gpu "$gpu" driver "$drv" driver_actual "$actual" \
+                                abi_expected "$prof" status "driver-wrong-module-flavour" instance "$iid" \
+                                rationale "$why" \
+                                detail "nvidia-smi: ${smi:0:120} || kernel: ${nvrm:0:400}" \
+                                ts "$(date -u +%FT%TZ)")"
+                        continue ;;
+                esac
                 info "    $actual installed but reports no GPU -- predates this silicon"
                 emit "$(jrec arch "$arch" gpu "$gpu" driver "$drv" driver_actual "$actual" \
                         abi_expected "$prof" status "driver-predates-gpu" instance "$iid" \
@@ -1626,7 +1682,7 @@ for a in ${ARCHES//,/ }; do
     total_units=$(( total_units + n )); nboxes=$(( nboxes + 1 ))
     open=""; arch_needs_open_module "$a" && open="  [needs -m=kernel-open]"
     say "  $a: $n applicable driver(s), floor $(arch_floor "$a")$open"
-    drivers_for_arch "$a" | while IFS=$'\t' read -r v _ p w; do
+    drivers_for_arch "$a" | while IFS='|' read -r v _ p w; do
         printf '      %-12s -> ABI %-4s %s\n' "$v" "$p" "$w"
     done
 done
