@@ -23,6 +23,26 @@
  *
  *   gcc -O0 -o /tmp/a1_osdesc_gate_test a1_osdesc_gate_test.c -ldl && /tmp/a1_osdesc_gate_test
  *
+ * READ THIS BEFORE TRUSTING A PASS.  Run from guest userspace against the STOCK
+ * module, the negative probes are refused by the GUEST MODULE, not by the host
+ * gate: the module tries to migrate the range first (nvkvm_ioctl.c:409-440) and
+ * fails on an address the guest does not own, so the ioctl never leaves the
+ * guest.  The probes pass, and would keep passing with the host gate removed.
+ *
+ * The threat model is a malicious guest KERNEL, which simply would not migrate.
+ * To exercise the host gate, build a module that forwards the raw ioctl:
+ *
+ *   cp -r /mnt/nvkvm/src /tmp/bp/src && cd /tmp/bp/src/guest
+ *   L=$(grep -n '^#include' nvkvm_ioctl.c | tail -1 | cut -d: -f1)
+ *   sed -i "${L}a #define nvkvm_cpu_pages_migrate_range(a,b,c,d) 0" nvkvm_ioctl.c
+ *   make KDIR=/lib/modules/$(uname -r)/build
+ *   sudo rmmod nvkvm_guest && sudo insmod ./nvkvm-guest.ko
+ *
+ * Then the probe reaches the host and MUST come back status=0x1e
+ * (NV_ERR_INVALID_ADDRESS) with "DENY OS_DESCRIPTOR ... (A-1)" in QEMU's log.
+ * Measured on an RTX 3060 / 575.51.03: exactly that, and cuMemHostRegister
+ * still succeeds on the stock module.  Restore the stock module afterwards.
+ *
  * Exit: 0 = gate holds and registration still works, 1 = otherwise.
  */
 #include <stdio.h>
