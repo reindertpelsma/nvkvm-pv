@@ -853,14 +853,58 @@ verify_is_vm() {
 # boxes that happen to have them.)
 # ---------------------------------------------------------------------------
 PROVISION_FAIL_DETAIL=""
+
+HOST_APT_DETAIL=""
+quiesce_host_apt() {
+    local out rc
+    HOST_APT_DETAIL=""
+    out="$(rsh_t 300 '
+systemctl stop apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+systemctl mask --runtime apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service 2>/dev/null || true
+
+# A service reaching inactive is not enough: the package worker can outlive
+# the unit stop briefly.  Do not launch a second apt until every dpkg/apt lock
+# is free.  Once the timers are runtime-masked there is no new contender able
+# to enter between this check and the following apt invocation.
+for attempt in $(seq 1 60); do
+    busy=""
+    if command -v fuser >/dev/null 2>&1; then
+        busy="$(fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true)"
+    else
+        busy="$(pgrep -f "(^|/)(apt|apt-get|dpkg|unattended-upgr)" 2>/dev/null || true)"
+    fi
+    [ -z "$busy" ] && exit 0
+    sleep 2
+done
+
+echo "[HARNESS] apt/dpkg locks remained busy after services and timers were stopped"
+command -v fuser >/dev/null 2>&1 && \
+    fuser -v /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>&1 || true
+ps -eo pid,ppid,stat,comm,args | grep -E "(apt|dpkg|unattended)" | grep -v grep || true
+exit 73
+' 2>&1)"; rc=$?
+    if [ "$rc" != 0 ]; then
+        HOST_APT_DETAIL="${out: -3000}"
+        [ -n "$HOST_APT_DETAIL" ] || HOST_APT_DETAIL="[HARNESS] host apt quiesce failed (rc=$rc)"
+        return 1
+    fi
+    return 0
+}
+
 provision_box() {
     local step cmd tmo rc errs tail
     PROVISION_FAIL_DETAIL=""; PROVISION_FAILED_STEP=""
 
-    # unattended-upgrades has twice wedged the apt resolver at 100% CPU holding
-    # the dpkg lock, failing the guest build with rc=100.  That reads as a
-    # result about a GPU and is nothing of the kind.
-    rsh_t 120 'systemctl stop unattended-upgrades 2>/dev/null; systemctl mask unattended-upgrades 2>/dev/null; true' >/dev/null 2>&1
+    # A one-time `systemctl stop unattended-upgrades` is not sufficient.  On
+    # instance 48670339 build_qemu.sh completed, then apt-daily restarted and
+    # setup_guest.sh failed on lock-frontend held by unattended-upgr.  Recheck
+    # before every apt-using phase, with the timers runtime-masked and the lock
+    # holder proven gone.
+    if ! quiesce_host_apt; then
+        PROVISION_FAIL_DETAIL="$HOST_APT_DETAIL"
+        PROVISION_FAILED_STEP="apt-quiesce"
+        return 1
+    fi
 
     info "  shipping the tree"
     tar --exclude=.git --exclude=sweep-runs -czf /tmp/nvkvm-sweep-tree.tgz -C "$REPO" . 2>/dev/null \
@@ -882,6 +926,11 @@ provision_box() {
     # --force as well.  That has wasted a full box cycle before.
     local ENVP='DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1'
     for step in build guest; do
+        if ! quiesce_host_apt; then
+            PROVISION_FAIL_DETAIL="$HOST_APT_DETAIL"
+            PROVISION_FAILED_STEP="apt-quiesce"
+            return 1
+        fi
         case "$step" in
             build) cmd="cd /root/nvkvm && $ENVP bash scripts/build_qemu.sh --install-deps"; tmo=3900 ;;
             guest) cmd="cd /root/nvkvm && $ENVP bash scripts/setup_guest.sh";               tmo=3000 ;;
@@ -1042,7 +1091,11 @@ boot_and_validate() {
     # recorded `guest-no-boot` against a guest that had booted fine.  Measured
     # on an RTX 5060 box, 2026-08-24.  Re-assert the mask, then retry while the
     # lock clears, then say so plainly if it still is not there.
-    rsh_t 200 'systemctl stop unattended-upgrades 2>/dev/null; systemctl mask unattended-upgrades 2>/dev/null; true' >/dev/null 2>&1
+    if ! quiesce_host_apt; then
+        VR_STATUS="host-apt-busy"
+        VR_DETAIL="$HOST_APT_DETAIL"
+        return
+    fi
     if ! rsh_t 120 'command -v sshpass >/dev/null' >/dev/null 2>&1; then
         for _ in 1 2 3 4 5 6 7 8; do
             rsh_t 240 'DEBIAN_FRONTEND=noninteractive apt-get install -y -q sshpass' >/dev/null 2>&1
@@ -1325,6 +1378,15 @@ sweep_one_box() {
 # ---------------------------------------------------------------------------
 # every applicable driver, on a box that is already provisioned
 # ---------------------------------------------------------------------------
+parse_nvrm_driver_version() {
+    # Proprietary banner: "Kernel Module  580.95.05"
+    # Open banner:        "Kernel Module for x86_64  580.95.05"
+    # The old proprietary-only expression returned an empty string for every
+    # current Vast desktop image, silently suppressing the free control run.
+    grep -oE 'Kernel Module( for [^[:space:]]+)?[[:space:]]+[0-9]+\.[0-9]+(\.[0-9]+)?' \
+        | awk '{print $NF}' | tail -1
+}
+
 sweep_drivers_on_box() {
     local arch="$1" gpu="$2" iid="$3" machine="$4" logdir="$5"
     local drv alts prof why cur0 todo tested=0 smi actual abi_ok t0 t1 dur applicable nvrm
@@ -1338,7 +1400,7 @@ sweep_drivers_on_box() {
     fi
 
     cur0="$(rsh_t 90 'cat /proc/driver/nvidia/version 2>/dev/null | head -1' 2>/dev/null \
-            | grep -oE 'Kernel Module +[0-9]+\.[0-9]+(\.[0-9]+)?' | awk '{print $NF}')"
+            | parse_nvrm_driver_version)"
 
     # THE CONTROL RUN.  Measure whatever the image already ships BEFORE
     # anything is purged, and label it a control rather than a matrix row.

@@ -77,4 +77,17 @@ kms_activate = section(
 assert "struct nvkvm_kms *kms = ddev->dev_private;" in kms_activate
 assert "nvkvm_kms_head = kms;" in kms_activate
 
+setup_guest = (ROOT / "scripts/setup_guest.sh").read_text(encoding="utf-8")
+module_unit = setup_guest[setup_guest.index("- path: /etc/systemd/system/nvkvm-guest.service"):
+                          setup_guest.index("packages:", setup_guest.index(
+                              "- path: /etc/systemd/system/nvkvm-guest.service"))]
+ordered(
+    module_unit,
+    "mktemp -d /var/tmp/nvkvm-guest.XXXXXX",
+    "cp -a /mnt/nvkvm/src/guest/.",
+    'make -C \"$work\"',
+    'insmod \"$work/nvkvm-guest.ko\"',
+)
+assert "cd /mnt/nvkvm/src/guest && make" not in module_unit
+
 print("guest_wiring_test: PASS")

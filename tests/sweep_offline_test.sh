@@ -407,6 +407,15 @@ check "an empty ssh target REFUSES to run the command locally" "$rc" "97"
 rm -f "$TMP/bin/ssh"
 
 echo
+echo "=== 20. both NVIDIA kernel-module banners identify the running driver ==="
+check "proprietary NVRM banner" \
+  "$(printf '%s\n' 'NVRM version: NVIDIA UNIX x86_64 Kernel Module  580.95.05  Release Build' | parse_nvrm_driver_version)" \
+  "580.95.05"
+check "open NVRM banner" \
+  "$(printf '%s\n' 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.105.08  Release Build' | parse_nvrm_driver_version)" \
+  "580.105.08"
+
+echo
 echo "======================================================================"
 printf 'sweep offline suite: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

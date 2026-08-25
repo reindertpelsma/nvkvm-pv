@@ -125,7 +125,12 @@ write_files:
       [Service]
       Type=oneshot
       RemainAfterExit=yes
-      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { modprobe drm_shmem_helper 2>/dev/null; cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build && insmod ./nvkvm-guest.ko; }'
+      # The 9p source mount is deliberately read-only.  Build from a private
+      # guest directory so loading the module never grants guest root a write
+      # path into host-owned source.  mktemp makes the cleanup target concrete
+      # before the trap is installed; no shared or user-selected path is ever
+      # recursively removed.
+      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { work=$(mktemp -d /var/tmp/nvkvm-guest.XXXXXX) || exit 1; trap "rm -rf -- \"$work\"" EXIT; cp -a /mnt/nvkvm/src/guest/. "$work/" && modprobe drm_shmem_helper 2>/dev/null; make -C "$work" KDIR=/lib/modules/$(uname -r)/build && insmod "$work/nvkvm-guest.ko"; }'
       # `|| true`: stage_guest_libs.sh exits non-zero when an OPTIONAL library
       # is absent from the bundle (the Wayland/GBM EGL platform libraries are
       # not part of the driver, so a headless host legitimately has none).
