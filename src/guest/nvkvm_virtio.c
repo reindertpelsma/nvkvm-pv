@@ -484,8 +484,15 @@ static void nvkvm_evt_callback(struct virtqueue *vq)
 				const struct nvkvm_evt_ui_info *ui =
 					(const struct nvkvm_evt_ui_info *)evt;
 
+#ifdef NVKVM_GRAPHICS
 				nvkvm_kms_set_host_size(le32_to_cpu(ui->width),
 							le32_to_cpu(ui->height));
+#else
+				/* The compute-only module deliberately links no KMS object.
+				 * Still consume and recycle a host UI event so a mismatched
+				 * host cannot wedge VQ_EVT behind an unhandled buffer. */
+				(void)ui;
+#endif
 				break;
 			}
 			case NVKVM_EVT_TYPE_POLL:
