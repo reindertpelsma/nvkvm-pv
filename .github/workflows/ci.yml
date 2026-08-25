@@ -33,6 +33,11 @@
 #                 so a bad edit to nvkvm_abi.h is caught in milliseconds instead
 #                 of on a rented H100.
 #
+#   broker        The process outside the sandbox owns the host display,
+#                 keyboard and clipboard.  Its hostile-client parser and
+#                 persistent-client lifecycle tests are blocking, including a
+#                 sanitizer-clean rebuild from a clean tree.
+#
 # The GPU is deliberately absent.  GitHub-hosted runners have no NVIDIA device,
 # so tests/validate.sh cannot run here and is not attempted; hardware coverage
 # comes from scripts/sweep_matrix.py against rented boxes.  Kernel-module
@@ -88,6 +93,31 @@ jobs:
             exit 1
           fi
           echo "tree still matches HEAD after a full build"
+
+  broker:
+    name: display broker
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install display protocol build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libgbm-dev libwayland-dev wayland-protocols \
+            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-xinput-dev
+
+      - name: clean build and hostile-client regression tests
+        working-directory: src/broker
+        run: make clean check
+
+      - name: ASAN + UBSAN clean rebuild and regression tests
+        working-directory: src/broker
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: make check-sanitize
 
   qemu-syntax:
     name: src/qemu compile check
