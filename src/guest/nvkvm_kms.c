@@ -108,13 +108,17 @@ module_param_named(kms_max_height, nvkvm_kms_max_h, uint, 0444);
 MODULE_PARM_DESC(kms_max_height,
 		 "largest height the head can ever be asked for (default 2160)");
 
-/* The single virtual head.  One head by construction, so a pointer rather than
- * a lookup; NULL until nvkvm_kms_init() has finished building it, which is why
- * nvkvm_kms_set_host_size() must tolerate that.  The lock is the lifetime
- * handoff between the softirq virtqueue callback and process-context teardown:
- * shutdown unpublishes under it before synchronously cancelling resize work. */
+/* The single registered virtual head.  Init keeps the constructed object in
+ * ddev->dev_private; activate publishes it here only after drm_dev_register()
+ * succeeds.  The lock is the lifetime handoff between the softirq virtqueue
+ * callback and process-context teardown: shutdown unpublishes under it before
+ * synchronously cancelling resize work.  Host-size events arriving before
+ * registration are retained as a plain pair, never as a pointer to an
+ * unregistered drm_device. */
 static struct nvkvm_kms *nvkvm_kms_head;
 static DEFINE_SPINLOCK(nvkvm_kms_head_lock);
+static unsigned int nvkvm_pending_host_w;
+static unsigned int nvkvm_pending_host_h;
 
 static void nvkvm_kms_clamp_mode(void)
 {
@@ -347,6 +351,8 @@ void nvkvm_kms_set_host_size(unsigned int w, unsigned int h)
 	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
 	kms = nvkvm_kms_head;
 	if (!kms) {
+		nvkvm_pending_host_w = w;
+		nvkvm_pending_host_h = h;
 		spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
 		return;
 	}
@@ -846,13 +852,11 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	}
 
 	drm_mode_config_reset(ddev);
-	/* Publish the fully constructed object, but leave it inactive until
-	 * drm_dev_register() succeeds.  UI events in that interval update the
-	 * pending pair without scheduling a hotplug against an unregistered DRM
-	 * device; nvkvm_kms_activate() delivers the latest pair afterwards. */
-	spin_lock_irq(&nvkvm_kms_head_lock);
-	nvkvm_kms_head = kms;
-	spin_unlock_irq(&nvkvm_kms_head_lock);
+	/* Do not expose this pointer to the virtio event path yet: a host-size
+	 * event is allowed to arrive while drm_dev_register() is still running,
+	 * and no DRM helper may observe the device before registration succeeds.
+	 * ddev owns the construction result until nvkvm_kms_activate(). */
+	ddev->dev_private = kms;
 	pr_info("nvkvm: virtual KMS head ready (%ux%u, up to %ux%u, 1 connector/crtc)\n",
 		kms->cur_w, kms->cur_h,
 		nvkvm_kms_max_w, nvkvm_kms_max_h);
@@ -865,20 +869,30 @@ err_workqueue:
 }
 
 /* Called immediately after drm_dev_register() succeeds. */
-void nvkvm_kms_activate(void)
+void nvkvm_kms_activate(struct drm_device *ddev)
 {
-	struct nvkvm_kms *kms;
+	struct nvkvm_kms *kms = ddev->dev_private;
 	unsigned long head_flags, pending_flags;
 
+	if (!kms)
+		return;
 	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
-	kms = nvkvm_kms_head;
-	if (!kms) {
+	if (WARN_ON_ONCE(nvkvm_kms_head && nvkvm_kms_head != kms)) {
 		spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
 		return;
 	}
 	spin_lock_irqsave(&kms->pending_lock, pending_flags);
 	if (!kms->stopping) {
+		if (nvkvm_pending_host_w && nvkvm_pending_host_h) {
+			/* An event can beat nvkvm_kms_clamp_mode() during probe,
+			 * so enforce the now-final mode_config ceiling again. */
+			kms->pending_w = min(nvkvm_pending_host_w,
+					     nvkvm_kms_max_w);
+			kms->pending_h = min(nvkvm_pending_host_h,
+					     nvkvm_kms_max_h);
+		}
 		kms->active = true;
+		nvkvm_kms_head = kms;
 		if (kms->cur_w != kms->pending_w ||
 		    kms->cur_h != kms->pending_h)
 			schedule_work(&kms->resize_work);
@@ -890,20 +904,19 @@ void nvkvm_kms_activate(void)
 /* Stop every path that can name drmm-owned KMS state before the DRM device or
  * the virtio transport is released.  Publication and queueing share a lock;
  * work/timer cancellation is synchronous after the pointer disappears. */
-void nvkvm_kms_fini(void)
+void nvkvm_kms_fini(struct drm_device *ddev)
 {
-	struct nvkvm_kms *kms;
+	struct nvkvm_kms *kms = ddev->dev_private;
 	struct workqueue_struct *present_wq;
 	struct drm_framebuffer *fb;
 	unsigned long head_flags, pending_flags;
 
-	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
-	kms = nvkvm_kms_head;
 	if (!kms) {
-		spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
 		return;
 	}
-	nvkvm_kms_head = NULL;
+	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
+	if (nvkvm_kms_head == kms)
+		nvkvm_kms_head = NULL;
 	spin_lock_irqsave(&kms->pending_lock, pending_flags);
 	kms->active = false;
 	kms->stopping = true;
@@ -924,4 +937,5 @@ void nvkvm_kms_fini(void)
 		drm_framebuffer_put(fb);
 	if (present_wq)
 		destroy_workqueue(present_wq);
+	ddev->dev_private = NULL;
 }

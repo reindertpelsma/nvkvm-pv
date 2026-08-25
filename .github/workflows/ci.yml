@@ -60,6 +60,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: guest UVM and KMS ordering wiring
+        run: python3 tests/guest_wiring_test.py
+
       # run_tests.sh, not `make run`.  `make run` exits non-zero by design --
       # test_isolate fails 5 of its 7 cases at runtime on pre-existing API
       # drift -- which makes it useless as a pass/fail signal.  run_tests.sh
