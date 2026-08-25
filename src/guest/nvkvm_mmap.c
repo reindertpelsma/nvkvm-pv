@@ -343,6 +343,7 @@ static int nvkvm_uvm_mmap_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
 
 	if (!st)
 		return 0;
+	lockdep_assert_held(&st->ext_lock);
 	mutex_lock(&st->lock);
 	if (!st->shadow_valid) {
 		mutex_unlock(&st->lock);
@@ -389,11 +390,21 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * already exists in the host va_space and keeps the forwarding path.
 	 */
 	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state) {
+		int ret;
+
+		/* One transaction with ALLOC_SEMAPHORE_POOL/FREE: classification
+		 * and the selected mmap must not straddle an ioctl whose host state
+		 * and local intent are committed under this same lock. */
+		mutex_lock(&ctx->uvm_state->ext_lock);
 		intent = nvkvm_uvm_mmap_intent(ctx, vma->vm_start, vma_len);
 		if (intent < 0)
-			return intent;
-		if (!intent)
-			return nvkvm_uvm_ext_mmap(ctx, vma);
+			ret = intent;
+		else if (!intent)
+			ret = nvkvm_uvm_ext_mmap(ctx, vma);
+		else
+			ret = nvkvm_mmap_request_isolate(ctx, vma);
+		mutex_unlock(&ctx->uvm_state->ext_lock);
+		return ret;
 	}
 
 	return nvkvm_mmap_request_isolate(ctx, vma);

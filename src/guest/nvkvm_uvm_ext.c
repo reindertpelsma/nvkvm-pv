@@ -483,6 +483,9 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 
 	if (!st)
 		return -EINVAL;
+	/* nvkvm_mmap_request() owns the outer transaction so its decision that
+	 * this is MANAGED cannot race a semaphore-pool allocation/free. */
+	lockdep_assert_held(&st->ext_lock);
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);
 	ap     = kzalloc(ap_size, GFP_KERNEL);
@@ -500,18 +503,17 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 		goto out;
 	}
 
-	mutex_lock(&st->ext_lock);
 	mutex_lock(&st->lock);
 	if (!st->shadow_valid) {
 		mutex_unlock(&st->lock);
 		ret = -EIO;
-		goto unlock;
+		goto out_locked;
 	}
 	mutex_unlock(&st->lock);
 
 	ret = ext_tree_build(st);
 	if (ret)
-		goto unlock;
+		goto out_locked;
 
 	tctl = ext_target_of(st->ext_ctl);
 	tuvm = ext_target_of(ctx);
@@ -541,7 +543,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	if (IS_ERR(region->ext_map_ctl)) {
 		ret = PTR_ERR(region->ext_map_ctl);
 		region->ext_map_ctl = NULL;
-		goto unlock;
+		goto out_locked;
 	}
 	region->ext_ctl_handle_id = region->ext_map_ctl->handle_id;
 
@@ -558,7 +560,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 			"nvkvm: uvm fallback: sysmem alloc 0x%lx bytes ret=%d nvstatus=0x%x\n",
 			vma_len, ret, nvstatus);
 		ret = ret ? ret : -ENOMEM;
-		goto unlock;
+		goto out_locked;
 	}
 	region->ext_h_memory = h;
 
@@ -587,7 +589,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 		pr_warn_ratelimited("nvkvm: uvm fallback: RM_MAP_MEMORY ret=%d nvstatus=0x%x\n",
 				    ret, mm->status);
 		ret = ret < 0 ? ret : -EIO;
-		goto unlock;
+		goto out_locked;
 	}
 
 	/*
@@ -607,7 +609,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 					   &gpa_base, &mmap_token);
 	if (ret) {
 		pr_warn_ratelimited("nvkvm: uvm fallback: MMAP_ON_ISOLATE: %d\n", ret);
-		goto unlock;
+		goto out_locked;
 	}
 	region->mmap_token = mmap_token;
 	region->gpa_base   = (unsigned long)gpa_base;
@@ -616,7 +618,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	if (!nvkvm_gpa_in_mmap_window((unsigned long)gpa_base, vma_len)) {
 		pr_warn("nvkvm: uvm fallback: GPA 0x%llx outside window\n", gpa_base);
 		ret = -EIO;
-		goto unlock;
+		goto out_locked;
 	}
 
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
@@ -625,7 +627,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 			      (unsigned long)(gpa_base >> PAGE_SHIFT),
 			      vma_len, vma->vm_page_prot);
 	if (ret)
-		goto unlock;
+		goto out_locked;
 	/* The window is a prefetchable BAR to the guest, so remap_pfn_range()
 	 * silently downgraded these write-back pages to UC-.  They are
 	 * cache-coherent host RAM; put them back.  Same reasoning, and the same
@@ -645,7 +647,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 			"nvkvm: uvm fallback: CREATE_EXTERNAL_RANGE 0x%llx+0x%lx ret=%d nvstatus=0x%x\n",
 			(unsigned long long)gva, vma_len, ret, nvstatus);
 		ret = ret ? ret : -EIO;
-		goto unlock;
+		goto out_locked;
 	}
 	have_range = true;
 
@@ -653,7 +655,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	if (!n_gpus) {
 		pr_warn_ratelimited("nvkvm: uvm fallback: no GPU registered on this UVM fd\n");
 		ret = -ENODEV;
-		goto unlock;
+		goto out_locked;
 	}
 	put_u64(mp, 0,  gva);
 	put_u64(mp, 8,  (__u64)vma_len);
@@ -669,7 +671,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 			"nvkvm: uvm fallback: MAP_EXTERNAL_ALLOCATION 0x%llx+0x%lx ret=%d nvstatus=0x%x\n",
 			(unsigned long long)gva, vma_len, ret, nvstatus);
 		ret = ret ? ret : -EIO;
-		goto unlock;
+		goto out_locked;
 	}
 
 	spin_lock(&ctx->mmap_lock);
@@ -683,10 +685,9 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	region = NULL;                    /* handed to the VMA */
 	ret = 0;
 
-unlock:
+out_locked:
 	if (ret && region)
 		ext_unwind(region, have_range, have_mmap);
-	mutex_unlock(&st->ext_lock);
 out:
 	kfree(region); kfree(ap); kfree(mm); kfree(cp); kfree(mp);
 	return ret;
