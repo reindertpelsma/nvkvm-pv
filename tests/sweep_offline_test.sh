@@ -129,6 +129,7 @@ REGISTRY="$TMP/registry"
 : >"$REGISTRY"
 RESULTS="$TMP/sweep.jsonl"
 : >"$RESULTS"
+STOP_FILE="$TMP/stop"
 MAX_DPH=0.50
 PROTECTED="99999999"
 

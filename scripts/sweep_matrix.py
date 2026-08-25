@@ -226,6 +226,87 @@ def rsh(S, cmd):
     return f"{S} {shlex.quote(cmd)}"
 
 
+def quiesce_gpu_clients(S):
+    """Stop every workload which can retain an NVIDIA device fd.
+
+    The KVM CLI image historically used by this sweep has no graphical
+    session.  The desktop image does: it boots graphical.target, SDDM
+    auto-logs UID 1000 into Plasma/Xorg, and Selkies keeps a user service alive
+    which repeatedly runs nvidia-smi.  Merely stopping the display manager is
+    therefore insufficient -- a freshly respawned nvidia-smi can race module
+    removal after Xorg has gone away.
+
+    Measured on Vast instance 48668379 (the requested desktop template): Xorg
+    held nvidia_drm, and after isolating multi-user.target Selkies still held
+    nvidia through its nvidia-smi sampler.  End the seat and its user manager,
+    then kill any remaining holders by device fd.  This is a dedicated,
+    disposable sweep VM; no unrelated GPU workload belongs on it.
+    """
+    cmd = r"""
+systemctl isolate multi-user.target 2>/dev/null || true
+systemctl stop display-manager.service sddm.service gdm.service gdm3.service lightdm.service 2>/dev/null || true
+systemctl stop nvkvm-vm.service nvidia-persistenced.service 2>/dev/null || true
+
+seat_uids="$(loginctl list-sessions --no-legend 2>/dev/null | awk '$4 == "seat0" { print $2 }' | sort -u)"
+loginctl terminate-seat seat0 2>/dev/null || true
+for uid in $seat_uids; do
+    systemctl stop "user@${uid}.service" 2>/dev/null || true
+    pkill -TERM -u "$uid" 2>/dev/null || true
+done
+
+# The bracket keeps pkill from matching this remote shell's own argv.
+pkill -TERM -f '[q]emu-system-x86_64' 2>/dev/null || true
+
+if command -v fuser >/dev/null 2>&1; then
+    fuser -k -TERM /dev/nvidia* 2>/dev/null || true
+    sleep 2
+    fuser -k -KILL /dev/nvidia* 2>/dev/null || true
+fi
+
+if systemctl is-active --quiet display-manager.service 2>/dev/null; then
+    echo '[HARNESS] display-manager.service is still active after quiescing'
+    exit 70
+fi
+
+if command -v fuser >/dev/null 2>&1; then
+    holders="$(fuser /dev/nvidia* 2>/dev/null || true)"
+    if [ -n "$holders" ]; then
+        echo "[HARNESS] NVIDIA device fds are still held by PIDs:$holders"
+        fuser -v /dev/nvidia* 2>&1 || true
+        exit 71
+    fi
+fi
+"""
+    out, rc = sh(rsh(S, cmd), timeout=240)
+    if rc != 0:
+        return False, out[-1600:] or f"[HARNESS] GPU quiesce failed (rc={rc})"
+    return True, ""
+
+
+def unload_nvidia_modules(S):
+    """Remove the running NVIDIA stack or return an explicit harness error."""
+    cmd = r"""
+for attempt in 1 2 3; do
+    for module in nvidia_peermem nvidia_uvm nvidia_drm nvidia_modeset nvidia; do
+        rmmod "$module" 2>/dev/null || true
+    done
+    grep -q '^nvidia' /proc/modules || exit 0
+    sleep 1
+done
+
+echo '[HARNESS] NVIDIA modules remain loaded after GPU clients were quiesced:'
+grep '^nvidia' /proc/modules || true
+if command -v fuser >/dev/null 2>&1; then
+    fuser -v /dev/nvidia* 2>&1 || true
+fi
+exit 72
+"""
+    out, rc = sh(rsh(S, cmd), timeout=180)
+    if rc != 0:
+        return False, out[-1600:] or f"[HARNESS] NVIDIA module unload failed (rc={rc})"
+    return True, ""
+
+
 def purge_distro_driver(S):
     """Remove the DISTRO-PACKAGED NVIDIA driver before the first .run install.
 
@@ -389,6 +470,14 @@ def install_driver(S, ver, arch, log):
     """
     kernel_open = arch in OPEN_MODULE_ARCHES
 
+    # This must precede even the fast path.  A preinstalled driver does not
+    # need replacing, but validating nvkvm while the desktop template's Xorg
+    # and video streamer are concurrently consuming the passthrough GPU makes
+    # both correctness and performance results ambiguous.
+    quiet, detail = quiesce_gpu_clients(S)
+    if not quiet:
+        return False, detail, None
+
     # FAST PATH.  575.51.03 is preinstalled on the vast KVM image and is no
     # longer downloadable from either NVIDIA path, so the only way to test that
     # row is to recognise that it is already installed.  This also saves a
@@ -458,10 +547,15 @@ def install_driver(S, ver, arch, log):
     # shell and the rest of the command (the gpu-reset, the `true`) never runs.
     # This project has a standing rule against `pkill -f qemu-system-x86` for
     # exactly this reason; the bracket makes the pattern not match itself.
-    sh(rsh(S, "systemctl stop nvkvm-vm 2>/dev/null; "
-              "systemctl stop nvidia-persistenced 2>/dev/null; "
-              "pkill -f '[q]emu-system-x86_64' 2>/dev/null; true"), timeout=180)
-    sh(f"{S} 'rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia 2>/dev/null; true'", timeout=180)
+    # Downloads and package removal take long enough for an ill-behaved user
+    # service to respawn.  Re-quiesce at the actual module boundary, and never
+    # run the installer if the old stack cannot be proven absent.
+    quiet, detail = quiesce_gpu_clients(S)
+    if not quiet:
+        return False, detail, None
+    unloaded, detail = unload_nvidia_modules(S)
+    if not unloaded:
+        return False, detail, None
 
     mod   = "-m=kernel-open" if kernel_open else "-m=kernel"
     other = "-m=kernel" if kernel_open else "-m=kernel-open"
