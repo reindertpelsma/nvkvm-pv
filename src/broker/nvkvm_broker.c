@@ -1109,8 +1109,9 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     struct stat st;
     off_t size;
     uint32_t bpp;
+    uint32_t fourcc;
     uint64_t need;
-    char fcc[8];
+    char fcc[8], fcc2[8];
 
     if (!nb_fd_is_dmabuf(fd, ss->accept_memfd)) {
         nb_err("ATTACH: the fd is not a dma-buf");
@@ -1125,16 +1126,52 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         return -EINVAL;
     }
     /* HARDENING 3: not a hardcoded list — what the GPU advertises. */
-    if (!ss->ops->format_ok(ss, c->fourcc, c->modifier)) {
-        nb_err("ATTACH: fourcc %s modifier 0x%016llx is not advertised by "
-               "this display", nb_fourcc_name(c->fourcc, fcc),
-               (unsigned long long)c->modifier);
-        return -EINVAL;
+    fourcc = c->fourcc;
+    if (!ss->ops->format_ok(ss, fourcc, c->modifier)) {
+        /*
+         * Before refusing, try the OPAQUE TWIN of an alpha format.
+         *
+         * This is not a relaxation of HARDENING 3: the pair we fall back to
+         * must ITSELF be advertised, so the compositor is still only ever
+         * handed something it said it could import.  What changes is which of
+         * two bit-identical descriptions of the same buffer we hand it.
+         *
+         * A guest head flips AR24; the compositor advertises the NVIDIA
+         * block-linear modifier for XR24 only, because alpha goes through its
+         * blend path and block-linear is not always wired up there.  The bytes
+         * are the same either way and a scanout has no meaningful alpha, so
+         * describing it as opaque is both correct and cheaper for the
+         * compositor -- it may skip blending altogether.
+         *
+         * If the twin is not advertised either, we still refuse.
+         */
+        uint32_t twin = nb_fourcc_opaque_twin(fourcc);
+
+        if (twin && ss->ops->format_ok(ss, twin, c->modifier)) {
+            static bool told;
+
+            if (!told) {
+                told = true;
+                nb_log("ATTACH: %s modifier 0x%016llx is not advertised, but "
+                       "its opaque twin %s is — presenting as %s (same bytes; "
+                       "a scanout has no alpha).  Logged once.",
+                       nb_fourcc_name(fourcc, fcc),
+                       (unsigned long long)c->modifier,
+                       nb_fourcc_name(twin, fcc2),
+                       nb_fourcc_name(twin, fcc2));
+            }
+            fourcc = twin;
+        } else {
+            nb_err("ATTACH: fourcc %s modifier 0x%016llx is not advertised by "
+                   "this display", nb_fourcc_name(fourcc, fcc),
+                   (unsigned long long)c->modifier);
+            return -EINVAL;
+        }
     }
-    bpp = nb_fourcc_bpp(c->fourcc);
+    bpp = nb_fourcc_bpp(fourcc);
     if (bpp == 0) {
         nb_err("ATTACH: fourcc %s has no known bytes-per-pixel, so its extent "
-               "cannot be bounded", nb_fourcc_name(c->fourcc, fcc));
+               "cannot be bounded", nb_fourcc_name(fourcc, fcc));
         return -EINVAL;
     }
     /* A row must hold the pixels it claims to. */
@@ -1176,7 +1213,7 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     d->height   = c->height;
     d->stride   = c->stride;
     d->offset   = c->offset;
-    d->fourcc   = c->fourcc;
+    d->fourcc   = fourcc;   /* possibly the opaque twin, see above */
     d->modifier = c->modifier;
     d->bpp      = bpp;
     d->seq      = c->seq;

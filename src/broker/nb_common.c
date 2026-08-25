@@ -40,6 +40,33 @@ uint32_t nb_fourcc_bpp(uint32_t fourcc)
     }
 }
 
+/*
+ * The opaque twin of an alpha format.
+ *
+ * ARGB8888 and XRGB8888 are the SAME bytes; the only difference is whether the
+ * fourth channel is honoured.  A scanout has no meaningful alpha -- a KMS
+ * primary plane ignores it -- so a guest head that flips AR24 can always be
+ * shown as XR24 without changing a single pixel.
+ *
+ * This exists because compositors routinely advertise a modifier for the
+ * opaque format and NOT for its alpha twin: alpha has to go through their
+ * blend path, and block-linear layouts are not always wired up there.  MEASURED
+ * on GNOME/Mutter with an RTX 4070: the guest presented AR24 with NVIDIA
+ * block-linear 0x0300000000606014, the compositor advertised that modifier for
+ * XR24 only, and every frame was refused as "not advertised by this display".
+ *
+ * Substituting is strictly MORE conservative than accepting: XR24 tells the
+ * compositor the surface is opaque, so it may skip blending entirely.
+ */
+uint32_t nb_fourcc_opaque_twin(uint32_t fourcc)
+{
+    switch (fourcc) {
+    case NB_FOURCC('A', 'R', '2', '4'): return NB_FOURCC('X', 'R', '2', '4');
+    case NB_FOURCC('A', 'B', '2', '4'): return NB_FOURCC('X', 'B', '2', '4');
+    default:                            return 0;
+    }
+}
+
 const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
 {
     unsigned i;

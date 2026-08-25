@@ -19,6 +19,8 @@
  *
  *   --bad-size H       claim height H for a buffer that is smaller (A-18)
  *   --bad-fourcc       claim a format the display never advertised
+ *   --alpha-fourcc     send AR24 where only its opaque twin XR24 is
+ *                      advertised: must be ACCEPTED and shown as XR24
  *   --bad-dim          claim dimensions past NVKVM_BROKER_MAX_DIM
  *   --bad-fd           send a pipe instead of a dma-buf
  *   --bad-frame        send a truncated, wrongly sized message
@@ -126,6 +128,7 @@ int main(int argc, char **argv)
     int sock, i;
     unsigned pw = 0, ph = 0, ww = 0, wh = 0;
     int bad_size = 0, bad_fourcc = 0, bad_dim = 0, bad_fd = 0, bad_frame = 0;
+    int alpha_fourcc = 0;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
     int quiet_after = 0, caps_clipboard = 0;
 
@@ -136,7 +139,7 @@ int main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s <socket> [--present WxH] [--window WxH]\n"
-                        "       [--bad-size H|--bad-fourcc|--bad-dim|"
+                        "       [--bad-size H|--bad-fourcc|--alpha-fourcc|--bad-dim|"
                         "--bad-fd|--bad-frame|--bad-two-fds|--bad-reserved|"
                         "--bad-commit-fd|--caps-clipboard]\n", argv[0]);
         return 2;
@@ -149,6 +152,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--window") && v)  { sscanf(v, "%ux%u", &ww, &wh); i++; }
         else if (!strcmp(a, "--bad-size") && v){ bad_size = atoi(v); i++; }
         else if (!strcmp(a, "--bad-fourcc"))   { bad_fourcc = 1; }
+        else if (!strcmp(a, "--alpha-fourcc")) { alpha_fourcc = 1; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
         else if (!strcmp(a, "--bad-frame"))    { bad_frame = 1; }
@@ -305,6 +309,14 @@ int main(int argc, char **argv)
             if (bad_fourcc) {
                 c.fourcc = FOURCC('N', 'V', '1', '2');
                 printf("  -> ATTACH claiming an unadvertised fourcc\n");
+            }
+            if (alpha_fourcc) {
+                /* Only XR24 is advertised by the test backend.  AR24 is the
+                 * same bytes, so the broker must present it as XR24 rather
+                 * than refuse the frame. */
+                c.fourcc = FOURCC('A', 'R', '2', '4');
+                printf("  -> ATTACH with AR24, whose opaque twin XR24 is "
+                       "advertised\n");
             }
             if (bad_dim) {
                 c.width = NVKVM_BROKER_MAX_DIM + 1;
