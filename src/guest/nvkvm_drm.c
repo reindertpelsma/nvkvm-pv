@@ -1208,10 +1208,12 @@ int nvkvm_drm_init(struct device *fallback_parent)
 	if (ret) {
 		pr_warn("nvkvm: drm_dev_register failed: %d (graphics disabled)\n",
 			ret);
+		nvkvm_kms_fini();
 		drm_dev_put(ddev);
 		pci_dev_put(pdev);
 		return ret;
 	}
+	nvkvm_kms_activate();
 	nvkvm.drm_dev = ddev;
 	/* The drm_device now holds its own reference on the parent; drop ours. */
 	pci_dev_put(pdev);
@@ -1224,6 +1226,7 @@ int nvkvm_drm_init(struct device *fallback_parent)
 void nvkvm_drm_fini(void)
 {
 	if (nvkvm.drm_dev) {
+		nvkvm_kms_fini();
 		drm_dev_unregister(nvkvm.drm_dev);
 		drm_dev_put(nvkvm.drm_dev);
 		nvkvm.drm_dev = NULL;
