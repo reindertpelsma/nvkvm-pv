@@ -1,0 +1,24 @@
+[Unit]
+# Deliberately tiny and STABLE. This is the only nvkvm logic that lives in the
+# SteamOS image; everything else is on the read-only 9p share, so updating the
+# logic never requires touching the image (design note 2).
+Description=nvkvm guest provisioning and validation
+DefaultDependencies=no
+After=local-fs.target network-online.target
+Wants=network-online.target
+Before=display-manager.service sddm.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Always the in-image entry point: it mounts the share, then hands over to the
+# share's steamos_boot.sh if that worked, or diagnoses precisely why it did not.
+ExecStart=/usr/local/sbin/nvkvm-recovery.sh boot
+StandardOutput=journal+console
+StandardError=journal+console
+# Never block boot on our own failure (design note 4).
+SuccessExitStatus=0 1
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

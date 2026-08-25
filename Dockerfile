@@ -7,8 +7,9 @@
 #   docker compose build && docker compose up
 #
 # The container needs /dev/kvm and, for GPU forwarding, the NVIDIA container
-# runtime (`--gpus all`).  It does NOT need --privileged or extra capabilities:
-# see the FAQ entry "Can nvkvm itself run inside a container?".
+# runtime (`--gpus all`). It does NOT need --privileged. Compose drops every
+# capability and adds back only the four used to establish the isolates'
+# uid+chroot sandbox; see docker-compose.yml for why dropping those is weaker.
 
 # ── build stage: compile the isolate stub and patched QEMU ────────────────
 FROM ubuntu:24.04 AS build
@@ -63,7 +64,9 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
         libglib2.0-0t64 libpixman-1-0 libslirp0 libepoxy0 libgbm1 libegl1 \
         libdrm2 libattr1 seabios ipxe-qemu \
         `# setup_guest.sh: fetch and prepare the guest disk on first run` \
-        wget ca-certificates qemu-utils genisoimage \
+        wget curl ca-certificates qemu-utils genisoimage \
+        `# SteamOS: pinned recovery download + disposable Alpine installer VM` \
+        bzip2 cpio gzip tar ovmf util-linux \
         `# reaching the guest, and building nvkvm-guest.ko inside it` \
         openssh-client sshpass \
     && rm -rf /var/lib/apt/lists/*
@@ -71,7 +74,17 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
 COPY --from=build /opt/qemu-nvkvm /opt/qemu-nvkvm
 COPY --from=build /usr/lib/nvkvm  /usr/lib/nvkvm
 COPY . /opt/nvkvm
-
 WORKDIR /opt/nvkvm
-EXPOSE 2222
+
+# .git is intentionally excluded from the image context, but SteamOS needs a
+# stable source identity next to the module it builds so it can tell whether a
+# later boot is already converged. Hash only module/provisioning inputs: a docs
+# edit must not trigger a guest kernel rebuild.
+RUN test -d src && test -d boot && test -f tests/validate.sh \
+    && find src boot tests/validate.sh -type f -print0 \
+        | sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f1 \
+        > /opt/nvkvm/.nvkvm-source-id \
+    && ln -s /opt/nvkvm/scripts/steamos-ssh.sh /usr/local/bin/nvkvm-steamos-ssh
+
+EXPOSE 2222 15022
 ENTRYPOINT ["/opt/nvkvm/scripts/container-entrypoint.sh"]

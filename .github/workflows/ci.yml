@@ -69,6 +69,9 @@ jobs:
       - name: build and run the unit suite
         run: bash tests/unit/run_tests.sh
 
+      - name: SteamOS provisioning keeps Plasma as the desktop
+        run: bash tests/steamos_boot_config_test.sh
+
       # Regression 3, the cheap half.  A full working-tree-vs-HEAD guard has to
       # live where the tree is (scripts/sweep_matrix.py --check-tree), because a
       # CI runner checks out clean by definition.  What CI CAN catch is the
@@ -129,7 +132,9 @@ jobs:
       - name: shellcheck (blocking, severity >= warning)
         run: |
           docker run --rm -v "$PWD:/mnt" koalaman/shellcheck:v0.10.0 \
-            -S warning scripts/*.sh tests/qemu_syntax_check.sh tests/unit/run_tests.sh
+            -S warning boot/*.sh install_steamos_vm.sh scripts/*.sh \
+            tests/qemu_syntax_check.sh tests/steamos_boot_config_test.sh \
+            tests/unit/run_tests.sh
 
       # NON-BLOCKING for info/style.  There are ~18 of those across scripts/,
       # mostly SC2086 and SC2012, and they are pre-existing.  Failing on them

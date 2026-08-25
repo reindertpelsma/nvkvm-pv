@@ -170,8 +170,10 @@ staging step.
 
 - **Requirements:** `/dev/kvm` and, for the GPU, the
   [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
-  Both are already in [`docker-compose.yml`](docker-compose.yml). No
-  `--privileged`, no added capabilities.
+  Both are already in [`docker-compose.yml`](docker-compose.yml). There is no
+  `--privileged`; Compose drops everything and restores only `SETUID`, `SETGID`,
+  `SETPCAP`, and `SYS_CHROOT`, which the isolates need for uid separation and
+  chroot. Dropping those four too silently weakens the isolate to seccomp-only.
 - **The isolation trade differs from a bare host, and is not obviously worse.**
   Containers block user namespaces, so the isolate falls back to UID separation —
   but most of our audit findings target the VMM, which a container confines and a
@@ -185,6 +187,10 @@ staging step.
 - **Knobs:** `VM_MEM`, `VM_SMP`, and `NVKVM_GUEST_IMAGE_URL` to bring your own
   cloud image — anything cloud-init capable that can build an out-of-tree module
   should work; only Ubuntu 24.04 is tested.
+
+The same image also has an opt-in `steamos` service. It builds a real dual-slot
+SteamOS qcow2 in an unprivileged disposable VM and displays it through a broker
+in the host desktop session; see [SteamOS in the container](docs/howto/steamos-container.md).
 
 ### Prebuilt tarball, on a bare host
 
@@ -643,6 +649,7 @@ container support, llvmpipe, bit-identical results.
 |---|---|
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The request path end to end, and how the hard problems are solved |
 | [`docs/howto/`](docs/howto/) | Building, running, staging guest libraries, adding a driver version |
+| [SteamOS container](docs/howto/steamos-container.md) | Valve installer VM, durable volumes, host display broker and guest SSH |
 | [`docs/reference/`](docs/reference/) | ABI profiles, allowlists, virtio protocol, device nodes |
 | [FAQ](docs/faq.md) | The full set — driver coverage, guest distros, containers, llvmpipe |
 | [Correctness](docs/reference/correctness.md) | What is known to be wrong, how far it is traced, how to reproduce it |

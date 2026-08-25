@@ -1,0 +1,10 @@
+[Unit]
+Description=Provision nvkvm into the newly staged SteamOS image
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nvkvm-recovery.sh plant
+# Always succeed: the script is self-repairing and runs again on the new image's
+# first boot anyway, so a failure here is not worth failing an update over.
+SuccessExitStatus=0 1
+ExecStopPost=/bin/true

@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for a staged SteamOS update so nvkvm can provision the new image
+# /run/steamos-atomupd/reboot_for_update is written by SteamOS's own rauc
+# post-install hook once the new slot has been fully written and marked bootable.
+# Watching it means we never modify a Valve-owned file and, critically, never sit
+# in rauc's exit path -- so a bug here can NEVER make the OS un-updatable
+# (design note 3).
+
+[Path]
+PathExists=/run/steamos-atomupd/reboot_for_update
+Unit=nvkvm-plant-stub.service
+
+[Install]
+WantedBy=multi-user.target

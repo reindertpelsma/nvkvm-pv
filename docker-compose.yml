@@ -114,5 +114,72 @@ services:
     stdin_open: true    # -serial stdio: keep the guest console attached
     tty: true
 
+  steamos:
+    # Opt-in so a plain `docker compose up` keeps its historical behaviour and
+    # does not unexpectedly boot two VMs. Start this service with:
+    #   docker compose --profile steamos up steamos
+    profiles: [steamos]
+    image: ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2
+    build: .
+    entrypoint: ["/opt/nvkvm/scripts/steamos-container-entrypoint.sh"]
+
+    # Same deliberate sandbox bootstrap set as the existing service above.
+    # Dropping these four as well makes the per-process isolates fall back from
+    # uid+chroot to seccomp-only; QEMU drops them after isolate setup.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+      - SETPCAP
+      - SYS_CHROOT
+    security_opt:
+      - no-new-privileges:true
+    devices:
+      # Used twice: first by the disposable Alpine installer VM, then SteamOS.
+      - /dev/kvm
+    group_add:
+      # Numeric host GIDs. On the physical validation machine these are
+      # kvm=991 and ubuntu=1000; override them on a different host with
+      # `stat -c %g /dev/kvm` and `id -g` respectively.
+      - "${NVKVM_KVM_GID:-991}"
+      - "${NVKVM_BROKER_GID:-1000}"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              # Keep the exact working set from the generic service. In
+              # particular compute gates /dev/nvidia-uvm and display gates
+              # /dev/nvidia-modeset; NVKMS is used by the graphics stack.
+              capabilities: [gpu, utility, compute, graphics, display, video]
+    environment:
+      VM_MEM: ${STEAMOS_VM_MEM:-12G}
+      VM_SMP: ${STEAMOS_VM_SMP:-8}
+      NVKVM_STEAMOS_DISK_SIZE: ${NVKVM_STEAMOS_DISK_SIZE:-64G}
+      NVKVM_STEAMOS_PROFILE: ${NVKVM_STEAMOS_PROFILE:-steamos}
+      NVKVM_STEAMOS_RECOVERY_URL: ${NVKVM_STEAMOS_RECOVERY_URL:-}
+      NVKVM_STEAMOS_LATEST: ${NVKVM_STEAMOS_LATEST:-0}
+      NVKVM_BROKER_SOCKET: /run/nvkvm/${NVKVM_BROKER_SOCKET_NAME:-steamos.sock}
+      # Diagnostic/bisect escape hatch: `none` removes the display broker from
+      # the process path while keeping the guest GPU and validation SSH alive.
+      NVKVM_STEAMOS_QEMU_DISPLAY: ${NVKVM_STEAMOS_QEMU_DISPLAY:-}
+    volumes:
+      # Both are asserted as mounts by the entrypoint. The first holds the
+      # recovery image, qcow2 and private SSH key; the second is guest ~/data
+      # and contains only public authorized_keys files.
+      - nvkvm-steamos:/var/lib/nvkvm-steamos
+      - nvkvm-steamos-data:/data
+      # Directory, never socket inode: broker restart creates a new inode.
+      - ${NVKVM_BROKER_DIR:-/run/nvkvm}:/run/nvkvm
+    ports:
+      - "127.0.0.1:${NVKVM_STEAMOS_HOST_SSH_PORT:-15022}:15022"
+    stdin_open: true
+    tty: true
+    stop_grace_period: 2m
+
 volumes:
   nvkvm-guest:
+  nvkvm-steamos:
+  nvkvm-steamos-data:
