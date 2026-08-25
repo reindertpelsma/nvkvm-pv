@@ -67,6 +67,40 @@ uint32_t nb_fourcc_opaque_twin(uint32_t fourcc)
     }
 }
 
+/*
+ * The vendor half of a DRM format modifier.
+ *
+ * Worth naming in an error, because the most confusing way this fails is a
+ * VENDOR mismatch: the guest's GPU produces a tiling its own driver
+ * understands, the host compositor enumerates a different vendor's tilings
+ * entirely, and the rejection reads as if one specific pair were missing when
+ * in fact no pair could ever match.  MEASURED on a hybrid laptop: Mutter
+ * RENDERS on the NVIDIA GPU (renderD128 -> 0000:01:00.0) but advertised 28
+ * pairs that were all Intel (0x01), LINEAR or INVALID, because its v3 list is
+ * built from the Intel SCANOUT device -- while the guest presented NVIDIA
+ * block-linear (0x03).  Nothing about the format was wrong; the two sides were
+ * describing different GPUs, and no fourcc substitution can bridge that.
+ */
+const char *nb_modifier_vendor(uint64_t modifier)
+{
+    if (modifier == 0x00ffffffffffffffULL) return "implicit"; /* MOD_INVALID */
+    if (modifier == 0)                         return "LINEAR";
+    switch ((unsigned)(modifier >> 56) & 0xff) {
+    case 0x00: return "none";
+    case 0x01: return "INTEL";
+    case 0x02: return "AMD";
+    case 0x03: return "NVIDIA";
+    case 0x04: return "SAMSUNG";
+    case 0x05: return "QCOM";
+    case 0x06: return "VIVANTE";
+    case 0x07: return "BROADCOM";
+    case 0x08: return "ARM";
+    case 0x09: return "ALLWINNER";
+    case 0x0a: return "AMLOGIC";
+    default:   return "unknown vendor";
+    }
+}
+
 const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
 {
     unsigned i;
@@ -161,8 +195,10 @@ void nb_formats_log(const struct nb_formats *f, const char *what)
     for (i = 0; i < f->n && shown < 64; i++, shown++) {
         char fcc[8];
 
-        nb_log("    %s  modifier 0x%016llx", nb_fourcc_name(f->e[i].fourcc, fcc),
-               (unsigned long long)f->e[i].modifier);
+        nb_log("    %s  modifier 0x%016llx (%s)",
+               nb_fourcc_name(f->e[i].fourcc, fcc),
+               (unsigned long long)f->e[i].modifier,
+               nb_modifier_vendor(f->e[i].modifier));
     }
 }
 

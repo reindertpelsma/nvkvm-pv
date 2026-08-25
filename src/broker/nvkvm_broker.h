@@ -419,6 +419,8 @@ uint32_t nb_fourcc_bpp(uint32_t fourcc);
 /* The opaque twin of an alpha format (AR24->XR24), or 0 if there is none.
  * Same byte layout; only the alpha channel's meaning differs. */
 uint32_t nb_fourcc_opaque_twin(uint32_t fourcc);
+/* Human name for a modifier's vendor half — INTEL/NVIDIA/AMD/LINEAR/... */
+const char *nb_modifier_vendor(uint64_t modifier);
 const char *nb_fourcc_name(uint32_t fourcc, char buf[8]);
 
 /*

@@ -1162,9 +1162,21 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             fourcc = twin;
         } else {
-            nb_err("ATTACH: fourcc %s modifier 0x%016llx is not advertised by "
-                   "this display", nb_fourcc_name(fourcc, fcc),
-                   (unsigned long long)c->modifier);
+            /*
+             * Name the VENDOR.  A rejection that lists only the pair reads as
+             * "one entry is missing"; when the vendor differs from everything
+             * the display offers, NO pair can ever match and the answer is a
+             * copy, not a different format.  Saying so here is the difference
+             * between a one-line diagnosis and an evening of bisecting.
+             */
+            nb_err("ATTACH: fourcc %s modifier 0x%016llx (%s) is not "
+                   "advertised by this display.  If the compositor runs on a "
+                   "different GPU than the guest's, no modifier will ever "
+                   "match and a readback/copy path is required — run the "
+                   "broker with --verbose to see what it does advertise.",
+                   nb_fourcc_name(fourcc, fcc),
+                   (unsigned long long)c->modifier,
+                   nb_modifier_vendor(c->modifier));
             return -EINVAL;
         }
     }
