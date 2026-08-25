@@ -227,10 +227,12 @@ was slow — so both sides are non-blocking by construction:
 - Reads from the client and writes to the display server are both
   `MSG_DONTWAIT` / non-blocking; a compositor socket that will not take a write
   gets `POLLOUT` on the next `poll()` rather than a blocking flush.
-- On the QEMU side the relay sends with `MSG_DONTWAIT` from the virtio worker
-  thread. If the socket is full the frame is **dropped and counted**: the guest
-  produced faster than the display can consume and the next flip carries a
-  newer buffer. A vCPU is never blocked on the display.
+- On the QEMU side PRESENT currently runs inline in the BQL-held virtqueue
+  callback.  The relay socket is main-loop/BQL-owned and every send uses
+  `MSG_DONTWAIT`; if the socket is full the frame is **dropped and counted**.
+  The newest dma-buf remains retained for reconnect, while older frames are
+  replaced.  A future worker offload must marshal submission back to the main
+  loop rather than creating a second socket owner.
 
 One honest exception, stated rather than hidden: the **X11 backend's import**
 uses `xcb_request_check()`, which is a blocking round trip to the X server. It
