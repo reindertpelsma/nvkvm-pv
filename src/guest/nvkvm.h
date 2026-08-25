@@ -119,6 +119,13 @@ struct nvkvm_session {
 
 struct nvkvm_mmap_region {
 	struct list_head list;
+	/*
+	 * One reference per VMA that carries this object in vm_private_data.
+	 * Linux calls vm_ops.open when a VMA is copied or split and close once
+	 * for every resulting VMA.  Managed fallback backing may therefore be
+	 * released only after this count reaches zero, not on the first close.
+	 */
+	refcount_t vma_refs;
 	__u32    mmap_token;       /* opaque token from host                */
 	__u32    handle_id;        /* QEMU-side handle (for isolate re-map) */
 	unsigned long gpa_base;    /* guest physical address                */
@@ -133,8 +140,9 @@ struct nvkvm_mmap_region {
 	 *
 	 * Everything teardown needs is cached HERE rather than reached through
 	 * the fd context, because teardown runs from vma_close(), which can fire
-	 * after the owning fd has been closed.  `ctx` is used for exactly one
-	 * thing -- the mmap_lock that arbitrates the claim below.
+	 * after close(2) removed the userspace descriptor.  The VMA's vm_file
+	 * reference keeps the struct file, and therefore `ctx`, alive until the
+	 * last VMA close.  `ctx` is used only for mmap_lock below.
 	 */
 	struct nvkvm_fd_ctx *ctx;   /* owning UVM fd, for the claim lock     */
 	/*
@@ -225,6 +233,12 @@ struct nvkvm_uvm_mapping_intent {
 	void            *params;      /* mode-specific params blob  */
 	size_t           params_size;
 };
+
+/* The dormant REALIZE snapshot has fixed arrays of 16 entries, and nvkvm
+ * exposes at most 16 GPUs.  Keep the live shadow state within the same
+ * semantics-derived bounds instead of accepting an unbounded list that its
+ * only consumer would truncate. */
+#define NVKVM_UVM_MAX_INTENTS 16
 struct nvkvm_uvm_realization {
 	struct list_head list;
 	__u64            realize_token;
@@ -235,6 +249,15 @@ struct nvkvm_uvm_realization {
 struct nvkvm_uvm_fd_state {
 	struct mutex     lock;
 	bool             initialized;
+	/* A lost/capped bookkeeping update must not change the result of an
+	 * ioctl the host already accepted.  Instead it makes the shadow unusable
+	 * and managed mmap fails closed until a successful DEINITIALIZE resets
+	 * both the host state and this bounded mirror. */
+	bool             shadow_valid;
+	/* VA-space and range-group records are consumed only by the dormant
+	 * REALIZE snapshot.  Losing that bounded mirror must not disable the
+	 * ordinary managed-memory fallback, whose inputs remain intact. */
+	bool             realize_valid;
 	__u64            init_flags;
 	/*
 	 * Managed-memory fallback: the private RM object tree this UVM fd owns
@@ -246,6 +269,9 @@ struct nvkvm_uvm_fd_state {
 	 * is ONE-SHOT PER `struct file` (nv-mmap.c:503-509), so the
 	 * NV_ESC_RM_MAP_MEMORY that arms it and the mmap that consumes it must
 	 * not interleave with another thread's pair on the same ctl handle.
+	 * When both UVM locks are needed, the order is ext_lock -> lock.  The
+	 * managed-allocation UUID snapshot follows that order; ioctl bookkeeping
+	 * takes only lock and therefore cannot invert it.
 	 */
 	struct mutex     ext_lock;
 	struct nvkvm_fd_ctx *ext_ctl;   /* private /dev/nvidiactl handle     */
@@ -259,6 +285,10 @@ struct nvkvm_uvm_fd_state {
 	struct list_head range_groups;        /* nvkvm_uvm_range_group */
 	struct list_head intents;             /* nvkvm_uvm_mapping_intent */
 	struct list_head realizations;        /* nvkvm_uvm_realization */
+	__u32            n_registered_gpus;
+	__u32            n_registered_va_spaces;
+	__u32            n_range_groups;
+	__u32            n_intents;
 };
 
 struct nvkvm_fd_ctx {
