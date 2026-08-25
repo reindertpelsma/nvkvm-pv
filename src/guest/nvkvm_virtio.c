@@ -198,12 +198,22 @@ static void inflight_dequeue(struct nvkvm_state *state,
  */
 #define NVKVM_RESP_BUF_SIZE  512
 
+static bool nvkvm_request_type_known(__u32 type)
+{
+	/* The protocol deliberately has one legacy block and one current block. */
+	return (type >= NVKVM_REQ_OPEN && type <= NVKVM_REQ_MUNMAP) ||
+	       (type >= NVKVM_REQ_LIST_NVIDIA_DEVICES &&
+		type <= NVKVM_REQ_XISO_IMPORT);
+}
+
 /* ── VQ_TX completion callback — called from softirq context ─────────────── */
 /*
  * QEMU writes the response into the IN sg of the TX element and pushes it
  * back.  The data pointer we passed to virtqueue_add_sgs() is the inflight
  * record, so virtqueue_get_buf() returns inf directly.
  */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
 static void nvkvm_tx_done_callback(struct virtqueue *vq)
 {
 	struct nvkvm_state *state = vq->vdev->priv;
@@ -213,6 +223,7 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 
 	for (;;) {
 		struct nvkvm_hdr *hdr;
+		__u32 response_type;
 
 		/* Serialize ring access against concurrent submitters. */
 		spin_lock_irqsave(&state->vq_tx_lock, flags);
@@ -241,7 +252,31 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 				    le32_to_cpu(hdr->type));
 		}
 
-		switch (le32_to_cpu(hdr->type)) {
+		response_type = le32_to_cpu(hdr->type);
+		if (!nvkvm_request_type_known(response_type)) {
+			pr_warn("nvkvm: tx_done: unknown type %u\n", response_type);
+			inf->status = EINVAL;
+			complete(&inf->done);
+			continue;
+		}
+
+		/*
+		 * No default arm: nvkvm_request_type is an enum and -Wswitch is an
+		 * error for this function, so a new protocol request cannot compile
+		 * until its completion shape is accounted for here.
+		 */
+		switch ((enum nvkvm_request_type)response_type) {
+		case NVKVM_REQ_OPEN:
+		case NVKVM_REQ_CLOSE:
+		case NVKVM_REQ_IOCTL:
+		case NVKVM_REQ_MMAP:
+		case NVKVM_REQ_MUNMAP:
+		case NVKVM_REQ_LIST_NVIDIA_DEVICES:
+			/* These paths are retired or use a dedicated response path. */
+			pr_warn("nvkvm: tx_done: unexpected type %u on the sync queue\n",
+				response_type);
+			inf->status = EINVAL;
+			break;
 		case NVKVM_REQ_OPEN_NVIDIA_HANDLE: {
 			struct nvkvm_resp_open_nvidia_handle *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
@@ -326,9 +361,9 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			break;
 		}
 		/*
-		 * #127 poll arm/disarm.  These two were the ONLY request types
-		 * with no case here, so every completion fell to the default
-		 * arm below, which warns and reports EINVAL to the waiter.
+		 * #127 poll arm/disarm.  These two had no cases here, so every
+		 * completion fell to the old default arm, which warned and reported
+		 * EINVAL to the waiter.
 		 *
 		 * How it presented: OBSERVED on an RTX PRO 6000 Blackwell on
 		 * 2026-08-23 as a steady trickle of
@@ -380,15 +415,16 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->fault_addr = le64_to_cpu(resp->realize_token);
 			break;
 		}
-		default:
-			pr_warn("nvkvm: tx_done: unknown type %u\n",
-				le32_to_cpu(hdr->type));
-			inf->status = EINVAL;
+		case NVKVM_REQ_INTERRUPT: {
+			struct nvkvm_resp_interrupt *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
 			break;
+		}
 		}
 		complete(&inf->done);
 	}
 }
+#pragma GCC diagnostic pop
 
 /* ── VQ_RX callback — unused (responses come back on VQ_TX) ─────────────── */
 
@@ -585,6 +621,13 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 	 */
 	if (inf->isolate_id) {
 		if (wait_for_completion_interruptible(&inf->done) == -ERESTARTSYS) {
+			long long interrupted =
+				(long long)atomic64_inc_return(&state->interrupted_waits);
+
+			pr_info_ratelimited(
+				"nvkvm: signal interrupted forwarded ioctl wait (count=%lld pid=%d isolate=%u txn=0x%x)\n",
+				interrupted, task_pid_nr(current), inf->isolate_id,
+				inf->txn_id);
 			nvkvm_virtio_interrupt_isolate(inf->isolate_id,
 						       inf->txn_id);
 			wait_for_completion(&inf->done);
@@ -808,6 +851,7 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	spin_lock_init(&state->vq_tx_lock);
 	INIT_LIST_HEAD(&state->inflight_list);
 	atomic_set(&state->next_txn_id, 0);
+	atomic64_set(&state->interrupted_waits, 0);
 	bitmap_zero(state->txn_inflight_bm, NVKVM_MAX_INFLIGHT);
 	spin_lock_init(&state->slot_lock);
 	bitmap_zero(state->slot_bitmap, NVKVM_SHM_NSLOTS);

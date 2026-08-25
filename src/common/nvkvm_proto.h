@@ -134,39 +134,48 @@ struct nvkvm_shm_ctrl {
 
 /* ── Request types ───────────────────────────────────────────────────────── */
 
-/* Legacy (compat, will be removed) */
-#define NVKVM_REQ_OPEN                   1
-#define NVKVM_REQ_CLOSE                  2
-#define NVKVM_REQ_IOCTL                  3
-#define NVKVM_REQ_MMAP                   4
-#define NVKVM_REQ_MUNMAP                 5
+/*
+ * Keep these as an enum, not preprocessor constants.  The guest completion
+ * switch is deliberately exhaustive over this type and compiled with
+ * -Werror=switch: adding a request here without teaching the guest how to
+ * consume its response must fail the module build, not become a third
+ * "unknown type" runtime bug.
+ */
+enum nvkvm_request_type {
+	/* Legacy (compat, will be removed) */
+	NVKVM_REQ_OPEN                    = 1,
+	NVKVM_REQ_CLOSE                   = 2,
+	NVKVM_REQ_IOCTL                   = 3,
+	NVKVM_REQ_MMAP                    = 4,
+	NVKVM_REQ_MUNMAP                  = 5,
 
-/* Isolate/handle architecture */
-#define NVKVM_REQ_LIST_NVIDIA_DEVICES    10  /* enumerate host GPU devices     */
-#define NVKVM_REQ_OPEN_NVIDIA_HANDLE     11  /* open /dev/nvidia* in QEMU      */
-#define NVKVM_REQ_OPEN_MEMORY_HANDLE     12  /* memfd_create in QEMU           */
-#define NVKVM_REQ_CLOSE_HANDLE           13  /* close when no isolate holds it */
-#define NVKVM_REQ_CREATE_ISOLATE         14  /* spawn isolate process          */
-#define NVKVM_REQ_KILL_ISOLATE           15  /* exit isolate process           */
-#define NVKVM_REQ_COPY_HANDLE_TO_ISOLATE 16  /* SCM_RIGHTS send                */
-#define NVKVM_REQ_CLOSE_HANDLE_ON_ISOLATE 17 /* CLOSE_FD cmd to isolate        */
-#define NVKVM_REQ_IOCTL_ON_ISOLATE       18  /* IOCTL cmd via isolate          */
-#define NVKVM_REQ_MMAP_ON_ISOLATE        19  /* MMAP cmd via isolate           */
-#define NVKVM_REQ_MUNMAP_ON_ISOLATE      20  /* MUNMAP cmd via isolate         */
-#define NVKVM_REQ_POLL_ON_ISOLATE        21  /* start polling fd in isolate    */
-#define NVKVM_REQ_UNPOLL_ON_ISOLATE      22  /* stop polling fd in isolate     */
-#define NVKVM_REQ_WRITE_MEMORY_HANDLE    23  /* shm_slot → memfd (page upload) */
-#define NVKVM_REQ_READ_MEMORY_HANDLE     24  /* memfd → shm_slot (writeback)   */
-#define NVKVM_REQ_REALIZE_UVM_MAPPING    25  /* state-machine mmap-realize     */
-#define NVKVM_REQ_READ_HOST_FILE         26  /* read live host proc/sys file   */
-#define NVKVM_REQ_INTERRUPT              27  /* interrupt an in-flight ioctl   */
-#define NVKVM_REQ_SETUP_RING             28  /* fetch this session's command-buffer ring GPA */
-#define NVKVM_REQ_ENTER_LOOP             29  /* drive the isolate's SPSC consumer loop */
-#define NVKVM_REQ_PRESENT                30  /* #106 present path: virtual head flipped a
-                                              * scanout bo; QEMU exports its host dma-buf  */
-#define NVKVM_REQ_XISO_IMPORT            31  /* #110 cross-isolate dma-buf: broker a bo from
-                                              * the owner isolate into the caller's; returns
-                                              * the caller-local stub GEM handle            */
+	/* Isolate/handle architecture */
+	NVKVM_REQ_LIST_NVIDIA_DEVICES     = 10, /* enumerate host GPU devices     */
+	NVKVM_REQ_OPEN_NVIDIA_HANDLE      = 11, /* open /dev/nvidia* in QEMU      */
+	NVKVM_REQ_OPEN_MEMORY_HANDLE      = 12, /* memfd_create in QEMU           */
+	NVKVM_REQ_CLOSE_HANDLE            = 13, /* close when no isolate holds it */
+	NVKVM_REQ_CREATE_ISOLATE          = 14, /* spawn isolate process          */
+	NVKVM_REQ_KILL_ISOLATE            = 15, /* exit isolate process           */
+	NVKVM_REQ_COPY_HANDLE_TO_ISOLATE  = 16, /* SCM_RIGHTS send                */
+	NVKVM_REQ_CLOSE_HANDLE_ON_ISOLATE = 17, /* CLOSE_FD cmd to isolate        */
+	NVKVM_REQ_IOCTL_ON_ISOLATE        = 18, /* IOCTL cmd via isolate          */
+	NVKVM_REQ_MMAP_ON_ISOLATE         = 19, /* MMAP cmd via isolate           */
+	NVKVM_REQ_MUNMAP_ON_ISOLATE       = 20, /* MUNMAP cmd via isolate         */
+	NVKVM_REQ_POLL_ON_ISOLATE         = 21, /* start polling fd in isolate    */
+	NVKVM_REQ_UNPOLL_ON_ISOLATE       = 22, /* stop polling fd in isolate     */
+	NVKVM_REQ_WRITE_MEMORY_HANDLE     = 23, /* shm_slot → memfd (page upload) */
+	NVKVM_REQ_READ_MEMORY_HANDLE      = 24, /* memfd → shm_slot (writeback)   */
+	NVKVM_REQ_REALIZE_UVM_MAPPING     = 25, /* state-machine mmap-realize     */
+	NVKVM_REQ_READ_HOST_FILE          = 26, /* read live host proc/sys file   */
+	NVKVM_REQ_INTERRUPT               = 27, /* interrupt an in-flight ioctl   */
+	NVKVM_REQ_SETUP_RING              = 28, /* fetch this session's command-buffer ring GPA */
+	NVKVM_REQ_ENTER_LOOP              = 29, /* drive the isolate's SPSC consumer loop */
+	NVKVM_REQ_PRESENT                 = 30, /* #106 present path: virtual head flipped a
+	                                           * scanout bo; QEMU exports its host dma-buf  */
+	NVKVM_REQ_XISO_IMPORT             = 31, /* #110 cross-isolate dma-buf: broker a bo from
+	                                           * the owner isolate into the caller's; returns
+	                                           * the caller-local stub GEM handle            */
+};
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
 

@@ -393,6 +393,7 @@ struct nvkvm_state {
 	 */
 	spinlock_t              vq_tx_lock;
 	atomic_t                next_txn_id;        /* monotonic seed */
+	atomic64_t              interrupted_waits;  /* signal-interrupted ioctl waits */
 	unsigned long           txn_inflight_bm[NVKVM_MAX_INFLIGHT / BITS_PER_LONG];
 
 	/* Slot allocator for shared memory */
