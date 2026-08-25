@@ -28,6 +28,10 @@ package abi_parity
 // static size_t sz_nv00de_v545(void) { return sizeof(struct nv00de_alloc_parameters_v545); }
 // static size_t sz_nv_vaspace(void)  { return sizeof(struct nv_vaspace_allocation_parameters); }
 // static size_t sz_nv_memalloc(void) { return sizeof(struct nv_memory_allocation_params_v545); }
+// static size_t sz_nv_memalloc_common(void) {
+//     return offsetof(struct nv_memory_allocation_params_v545, size) +
+//            sizeof(((struct nv_memory_allocation_params_v545 *)0)->size);
+// }
 //
 // // ioctl wrapper structs
 // static size_t sz_card_info(void)    { return sizeof(struct nv_ioctl_card_info); }
@@ -134,6 +138,7 @@ var Sizes = struct {
 	Nv00deV545 uintptr
 	NvVaspace  uintptr
 	NvMemAlloc uintptr
+	NvMemAllocCommon uintptr
 
 	// ioctl wrapper structs
 	CardInfo   uintptr
@@ -203,6 +208,7 @@ var Sizes = struct {
 	Nv00deV545: uintptr(C.sz_nv00de_v545()),
 	NvVaspace:  uintptr(C.sz_nv_vaspace()),
 	NvMemAlloc: uintptr(C.sz_nv_memalloc()),
+	NvMemAllocCommon: uintptr(C.sz_nv_memalloc_common()),
 
 	CardInfo:   uintptr(C.sz_card_info()),
 	RegFd:      uintptr(C.sz_reg_fd()),

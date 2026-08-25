@@ -471,6 +471,9 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	size_t mp_size = nvkvm_prof()->uvm_map_ext_size;
 	unsigned fd_off = nvkvm_prof()->uvm_map_ext_fd_off;
 	__u32 ap_size = nvkvm_prof()->mem_alloc_size;
+	size_t ap_common_size =
+		offsetof(struct nv_memory_allocation_params_v545, size) +
+		sizeof(ap->size);
 	struct ext_target tctl, tuvm;
 	__u32 nvstatus = 0, h = 0, n_gpus;
 	__u64 gpa_base = 0;
@@ -487,8 +490,12 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	cp     = kzalloc(sizeof(*cp), GFP_KERNEL);
 	mp     = kzalloc(mp_size, GFP_KERNEL);
 	if (!region || !ap || !mm || !cp || !mp) { ret = -ENOMEM; goto out; }
+	/* mem_alloc_size is measured per profile: 515--535 legitimately use a
+	 * shorter allocation struct than V545.  The fallback writes only the
+	 * owner/type/attr/size common prefix, so require the compiler-derived end
+	 * of the last field used rather than the newest full-struct size. */
 	if (mp_size < fd_off + 16 || fd_off < UVM_MAP_EXT_PERGPU_OFF + 8 ||
-	    ap_size < sizeof(*ap)) {
+	    ap_size < ap_common_size) {
 		ret = -EINVAL;
 		goto out;
 	}
