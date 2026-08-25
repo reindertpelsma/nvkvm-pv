@@ -801,6 +801,12 @@ void nb_sink_clip_finish(struct nb_sink *s, uint64_t generation, bool paste)
 bool nb_sink_send_clipboard(struct nb_sink *s, uint64_t generation,
                             const char *text, size_t len)
 {
+    /* A delayed ctrl+shift+V may need both modifiers synthesized around the
+     * balanced key press after the physical keys were released: ctrl down,
+     * shift down, key down/up, shift up, ctrl up.  Reserve all six slots before
+     * queuing any clipboard chunk so ring pressure cannot split that chord or
+     * disconnect the client halfway through it. */
+    const unsigned replay_reserve = 6u;
     size_t off = 0;
     unsigned chunks;
 
@@ -816,7 +822,7 @@ bool nb_sink_send_clipboard(struct nb_sink *s, uint64_t generation,
     chunks = len == 0 ? 1u :
         (unsigned)((len + NVKVM_BROKER_CLIP_PKT_BYTES - 1u) /
                    NVKVM_BROKER_CLIP_PKT_BYTES);
-    if (nb_tx_used(s) + chunks + 4u >= NB_TXRING) {
+    if (nb_tx_used(s) + chunks + replay_reserve >= NB_TXRING) {
         nb_log("clipboard: the client is not draining; dropping this paste "
                "rather than sending half of it");
         return false;

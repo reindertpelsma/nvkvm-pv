@@ -60,6 +60,12 @@ def paste_chord(proc, finish=True):
     input_lines(proc, *(lines + (("c",) if finish else ())))
 
 
+def shifted_paste_chord(proc, finish=True):
+    lines = ("k 29 1", "k 42 1", "k 47 1", "k 47 0", "k 42 0",
+             "k 29 0")
+    input_lines(proc, *(lines + (("c",) if finish else ())))
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit("usage: test_lifecycle.py /path/to/broker")
@@ -140,6 +146,20 @@ def main():
             if replay != [(29, 1), (47, 1), (47, 0), (29, 0)]:
                 raise RuntimeError(f"paste chord was not coherently replayed: "
                                    f"{replay!r}")
+
+            # Ctrl+Shift+V is the largest delayed replay: both physical
+            # modifiers can be released before the asynchronous selection
+            # arrives, requiring six reserved ring entries around the text.
+            shifted_paste_chord(proc, finish=True)
+            packets = drain(b, 0.5)
+            clip_pos = [i for i, pkt in enumerate(packets)
+                        if pkt[0] == EV_CLIPBOARD]
+            replay = [(pkt[3], pkt[4]) for i, pkt in enumerate(packets)
+                      if pkt[0] == EV_KEY and i > max(clip_pos)]
+            if replay != [(29, 1), (42, 1), (47, 1), (47, 0),
+                          (42, 0), (29, 0)]:
+                raise RuntimeError(f"shifted paste chord was not coherently "
+                                   f"replayed: {replay!r}")
 
             # The advertised 7 KiB maximum must fit atomically in the fixed
             # event ring.  Exact-limit arithmetic used to disagree between
