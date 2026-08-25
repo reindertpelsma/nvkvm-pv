@@ -137,6 +137,15 @@ run_case '' --present 320x240 --bad-fourcc
 check   "an unadvertised fourcc is rejected" 'is not advertised by this display' "$CASE_LOG"
 nocheck "and does not reach attach"          'TEST attach' "$CASE_LOG"
 
+# The opaque-twin fallback: an alpha format whose twin IS advertised must be
+# accepted and presented as the twin.  HARDENING 3 is not relaxed -- the pair
+# actually handed to the display is still one the display named.
+run_case '' --present 320x240 --alpha-fourcc
+check   "AR24 falls back to its advertised opaque twin XR24" \
+        'opaque twin' "$CASE_LOG"
+check   "and the frame is attached, not refused" 'TEST attach' "$CASE_LOG"
+nocheck "with no rejection"                      'not advertised by' "$CASE_LOG"
+
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"
 nocheck "and do not reach attach"                     'TEST attach'     "$CASE_LOG"
