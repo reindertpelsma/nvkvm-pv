@@ -238,7 +238,6 @@ fi
 
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "UNIT SUITE OK — all 9 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
     # Counted, not hardcoded: the number said "8" for a while after a ninth
     # suite was added, which is exactly the kind of stale claim this file exists
     # to prevent.

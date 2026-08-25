@@ -81,7 +81,7 @@
 
 typedef struct NvkvmRelay {
     int         sock;           /* the broker connection, or -1               */
-    QemuMutex   lock;           /* serialises sends; the virtio worker sends  */
+    QemuMutex   lock;           /* serialises sends and retained-frame state */
     QemuConsole *con;           /* where input is injected                    */
     uint32_t    caps;           /* from HELLO                                 */
 
@@ -177,9 +177,10 @@ bool nvkvm_display_relay_active(void)
 /* ── sending ─────────────────────────────────────────────────────────────── */
 
 /*
- * One command, optionally carrying one fd.  MSG_DONTWAIT throughout: this can
- * be called from a virtio worker thread, and a display that has stopped
- * draining must cost a dropped frame, never a blocked vCPU.
+ * One command, optionally carrying one fd.  MSG_DONTWAIT throughout: PRESENT
+ * currently runs inline in the BQL-held virtqueue callback, so a display that
+ * has stopped draining must cost a dropped frame, never a stalled VM.  Keep
+ * this non-blocking if PRESENT is moved to a worker later.
  *
  * Returns 0, -EAGAIN when the socket is full, or another -errno (fatal).
  */
@@ -317,12 +318,11 @@ static void relay_drop(NvkvmRelay *r, const char *why)
      */
     relay_connection_state_reset(r);
     /*
-     * The fd is in the main loop's iohandler set, and relay_drop() is
-     * reachable from a virtio WORKER thread (a failed send).  Unregistering
-     * and closing a polled fd out from under the main loop is a
-     * use-after-close, so the teardown is bounced to the main loop.  Setting
-     * r->sock = -1 first is what makes every other path stop using it
-     * immediately, so the delay costs nothing.
+     * The fd is in the main loop's iohandler set.  PRESENT and the readable
+     * callback are both BQL-serialised today, but PRESENT's source comment
+     * explicitly leaves worker offload open.  Keep descriptor teardown on the
+     * main loop so that future change cannot close a polled fd underneath it.
+     * Setting r->sock = -1 first makes every other path stop using it.
      */
     aio_bh_schedule_oneshot(qemu_get_aio_context(), relay_close_bh,
                             (void *)(intptr_t)fd);
@@ -333,8 +333,8 @@ static void relay_drop(NvkvmRelay *r, const char *why)
                  why, r->n_sent, r->n_dropped, r->n_uncommitted);
     /*
      * RESTARTING A DISPLAY PROCESS MUST NOT BE A VM-AFFECTING EVENT.  Arm the
-     * retry from the main loop -- relay_drop() is reachable from a virtio
-     * worker thread and QEMUTimer is not thread-safe.
+     * retry from the main loop too: QEMUTimer is not thread-safe, and keeping
+     * this ownership rule makes a future PRESENT offload safe.
      */
     r->retry_ms = RELAY_RETRY_MIN_MS;
     r->retry_logged = false;
@@ -866,9 +866,10 @@ static int relay_connect(NvkvmRelay *r, const char *path, Error **errp)
                   "pointer and keyboard still work while the window is "
                   "active.");
     }
-    /* Non-blocking from here on, in both directions: the send side runs on a
-     * virtio worker thread and must never stall a vCPU, and the receive side
-     * runs on the main loop and must never stall the VM. */
+    /* Non-blocking from here on, in both directions: PRESENT currently runs
+     * inline in the BQL-held virtqueue callback, where a blocked send stalls
+     * the VM.  It may be offloaded later, in which case blocking a worker is
+     * still wrong.  The receive side runs on the main loop too. */
     if (!g_unix_set_fd_nonblocking(fd, true, NULL)) {
         error_setg(errp, "nvkvm-broker: cannot set O_NONBLOCK");
         close(fd);
@@ -1230,7 +1231,7 @@ static void relay_retry(void *opaque)
     int rc;
 
     qemu_mutex_lock(&r->lock);
-    if (r->sock >= 0) {                 /* raced with something else */
+    if (r->sock >= 0) {                 /* a stale retry needs no work */
         qemu_mutex_unlock(&r->lock);
         return;
     }
