@@ -52,6 +52,7 @@ tests/unit/test_r1_type_dev
 tests/unit/test_transport_ready
 tests/unit/test_relay_state
 tests/unit/test_relay_clip
+tests/unit/test_relay_wiring
 
 # generated at build time by tests/unit/Makefile (the U-5 function, extracted
 # from src/stub/nvkvm_stub.c so the test cannot drift from the code it pins)
@@ -76,6 +77,10 @@ tests/unit/r1_stub_type_dev.inc
 # Relay recovery/clipboard helpers extracted from the production QEMU source.
 tests/unit/relay_state_helpers.inc
 tests/unit/relay_clip_batch.inc
+tests/unit/relay_fd_ownership.inc
+tests/unit/relay_clip_wiring.inc
+tests/unit/relay_writable_wiring.inc
+tests/unit/relay_connect_wiring.inc
 
 # scripts/sweep.sh run output: results, raw logs pulled off rented boxes,
 # and the instance registry the auto-destroy timer reads.
