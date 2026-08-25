@@ -505,6 +505,65 @@ are actionable from the summary.
 
 ---
 
+## Remediation branch status — 2026-08-25
+
+The findings above describe audited revision `ce42001`.  They were remediated
+on `fix/audit-remediation-20260825`; this section records the disposition
+without rewriting the evidence or severity of the original findings.  The
+branch was not merged merely on the strength of source review: local gates were
+run first, and GPU validation is tracked separately below.
+
+| Findings | Disposition on the remediation branch |
+|---|---|
+| SR-01 | Fixed in `9eac58b`. Every copied/split/inherited VMA takes a `refcount_t` reference and only the final close releases the mapping. Teardown no longer dereferences the single stale `region->vma`. A fork + partial-unmap + 80-extent/160-MiB churn reproducer is in `tests/repro/uvm_vma_lifetime.c`. |
+| SR-02 | Fixed by `9eac58b` and completed by `86641e0`. `registered_gpus` is read under its writer's state mutex, with the explicit nesting order `ext_lock -> lock`. The outer lock now spans mmap classification and the chosen mmap operation. |
+| SR-03 | Fixed by `9eac58b` and `86641e0`. Failed host calls create no state; duplicates replace by key; matching teardown removes entries. Required semaphore-pool classification metadata is pre-admitted and byte-bounded before forwarding. Optional dormant REALIZE blobs have a separate budget, so losing them cannot disable ordinary managed mmap. The host round trip and shadow commit are one same-fd transaction. |
+| SR-04 | Fixed in `fd098b9`. Adopted listeners must be listening `AF_UNIX` `SOCK_STREAM` sockets, and `--no-peercred` is refused for adopted/socket-activated descriptors. The hostile adopted-socket test is blocking CI. |
+| RR-01, RR-02 | Fixed in `845ab71` and `86641e0`. UI events coalesce onto process-context work; KMS is published only after `drm_dev_register()` succeeds; teardown unpublishes, cancels resize/present/timer work, destroys the workqueue, and then releases DRM. |
+| RR-03, RR-06..08 | Fixed in `3d70541`, `bdc9529`, and `77358b6`. The relay retains the newest frame while disconnected, resets connection-generation framing/clipboard state, queues complete clipboard transactions, and performs connect/HELLO/replay through a fully nonblocking BQL-owned state machine. Exact fd handlers are removed synchronously before close. |
+| RR-04 | Fixed in `6382eec`. The allocation guard now requires only the compiler-derived end of the last field actually written, rather than the full V545 struct. ABI parity exercises every measured profile and proves that a shorter pre-545 profile is present. This is NVIDIA-driver-specific ABI behavior and must be carried to generated/tag-specific variants and checked against their OGKM tags. |
+| RR-05 | Fixed in `973fd96`. Compute-only builds consume UI events without linking KMS; kernel-matrix error extraction is case-insensitive, so the linked uppercase modpost failure is actionable. |
+| BR-01..07 | Fixed in `fd098b9` and `3870bd2`. Per-client and async clipboard state is generation-scoped, delayed paste replays one balanced six-edge chord, the honest transfer cap is 7168 bytes, transactions reset deterministically, backend capability claims match implementation, Wayland source writes are nonblocking, relative motion saturates, and hardening failures fail closed. |
+| CI-01 | Fixed in `239539a`. Normal and ASAN+UBSAN broker builds, hostile adopted-socket authentication, clipboard framing and persistent-client lifecycle tests are blocking. `86641e0` also gates the guest UVM/KMS ordering wiring. |
+
+The `registered_gpus` question is narrower than the original finding can make
+it sound. Ordinary libcuda registers GPUs during setup, and the list is
+append-only between a successful `UVM_REGISTER_GPU` and its matching
+unregister/deinitialization. It is not, however, a probe-only constant: the
+driver accepts the ioctl on the live fd, and another thread may call `mmap()`
+on that same fd concurrently. The old writer used `st->lock` while the mmap
+reader used only `ext_lock`, so startup-like usage did not supply a kernel
+synchronization guarantee. The common transaction lock now makes both the
+normal ordering and an adversarial same-fd ordering defined.
+
+No NVIDIA control command was added to the allowlist, and no scheduling
+control was changed to accept-and-drop. The type-27 completion fix remains
+inert with respect to Vulkan initialization. The only NVIDIA-driver-specific
+ABI correction in this remediation is RR-04's pre-545 common-prefix guard;
+the broker protocol changes are nvkvm's own protocol, not NVIDIA ABI.
+
+### Local remediation verification
+
+| Check on the combined branch | Result |
+|---|---|
+| core unit suite | pass: all 15 suites; relay wiring 22/22, relay state 17/17, relay clipboard 35/35; 9 isolate cases with no known failures |
+| QEMU syntax | pass with default GCC 15 and GCC 14 |
+| guest source ordering gate | pass |
+| guest module, local kernel 7.0, `NVKVM_GRAPHICS=1` | pass |
+| guest module, local kernel 7.0, `NVKVM_GRAPHICS=0` | pass; directly closes the linked CI failure mode |
+| ABI parity | pass; includes the pre-545 common-prefix regression |
+| VMA lifetime reproducer | warning-clean compilation; execution requires nvkvm GPU hardware |
+| broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 43/43, adopted socket, clipboard and lifecycle suites |
+| rental safety harness | pass: 71/71 offline cases |
+| ShellCheck 0.10 at blocking severity | pass |
+
+These local results are not a GPU claim. The branch must remain unmerged until
+the recorded hardware sweep exercises CUDA managed memory, Vulkan device
+creation/dispatch and EGL pixel correctness on the intended driver/profile
+matrix.
+
+---
+
 ## Inherited open and deliberately accepted items
 
 These were rechecked for continued presence, but are not new discoveries. The
