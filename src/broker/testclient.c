@@ -127,7 +127,7 @@ int main(int argc, char **argv)
     unsigned pw = 0, ph = 0, ww = 0, wh = 0;
     int bad_size = 0, bad_fourcc = 0, bad_dim = 0, bad_fd = 0, bad_frame = 0;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
-    int quiet_after = 0;
+    int quiet_after = 0, caps_clipboard = 0;
 
     /* Line-buffered: this tool is normally watched live and normally ended
      * with Ctrl-C or timeout(1), and a fully buffered pipe would throw away
@@ -138,7 +138,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <socket> [--present WxH] [--window WxH]\n"
                         "       [--bad-size H|--bad-fourcc|--bad-dim|"
                         "--bad-fd|--bad-frame|--bad-two-fds|--bad-reserved|"
-                        "--bad-commit-fd]\n", argv[0]);
+                        "--bad-commit-fd|--caps-clipboard]\n", argv[0]);
         return 2;
     }
     for (i = 2; i < argc; i++) {
@@ -155,6 +155,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--bad-two-fds"))  { bad_two = 1; }
         else if (!strcmp(a, "--bad-reserved")) { bad_reserved = 1; }
         else if (!strcmp(a, "--bad-commit-fd")){ bad_commit_fd = 1; }
+        else if (!strcmp(a, "--caps-clipboard")){ caps_clipboard = 1; }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (!pw) { pw = 640; }
@@ -227,6 +228,16 @@ int main(int argc, char **argv)
             continue;
         }
         quiet_after = 1;
+
+        if (caps_clipboard) {
+            struct nvkvm_broker_cmd c = {
+                .type = NVKVM_BROKER_CMD_CAPS,
+                .width = NVKVM_BROKER_CLIENT_CLIPBOARD,
+            };
+
+            printf("  -> CAPS clipboard-agent\n");
+            send_cmd(sock, &c, NULL, 0, sizeof(c));
+        }
 
         if (ww && wh) {
             struct nvkvm_broker_cmd c = {

@@ -109,7 +109,7 @@ GBM_LIBS   = $(shell $(PKG_CONFIG) --libs gbm)
 endif
 
 .SECONDARY:
-.PHONY: all install clean report check
+.PHONY: all install clean report check check-sanitize
 all: report $(BIN) $(TESTCLIENT) $(RELAY) $(if $(HAVE_GBM),$(DMASRC),)
 
 report:
@@ -174,6 +174,17 @@ test-utf8: test/utf8_extracted.inc test/test_utf8.c
 check: all test-utf8
 	./test-utf8
 	bash selftest.sh
+	python3 test/test_adopted_socket.py ./$(BIN)
+	python3 test/test_clipboard.py ./$(BIN)
+	python3 test/test_lifecycle.py ./$(BIN)
+
+# Keep the sanitizer invocation reproducible locally and in CI.  A clean
+# rebuild matters here: mixing instrumented and ordinary objects links fine
+# and produces a test result that did not cover what it claims to cover.
+check-sanitize:
+	$(MAKE) clean
+	$(MAKE) CFLAGS="$(CFLAGS) -O1 -fsanitize=address,undefined -fno-omit-frame-pointer" \
+	        LDFLAGS="$(LDFLAGS) -fsanitize=address,undefined" check
 
 install: $(BIN)
 	install -d $(DESTDIR)$(PREFIX)/bin
@@ -181,4 +192,4 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) *.o *.d \
-	      *-client-protocol.h *-protocol.c
+	      *-client-protocol.h *-protocol.c test-utf8 test/utf8_extracted.inc

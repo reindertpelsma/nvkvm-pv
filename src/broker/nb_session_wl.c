@@ -317,10 +317,16 @@ struct nb_wl {
     struct wl_data_device         *ddev;
     struct wl_data_offer          *offer;      /* current selection, if text */
     bool                           offer_text; /* it advertised our mime     */
+    /* data_offer precedes the selection/enter event that says what the object
+     * is for.  Keep that candidate separate so an ignored DnD offer cannot
+     * replace the clipboard selection. */
+    struct wl_data_offer          *pending_offer;
+    bool                           pending_offer_text;
     struct wl_data_source         *source;     /* ours, when we own it       */
     char                          *src_text;   /* what we would send         */
     size_t                         src_len;
     int                            fetch_fd;   /* pipe being read, or -1     */
+    uint64_t                       fetch_generation;
     uint64_t                       clip_notice_until;  /* title-bar notice   */
     char                           fetch_buf[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
     size_t                         fetch_len;
@@ -1051,6 +1057,8 @@ static void doffer_offer(void *d, struct wl_data_offer *o, const char *mime)
 
     if (w->offer == o && !strcmp(mime, NB_CLIP_MIME)) {
         w->offer_text = true;
+    } else if (w->pending_offer == o && !strcmp(mime, NB_CLIP_MIME)) {
+        w->pending_offer_text = true;
     }
 }
 static void doffer_source_actions(void *d, struct wl_data_offer *o, uint32_t a) {}
@@ -1066,10 +1074,14 @@ static void ddev_data_offer(void *d, struct wl_data_device *dev,
 {
     struct nb_wl *w = d;
 
-    /* A new offer supersedes any we were tracking; the compositor destroys the
-     * old one for us only when it sends selection(NULL). */
-    w->offer = o;
-    w->offer_text = false;
+    /* This event does not say whether `o` is a selection or drag-and-drop
+     * offer.  Association comes in selection()/enter(), so replacing the
+     * current selection here confuses the two object lifetimes. */
+    if (w->pending_offer && w->pending_offer != w->offer) {
+        wl_data_offer_destroy(w->pending_offer);
+    }
+    w->pending_offer = o;
+    w->pending_offer_text = false;
     wl_data_offer_add_listener(o, &doffer_listener, w);
 }
 static void ddev_selection(void *d, struct wl_data_device *dev,
@@ -1078,19 +1090,42 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
     struct nb_wl *w = d;
 
     if (!o) {
+        if (w->offer) {
+            wl_data_offer_destroy(w->offer);
+        }
         w->offer = NULL;
         w->offer_text = false;
         return;
     }
     /* The offer we were told about in data_offer is now THE selection. */
-    if (w->offer != o) {
-        w->offer = o;
+    if (w->offer && w->offer != o) {
+        wl_data_offer_destroy(w->offer);
+    }
+    w->offer = o;
+    if (w->pending_offer == o) {
+        w->offer_text = w->pending_offer_text;
+        w->pending_offer = NULL;
+        w->pending_offer_text = false;
+    } else {
+        /* The protocol promises data_offer first.  Fail this offer closed if a
+         * compositor violates that ordering; it has no recorded MIME set. */
         w->offer_text = false;
     }
 }
 static void ddev_enter(void *d, struct wl_data_device *v, uint32_t s,
                        struct wl_surface *su, wl_fixed_t x, wl_fixed_t y,
-                       struct wl_data_offer *o) {}
+                       struct wl_data_offer *o)
+{
+    struct nb_wl *w = d;
+
+    /* Drag-and-drop is deliberately unsupported.  Destroy its offer now that
+     * the association is known, without disturbing the clipboard selection. */
+    if (o && o == w->pending_offer) {
+        wl_data_offer_destroy(o);
+        w->pending_offer = NULL;
+        w->pending_offer_text = false;
+    }
+}
 static void ddev_leave(void *d, struct wl_data_device *v) {}
 static void ddev_motion(void *d, struct wl_data_device *v, uint32_t t,
                         wl_fixed_t x, wl_fixed_t y) {}
@@ -1111,18 +1146,34 @@ static void dsrc_send(void *d, struct wl_data_source *src, const char *mime,
 {
     struct nb_wl *w = d;
     size_t off = 0;
+    int flags;
 
     if (!w->src_text || strcmp(mime, NB_CLIP_MIME)) {
         close(fd);
         return;
     }
-    /* Blocking write to a pipe the requester owns.  Bounded by the clipboard
-     * cap, and a reader that goes away gives EPIPE rather than a stall --
-     * SIGPIPE is ignored process-wide. */
+    /* The requester owns this fd.  It must not be allowed to stop the single
+     * display/input loop by declining to read.  The selection is bounded and
+     * normally fits in one pipe write; under pressure, fail this request
+     * instead of blocking the user's keyboard. */
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        nb_err("clipboard: cannot make a host requester's selection fd "
+               "nonblocking: %s; refusing that request", strerror(errno));
+        close(fd);
+        return;
+    }
     while (off < w->src_len) {
         ssize_t n = write(fd, w->src_text + off, w->src_len - off);
 
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                nb_log("clipboard: a host requester stopped draining; "
+                       "abandoning its nonblocking selection transfer");
+            }
             break;
         }
         off += (size_t)n;
@@ -1195,7 +1246,8 @@ static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
 
 /* ── host -> guest: read the selection, asynchronously ───────────────────── */
 
-static int wl_fetch_clipboard(struct nb_session *s)
+static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
+                              uint64_t generation)
 {
     struct nb_wl *w = s->priv;
     int fds[2];
@@ -1214,6 +1266,7 @@ static int wl_fetch_clipboard(struct nb_session *s)
     wl_display_flush(w->dpy);
     w->fetch_fd = fds[0];
     w->fetch_len = 0;
+    w->fetch_generation = generation;
     return 0;
 }
 
@@ -1225,14 +1278,15 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
 {
     for (;;) {
         ssize_t n = read(w->fetch_fd, w->fetch_buf + w->fetch_len,
-                         sizeof(w->fetch_buf) - 1 - w->fetch_len);
+                         sizeof(w->fetch_buf) - w->fetch_len);
 
         if (n > 0) {
             w->fetch_len += (size_t)n;
-            if (w->fetch_len >= sizeof(w->fetch_buf) - 1) {
+            if (w->fetch_len > NVKVM_BROKER_CLIP_MAX_BYTES) {
                 nb_log("clipboard: host selection is larger than the %u-byte "
                        "cap; not pasting it",
                        NVKVM_BROKER_CLIP_MAX_BYTES);
+                nb_sink_clip_finish(sink, w->fetch_generation, false);
                 break;
             }
             continue;
@@ -1243,16 +1297,42 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
         if (n < 0 && errno == EINTR) {
             continue;
         }
+        if (n < 0) {
+            nb_log("clipboard: reading the host selection failed: %s",
+                   strerror(errno));
+        }
         /* n == 0: EOF, the whole selection is here. */
         if (n == 0 && w->fetch_len > 0) {
-            nb_sink_send_clipboard(sink, w->fetch_buf, w->fetch_len);
+            bool sent = nb_sink_send_clipboard(sink, w->fetch_generation,
+                                               w->fetch_buf, w->fetch_len);
+
+            nb_sink_clip_finish(sink, w->fetch_generation, sent);
+        } else {
+            nb_sink_clip_finish(sink, w->fetch_generation, false);
         }
         break;
     }
     close(w->fetch_fd);
     w->fetch_fd = -1;
     w->fetch_len = 0;
+    w->fetch_generation = 0;
     return true;
+}
+
+static void wl_client_detach(struct nb_session *s, uint64_t generation)
+{
+    struct nb_wl *w = s->priv;
+
+    if (w->fetch_fd >= 0 && w->fetch_generation == generation) {
+        close(w->fetch_fd);
+        w->fetch_fd = -1;
+        w->fetch_len = 0;
+        w->fetch_generation = 0;
+    }
+    /* The warning/title state described the departed VM, not the persistent
+     * host window. */
+    w->clip_notice_until = 0;
+    tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
 }
 
 /* ── the output's fractional scale ───────────────────────────────────────── */
@@ -2843,23 +2923,7 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
      * a separate fd and its readiness has nothing to do with the compositor's.
      */
     if (w->fetch_fd >= 0 && w->pfd && (w->pfd[1].revents & (POLLIN | POLLHUP))) {
-        if (wl_fetch_pump(w, sink)) {
-            /* Finished, however it ended.  Release the held paste key on EVERY
-             * path or the keystroke is swallowed and paste appears broken. */
-            nb_sink_clip_release(sink);
-        }
-    }
-    if (sink->clip_want_paste && w->fetch_fd < 0) {
-        int r = wl_fetch_clipboard(s);
-
-        sink->clip_want_paste = false;
-        if (r != 0) {
-            if (r == -ENOENT) {
-                nb_log("clipboard: the host selection is empty or is not "
-                       "text, so this paste sent nothing");
-            }
-            nb_sink_clip_release(sink);
-        }
+        (void)wl_fetch_pump(w, sink);
     }
 
     if (w->pfd && (w->pfd->revents & POLLOUT)) {
@@ -3029,6 +3093,19 @@ static void wl_close_session(struct nb_session *s)
         return;
     }
     wl_set_grab(s, false);
+    if (w->fetch_fd >= 0) {
+        close(w->fetch_fd);
+    }
+    if (w->pending_offer && w->pending_offer != w->offer) {
+        wl_data_offer_destroy(w->pending_offer);
+    }
+    if (w->offer) {
+        wl_data_offer_destroy(w->offer);
+    }
+    if (w->source) {
+        wl_data_source_destroy(w->source);
+    }
+    free(w->src_text);
     for (i = 0; i < NB_MAX_BUFS; i++) {
         wl_buf_destroy(w, i);
     }
@@ -3132,6 +3209,9 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     if (!w->ddev) {
         nb_log("no wl_data_device: clipboard is unavailable on this "
                "compositor, whatever --clipboard says");
+    }
+    if (w->ddev) {
+        s->clipboard_caps = NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G;
     }
 
     if (!w->comp || !w->wm_base) {
@@ -3343,6 +3423,7 @@ static const struct nb_session_ops wl_ops = {
     .attach = wl_attach,
     .commit = wl_commit,
     .resize = wl_resize,
+    .client_detach = wl_client_detach,
     .show_idle = wl_show_idle,
     .dismiss_dialog = wl_dismiss_dialog,
     .set_clipboard = wl_set_clipboard,

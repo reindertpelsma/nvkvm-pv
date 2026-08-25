@@ -30,6 +30,8 @@
  *     w <v> <h>                   wheel
  *     f <0|1>                     focus out/in
  *     p <0|1>                     pointer leave/enter
+ *     c                           complete the current clipboard fetch
+ *     s                           attempt a cancelled client's stale fetch
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -56,6 +58,9 @@ struct nb_test {
     uint64_t pending_id;
     uint32_t pending_w, pending_h;
     unsigned resize_w, resize_h;    /* announced on the next dispatch */
+    bool     fetch_pending;
+    uint64_t fetch_generation;
+    uint64_t stale_fetch_generation;
 };
 
 static int test_pollfds(struct nb_session *s, struct pollfd *out, int max)
@@ -68,6 +73,44 @@ static int test_pollfds(struct nb_session *s, struct pollfd *out, int max)
     out[0].events = POLLIN;
     out[0].revents = 0;
     return 1;
+}
+
+static void test_finish_fetch(struct nb_test *t, struct nb_sink *sink,
+                              unsigned requested_len)
+{
+    static char text[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
+    static bool initialized;
+    size_t len = requested_len ? requested_len : 19u;
+    bool sent;
+
+    if (!t->fetch_pending) {
+        return;
+    }
+    if (!initialized) {
+        memset(text, 'x', sizeof(text));
+        initialized = true;
+    }
+    if (len > sizeof(text)) {
+        len = sizeof(text);
+    }
+    t->fetch_pending = false;
+    sent = nb_sink_send_clipboard(sink, t->fetch_generation, text, len);
+    nb_sink_clip_finish(sink, t->fetch_generation, sent);
+    t->fetch_generation = 0;
+}
+
+static void test_finish_stale_fetch(struct nb_test *t, struct nb_sink *sink)
+{
+    static const char text[] = "stale-host-clipboard";
+    uint64_t generation = t->stale_fetch_generation;
+    bool sent;
+
+    if (!generation) {
+        return;
+    }
+    t->stale_fetch_generation = 0;
+    sent = nb_sink_send_clipboard(sink, generation, text, sizeof(text) - 1u);
+    nb_sink_clip_finish(sink, generation, sent);
 }
 
 static void test_line(struct nb_session *s, struct nb_sink *sink,
@@ -87,6 +130,8 @@ static void test_line(struct nb_session *s, struct nb_sink *sink,
     case 'w': nb_sink_wheel(sink, a, b); break;
     case 'f': nb_sink_focus(sink, a != 0); break;
     case 'p': nb_sink_pointer(sink, a != 0); break;
+    case 'c': test_finish_fetch(s->priv, sink, (unsigned)a); break;
+    case 's': test_finish_stale_fetch(s->priv, sink); break;
     default: break;
     }
 }
@@ -191,6 +236,38 @@ static int test_set_fullscreen(struct nb_session *s, bool on)
     return 0;
 }
 
+static int test_set_clipboard(struct nb_session *s, const char *text, size_t len)
+{
+    nb_log("TEST clipboard from guest: %zu bytes", len);
+    return 0;
+}
+
+static int test_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
+                                uint64_t generation)
+{
+    struct nb_test *t = s->priv;
+
+    if (t->fetch_pending) {
+        return -EBUSY;
+    }
+    t->fetch_pending = true;
+    t->fetch_generation = generation;
+    return 0;
+}
+
+static void test_client_detach(struct nb_session *s, uint64_t generation)
+{
+    struct nb_test *t = s->priv;
+
+    if (t->fetch_pending && t->fetch_generation == generation) {
+        /* Keep only the generation so `s` can model a completion callback
+         * that was already queued when cancellation closed the real fd. */
+        t->stale_fetch_generation = generation;
+        t->fetch_pending = false;
+        t->fetch_generation = 0;
+    }
+}
+
 static void test_close(struct nb_session *s)
 {
     free(s->priv);
@@ -214,6 +291,7 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
                    NB_DRM_FORMAT_MOD_INVALID);
 
     s->accept_memfd = true;
+    s->clipboard_caps = NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G;
     s->caps = NVKVM_BROKER_CAP_KEYBOARD | NVKVM_BROKER_CAP_ABS_POINTER |
               NVKVM_BROKER_CAP_REL_POINTER | NVKVM_BROKER_CAP_POINTER_LOCK |
               NVKVM_BROKER_CAP_TOTAL_GRAB | NVKVM_BROKER_CAP_FOCUS_EVENTS |
@@ -241,6 +319,9 @@ static const struct nb_session_ops test_ops = {
     .attach = test_attach,
     .commit = test_commit,
     .resize = test_resize,
+    .client_detach = test_client_detach,
+    .set_clipboard = test_set_clipboard,
+    .fetch_clipboard = test_fetch_clipboard,
 };
 
 struct nb_session *nb_session_test(const struct nb_config *cfg)
