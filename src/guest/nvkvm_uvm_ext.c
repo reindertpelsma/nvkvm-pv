@@ -440,6 +440,10 @@ static __u32 ext_collect_uuids(struct nvkvm_uvm_fd_state *st, void *mp,
 	struct nvkvm_uvm_gpu_reg *g;
 	__u32 n = 0;
 
+	/* The writer uses st->lock.  We arrive with ext_lock held, establishing
+	 * the documented ext_lock -> lock order and snapshotting a fully linked
+	 * list rather than racing UVM_REGISTER_GPU on the same fd. */
+	mutex_lock(&st->lock);
 	list_for_each_entry(g, &st->registered_gpus, list) {
 		unsigned off = UVM_MAP_EXT_PERGPU_OFF + n * UVM_MAP_EXT_PERGPU_STRIDE;
 
@@ -450,6 +454,7 @@ static __u32 ext_collect_uuids(struct nvkvm_uvm_fd_state *st, void *mp,
 		memcpy((char *)mp + off, g->gpu_uuid, 16);
 		n++;
 	}
+	mutex_unlock(&st->lock);
 	return n;
 }
 
@@ -489,6 +494,13 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	}
 
 	mutex_lock(&st->ext_lock);
+	mutex_lock(&st->lock);
+	if (!st->shadow_valid) {
+		mutex_unlock(&st->lock);
+		ret = -EIO;
+		goto unlock;
+	}
+	mutex_unlock(&st->lock);
 
 	ret = ext_tree_build(st);
 	if (ret)
@@ -499,6 +511,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 
 	region->ctx               = ctx;
 	region->ext_backed        = true;
+	refcount_set(&region->vma_refs, 1);
 	region->ext_gva           = gva;
 	region->length            = vma_len;
 	region->handle_id         = ctx->handle_id;
