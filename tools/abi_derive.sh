@@ -25,6 +25,7 @@
 #   tools/abi_derive.sh --jobs 4            # parallel tags (default: nproc, max 8)
 #   tools/abi_derive.sh --work DIR --keep   # keep the clones + probe errors
 #   tools/abi_derive.sh --reference-check   # only the 5 rows nvkvm_abi.h cites
+#   tools/abi_derive.sh --all-published-supported # every numeric 515..610 tag
 #
 # Env equivalents: OGKM_TAGS, OGKM_WORK, OGKM_JOBS.
 set -uo pipefail
@@ -67,6 +68,7 @@ WORK="${OGKM_WORK:-}"
 JOBS="${OGKM_JOBS:-}"
 FORMAT="table"
 KEEP=0
+ALL_PUBLISHED_SUPPORTED=0
 REPO="https://github.com/NVIDIA/open-gpu-kernel-modules.git"
 
 while [ $# -gt 0 ]; do
@@ -77,10 +79,27 @@ while [ $# -gt 0 ]; do
 	--format) FORMAT="$2"; shift 2 ;;
 	--keep) KEEP=1; shift ;;
 	--reference-check) TAGS="$REFERENCE_TAGS"; shift ;;
+	--all-published-supported) ALL_PUBLISHED_SUPPORTED=1; shift ;;
 	-h|--help) sed -n '2,30p' "$0"; exit 0 ;;
 	*) echo "abi_derive.sh: unknown argument '$1'" >&2; exit 2 ;;
 	esac
 done
+
+if [ "$ALL_PUBLISHED_SUPPORTED" -eq 1 ]; then
+	remote_tags=$(git ls-remote --refs --tags "$REPO") || {
+		echo "abi_derive.sh: could not list official OGKM tags" >&2
+		exit 1
+	}
+	TAGS=$(printf '%s\n' "$remote_tags" |
+		awk '{ sub("refs/tags/", "", $2); print $2 }' |
+		grep -E '^[0-9]+(\.[0-9]+){1,2}$' |
+		awk -F. '$1 >= 515 && $1 <= 610' |
+		sort -V)
+	[ -n "$TAGS" ] || {
+		echo "abi_derive.sh: official tag query returned no numeric 515..610 tags" >&2
+		exit 1
+	}
+fi
 
 [ -n "$TAGS" ] || TAGS="$DEFAULT_TAGS"
 [ -n "$WORK" ] || WORK="$(mktemp -d "${TMPDIR:-/tmp}/ogkm-derive.XXXXXX")"
@@ -93,9 +112,12 @@ mkdir -p "$WORK"
 # ---------------------------------------------------------------------------
 # Field table: <name>|<headers,comma-sep>|<C expression>[|<headers>|<expr> ...]
 #
-# Field names match the members of `struct nvkvm_abi_profile` in
+# Most field names match members of `struct nvkvm_abi_profile` in
 # src/common/nvkvm_abi.h one-for-one, so a row here transcribes into that table
-# without a rename step (renames are where transcription bugs live).
+# without a rename step (renames are where transcription bugs live).  Fields
+# prefixed `uvm_register_gpu_` additionally prove the supposedly universal
+# REGISTER_GPU layout at every tag.  Keeping them in this same sweep prevents a
+# fixed offset in guest/QEMU/stub code from quietly crossing a driver boundary.
 #
 # A field may list SEVERAL header/expression alternatives, tried left to right;
 # the first that compiles wins and the table marks the row with the alternative
@@ -116,6 +138,9 @@ cat > "$FIELDS_FILE" <<'F'
 uvm_map_ext_size|uvm_types.h,uvm_ioctl.h|sizeof(UVM_MAP_EXTERNAL_ALLOCATION_PARAMS)
 uvm_map_ext_fd_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_MAP_EXTERNAL_ALLOCATION_PARAMS, rmCtrlFd)
 uvm_sem_pool_size|uvm_types.h,uvm_ioctl.h|sizeof(UVM_ALLOC_SEMAPHORE_POOL_PARAMS)
+uvm_register_gpu_size|uvm_types.h,uvm_ioctl.h|sizeof(UVM_REGISTER_GPU_PARAMS)
+uvm_register_gpu_fd_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_REGISTER_GPU_PARAMS, rmCtrlFd)
+uvm_register_gpu_status_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_REGISTER_GPU_PARAMS, rmStatus)
 chan_alloc_size|nvtypes.h,nvos.h,alloc/alloc_channel.h|sizeof(NV_CHANNEL_ALLOC_PARAMS)|nvtypes.h,nvos.h|sizeof(NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS)
 vaspace_alloc_size|nvtypes.h,nvos.h|sizeof(NV_VASPACE_ALLOCATION_PARAMETERS)
 mem_alloc_size|nvtypes.h,nvos.h|sizeof(NV_MEMORY_ALLOCATION_PARAMS)
@@ -242,12 +267,12 @@ esac
 
 # ---------------------------------------------------------------------------
 # Distinct-layout summary: the actual deliverable.  Two tags with an identical
-# 9-tuple need one profile between them; a change in the tuple IS a profile
+# measured tuple need one profile between them; a change in the tuple IS a profile
 # boundary, and the boundary is only real where a probe measured it.
 # ---------------------------------------------------------------------------
 if [ "$FORMAT" = "table" ]; then
 	echo
-	echo "── distinct layouts (identical 9-tuple ⇒ one profile) ──"
+	echo "── distinct layouts (identical measured tuple ⇒ one profile) ──"
 	SEP=" "
 	prev=""
 	for t in $TAG_LIST; do

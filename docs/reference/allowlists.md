@@ -30,19 +30,20 @@ Each entry is `{ cmd, min_size, fd_off[2] }`: the minimum parameter size, and
 the byte offsets of any embedded frontend-fd fields that need
 handle-id→host-fd translation. `0xffff` means "no fd field".
 
-Sizes are the exact `sizeof` from `src/abi/uvm.h` at driver 575.51.03, and the
-comment is explicit that they were *not* copied from gVisor:
+Sizes are the exact `sizeof` from `src/abi/uvm.h`, verified against NVIDIA's
+official OGKM tags rather than copied from a neighbouring nvproxy release:
 
-> `min_size` is the EXACT struct size from our ABI (`src/abi/uvm.h`, driver
-> 575.51.03) — verified by `sizeof`, NOT copied from gVisor's newer layouts
-> (several differ: e.g. `REGISTER_GPU` is 32B here, not gVisor's 40B-with-NUMA;
-> `REGISTER_CHANNEL` 48 not 56; `MIGRATE` 48 not 56).
+> `min_size` is the EXACT struct size from our ABI (`src/abi/uvm.h`), verified
+> against OGKM rather than copied from a neighbouring nvproxy release.
+> `REGISTER_GPU` is 40 bytes at every one of the 216 supported OGKM tags;
+> `REGISTER_CHANNEL` remains 48 rather than 56 and `MIGRATE` 48 rather than 56.
 >
 > — `src/qemu/nvkvm_isolate_handlers.c:589-598`
 
 Five commands (44, 45, 53, 65, 66) carry `min_size = 0` deliberately: there is no
 driver-verified layout for them and an over-strict guess had already mis-denied
-`REGISTER_GPU` once (`src/qemu/nvkvm_isolate_handlers.c:600-609`).
+`REGISTER_GPU` once. `REGISTER_GPU.rmCtrlFd` is an input fd at offset 24 and is
+translated through the per-VM handle table before forwarding.
 
 Two `min_size` values are version-variant and are overridden from the active ABI
 profile at check time — `UVM_MAP_EXTERNAL_ALLOCATION` (33) and

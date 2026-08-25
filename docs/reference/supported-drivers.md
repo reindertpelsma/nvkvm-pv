@@ -21,6 +21,14 @@ below are **measured**, not assumed: `tools/abi_derive.sh` compiled
 the "measured from OGKM" column, and `tests/abi_parity` asserts the table
 against those numbers (`go test -count=1 ./tests/abi_parity`).
 
+`UVM_REGISTER_GPU_PARAMS` is a separate universal invariant, not another
+profile row. A compiled sweep of every one of the 216 official numeric OGKM
+tags from 515.43.04 through 610.57.04 measured the same layout at every tag:
+size 40, `rmCtrlFd` at byte 24 and `rmStatus` at byte 36. There are therefore no
+driver-version boundaries for that structure. Reproduce the complete check
+with `tools/abi_derive.sh --all-published-supported`; the ordinary matrix also
+prints those three values for its representative tags.
+
 | profile | driver versions | measured from OGKM | booted in this repository |
 |---|---|---|---|
 | `NVKVM_ABI_515` | 515 – 520 | 515.43.04, 515.57, 515.105.01, 520.56.06, 520.61.07 | **no** |

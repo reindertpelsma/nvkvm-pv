@@ -38,6 +38,7 @@ is wrong.
 ```bash
 tools/abi_derive.sh --tags "585.xx.yy"          # just the new tag
 tools/abi_derive.sh                             # the whole matrix, re-derived
+tools/abi_derive.sh --all-published-supported   # every official 515..610 tag
 ```
 
 The script blobless-sparse-clones NVIDIA open-gpu-kernel-modules at each tag and
@@ -45,6 +46,13 @@ compiles one probe **per profile field**, printing `sizeof`/`offsetof` for each.
 Paste what it prints. A cell it could not compile prints `MISSING` and keeps the
 compiler error in the work dir — that is a gap to report, never a cell to fill
 in from a neighbouring branch.
+
+The output also measures the size of `UVM_REGISTER_GPU_PARAMS` and the offsets
+of `rmCtrlFd` and `rmStatus`. Those are universal wire constants rather than
+profile members today, but they still have to be checked over the complete
+supported range. Use `--all-published-supported` for ABI work that touches
+them: as of 610.57.04, all 216 official numeric tags from 515.43.04 onward
+compile as `40 / 24 / 36`, so there is one interval and no version gate.
 
 **Never hand-derive a row.** The script's header records why
 (`tools/abi_derive.sh:5-12`):

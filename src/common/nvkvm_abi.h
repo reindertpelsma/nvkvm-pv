@@ -82,6 +82,22 @@ enum nvkvm_abi_id {
 	NVKVM_ABI_610 = 610,   /* 610+: V610 channel (+hHandleVASpace, 376)       */
 };
 
+/* UVM_REGISTER_GPU_PARAMS is invariant across every published OGKM tag nvkvm
+ * supports.  tools/abi_derive.sh compiled these values at all 216 official
+ * numeric tags from 515.43.04 through 610.57.04: every result was size 40,
+ * rmCtrlFd offset 24 and rmStatus offset 36, with no compile failure.  There is
+ * therefore no version boundary to put in nvkvm_abi_profile: these three
+ * values are universal wire constants.
+ *
+ * Keep the offsets explicit because this ioctl embeds a frontend fd.  Treating
+ * +24 as rmStatus (the old 32-byte model) both suppressed managed fallback GPU
+ * registration and made the dormant REALIZE replay let the driver write eight
+ * bytes beyond a 32-byte stack object.
+ */
+#define NVKVM_UVM_REGISTER_GPU_SIZE       40u
+#define NVKVM_UVM_REGISTER_GPU_FD_OFF     24u
+#define NVKVM_UVM_REGISTER_GPU_STATUS_OFF 36u
+
 struct nvkvm_abi_profile {
 	unsigned id;                 /* enum nvkvm_abi_id                         */
 

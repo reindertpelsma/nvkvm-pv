@@ -79,11 +79,13 @@ struct uvm_uuid {
 
 struct uvm_register_gpu_params {
 	struct uvm_uuid gpu_uuid;
-	__u8   numa_enabled;
-	__u8   reserved0[3];
-	__s32  numa_node_id;
-	__u32  rm_status;
-	__u32  reserved1;
+	__u8       numa_enabled;
+	__u8       reserved0[3]; /* NvBool is one byte; align numa_node_id */
+	__s32      numa_node_id;
+	__s32      rm_ctrl_fd;
+	nvhandle_t h_client;
+	nvhandle_t h_smc_part_ref;
+	__u32      rm_status;
 };
 
 struct uvm_unregister_gpu_params {

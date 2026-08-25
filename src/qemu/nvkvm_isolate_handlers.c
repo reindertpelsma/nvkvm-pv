@@ -1010,26 +1010,28 @@ struct nvkvm_uvm_desc {
 	uint8_t  va_mode;     /* NVKVM_UVM_VA_*                             */
 };
 /*
- * min_size is the EXACT struct size from our ABI (src/abi/uvm.h, driver
- * 575.51.03) — verified by sizeof, NOT copied from gVisor's newer layouts
- * (several differ: e.g. REGISTER_GPU is 32B here, not gVisor's 40B-with-NUMA;
- * REGISTER_CHANNEL 48 not 56; MIGRATE 48 not 56).  The guest always sends
+ * min_size is the EXACT struct size from our ABI (src/abi/uvm.h), verified
+ * against OGKM rather than copied from a neighbouring nvproxy release.
+ * REGISTER_GPU is 40 bytes at every one of the 216 supported OGKM tags; the
+ * old 32-byte claim truncated rmCtrlFd/hClient/hSmcPartRef and read rmCtrlFd as
+ * rmStatus.  Other ioctls still differ from current gVisor layouts
+ * (REGISTER_CHANNEL 48 not 56; MIGRATE 48 not 56).  The guest always sends
  * exactly this size, so "param_size < min_size" rejects only malformed calls.
- * fd-field translation is limited to the two cmds the prior code translated
- * (MM_INITIALIZE@0, REGISTER_GPU_VASPACE@16); every other cmd forwarded with
- * its fd field untouched, exactly as before — generalizing it was speculative.
+ * fd_off lists every frontend fd the trusted path must resolve.  In particular
+ * REGISTER_GPU.rmCtrlFd@24 is an input fd, not an output status word.
  */
 static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
 	/* The full UVM command set (open kernel module / gVisor nvproxy
 	 * uvm.go).  min_size: cmds whose struct is defined in our ABI
-	 * (src/abi/uvm.h, driver 575.51.03) carry the exact sizeof, verified
-	 * by measurement — these are the layouts the guest actually sends, so
+	 * (src/abi/uvm.h) carry the exact sizeof, verified by measurement
+	 * against the supported official OGKM tags — these are the layouts the
+	 * guest actually sends, so
 	 * "param_size < min" rejects only malformed calls.  The five cmds NOT
 	 * in our ABI (44/45/53/65/66) carry min_size 0 (allow any size): we
 	 * have no driver-verified layout for them and an over-strict guess
 	 * already mis-denied REGISTER_GPU once; the kernel validates its own
-	 * struct against the fixed shm slot regardless.  fd-field translation
-	 * stays limited to the two cmds the pre-schema code translated. */
+	 * struct against the fixed shm slot regardless.  fd_off covers every
+	 * embedded frontend fd whose layout has been verified against OGKM. */
 	{ 0x30000001 /* UVM_INITIALIZE          */,  16, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 0x30000002 /* UVM_DEINITIALIZE        */,   8, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 23 /* UVM_CREATE_RANGE_GROUP          */,  16, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
@@ -1043,7 +1045,8 @@ static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
 	{ 31 /* UVM_SET_RANGE_GROUP             */,  32, { 0xffff, 0xffff }, 8, NVKVM_UVM_VA_USE },
 	{ 33 /* UVM_MAP_EXTERNAL_ALLOCATION     */, 9264, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
 	{ 34 /* UVM_FREE                        */,  24, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_FREE },
-	{ 37 /* UVM_REGISTER_GPU                */,  32, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 37 /* UVM_REGISTER_GPU                */, NVKVM_UVM_REGISTER_GPU_SIZE,
+		{ NVKVM_UVM_REGISTER_GPU_FD_OFF, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 38 /* UVM_UNREGISTER_GPU              */,  24, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 39 /* UVM_PAGEABLE_MEM_ACCESS         */,   8, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 42 /* UVM_SET_PREFERRED_LOCATION      */,  40, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
@@ -4709,11 +4712,47 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 
 	/* §8a.5 — validate per-mode intent shape. */
 	struct nvkvm_uvm_state_snapshot *snap = state_buf;
-	if (snap->n_gpus > NVKVM_UVM_MAX_REG_GPUS ||
-	    snap->n_va_spaces > NVKVM_UVM_MAX_VA_SPACES ||
-	    snap->n_range_groups > NVKVM_UVM_MAX_RANGE_GROUPS) {
+	uint32_t n_gpus = le32_to_cpu(snap->n_gpus);
+	uint32_t n_va_spaces = le32_to_cpu(snap->n_va_spaces);
+	uint32_t n_range_groups = le32_to_cpu(snap->n_range_groups);
+	if (n_gpus > NVKVM_UVM_MAX_REG_GPUS ||
+	    n_va_spaces > NVKVM_UVM_MAX_VA_SPACES ||
+	    n_range_groups > NVKVM_UVM_MAX_RANGE_GROUPS) {
 		resp->status = (uint32_t)-EINVAL;
 		return 0;
+	}
+
+	/* The snapshot is guest-controlled.  REGISTER_GPU and
+	 * REGISTER_GPU_VASPACE both embed an RM control fd, represented on the wire
+	 * by a QEMU handle id.  Prove every non-sentinel handle is a live nvidiactl
+	 * handle owned by this session before the stub resolves it; otherwise a
+	 * forged REALIZE request could borrow another session's RM client. */
+	for (uint32_t i = 0; i < n_gpus; i++) {
+		uint32_t hid = le32_to_cpu(snap->gpus[i].rm_ctrl_fd_handle_id);
+		struct nvkvm_handle *h;
+
+		if (hid == (uint32_t)-1)
+			continue;
+		h = nvkvm_handle_get(&nv->handles, hid);
+		if (!h || h->session_id != req->session_id ||
+		    h->type != NVKVM_HANDLE_TYPE_NVIDIA || h->dev_id != NVKVM_DEV_CTL) {
+			resp->status = (uint32_t)-EPERM;
+			return 0;
+		}
+	}
+	for (uint32_t i = 0; i < n_va_spaces; i++) {
+		uint32_t hid = le32_to_cpu(
+			snap->va_spaces[i].rm_ctrl_fd_handle_id);
+		struct nvkvm_handle *h;
+
+		if (hid == (uint32_t)-1)
+			continue;
+		h = nvkvm_handle_get(&nv->handles, hid);
+		if (!h || h->session_id != req->session_id ||
+		    h->type != NVKVM_HANDLE_TYPE_NVIDIA || h->dev_id != NVKVM_DEV_CTL) {
+			resp->status = (uint32_t)-EPERM;
+			return 0;
+		}
 	}
 
 	switch (req->mode) {

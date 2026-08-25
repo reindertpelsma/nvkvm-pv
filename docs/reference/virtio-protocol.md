@@ -6,8 +6,12 @@ unix socket. The guest never speaks the second one.
 
 Both sides must be compiled from the same header
 (`src/common/nvkvm_proto.h:6-7`). The version is checked at probe:
-`NVKVM_PROTO_VERSION` is 2 and the match is exact, else `-EPROTO`
+`NVKVM_PROTO_VERSION` is 3 and the match is exact, else `-EPROTO`
 (`src/common/nvkvm_proto.h:70`, `src/guest/nvkvm_virtio.c:599-633`).
+Version 3 expanded the dormant UVM state snapshot so `REGISTER_GPU` replay
+carries its embedded RM control handle and both RM object handles. This is an
+intentional incompatible wire change: rebuild the guest module and QEMU from
+the same nvkvm revision.
 
 ## The device
 

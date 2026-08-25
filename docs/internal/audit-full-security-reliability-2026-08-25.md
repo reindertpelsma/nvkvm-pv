@@ -22,6 +22,13 @@ socket callback are BQL-serialised in the current QEMU topology, so RR-03 is a
 conditional future-IOThread hazard rather than a current confirmed race.  The
 details and table below incorporate those corrections.
 
+**Post-remediation correction, 2026-08-25:** a Turing hardware run exposed an
+additional NVIDIA UVM ABI defect, RR-09. It was latent in the audited revision
+and became a managed-memory regression when the SR-03 fix correctly stopped
+recording registrations that appeared to fail. The fix is source-verified over
+the full supported driver range; post-fix GPU validation is tracked separately
+and is not claimed by this source finding.
+
 ---
 
 ## Executive verdict
@@ -64,6 +71,7 @@ remaining reasons concrete.
 | RR-04 | **high compatibility** | NVIDIA ABI profiles 515–535 | managed fallback rejects every pre-545 allocation layout |
 | RR-05 | **high build regression** | compute-only guest module | every kernel-matrix `graphics=0` build fails to link |
 | RR-06..08 | medium | display relay | broker-down fallback and reconnect/clipboard state defects |
+| RR-09 | **high compatibility** | NVIDIA UVM ABI 515–610 | `REGISTER_GPU` is truncated and its input fd is read as status; managed fallback loses every GPU |
 | BR-01..06 | medium/low | privileged broker | cross-client clipboard state and input/backend correctness |
 | CI-01 | medium | regression prevention | broker has no blocking CI job |
 
@@ -364,6 +372,36 @@ Validate chunk zero and monotonic indices, reset on a new transaction, and add
 an explicit abort or connection generation. On the sender, queue the complete
 bounded transaction or do not begin it.
 
+### RR-09 — HIGH compatibility — `UVM_REGISTER_GPU` was modeled as the wrong ABI
+
+**Code:** `src/abi/uvm.h`, `src/guest/nvkvm_ioctl.c`,
+`src/guest/nvkvm_main.c`, `src/qemu/nvkvm_isolate_handlers.c`,
+`src/stub/nvkvm_stub.c`, `src/common/nvkvm_proto.h`.
+
+nvkvm modeled `UVM_REGISTER_GPU_PARAMS` as 32 bytes and put `rm_status` at byte
+24. NVIDIA's actual structure is 40 bytes: `rmCtrlFd` is at 24, followed by
+`hClient`, `hSmcPartRef`, and `rmStatus` at 36. Commit `9eac58b` made UVM shadow
+state conditional on host success, as SR-03 requires, but the response checker
+then interpreted the successful call's nonzero `rmCtrlFd` input as a failed
+`rmStatus`. No GPU UUID entered `registered_gpus`; the managed-memory fallback
+reached `ext_collect_uuids()` with an empty set and returned `-ENODEV`, exposed
+by libcuda as `cuMemAllocManaged` error 999.
+
+The same wrong shape left a dormant memory-safety defect in REALIZE replay: the
+isolate stub supplied a 32-byte stack object to an ioctl whose driver writes 40
+bytes. The overwrite is contained to the sandboxed isolate, but it is still an
+eight-byte stack overwrite and a deterministic reliability failure if that
+path is activated.
+
+This is NVIDIA-driver-specific ABI work. A compiled source sweep checked all
+216 official numeric open-gpu-kernel-modules tags from 515.43.04 through
+610.57.04. Every tag compiled to size 40, `rmCtrlFd` offset 24 and `rmStatus`
+offset 36; there were zero missing probes and zero alternate layouts. Thus the
+supported range contains one interval for this structure and no version gate
+is appropriate. The repaired wire path forwards the full structure, translates
+and round-trips the embedded control fd, preserves the two RM handles needed by
+replay, and statically asserts the size and offsets in the headerless stub.
+
 ---
 
 ## New broker findings
@@ -523,6 +561,7 @@ run first, and GPU validation is tracked separately below.
 | RR-03, RR-06..08 | Fixed in `3d70541`, `bdc9529`, and `77358b6`. The relay retains the newest frame while disconnected, resets connection-generation framing/clipboard state, queues complete clipboard transactions, and performs connect/HELLO/replay through a fully nonblocking BQL-owned state machine. Exact fd handlers are removed synchronously before close. |
 | RR-04 | Fixed in `6382eec`. The allocation guard now requires only the compiler-derived end of the last field actually written, rather than the full V545 struct. ABI parity exercises every measured profile and proves that a shorter pre-545 profile is present. This is NVIDIA-driver-specific ABI behavior and must be carried to generated/tag-specific variants and checked against their OGKM tags. |
 | RR-05 | Fixed in `973fd96`. Compute-only builds consume UI events without linking KMS; kernel-matrix error extraction is case-insensitive, so the linked uppercase modpost failure is actionable. |
+| RR-09 | Fixed on this branch. The guest, QEMU schema, isolate stub and dormant REALIZE snapshot now use the official 40-byte layout; `rmCtrlFd@24` is translated and restored, `rmStatus@36` gates shadow commit, and replay preserves `hClient`/`hSmcPartRef`. ABI parity pins the wire constants and snapshot size. |
 | BR-01..07 | Fixed in `fd098b9` and `3870bd2`. Per-client and async clipboard state is generation-scoped, delayed paste replays one balanced six-edge chord, the honest transfer cap is 7168 bytes, transactions reset deterministically, backend capability claims match implementation, Wayland source writes are nonblocking, relative motion saturates, and hardening failures fail closed. |
 | CI-01 | Fixed in `239539a`. Normal and ASAN+UBSAN broker builds, hostile adopted-socket authentication, clipboard framing and persistent-client lifecycle tests are blocking. `86641e0` also gates the guest UVM/KMS ordering wiring. |
 
@@ -538,9 +577,11 @@ normal ordering and an adversarial same-fd ordering defined.
 
 No NVIDIA control command was added to the allowlist, and no scheduling
 control was changed to accept-and-drop. The type-27 completion fix remains
-inert with respect to Vulkan initialization. The only NVIDIA-driver-specific
-ABI correction in this remediation is RR-04's pre-545 common-prefix guard;
-the broker protocol changes are nvkvm's own protocol, not NVIDIA ABI.
+inert with respect to Vulkan initialization. The NVIDIA-driver-specific ABI
+corrections in this remediation are RR-04's pre-545 common-prefix guard and
+RR-09's universal `UVM_REGISTER_GPU_PARAMS` correction. Both must be carried
+to generated/tag-specific variants; the broker protocol changes are nvkvm's
+own protocol, not NVIDIA ABI.
 
 ### Local remediation verification
 
@@ -549,12 +590,12 @@ the broker protocol changes are nvkvm's own protocol, not NVIDIA ABI.
 | core unit suite | pass: all 15 suites; relay wiring 22/22, relay state 17/17, relay clipboard 35/35; 9 isolate cases with no known failures |
 | QEMU syntax | pass with default GCC 15 and GCC 14 |
 | guest source ordering gate | pass |
-| guest module, local kernel 7.0, `NVKVM_GRAPHICS=1` | pass |
-| guest module, local kernel 7.0, `NVKVM_GRAPHICS=0` | pass; directly closes the linked CI failure mode |
-| ABI parity | pass; includes the pre-545 common-prefix regression |
+| guest module, installed kernels 7.0.0-29 and 7.0.0-30, `NVKVM_GRAPHICS=1` | pass |
+| guest module, installed kernels 7.0.0-29 and 7.0.0-30, `NVKVM_GRAPHICS=0` | pass; directly closes the linked CI failure mode |
+| ABI parity | pass; includes the pre-545 common-prefix regression and universal REGISTER_GPU size/fd/status offsets |
 | VMA lifetime reproducer | warning-clean compilation; execution requires nvkvm GPU hardware |
 | broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 43/43, adopted socket, clipboard and lifecycle suites |
-| rental safety harness | pass: 71/71 offline cases |
+| rental safety harness | pass: 73/73 offline cases |
 | ShellCheck 0.10 at blocking severity | pass |
 
 These local results are not a GPU claim. The branch must remain unmerged until
