@@ -84,9 +84,11 @@ module_unit = setup_guest[setup_guest.index("- path: /etc/systemd/system/nvkvm-g
 ordered(
     module_unit,
     "mktemp -d /var/tmp/nvkvm-guest.XXXXXX",
-    "cp -a /mnt/nvkvm/src/guest/.",
-    'make -C \"$work\"',
-    'insmod \"$work/nvkvm-guest.ko\"',
+    'mkdir -p \"$work/src\"',
+    "cp -a /mnt/nvkvm/src/guest /mnt/nvkvm/src/common /mnt/nvkvm/src/abi",
+    'make -C \"$work/src/guest\" KDIR=/lib/modules/$(uname -r)/build clean',
+    'make -C \"$work/src/guest\"',
+    'insmod \"$work/src/guest/nvkvm-guest.ko\"',
 )
 assert "cd /mnt/nvkvm/src/guest && make" not in module_unit
 

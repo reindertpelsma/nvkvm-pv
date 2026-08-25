@@ -4,6 +4,7 @@
 *.mod
 *.mod.c
 *.mod.o
+*.cmd
 # ...but *.mod is a kernel build artifact rule (nvkvm-guest.mod) and it also
 # matches go.mod, which is how tests/abi_parity/go.mod got left behind when this
 # repo was extracted — the Go package then had no module file and `go test`

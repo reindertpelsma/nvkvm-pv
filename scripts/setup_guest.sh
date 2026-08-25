@@ -130,7 +130,7 @@ write_files:
       # path into host-owned source.  mktemp makes the cleanup target concrete
       # before the trap is installed; no shared or user-selected path is ever
       # recursively removed.
-      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { work=$(mktemp -d /var/tmp/nvkvm-guest.XXXXXX) || exit 1; trap "rm -rf -- \"$work\"" EXIT; cp -a /mnt/nvkvm/src/guest/. "$work/" && modprobe drm_shmem_helper 2>/dev/null; make -C "$work" KDIR=/lib/modules/$(uname -r)/build && insmod "$work/nvkvm-guest.ko"; }'
+      ExecStart=/bin/bash -c 'lsmod | grep -q nvkvm_guest || { work=$(mktemp -d /var/tmp/nvkvm-guest.XXXXXX) || exit 1; trap "rm -rf -- \"$work\"" EXIT; mkdir -p "$work/src" && cp -a /mnt/nvkvm/src/guest /mnt/nvkvm/src/common /mnt/nvkvm/src/abi "$work/src/" || exit 1; modprobe drm_shmem_helper 2>/dev/null || true; make -C "$work/src/guest" KDIR=/lib/modules/$(uname -r)/build clean >/dev/null && make -C "$work/src/guest" KDIR=/lib/modules/$(uname -r)/build && insmod "$work/src/guest/nvkvm-guest.ko"; }'
       # `|| true`: stage_guest_libs.sh exits non-zero when an OPTIONAL library
       # is absent from the bundle (the Wayland/GBM EGL platform libraries are
       # not part of the driver, so a headless host legitimately has none).

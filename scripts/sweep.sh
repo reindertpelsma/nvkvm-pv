@@ -907,7 +907,12 @@ provision_box() {
     fi
 
     info "  shipping the tree"
-    tar --exclude=.git --exclude=sweep-runs -czf /tmp/nvkvm-sweep-tree.tgz -C "$REPO" . 2>/dev/null \
+    # `git status` deliberately ignores build products, so a plain tar ships
+    # stale .o/.cmd files while still labelling the payload "clean HEAD".  A
+    # guest then imports absolute Kbuild paths from another kernel/worktree.
+    # Honour the repo's ignore rules at the shipment boundary as well.
+    tar --exclude-vcs-ignores --exclude=.git --exclude=sweep-runs \
+        -czf /tmp/nvkvm-sweep-tree.tgz -C "$REPO" . 2>/dev/null \
         || { PROVISION_FAIL_DETAIL="could not tar the repo"; PROVISION_FAILED_STEP="ship"; return 1; }
     timeout 900 scp $SSH_OPTS -P "$SCP_PORT" -q /tmp/nvkvm-sweep-tree.tgz "root@$SCP_HOST:/root/" \
         || { PROVISION_FAIL_DETAIL="scp of the tree failed"; PROVISION_FAILED_STEP="ship"; return 1; }

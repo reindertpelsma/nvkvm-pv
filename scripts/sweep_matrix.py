@@ -1057,7 +1057,8 @@ def run_one(offer, args):
         # holding the dpkg lock, failing setup_guest.sh with rc=100.  That
         # reads as a `guest-failed` row about a GPU and is nothing of the kind.
 
-        sh(f"cd {REPO} && tar --exclude=.git -czf /tmp/sweep-tree.tgz .", timeout=180)
+        sh(f"cd {REPO} && tar --exclude-vcs-ignores --exclude=.git "
+           f"--exclude=sweep-runs -czf /tmp/sweep-tree.tgz .", timeout=180)
         sh(f"scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -P {port} "
            f"-q /tmp/sweep-tree.tgz root@{host}:/root/", timeout=300)
         sh(f"{S} 'mkdir -p /root/nvkvm && tar -xzf /root/sweep-tree.tgz -C /root/nvkvm'", timeout=180)
