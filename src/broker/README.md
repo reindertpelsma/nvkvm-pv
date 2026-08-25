@@ -125,7 +125,9 @@ Seven rules, all in `nvkvm_broker.c`, all exercised by `selftest.sh`:
    it at `connect()` time from the peer's credentials, so the peer cannot forge
    it — and unlike the socket's file mode it still holds if somebody widened
    the permissions. The socket itself is created `0600` under a `umask`, so it
-   is never briefly world-writable.
+   is never briefly world-writable. An adopted listener must actually be an
+   `AF_UNIX` `SOCK_STREAM`; `--no-peercred` is refused for adopted descriptors,
+   because configured mode bits were never applied to them and prove nothing.
 
 Two more properties that are policy rather than parsing:
 
@@ -322,7 +324,16 @@ each one must be rejected.
 
 Options: `--backend auto|wayland|x11|test`, `--size WxH`, `--title`,
 `--allow-user`, `--allow-group`, `--drop-user`, `--verbose`.
+`--allow-group` compares the primary gid reported by `SO_PEERCRED`; Linux does
+not expose the peer's supplementary groups through that interface.
 By default root and the invoking user may connect.
+
+Clipboard modes are `off` (default), `guest-to-host`, and `consent`. `consent`
+adds host-to-guest transfer only after an explicit paste chord. Text is UTF-8
+and capped at 7 KiB (7168 bytes) in either direction. Automatic `full` sync is
+not implemented and is rejected rather than behaving exactly like `consent`.
+The Wayland backend implements clipboard transfer; X11 rejects every non-off
+mode. The explicit test backend has a simulated clipboard for regression tests.
 
 ### Putting the socket into a container
 
@@ -462,7 +473,7 @@ found**; each is described where it lives:
 
 - The broker builds clean with both backends and no warnings
   (`-Wall -Wextra -Wformat=2 -Wshadow -Wvla`).
-- `selftest.sh` — **42 checks, all passing** — against `--backend test`:
+- `selftest.sh` — **43 checks, all passing** — against `--backend test`:
   socket mode 0600; the handshake and its order; `SO_PEERCRED` rejection of an
   unlisted uid (run as root with `setpriv`, and it proves the rejected uid
   receives nothing at all); one-client-at-a-time; **the whole ATTACH
@@ -672,7 +683,9 @@ measure intervals, not counts.
 
 ### First things to try on the physical PC
 
-1. `cd src/broker && make check` — should be 42/42. Run it from a path
+1. `cd src/broker && make check` — the shell portion should be 43/43, followed
+   by the adopted-socket, clipboard-transaction and persistent-client tests.
+   Run it from a path
    `nobody` can traverse (see §8).
 2. Start the broker in your session; check the one-line grab announcement is
    the truth for your compositor, and that the advertised pair count is
@@ -727,11 +740,13 @@ dmabuf_source.c       test tooling, NOT part of the broker: allocates a REAL
 dmabuf_relay.c        the sandboxed side: receives an fd, relays it to the
                       broker.  Links libc and nothing else — run ldd on it
                       inside the container; that link line IS the §1 claim.
-selftest.sh           42 behavioural checks, no GPU required.  Note it needs
+selftest.sh           43 behavioural checks, no GPU required.  Note it needs
                       the tree to be reachable by `nobody` for the
                       SO_PEERCRED check — run it from /opt, not from /root,
                       or that one check fails for a permissions reason that
                       has nothing to do with the broker.
+test/*.py             adopted-socket authentication, clipboard framing/cap,
+                      and persistent-client generation/key-edge regressions.
 ```
 
 QEMU side: `src/qemu/nvkvm_display_relay.{c,h}`, the hook in

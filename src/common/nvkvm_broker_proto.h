@@ -133,15 +133,18 @@ enum {
 
 /*
  * The hard cap on one clipboard transfer, both directions.  A paste is text a
- * person selected; 16 KiB is far more than that and small enough that a
- * transfer cannot fill the outbound ring.  Enforced as a chunk count on the
+ * person selected; 7 KiB is far more than an ordinary paste and, unlike the
+ * old 16 KiB claim, it provably fits the broker's fixed 512-packet outbound
+ * ring with its four-packet control reserve.  Enforced as a chunk count on the
  * receiving side of each direction.
  */
-#define NVKVM_BROKER_CLIP_MAX_BYTES  16384u
+#define NVKVM_BROKER_CLIP_MAX_BYTES  7168u
 #define NVKVM_BROKER_CLIP_MAX_CHUNKS_PKT \
-    ((NVKVM_BROKER_CLIP_MAX_BYTES / NVKVM_BROKER_CLIP_PKT_BYTES) + 1u)
+    ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_PKT_BYTES - 1u) / \
+     NVKVM_BROKER_CLIP_PKT_BYTES)
 #define NVKVM_BROKER_CLIP_MAX_CHUNKS_CMD \
-    ((NVKVM_BROKER_CLIP_MAX_BYTES / NVKVM_BROKER_CLIP_CMD_BYTES) + 1u)
+    ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_CMD_BYTES - 1u) / \
+     NVKVM_BROKER_CLIP_CMD_BYTES)
 
 /*
  * EV_CLOSE.x — WHICH close the user asked for.  The broker asks the human and
