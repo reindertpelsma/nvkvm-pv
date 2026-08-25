@@ -14,30 +14,39 @@ This report does not silently supersede the earlier audits. The inherited open
 items are reconciled near the end; findings prefixed `SR-`, `RR-`, `BR-` and
 `CI-` below are new in this pass.
 
+**Revalidation correction, 2026-08-25:** the first version overstated SR-02
+and RR-03.  The `registered_gpus` locking mismatch is real, but the list is
+append-only during an fd's life and no crashing weak-memory execution has been
+demonstrated, so SR-02 is medium rather than high.  PRESENT and the broker
+socket callback are BQL-serialised in the current QEMU topology, so RR-03 is a
+conditional future-IOThread hazard rather than a current confirmed race.  The
+details and table below incorporate those corrections.
+
 ---
 
 ## Executive verdict
 
 No new path to host code execution was established. The audit did, however,
-find four high-severity boundary failures:
+find three high-severity boundary failures:
 
 1. A split or inherited managed-fallback VMA can free its shared backing while
    another VMA still maps it. This is both a guest-kernel use-after-free and,
    after the finite GPA quarantine is drained, a stale-GPA cross-process alias.
-2. The managed-fallback UUID collector walks a list under a different mutex
-   from the writer. A guest process can race the guest kernel into traversing a
-   partially linked node.
-3. Several UVM ioctls allocate persistent guest-kernel bookkeeping before the
+2. Several UVM ioctls allocate persistent guest-kernel bookkeeping before the
    host accepts the operation, with no cap, deduplication or rollback.
-4. The broker's `--no-peercred` safety check is based on a configured pathname
+3. The broker's `--no-peercred` safety check is based on a configured pathname
    mode that is irrelevant for an adopted descriptor. The broker accepts an
    adopted TCP listener and then accepts every peer on it.
 
-There are also three high-priority lifecycle/reliability defects: DRM hotplug
+The managed-fallback UUID collector also traverses an append-only list under a
+different mutex from its writer.  That is a real guest-triggerable data race
+and lock-discipline defect, but not a demonstrated corruption path.
+
+There are also two high-priority lifecycle/reliability defects: DRM hotplug
 is invoked from the virtqueue callback although the DRM helper requires process
-context; KMS state and its workqueue can outlive the DRM device; and QEMU's
-display-relay disconnect path races between the main loop and a worker and can
-schedule two closes for one descriptor.
+context, and KMS state and its workqueue can outlive the DRM device.  The QEMU
+display-relay disconnect code would become racy if PRESENT moves to a separate
+IOThread, but that concurrency is not present in the current topology.
 
 The tree should not be described as ready for mutually untrusted production
 tenants. That is consistent with `SECURITY.md`; these findings make some of the
@@ -46,12 +55,12 @@ remaining reasons concrete.
 | ID | Severity | Boundary / effect | Result |
 |---|---:|---|---|
 | SR-01 | **high** | guest process → guest kernel / another guest process | managed VMA split/fork UAF and stale GPA alias |
-| SR-02 | **high** | guest process → guest kernel | `registered_gpus` list race under mismatched mutexes |
+| SR-02 | **medium** | guest process → guest kernel | `registered_gpus` synchronization defect under mismatched mutexes; harmful execution not demonstrated |
 | SR-03 | **high** | guest process → guest kernel | unbounded persistent UVM state allocations |
 | SR-04 | **high, conditional** | unauthorized peer → privileged broker | adopted socket bypasses the premise of `--no-peercred` |
 | RR-01 | **high** | guest kernel reliability | process-context DRM helper called from virtqueue callback |
 | RR-02 | **high** | guest kernel reliability | KMS global/workqueue outlive DRM teardown |
-| RR-03 | **high** | VMM reliability | display-relay disconnect data race and double-close |
+| RR-03 | **medium, conditional** | VMM reliability | disconnect ownership would race if PRESENT moves outside the BQL |
 | RR-04 | **high compatibility** | NVIDIA ABI profiles 515–535 | managed fallback rejects every pre-545 allocation layout |
 | RR-05 | **high build regression** | compute-only guest module | every kernel-matrix `graphics=0` build fails to link |
 | RR-06..08 | medium | display relay | broker-down fallback and reconnect/clipboard state defects |
@@ -123,7 +132,7 @@ closes. Decide explicitly whether fork inheritance is supported; if not, add
 exists. Add fork plus partial-unmap tests that force GPA reuse beyond both
 quarantine limits.
 
-### SR-02 — HIGH — `registered_gpus` writer and reader use different locks
+### SR-02 — MEDIUM — `registered_gpus` writer and reader use different locks
 
 **Code:** `src/guest/nvkvm_main.c:1317-1327`,
 `src/guest/nvkvm_uvm_ext.c:437-453,491`.
@@ -131,11 +140,14 @@ quarantine limits.
 `UVM_REGISTER_GPU` appends to `st->registered_gpus` while holding `st->lock`.
 `ext_collect_uuids()` traverses the same list while its caller holds only
 `st->ext_lock`. The same fd can service an ioctl and an mmap concurrently, so
-the two paths are concurrent. `list_add_tail()` changes multiple links; a
-reader may observe an incompletely linked node and walk an invalid pointer.
+the accesses are not mutually excluded. Linux list traversal requires a common
+lock or an RCU discipline; this code has neither.
 
-This is a guest-process-triggered guest-kernel crash/corruption path, not merely
-a stale-value race.
+Revalidation found that the list is append-only until fd teardown and the
+writer uses tail insertion, publishing the forward link last.  That makes the
+original claim of a demonstrated invalid-pointer walk too strong, especially
+on x86.  This remains a real data race and weak-memory/lock-discipline defect,
+but a crash or corruption impact needs KCSAN evidence or a concrete execution.
 
 **Required correction:** snapshot or traverse the list under `st->lock`. If
 the mmap synthesis must also hold `ext_lock`, document and enforce one lock
@@ -242,20 +254,22 @@ Two independent `READ_ONCE`/`WRITE_ONCE` operations on width and height can
 also expose a mixed pair. This is low severity once the callback is moved; use
 one locked structure or packed value.
 
-### RR-03 — HIGH — display-relay disconnect can double-close a reused fd
+### RR-03 — MEDIUM, CONDITIONAL — disconnect ownership must remain BQL-local
 
 **Code:** `src/qemu/nvkvm_display_relay.c:78-88,238-280,282-403,678-713`.
 
-The virtio worker holds `r->lock` while sending and may call `relay_drop()`.
-The main-loop read callback calls `relay_drop()` without that lock. The drop
-function reads and writes `sock`, dimensions and retry state and schedules a
-deferred close of the copied descriptor.
+PRESENT is currently handled inline by the virtqueue callback under the BQL,
+and the broker readable callback runs in the same main AioContext.  The first
+report incorrectly called the PRESENT path a worker, so the two current drop
+sites are serialised and the double-close execution described there is not
+established.
 
-Two callers can observe the same non-negative descriptor, both store `-1`, and
-both schedule a close. After the first deferred close, the descriptor number
-may be reused before the second callback, allowing the second callback to close
-an unrelated QEMU fd. Independent unsynchronized accesses to `sock`, receive
-state and reconnect state are also C data races.
+The code and its comments nevertheless assume conflicting ownership models:
+send-side state is mutex-protected, the read callback is not, and deferred
+close is keyed only by the raw descriptor number.  If PRESENT is later moved to
+an IOThread or worker—as its surrounding code explicitly contemplates—two
+callers could observe one descriptor, schedule two closes, and have the second
+close hit a reused unrelated fd.
 
 **Required correction:** make the main loop the sole owner of connection state
 and descriptor registration/closure. Worker failures should queue a generation-
