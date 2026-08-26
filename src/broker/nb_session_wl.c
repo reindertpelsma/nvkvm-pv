@@ -1621,8 +1621,8 @@ static void wl_report_surface(struct nb_wl *w, int lw, int lh)
     unsigned pw, ph;
 
     switch (nb_res_mode) {
-    case NB_RES_GUEST:
-        return;                 /* suggest nothing; the guest picks */
+    case NB_RES_NONE:
+        return;                 /* suggest nothing at all */
     case NB_RES_FIXED:
         pw = nb_res_w;
         ph = nb_res_h;

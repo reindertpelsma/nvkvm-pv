@@ -2330,8 +2330,8 @@ static void usage(void)
 "                         auto   (default) the window's content size, sent at\n"
 "                                startup and whenever the window geometry\n"
 "                                changes -- never in reply to a guest frame\n"
-"                         guest  suggest nothing; the guest picks and the\n"
-"                                broker scales whatever it sends\n"
+"                         none   suggest nothing at all; the guest picks its\n"
+"                                own size and the broker scales it\n"
 "                         WxH    always suggest this size\n"
 "                       Use --scale to choose how a mismatch is fitted.\n"
 "  --present-mode=MODE  which presentation tier to offer.  The tiers are a\n"
@@ -2584,15 +2584,17 @@ int main(int argc, char **argv)
             if (a[12] == '=') { arg = a + 13; } else { NEEDVAL(); arg = v; }
             if (!strcmp(arg, "auto")) {
                 nb_res_mode = NB_RES_AUTO;
-            } else if (!strcmp(arg, "guest")) {
-                nb_res_mode = NB_RES_GUEST;
+            } else if (!strcmp(arg, "none") || !strcmp(arg, "guest")) {
+                /* `guest` was the first spelling; kept so anything already
+                 * written keeps working.  `none` is what it does. */
+                nb_res_mode = NB_RES_NONE;
             } else if (sscanf(arg, "%ux%u", &rw, &rh) == 2 && rw && rh &&
                        rw <= NVKVM_BROKER_MAX_DIM && rh <= NVKVM_BROKER_MAX_DIM) {
                 nb_res_mode = NB_RES_FIXED;
                 nb_res_w = rw;
                 nb_res_h = rh;
             } else {
-                nb_err("--resolution must be auto, guest, or WxH within 1..%u",
+                nb_err("--resolution must be auto, none, or WxH within 1..%u",
                        NVKVM_BROKER_MAX_DIM);
                 return 2;
             }
