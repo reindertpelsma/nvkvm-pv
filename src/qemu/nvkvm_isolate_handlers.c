@@ -1748,6 +1748,33 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 						  cr);
 			}
 		}
+		/*
+		 * CAN THE DISPLAY SHOW WHAT THE GUEST RENDERED?
+		 *
+		 * On a cross-vendor host it cannot: the guest's buffer is in its
+		 * own GPU's tiling and the compositor's GPU has no way to read
+		 * it.  MEASURED on a hybrid laptop -- Mutter advertised 28
+		 * (format, modifier) pairs, all Intel/LINEAR/INVALID, against a
+		 * guest presenting NVIDIA block-linear.  Every ATTACH was
+		 * refused and the window stayed black.
+		 *
+		 * A verdict of 0 means "no description of this buffer is
+		 * displayable", so the frame is detiled by the guest's own GPU
+		 * into a LINEAR udmabuf and THAT is submitted instead.  -1 means
+		 * the answer has not arrived; keep going zero-copy, because on
+		 * every same-vendor host it is yes and being briefly wrong costs
+		 * a round trip of frames rather than a permanently wrong mode.
+		 */
+		if (nvkvm_display_relay_format_verdict(req->format,
+						       req->modifier) == 0 &&
+		    nvkvm_present_submit_readback(nv, dmabuf_fd, iso_id,
+						  req->stub_handle,
+						  req->width, req->height,
+						  req->pitch, req->format,
+						  req->modifier)) {
+			resp->status = 0;
+			return 0;      /* readback owns the fd now */
+		}
 		if (nvkvm_display_relay_submit(nv, dmabuf_fd, req->width,
 					       req->height, req->pitch,
 					       req->format, req->modifier)) {

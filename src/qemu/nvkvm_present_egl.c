@@ -29,6 +29,11 @@
 #include "qemu/main-loop.h"
 #include "hw/qdev-core.h"
 #include "nvkvm_log.h"
+#include "nvkvm_udmabuf.h"
+
+/* DRM_FORMAT_XRGB8888, spelled locally so this file needs no drm_fourcc.h. */
+#define DRM_FORMAT_XR24_LOCAL 0x34325258u
+#include "nvkvm_display_relay.h"
 
 #include "nvkvm_present_egl.h"
 
@@ -431,6 +436,19 @@ typedef struct NvkvmPresent {
      * loop copies out of the other, so neither waits on the other and a frame
      * is never torn by a write landing mid-copy.
      */
+    /*
+     * CROSS-VENDOR PRESENT (readback for the broker).
+     *
+     * When the broker answers CMD_QUERY_FORMAT with "cannot show that", the
+     * frame has to be detiled by the guest's own GPU into something any
+     * compositor can import.  The staging pair is then backed by udmabuf, so
+     * the SAME pages are a pointer we glReadPixels into and a LINEAR dma-buf
+     * the broker hands to the compositor.  One GPU transfer, no CPU copy, no
+     * compositor upload -- see nvkvm_udmabuf.h for the measurements.
+     */
+    bool      relay_readback;      /* stage into udmabuf and submit to relay */
+    struct nvkvm_udmabuf stage_buf[2];
+
     uint8_t  *stage[2];
     uint32_t  stage_w, stage_h;
     unsigned  stage_write;   /* buffer the thread writes next */
@@ -802,15 +820,52 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, uint8_t *dst,
 }
 
 /* Size the staging pair for this geometry.  Returns false on OOM. */
+static void nvkvm_stage_release(NvkvmPresent *p)
+{
+    for (int i = 0; i < 2; i++) {
+        if (p->stage_buf[i].size) {
+            nvkvm_udmabuf_free(&p->stage_buf[i]);   /* also unmaps stage[i] */
+            p->stage[i] = NULL;
+        } else {
+            g_free(p->stage[i]);
+            p->stage[i] = NULL;
+        }
+    }
+}
+
 static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
 {
+    const size_t sz = (size_t)w * h * 4;
+
     if (p->stage[0] && p->stage_w == w && p->stage_h == h) {
         return true;
     }
-    g_free(p->stage[0]);
-    g_free(p->stage[1]);
-    p->stage[0] = g_malloc0((size_t)w * h * 4);
-    p->stage[1] = g_malloc0((size_t)w * h * 4);
+    nvkvm_stage_release(p);
+
+    if (p->relay_readback) {
+        /*
+         * Both buffers must succeed or neither is usable: a single-buffered
+         * readback would hand the compositor the buffer the GPU is writing.
+         */
+        if (!nvkvm_udmabuf_alloc(&p->stage_buf[0], sz) ||
+            !nvkvm_udmabuf_alloc(&p->stage_buf[1], sz)) {
+            nvkvm_stage_release(p);
+            fprintf(stderr, "nvkvm present: could not allocate udmabuf staging "
+                            "for %ux%u; the cross-vendor path is unavailable\n",
+                    w, h);
+            return false;
+        }
+        p->stage[0] = p->stage_buf[0].ptr;
+        p->stage[1] = p->stage_buf[1].ptr;
+        p->stage_w = w;
+        p->stage_h = h;
+        p->stage_write = 0;
+        p->stage_has_frame = false;
+        return true;
+    }
+
+    p->stage[0] = g_malloc0(sz);
+    p->stage[1] = g_malloc0(sz);
     p->stage_w = w;
     p->stage_h = h;
     p->stage_write = 0;
@@ -1315,6 +1370,51 @@ static const GraphicHwOps nvkvm_present_hwops = {
 static void nvkvm_present_bh(void *opaque)
 {
     NvkvmPresent *p = opaque;
+
+    /*
+     * Main loop, BQL held -- which is exactly why the submit happens HERE and
+     * not on the present thread.  The relay socket is BQL-owned (see the
+     * ownership contract in nvkvm_display_relay.h); a second owner is the
+     * RR-03 defect, and the present thread would be one.
+     */
+    if (p->relay_readback) {
+        unsigned idx;
+        bool have;
+        uint32_t w, h;
+
+        pthread_mutex_lock(&p->lock);
+        have = p->stage_has_frame;
+        idx  = p->stage_ready;
+        w    = p->stage_w;
+        h    = p->stage_h;
+        pthread_mutex_unlock(&p->lock);
+
+        if (have && p->stage_buf[idx].size) {
+            /*
+             * dup(): relay_submit takes ownership of the fd it is given and
+             * retains it as the last frame, but this one is ours for the life
+             * of the staging pair and gets reused every frame.
+             */
+            int fd = dup(p->stage_buf[idx].dmabuf);
+
+            if (fd < 0) {
+                fprintf(stderr, "nvkvm present: dup of the staging dma-buf "
+                                "failed: %s\n", strerror(errno));
+                return;
+            }
+            /*
+             * XR24, not the guest's fourcc: the readback packs BGRA and the
+             * buffer is opaque, and XR24 is what every compositor advertises
+             * against LINEAR.  Stride is tight -- glReadPixels was told so.
+             */
+            if (!nvkvm_display_relay_submit(p->nv, fd, w, h, w * 4,
+                                            DRM_FORMAT_XR24_LOCAL, 0)) {
+                close(fd);
+            }
+        }
+        return;
+    }
+
     graphic_hw_update(p->con);
 }
 
@@ -1363,8 +1463,7 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
         qemu_thread_join(&p->thread);
     }
     qemu_sem_destroy(&p->wake);
-    g_free(p->stage[0]);
-    g_free(p->stage[1]);
+    nvkvm_stage_release(p);   /* g_free or munmap+close, per how it was made */
     if (p->bh) {
         qemu_bh_delete(p->bh);
     }
@@ -1412,6 +1511,79 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     pthread_mutex_unlock(&p->lock);
 
     qemu_bh_schedule(p->bh);
+    return true;
+}
+
+/*
+ * Cross-vendor present: detile the guest's frame with the guest's own GPU and
+ * hand the broker a LINEAR buffer instead.
+ *
+ * Called when the broker has answered CMD_QUERY_FORMAT with "cannot show
+ * that" -- which on a hybrid host is the only possible answer, since the
+ * compositor's GPU cannot read NVIDIA tiling at any price.
+ *
+ * Deliberately NOT scheduling the BH here the way nvkvm_present_submit() does:
+ * there is nothing staged yet.  The present thread schedules it once a frame is
+ * ready, and the BH is what submits to the relay -- see nvkvm_present_bh() for
+ * why the submit must happen there and not on the thread.
+ *
+ * Returns false if the frame could not be taken; the caller still owns the fd.
+ */
+bool nvkvm_present_submit_readback(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                   uint32_t owner_isolate_id, uint32_t buf_key,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t stride, uint32_t fourcc,
+                                   uint64_t modifier)
+{
+    NvkvmPresent *p = nv->present_ctx;
+
+    if (!p) {
+        return false;
+    }
+    if (!p->relay_readback) {
+        if (!nvkvm_udmabuf_available()) {
+            return false;     /* said why once, at init; caller falls back */
+        }
+        /*
+         * Latched, not re-decided per frame.  The mode probe is bypassed
+         * outright: this path exists precisely because zero-copy is impossible
+         * here, so there is nothing to probe for.
+         */
+        p->relay_readback = true;
+        p->mode = 0;
+        fprintf(stderr, "nvkvm present: the display cannot import the guest's "
+                        "buffers, so frames are detiled by the guest's GPU into "
+                        "a LINEAR udmabuf the display can take (one GPU "
+                        "transfer, no CPU copy)\n");
+    }
+
+    pthread_mutex_lock(&p->lock);
+    if (p->fd >= 0) {
+        close(p->fd);        /* drop the frame the thread has not taken yet */
+        if (nvkvm_disp_stats()) {
+            nvkvm_st_dropped++;
+            nvkvm_st_bucket_dropped++;
+        }
+    }
+    p->fd       = dmabuf_fd;
+    p->owner    = owner_isolate_id;
+    p->key      = buf_key;
+    p->w        = width;
+    p->h        = height;
+    p->stride   = stride;
+    p->fourcc   = fourcc;
+    p->modifier = modifier;
+    p->dirty    = true;
+    pthread_mutex_unlock(&p->lock);
+
+    if (!nvkvm_present_thread_start(p)) {
+        pthread_mutex_lock(&p->lock);
+        p->fd    = -1;       /* give the fd back rather than leak it */
+        p->dirty = false;
+        pthread_mutex_unlock(&p->lock);
+        return false;
+    }
+    qemu_sem_post(&p->wake);
     return true;
 }
 
@@ -1475,6 +1647,22 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     (void)width; (void)height;
     (void)stride; (void)fourcc; (void)modifier;
     return false;            /* not accepted → caller closes the fd */
+}
+/*
+ * The cross-vendor path needs EGL by construction -- only the guest's GPU can
+ * detile its own tiling -- so in a no-OpenGL build it does not exist.  A
+ * compute-only VMM has no display to be cross-vendor with.
+ */
+bool nvkvm_present_submit_readback(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                   uint32_t owner_isolate_id, uint32_t buf_key,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t stride, uint32_t fourcc,
+                                   uint64_t modifier)
+{
+    (void)nv; (void)dmabuf_fd; (void)owner_isolate_id; (void)buf_key;
+    (void)width; (void)height;
+    (void)stride; (void)fourcc; (void)modifier;
+    return false;
 }
 void nvkvm_present_forget_isolate(struct VirtIONvgpu *nv, uint32_t isolate_id)
 {
