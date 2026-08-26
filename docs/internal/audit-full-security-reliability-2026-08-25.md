@@ -610,8 +610,23 @@ control was newly allowed; only the known `0x00730102` and `0x20800513` denials
 appeared. Vast instance 48712089 was verified destroyed; the run cost $0.0223.
 
 This proves the RR-09 regression is repaired for the structure's single
-source-derived ABI interval. The branch remains unmerged while the broader
-multi-architecture/profile sweep requested for release confidence continues.
+source-derived ABI interval. A second gate on tree `2dc9465` then covered an
+Ampere RTX 3060 across forced drivers 535.309.01/profile 535,
+570.124.06/profile 570 and 610.43.02/profile 610, plus the preinstalled
+580.105.08/profile-580 control. Every row selected the expected profile and
+scored 30 PASS / 0 FAIL / 0 SKIP, including the managed allocation/coherence,
+Vulkan compute and EGL pixel checks. The driver-set coverage was 3/3 with
+nothing untested. Vast instance 48715042 was verified destroyed and the
+label-scoped registry reconciled empty; cost was $0.0575. The passing runs kept
+the observed control denials, including `0x00730138` on 535 and `0x2080019f`
+on 610, so this test did not widen the allowlist. Reconciliation also found and
+fixed a sweep-reporting defect: warning capture used the reused transient unit
+name and accumulated prior drivers' warnings. It now filters the journal by
+the current systemd invocation id and rejects invalid/missing ids rather than
+silently misattributing a control to another driver.
+
+The branch remains unmerged while the broader multi-architecture/profile sweep
+requested for release confidence continues.
 
 ---
 

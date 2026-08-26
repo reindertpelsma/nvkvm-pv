@@ -36,6 +36,56 @@ Evidence: sweep instance 48712089, machine 54666, requested and observed driver
 verified absent from the Vast listing after destruction. Raw artifacts remain
 in `/workspace/nvkvm-sweep-rr09-9311bcb/` on the control machine.
 
+### Ampere multi-profile follow-up
+
+Tree `2dc9465` was then tested on the same required nested-KVM desktop image on
+an RTX 3060 (Ampere GA106). The preinstalled 580.105.08 control and all three
+forced driver rows passed **30 PASS / 0 FAIL / 0 SKIP**:
+
+| observed host driver | selected ABI profile | CUDA reported by guest | verdict |
+|---|---:|---:|---:|
+| 580.105.08 (control) | 580 | 13.0 | 30/30 |
+| 535.309.01 | 535 | 12.2 | 30/30 |
+| 570.124.06 | 570 | 12.8 | 30/30 |
+| 610.43.02 | 610 | 13.3 | 30/30 |
+
+Every row passed both managed-memory checks above, the byte-exact CUDA copy,
+PTX JIT and verified kernels, Vulkan compute, NVIDIA EGL and the pixel check.
+The selected profile matched `nvkvm_abi.h` in every case. This is especially
+useful coverage at the two ends exercised here: 535 is the oldest profile that
+can be built on the kernel-6.8 rental, while 610 uses the 376-byte V610 channel
+layout with `hHandleVASpace`.
+
+No control was admitted as a result. Passing runs retained these denials:
+
+- 580.105.08 control: `0x00730102` (2×).
+- 570.124.06: `0x00730102` (1×).
+- 610.43.02: `0x00730102` (2×), `0x2080019f` (1×),
+  `0x2080220b` (1×).
+- 535.309.01: `0x00730102` (1×), `0x00730138` (4×).
+
+The repeated `0x00730102` is
+`NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS`; `0x2080220b` is
+`RC_ENABLE_WATCHDOG`. These and the other numeric controls above are evidence,
+not candidates for allowlist widening: the complete workloads passed while
+they were denied.
+
+The original sweep summary printed cumulative counts because the transient
+`nvkvm-vm` unit name is reused and `journalctl -u` includes its earlier
+invocations. The per-driver list above was reconstructed from the retained raw
+log's QEMU PIDs/timestamps. The harness now scopes warning collection with
+`_SYSTEMD_INVOCATION_ID`, and refuses to attribute warnings if that identifier
+cannot be obtained.
+
+Evidence: replacement sweep instance 48715042, machine 35071, three forced
+driver verdicts, zero untested rows, 3,043 seconds and $0.0575 sweep cost. Raw
+logs and the JSON verdicts are in
+`/workspace/nvkvm-sweep-ampere-2dc9465/` on the control machine. The instance
+was destroyed, verified absent from the Vast listing, and the label-scoped
+registry reconciled empty. An earlier interrupted controller had banked a
+separate passing 580.105.08 control on instance 48713616; that instance was
+also destroyed and is not counted as a driver-set row.
+
 ## Coverage against the eight-profile table
 
 | profile | covers | booted here | previously booted | status |

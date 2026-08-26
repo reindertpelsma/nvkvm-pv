@@ -104,8 +104,18 @@ kernel launch.
 | RTX 3060 | Ampere GA106 | 8.6 | 610.43.02 | 610 |
 
 The 580.95.05 Turing row cleared the expanded 30-check suite, including three
-managed allocations and three verified CPU↔GPU coherence cycles. The last five
-Ampere rows additionally cleared the PTX JIT path, a matmul checked
+managed allocations and three verified CPU↔GPU coherence cycles. A current
+Ampere GA106 rerun on tree `2dc9465` did the same at 535.309.01 (profile 535),
+570.124.06 (profile 570), the 580.105.08 control (profile 580), and 610.43.02
+(profile 610): every row was **30 PASS / 0 FAIL / 0 SKIP**, and every selected
+profile matched the header. This spans the oldest profile buildable on the
+kernel-6.8 KVM rentals through the newest V610 channel layout. Drivers 515/525
+remain outside that rental's buildable kernel range, not silently counted as
+coverage. See the 2026-08-26 section of
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md) for exact denials, costs
+and retained evidence.
+
+The older Ampere rows additionally cleared the PTX JIT path, a matmul checked
 against a CPU reference, a Vulkan compute dispatch and offscreen EGL, via
 `tests/validate.sh` — see [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md)
 for the per-check values and for the one failure they surfaced: offscreen

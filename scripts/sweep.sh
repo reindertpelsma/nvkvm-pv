@@ -1058,8 +1058,21 @@ PY
 # as a success, which is exactly what this sweep exists to prevent.
 # ---------------------------------------------------------------------------
 VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""
+
+# A transient unit name is reused for every driver on the box.  `journalctl -u`
+# therefore grows monotonically: after N driver boots it contains the DENY/AUDIT
+# lines from all N.  Reporting that as the Nth driver's warning set silently
+# misattributes controls to the wrong NVIDIA branch.  Select one systemd
+# invocation, and validate the identifier before interpolating it into a remote
+# shell command.
+invocation_journal_query() {
+    local inv="${1:-}"
+    [[ "$inv" =~ ^[0-9A-Fa-f]{32}$ ]] || return 1
+    printf 'journalctl _SYSTEMD_INVOCATION_ID=%s' "$inv"
+}
+
 boot_and_validate() {
-    local drv="$1" gpu="$2" rc bundles G mod out booted=0
+    local drv="$1" gpu="$2" rc bundles G mod out booted=0 vm_inv vm_journal
     VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""
 
     # The host-libs bundle is the HOST DRIVER's userspace and MUST be rebuilt
@@ -1116,6 +1129,13 @@ boot_and_validate() {
 
     rsh_t 200 'systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --working-directory=/root/nvkvm bash scripts/run_test_vm.sh' >/dev/null 2>&1
 
+    vm_inv="$(rsh_t 90 'systemctl show nvkvm-vm.service --property=InvocationID --value 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
+    if ! vm_journal="$(invocation_journal_query "$vm_inv")"; then
+        VR_STATUS="vm-journal-scope-missing"
+        VR_DETAIL="[HARNESS] nvkvm-vm has no valid systemd InvocationID; refusing to attribute cumulative unit logs to driver $drv"
+        return
+    fi
+
     G='sshpass -p ubuntu ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p 2222 ubuntu@localhost'
     for _ in $(seq 1 30); do
         out="$(rsh_t 90 "$G 'mountpoint -q /mnt/nvkvm && echo MOUNTED'" 2>/dev/null)"
@@ -1124,7 +1144,7 @@ boot_and_validate() {
     done
     if [ "$booted" != 1 ]; then
         VR_STATUS="guest-no-boot"
-        VR_DETAIL="$(rsh_t 90 'journalctl -u nvkvm-vm --no-pager 2>/dev/null | tail -40' 2>/dev/null)"
+        VR_DETAIL="$(rsh_t 90 "$vm_journal --no-pager 2>/dev/null | tail -40" 2>/dev/null)"
         return
     fi
 
@@ -1149,7 +1169,7 @@ boot_and_validate() {
     # This is the single most valuable field in a driver sweep -- the profile
     # table is precisely what a new driver version breaks -- so it is captured
     # and reported for every driver, pass or fail.
-    VR_ABI="$(rsh_t 120 "journalctl -u nvkvm-vm --no-pager 2>/dev/null | grep -oE 'ABI profile [0-9]+' | tail -1" 2>/dev/null | awk '{print $NF}' | tr -d '\r')"
+    VR_ABI="$(rsh_t 120 "$vm_journal --no-pager 2>/dev/null | grep -oE 'ABI profile [0-9]+' | tail -1" 2>/dev/null | awk '{print $NF}' | tr -d '\r')"
     [ -z "$VR_ABI" ] && VR_ABI="?"
 
     # stage_guest_libs.sh exits 2 when an OPTIONAL library is missing (recorded,
@@ -1178,7 +1198,7 @@ boot_and_validate() {
     #   guest dmesg : nvkvm: AUDIT unknown ioctl ...
     #                 nvkvm: AUDIT param_size MISMATCH ...   (the alloc-size warning)
     VR_WARNINGS="$(
-        rsh_t 120 "journalctl -u nvkvm-vm --no-pager 2>/dev/null | grep -aoE 'nvkvm: (DENY|AUDIT)[^\"]{0,90}' | sort | uniq -c | sort -rn | head -40" 2>/dev/null
+        rsh_t 120 "$vm_journal --no-pager 2>/dev/null | grep -aoE 'nvkvm: (DENY|AUDIT)[^\"]{0,90}' | sort | uniq -c | sort -rn | head -40" 2>/dev/null
         rsh_t 120 "$G 'sudo dmesg 2>/dev/null | grep -aoE \"nvkvm: (AUDIT|DENY)[^\\\"]{0,90}\" | sort | uniq -c | sort -rn | head -40'" 2>/dev/null
     )"
 

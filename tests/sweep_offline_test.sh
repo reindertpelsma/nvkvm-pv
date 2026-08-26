@@ -416,6 +416,23 @@ check "open NVRM banner" \
   "580.105.08"
 
 echo
+echo "=== 21. warning attribution is scoped to one systemd invocation ==="
+check "a valid invocation selects the invocation journal field" \
+  "$(invocation_journal_query 0123456789abcdef0123456789abcdef)" \
+  "journalctl _SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef"
+if invocation_journal_query '0123; touch /tmp/not-a-journal-id' >/dev/null 2>&1; then
+    bad "an invalid/injectable invocation id was accepted"
+else
+    ok "invalid/injectable invocation ids are rejected"
+fi
+warnings_block="$(sed -n '/^[[:space:]]*VR_WARNINGS="\$(/,/^[[:space:]]*)"/p' "$REPO/scripts/sweep.sh")"
+if printf '%s\n' "$warnings_block" | grep -Fq '$vm_journal --no-pager'; then
+    ok "VR_WARNINGS uses the invocation-scoped journal selector"
+else
+    bad "VR_WARNINGS does not use the invocation-scoped journal selector"
+fi
+
+echo
 echo "======================================================================"
 printf 'sweep offline suite: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
