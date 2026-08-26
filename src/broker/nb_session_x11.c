@@ -150,11 +150,18 @@ struct nb_x11 {
     xcb_render_picture_t    dst_pic;    /* the content window as a Picture */
 #endif
     bool      idle_shown;
+    xcb_window_t dlg;           /* close-confirmation child, 0 = never made */
+    bool      dlg_mapped;
+    int       dlg_hot;          /* hovered row, -1 = none                 */
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
 static void x11_clip_flush_pending(struct nb_x11 *x);
 static int  x11_show_idle(struct nb_session *s);
+static void x11_dlg_show(struct nb_x11 *x);
+static void x11_dlg_hide(struct nb_x11 *x);
+static void x11_dlg_paint(struct nb_x11 *x);
+static int  x11_dlg_hit(int px, int py);
 static void x11_clip_serve(struct nb_x11 *x,
                            const xcb_selection_request_event_t *rq);
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
@@ -749,16 +756,26 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                  * that exists, take the graceful choice, which is the same
                  * default the Wayland dialog offers on Enter.
                  */
-                nb_log("the window manager asked the window to close: "
-                       "requesting an ACPI powerdown");
-                if (!nb_sink_close_request(sink,
-                                           NVKVM_BROKER_CLOSE_POWERDOWN)) {
+                /*
+                 * ASK, do not decide.  WM_DELETE_WINDOW is a request, and the
+                 * three possible answers -- shut the guest down, force it off,
+                 * or just close the display -- are not interchangeable.  With
+                 * no VM attached there is nothing to ask about, so the X really
+                 * does mean close.
+                 */
+                if (x->current < 0 && x->idle_shown) {
                     x->quit = true;
+                } else {
+                    x11_dlg_show(x);
                 }
             }
             break;
         }
         case XCB_EXPOSE:
+            if (x->dlg_mapped) {
+                x11_dlg_paint(x);
+                break;
+            }
             /* Only meaningful while the placeholder is what is on screen; a
              * live guest repaints itself on the next present. */
             if (x->idle_shown && x->current < 0) {
@@ -811,6 +828,15 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 nb_sink_focus(sink, true);
                 x11_clip_flush_pending(x);
             }
+            if (x->dlg_mapped) {
+                /* Modal: ESC dismisses, everything else is swallowed rather
+                 * than half-delivered to a guest that is being asked about. */
+                if (x11_kc_to_evdev(k->detail) == 1 /* KEY_ESC */ &&
+                    (ev->response_type & 0x7f) == XCB_KEY_RELEASE) {
+                    x11_dlg_hide(x);
+                }
+                break;
+            }
             nb_sink_key(sink, x11_kc_to_evdev(k->detail),
                         (ev->response_type & 0x7f) == XCB_KEY_PRESS);
             break;
@@ -820,6 +846,37 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             xcb_button_press_event_t *b = (void *)ev;
             bool down = (ev->response_type & 0x7f) == XCB_BUTTON_PRESS;
             unsigned d = b->detail;
+
+            x->last_time = b->time;
+            if (x->dlg_mapped) {
+                /* PRESS ARMS, RELEASE ACTS -- none of these four should fire
+                 * from a mis-click, and a click anywhere else dismisses. */
+                if (b->event != x->dlg) {
+                    if (!down) {
+                        x11_dlg_hide(x);
+                    }
+                    break;
+                }
+                if (!down) {
+                    int hit = x11_dlg_hit(b->event_x, b->event_y);
+
+                    x11_dlg_hide(x);
+                    if (hit == 0) {
+                        if (!nb_sink_close_request(sink,
+                                NVKVM_BROKER_CLOSE_POWERDOWN)) {
+                            x->quit = true;
+                        }
+                    } else if (hit == 1) {
+                        if (!nb_sink_close_request(sink,
+                                NVKVM_BROKER_CLOSE_FORCE)) {
+                            x->quit = true;
+                        }
+                    } else if (hit == 2) {
+                        nb_sink_detach(sink, "the user closed the display");
+                    }
+                }
+                break;      /* never reaches the guest while the dialog is up */
+            }
 
             if (d == 4 || d == 5) {
                 if (down) {
@@ -841,6 +898,18 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
         case XCB_MOTION_NOTIFY: {
             xcb_motion_notify_event_t *m = (void *)ev;
             int cx = m->event_x, cy = m->event_y;
+
+            if (x->dlg_mapped) {
+                if (m->event == x->dlg) {
+                    int hit = x11_dlg_hit(m->event_x, m->event_y);
+
+                    if (hit != x->dlg_hot) {
+                        x->dlg_hot = hit;
+                        x11_dlg_paint(x);
+                    }
+                }
+                break;
+            }
 
             /*
              * Map into the CONTENT window, which is the guest's framebuffer.
@@ -1089,7 +1158,139 @@ static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
     }
 }
 
+/* ── close dialog ────────────────────────────────────────────────────────── */
+/*
+ * Same four choices and the same geometry as the Wayland overlay, drawn as a
+ * child window because on X11 the window manager owns the frame and its close
+ * button: WM_DELETE_WINDOW is a REQUEST, and answering it by killing the guest
+ * outright is not a decision the broker gets to make for the user.
+ */
+#define NB_DLG_W     560
+#define NB_DLG_BTN_H  40
+#define NB_DLG_GAP     8
+#define NB_DLG_PAD    18
+#define NB_DLG_N       4
+#define NB_DLG_TITLE  26
+#define NB_DLG_H  (NB_DLG_PAD * 2 + NB_DLG_TITLE + NB_DLG_GAP + \
+                   NB_DLG_N * (NB_DLG_BTN_H + NB_DLG_GAP))
+
+static const char *const x11_dlg_label[NB_DLG_N] = {
+    "SHUT DOWN THE GUEST (ACPI)",
+    "FORCE OFF THE VM",
+    "CLOSE THE DISPLAY ONLY",
+    "CANCEL",
+};
+
+static void x11_dlg_hide(struct nb_x11 *x)
+{
+    if (!x->dlg_mapped) {
+        return;
+    }
+    xcb_unmap_window(x->c, x->dlg);
+    x->dlg_mapped = false;
+    x->dlg_hot = -1;
+    /* Whatever the pointer policy was before the dialog, it is again. */
+    x11_show_cursor(x, !x->grabbed);
+    xcb_flush(x->c);
+}
+
+static void x11_dlg_paint(struct nb_x11 *x)
+{
+    uint32_t *px = calloc((size_t)NB_DLG_W * NB_DLG_H, 4);
+    int i;
+
+    if (!px) {
+        return;
+    }
+    nb_placeholder_fill(px, NB_DLG_W, NB_DLG_H, NB_DLG_W, 0xff101418u);
+    nb_placeholder_text(px, NB_DLG_W, NB_DLG_H, NB_DLG_W, NB_DLG_PAD,
+                        NB_DLG_PAD, "CLOSE THIS WINDOW?", 2, 0xffe6edf3u);
+    for (i = 0; i < NB_DLG_N; i++) {
+        int top = NB_DLG_PAD + NB_DLG_TITLE + NB_DLG_GAP +
+                  i * (NB_DLG_BTN_H + NB_DLG_GAP);
+        uint32_t bg = i == x->dlg_hot ? 0xff2b3947u : 0xff1b2027u;
+
+        nb_placeholder_fill(px + (size_t)top * NB_DLG_W + NB_DLG_PAD,
+                            NB_DLG_W - 2 * NB_DLG_PAD, NB_DLG_BTN_H,
+                            NB_DLG_W, bg);
+        nb_placeholder_text(px, NB_DLG_W, NB_DLG_H, NB_DLG_W,
+                            NB_DLG_PAD + 12, top + (NB_DLG_BTN_H - 14) / 2,
+                            x11_dlg_label[i], 2,
+                            i == 1 ? 0xffff6b6bu : 0xffe6edf3u);
+    }
+    if (!x->idle_gc) {
+        x->idle_gc = xcb_generate_id(x->c);
+        xcb_create_gc(x->c, x->idle_gc, x->win, 0, NULL);
+    }
+    x11_blit(x, x->dlg, x->idle_gc, px, NB_DLG_W, NB_DLG_H);
+    xcb_flush(x->c);
+    free(px);
+}
+
+static void x11_dlg_show(struct nb_x11 *x)
+{
+    uint32_t vals[4];
+
+    if (x->dlg_mapped) {
+        return;
+    }
+    if (!x->dlg) {
+        uint32_t m = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+        uint32_t v[2] = { x->screen->black_pixel,
+                          XCB_EVENT_MASK_BUTTON_PRESS |
+                          XCB_EVENT_MASK_BUTTON_RELEASE |
+                          XCB_EVENT_MASK_POINTER_MOTION |
+                          XCB_EVENT_MASK_EXPOSURE };
+
+        x->dlg = xcb_generate_id(x->c);
+        xcb_create_window(x->c, XCB_COPY_FROM_PARENT, x->dlg, x->win,
+                          0, 0, NB_DLG_W, NB_DLG_H, 0,
+                          XCB_WINDOW_CLASS_INPUT_OUTPUT,
+                          x->screen->root_visual, m, v);
+    }
+    vals[0] = (uint32_t)((x->win_w - NB_DLG_W) / 2 > 0 ? (x->win_w - NB_DLG_W) / 2 : 0);
+    vals[1] = (uint32_t)((x->win_h - NB_DLG_H) / 2 > 0 ? (x->win_h - NB_DLG_H) / 2 : 0);
+    vals[2] = NB_DLG_W;
+    vals[3] = NB_DLG_H;
+    xcb_configure_window(x->c, x->dlg,
+                         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                         XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT,
+                         vals);
+    xcb_map_window(x->c, x->dlg);
+    /* Raise above the content, which is the guest's frame. */
+    { uint32_t st = XCB_STACK_MODE_ABOVE;
+      xcb_configure_window(x->c, x->dlg, XCB_CONFIG_WINDOW_STACK_MODE, &st); }
+    x->dlg_mapped = true;
+    x->dlg_hot = -1;
+    /* The user is being asked a question: give them a pointer to answer it. */
+    x11_show_cursor(x, true);
+    x11_dlg_paint(x);
+}
+
+static int x11_dlg_hit(int px, int py)
+{
+    int i;
+
+    if (px < NB_DLG_PAD || px >= NB_DLG_W - NB_DLG_PAD) {
+        return -1;
+    }
+    for (i = 0; i < NB_DLG_N; i++) {
+        int top = NB_DLG_PAD + NB_DLG_TITLE + NB_DLG_GAP +
+                  i * (NB_DLG_BTN_H + NB_DLG_GAP);
+
+        if (py >= top && py < top + NB_DLG_BTN_H) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 /* The "no VM attached" screen.  Same painter the Wayland backend uses. */
+static void x11_dismiss_dialog(struct nb_session *s)
+{
+    x11_dlg_hide(s->priv);
+}
+
 static int x11_show_idle(struct nb_session *s)
 {
     struct nb_x11 *x = s->priv;
@@ -1841,6 +2042,7 @@ static const struct nb_session_ops x11_ops = {
     .commit = x11_commit,
     .resize = x11_resize,
     .show_idle = x11_show_idle,
+    .dismiss_dialog = x11_dismiss_dialog,
     .resync = x11_resync,
     .tick = x11_tick,
     .notify_clipboard = x11_notify_clipboard,
