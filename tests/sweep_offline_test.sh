@@ -402,6 +402,9 @@ while IFS= read -r line; do
 done <<<"$(printf 'a\nb\nc\nd\ne\nf\n')"
 check "all 6 driver rows are visited, not just the first" "$iterations" "6"
 SSH=""
+# The cache-relay test below deliberately replaces rsh_t with a local fake
+# after this assertion; this call must exercise the original definition.
+# shellcheck disable=SC2218
 rsh_t 5 'rm -rf /definitely/not/local' >/dev/null 2>&1; rc=$?
 check "an empty ssh target REFUSES to run the command locally" "$rc" "97"
 rm -f "$TMP/bin/ssh"
@@ -431,6 +434,48 @@ if printf '%s\n' "$warnings_block" | grep -Fq '$vm_journal --no-pager'; then
 else
     bad "VR_WARNINGS does not use the invocation-scoped journal selector"
 fi
+
+echo
+echo "=== 22. coordinator driver-cache relay is atomic and digest-checked ==="
+DRIVER_CACHE_DIR="$TMP/driver cache"
+FAKE_REMOTE_CACHE="$TMP/remote-driver-cache"
+mkdir -p "$DRIVER_CACHE_DIR" "$FAKE_REMOTE_CACHE"
+printf 'verified installer bytes\n' >"$DRIVER_CACHE_DIR/NVIDIA-Linux-x86_64-610.43.02.run"
+export FAKE_REMOTE_CACHE
+cat >"$TMP/bin/scp" <<'SCPSTUB'
+#!/usr/bin/env bash
+src=""; dst=""
+for arg in "$@"; do src="$dst"; dst="$arg"; done
+dst="${dst#*:}"
+dst="${dst/#\/root\/nvkvm-driver-cache/$FAKE_REMOTE_CACHE}"
+mkdir -p "$(dirname "$dst")"
+if [ "${FAKE_SCP_CORRUPT:-0}" = 1 ]; then
+    printf 'corrupt in transit\n' >"$dst"
+else
+    cp -- "$src" "$dst"
+fi
+SCPSTUB
+chmod +x "$TMP/bin/scp"
+SCP_HOST=example.invalid; SCP_PORT=22; SSH_OPTS=""
+rsh_t() {
+    shift
+    local cmd="$*"
+    cmd="${cmd//\/root\/nvkvm-driver-cache/$FAKE_REMOTE_CACHE}"
+    bash -c "$cmd" </dev/null
+}
+stage_cached_driver 610.43.02 >/dev/null 2>&1; rc=$?
+check "a cached installer is relayed successfully" "$rc" "0"
+check "the promoted bytes equal the coordinator cache" \
+  "$(sha256sum "$DRIVER_CACHE_DIR/NVIDIA-Linux-x86_64-610.43.02.run" "$FAKE_REMOTE_CACHE/NVIDIA-Linux-x86_64-610.43.02.run" | awk '{print $1}' | uniq | wc -l)" "1"
+rm -f "$FAKE_REMOTE_CACHE/NVIDIA-Linux-x86_64-610.43.02.run"
+FAKE_SCP_CORRUPT=1 stage_cached_driver 610.43.02 >/dev/null 2>&1; rc=$?
+check "a transfer digest mismatch is rejected" "$rc" "2"
+if [ -e "$FAKE_REMOTE_CACHE/NVIDIA-Linux-x86_64-610.43.02.run" ]; then
+    bad "a corrupt transfer was promoted to the remote cache"
+else
+    ok "a corrupt transfer is removed before promotion"
+fi
+rm -f "$TMP/bin/scp"
 
 echo
 echo "======================================================================"

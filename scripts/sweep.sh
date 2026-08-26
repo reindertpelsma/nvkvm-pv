@@ -71,6 +71,7 @@
 #   scripts/sweep.sh                          # dry run: plan + real offer
 #                                             # lookup + cost estimate. $0.
 #   scripts/sweep.sh --arch ampere --drivers 580.95.05 --go     # L1
+#   scripts/sweep.sh --arch ada --driver-cache /srv/nvidia --go  # relay CDN-blocked installers
 #   scripts/sweep.sh --arch ampere --go                          # L2
 #   scripts/sweep.sh --all-arches --go --max-spend 12            # L3
 #   scripts/sweep.sh --resume sweep-runs/2026-08-23T10-00-00Z --go
@@ -123,6 +124,7 @@ ARCHES=""
 ALL_ARCHES=0
 GPU_FILTER=""
 DRIVERS_REQ=""
+DRIVER_CACHE_DIR="${NVKVM_SWEEP_DRIVER_CACHE:-}"
 PRESET="boundary"
 MIN_DRIVERS=5
 MAX_DPH=0.50
@@ -210,6 +212,7 @@ while [ $# -gt 0 ]; do
         --all-arches)   ALL_ARCHES=1; shift ;;
         --gpu)          GPU_FILTER="$2"; shift 2 ;;
         --drivers)      DRIVERS_REQ="$2"; shift 2 ;;
+        --driver-cache) DRIVER_CACHE_DIR="$2"; shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
         --max-dph)      MAX_DPH="$2"; shift 2 ;;
@@ -239,6 +242,13 @@ say()  { printf '%s\n' "$*"; }
 info() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] !! %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf '\n%s: FATAL: %s\n' "$SELF" "$*" >&2; exit "${2:-3}"; }
+
+if [ -n "$DRIVER_CACHE_DIR" ]; then
+    [ -d "$DRIVER_CACHE_DIR" ] \
+        || die "driver cache is not a directory: $DRIVER_CACHE_DIR" 3
+    DRIVER_CACHE_DIR="$(cd -- "$DRIVER_CACHE_DIR" && pwd -P)" \
+        || die "cannot resolve driver cache: $DRIVER_CACHE_DIR" 3
+fi
 
 stop_requested() { [ -f "$STOP_FILE" ]; }
 
@@ -979,10 +989,75 @@ $tail"
 # ---------------------------------------------------------------------------
 DRIVER_DETAIL=""
 DRIVER_ACTUAL=""
+DRIVER_CACHE_DETAIL=""
+
+# Some NVIDIA CDN edges return HTTP 403 to otherwise healthy rented hosts.
+# An optional coordinator-local cache lets the sweep relay the exact installer
+# over the already-established SSH connection.  The coordinator only hashes
+# and copies these bytes; it NEVER executes an NVIDIA runfile.  The untrusted
+# KVM box verifies the makeself archive with --check before using it.
+#
+# Cache filenames are NVIDIA's canonical names:
+#   NVIDIA-Linux-x86_64-610.43.02.run
+# A transfer lands under a temporary name, is compared with the coordinator's
+# SHA-256, and is renamed atomically.  A stale partial can therefore never look
+# like a cache hit on the next attempt.
+stage_cached_driver() {
+    local ver="$1" src remote tmp want got
+    DRIVER_CACHE_DETAIL=""
+    [ -n "$DRIVER_CACHE_DIR" ] || return 1
+    [[ "$ver" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] || {
+        DRIVER_CACHE_DETAIL="[HARNESS] refusing invalid driver-cache version '$ver'"
+        return 2
+    }
+    src="$DRIVER_CACHE_DIR/NVIDIA-Linux-x86_64-$ver.run"
+    [ -f "$src" ] || return 1
+    [ -n "${SCP_HOST:-}" ] && [ -n "${SCP_PORT:-}" ] || {
+        DRIVER_CACHE_DETAIL="[HARNESS] cannot relay cached driver $ver: no SSH endpoint"
+        return 2
+    }
+
+    want="$(sha256sum -- "$src" 2>/dev/null | awk '{print $1}')"
+    [[ "$want" =~ ^[0-9a-f]{64}$ ]] || {
+        DRIVER_CACHE_DETAIL="[HARNESS] cannot hash cached driver: $src"
+        return 2
+    }
+    remote="/root/nvkvm-driver-cache/NVIDIA-Linux-x86_64-$ver.run"
+    got="$(rsh_t 120 "sha256sum '$remote' 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n')"
+    if [ "$got" = "$want" ]; then
+        info "    driver cache: $ver already staged and SHA-256 matched"
+        return 0
+    fi
+
+    rsh_t 120 'install -d -m 0700 /root/nvkvm-driver-cache' >/dev/null 2>&1 || {
+        DRIVER_CACHE_DETAIL="[HARNESS] could not create the remote driver-cache directory"
+        return 2
+    }
+    tmp="$remote.part.$$"
+    timeout 1800 scp $SSH_OPTS -P "$SCP_PORT" -q -- "$src" "root@$SCP_HOST:$tmp" || {
+        rsh_t 90 "rm -f '$tmp'" >/dev/null 2>&1
+        DRIVER_CACHE_DETAIL="[HARNESS] scp failed while relaying cached driver $ver"
+        return 2
+    }
+    got="$(rsh_t 300 "sha256sum '$tmp' 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n')"
+    if [ "$got" != "$want" ]; then
+        rsh_t 90 "rm -f '$tmp'" >/dev/null 2>&1
+        DRIVER_CACHE_DETAIL="[HARNESS] SHA-256 mismatch after relaying cached driver $ver"
+        return 2
+    fi
+    rsh_t 120 "chmod 0700 '$tmp' && mv -f '$tmp' '$remote'" >/dev/null 2>&1 || {
+        rsh_t 90 "rm -f '$tmp'" >/dev/null 2>&1
+        DRIVER_CACHE_DETAIL="[HARNESS] could not atomically promote cached driver $ver"
+        return 2
+    }
+    info "    driver cache: relayed $ver (SHA-256 $want)"
+    return 0
+}
+
 install_driver() {
     local ver="$1" arch="$2" logfile="$3" alts="$4" want_abi="$5"
-    local vetted="" a out lic
-    DRIVER_DETAIL=""; DRIVER_ACTUAL=""
+    local vetted="" a out lic cache_err=""
+    DRIVER_DETAIL=""; DRIVER_ACTUAL=""; DRIVER_CACHE_DETAIL=""
 
     # MODULE FLAVOUR, not just version.  sweep_matrix.install_driver() has a
     # fast path -- "cur == ver, nothing to do" -- that compares only the
@@ -1011,6 +1086,17 @@ install_driver() {
         else
             warn "    refusing alternate $a for $ver: it selects ABI $(abi_expected "$a"), not $want_abi"
         fi
+    done
+
+    # Stage the primary and any ABI-vetted substitutes before the helper
+    # purges the working driver.  Missing cache entries are normal; an actual
+    # relay failure is retained so a later CDN failure names both causes.
+    for a in "$ver" ${vetted//,/ }; do
+        stage_cached_driver "$a"
+        case $? in
+            0|1) ;;
+            2) cache_err="${cache_err}${cache_err:+; }$DRIVER_CACHE_DETAIL" ;;
+        esac
     done
 
     out="$(python3 - "$REPO" "$SSH" "$ver" "$arch" "$logfile" "$vetted" <<'PY'
@@ -1043,6 +1129,11 @@ PY
     out="$(printf '%s\n' "$out" | grep '^@@RESULT@@' | tail -1 | sed 's/^@@RESULT@@//')"
     [ -n "$out" ] || { DRIVER_DETAIL="[HARNESS] no result line from the installer helper"; return 1; }
     DRIVER_DETAIL="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("detail",""))' 2>/dev/null)"
+    if [ -n "$cache_err" ] && [ -n "$DRIVER_DETAIL" ]; then
+        DRIVER_DETAIL="$cache_err; $DRIVER_DETAIL"
+    elif [ -n "$cache_err" ]; then
+        DRIVER_DETAIL="$cache_err"
+    fi
     DRIVER_ACTUAL="$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("actual",""))' 2>/dev/null)"
     printf '%s' "$out" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ok") else 1)' 2>/dev/null
 }
@@ -1791,6 +1882,7 @@ say "  tree          : $TREE_STAMP"
 say "  image         : $KVM_IMAGE"
 say "  architectures : $ARCHES"
 say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_REQ)}"
+say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
 say "  caps          : \$$MAX_DPH/hr per box, \$$MAX_SPEND total, ${BUDGET_HOURS}h auto-destroy"
 say ""

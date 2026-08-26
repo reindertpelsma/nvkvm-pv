@@ -595,7 +595,8 @@ own protocol, not NVIDIA ABI.
 | ABI parity | pass; includes the pre-545 common-prefix regression and universal REGISTER_GPU size/fd/status offsets |
 | VMA lifetime reproducer | warning-clean compilation; execution requires nvkvm GPU hardware |
 | broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 46/46, adopted socket, clipboard and lifecycle suites |
-| rental safety harness | pass: 73/73 offline cases |
+| rental safety harness | pass: 80/80 offline cases, including invocation-scoped warnings and atomic driver-cache relay |
+| guest cloud-image cache | pass: 15/15 interruption, resume, digest, atomic-promotion and custom-image cases |
 | ShellCheck 0.10 at blocking severity | pass |
 
 ### Hardware remediation verification
@@ -624,6 +625,26 @@ fixed a sweep-reporting defect: warning capture used the reused transient unit
 name and accumulated prior drivers' warnings. It now filters the journal by
 the current systemd invocation id and rejects invalid/missing ids rather than
 silently misattributing a control to another driver.
+
+An Ada RTX 4070 follow-up on tree `ddf2b5a` produced a clean 30 PASS / 0 FAIL /
+0 SKIP control on 580.105.08/profile 580. Its two `0x00730102` denials were
+scoped only to that boot, providing the first real-hardware check of the
+invocation-id reporting fix. The two forced rows did **not** produce verdicts:
+the Hong Kong rental received HTTP 403 from both NVIDIA CDN URL families for
+610.43.02 and 535.309.01. The harness correctly recorded two
+`driver-install-failed` rows and a coverage shortfall rather than banking or
+skipping them. Instance 48719818 was verified destroyed; cost was $0.0484.
+
+That run exposed two harness reliability gaps now remediated before the Ada
+retry. `setup_guest.sh` previously wrote a cloud-image download directly to its
+final cache path and accepted existence on rerun; it now resumes under a
+`.part` name, verifies Ubuntu's published SHA-256 (or an explicit custom-image
+digest), and promotes atomically. The sweep can also relay canonical NVIDIA
+runfiles from an optional coordinator-local cache. The trusted coordinator
+only hashes and copies the file; transfer equality is proven remotely and the
+disposable KVM box still runs the archive's own `--check`. No driver installer
+is executed on the coordinator, and no transport failure is converted into a
+test verdict.
 
 The branch remains unmerged while the broader multi-architecture/profile sweep
 requested for release confidence continues.

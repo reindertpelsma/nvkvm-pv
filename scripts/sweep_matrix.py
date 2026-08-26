@@ -420,6 +420,28 @@ def _fetch_installer(S, candidates, tried):
     instead of being guessed at afterwards.
     """
     for cand in candidates:
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,2}", cand):
+            tried.append(f"local relay {cand!r} -> [HARNESS] invalid driver version")
+            continue
+
+        # sweep.sh may have relayed a coordinator-local copy for providers
+        # whose NVIDIA CDN edge denies rented IPs.  The coordinator verified
+        # transport with SHA-256; verify the makeself archive itself HERE, on
+        # the disposable VM, before use.  Never execute a cached runfile on the
+        # trusted coordinator.
+        cache = f"/root/nvkvm-driver-cache/NVIDIA-Linux-x86_64-{cand}.run"
+        _, cached = sh(rsh(S, f"test -s {shlex.quote(cache)}"), timeout=120)
+        if cached == 0:
+            _, copied = sh(rsh(S,
+                f"install -m 0700 {shlex.quote(cache)} /root/drv.run"), timeout=300)
+            _, checked = sh(rsh(S,
+                "/root/drv.run --check >/root/drvcheck.log 2>&1"), timeout=900)
+            if copied == 0 and checked == 0:
+                tried.append(f"local relay {cache} -> verified intact")
+                return True, cand
+            tried.append(f"local relay {cache} -> CORRUPT "
+                         f"(copy rc={copied}, --check rc={checked})")
+
         for url in driver_urls(cand):
             out, _ = sh(rsh(S,
                 f"curl -sS -L --max-time 1500 -w '\\nHTTP=%{{http_code}}' "
