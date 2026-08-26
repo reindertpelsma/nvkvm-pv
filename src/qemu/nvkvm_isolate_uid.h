@@ -199,6 +199,7 @@
 struct nvkvm_isolate_cfg {
 	unsigned  mode;        /* bitmask of NVKVM_ISO_MODE_*  */
 	uint32_t  uid_base;    /* first uid/gid of this VM's window */
+	bool      uid_base_explicit; /* an operator named it: never relocate */
 };
 
 /* ── Mode string parsing ─────────────────────────────────────────────────

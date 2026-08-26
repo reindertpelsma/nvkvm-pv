@@ -66,6 +66,7 @@ declare -A TALLY_SUITES=(
 
 # Suites with their own ad-hoc output.  Value is a line that must appear.
 declare -A MARKER_SUITES=(
+    [test_uidmap]="test_uidmap passed"
     [test_open_scm]="ALL OPEN_SCM TESTS PASSED"
     [test_ctrl_gate]="test_ctrl_gate: PASS"
 )
@@ -132,7 +133,7 @@ ISOLATE_KNOWN_FAIL=""
 # is environment-dependent, name it here WITH the reason.
 ISOLATE_ENV_DEPENDENT=""
 
-ALL_BINARIES="test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring mock_stub"
+ALL_BINARIES="test_uidmap test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring mock_stub"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }

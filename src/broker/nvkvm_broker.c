@@ -45,6 +45,7 @@
 #include <pwd.h>
 #include <sys/syscall.h>
 #include <linux/capability.h>
+#include "nvkvm_uidmap.h"
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2111,6 +2112,54 @@ static int nb_drop_privs(const char *user)
      * that owns nothing on the system, rather than as the desktop user whose
      * files, keys and autostart directory it would otherwise still reach.
      */
+    /*
+     * "auto": pick a uid nothing owns, from INSIDE this namespace's uid map.
+     *
+     * Done here rather than in the launcher because only this process can read
+     * /proc/self/uid_map, and a uid outside it fails setuid() with EINVAL --
+     * which is what a hardcoded high offset does under `dockerd --userns-remap`
+     * or sysbox-runc, where the container typically maps just 65536 uids.
+     *
+     * Chosen from the TOP half of the usable range: real accounts, system users
+     * and /etc/subuid allocations all live low, so the top collides with least.
+     * Deliberately not 65534 -- `nobody` is shared by half the sandboxed daemons
+     * on a desktop, and while PR_SET_DUMPABLE(0) below stops a same-uid process
+     * ptracing us for the display fd, it does not stop one signalling us dead.
+     */
+    if (!strcmp(user, "auto")) {
+        struct nvkvm_uidmap map;
+        uint32_t span, pick;
+        unsigned int seed = 0;
+        FILE *rnd = fopen("/dev/urandom", "re");
+
+        nvkvm_uidmap_get(&map);
+        if (rnd) {
+            if (fread(&seed, sizeof(seed), 1, rnd) != 1) {
+                seed = (unsigned int)getpid();
+            }
+            fclose(rnd);
+        } else {
+            seed = (unsigned int)getpid();
+        }
+        /* Top half, but never uid 0 and never below the map's floor. */
+        uint32_t lo = map.lo + (map.hi - map.lo) / 2;
+
+        if (lo == 0) {
+            lo = 1;
+        }
+        span = map.hi > lo ? map.hi - lo : 0;
+        pick = span ? lo + (seed % span) : lo;
+        if (pick == 0 || pick == geteuid()) {
+            pick = lo ? lo : 1;
+        }
+        uid = (uid_t)pick;
+        gid = (gid_t)pick;
+        have_target = true;
+        snprintf(label, sizeof(label), "uid %u gid %u (auto, map %u..%u)",
+                 (unsigned)uid, (unsigned)gid, map.lo, map.hi);
+        goto do_drop;
+    }
+
     if (user[0] >= '0' && user[0] <= '9') {
         char *end = NULL;
         unsigned long want = strtoul(user, &end, 10);
@@ -2148,6 +2197,8 @@ static int nb_drop_privs(const char *user)
     if (!have_target) {
         goto harden;
     }
+
+do_drop:
 
     /*
      * Everything the broker needs is already an OPEN FD by the time this runs:
@@ -2249,7 +2300,9 @@ static void usage(void)
 "  --allow-user NAME    additional user allowed to connect (repeatable)\n"
 "  --allow-group NAME   additional PRIMARY gid allowed to connect; SO_PEERCRED\n"
 "                       does not report a peer's supplementary groups\n"
-"  --drop-user NAME     become this user after the window is up\n"
+"  --drop-user WHO      become this user after the window is up: a name, a\n"
+"                       numeric UID[:GID], or `auto` to pick a uid nothing\n"
+"                       owns from inside this namespace's uid map\n"
 "  --fullscreen         start fullscreen (CTRL+ALT+F toggles)\n"
 "  --scale MODE         aspect (default) keeps the guest's aspect ratio and\n"
 "                       fills the remainder with black; stretch fills the\n"
