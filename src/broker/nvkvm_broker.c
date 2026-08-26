@@ -43,6 +43,8 @@
 #include <grp.h>
 #include <limits.h>
 #include <pwd.h>
+#include <sys/syscall.h>
+#include <linux/capability.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2090,38 +2092,120 @@ static bool nb_peer_allowed(int fd, const struct nb_config *cfg,
 static int nb_drop_privs(const char *user)
 {
     struct passwd *pw = NULL;
+    uid_t uid = 0;
+    gid_t gid = 0;
+    bool have_target = false;
+    char label[64];
 
-    if (geteuid() == 0 && !user) {
-        nb_log("WARNING: running as root and --drop-user was not given. "
-               "The broker will stay root. Pass --drop-user <name>.");
-    } else if (geteuid() == 0) {
+    if (!user) {
+        if (geteuid() == 0) {
+            nb_log("WARNING: running as root and --drop-user was not given. "
+                   "The broker will stay root. Pass --drop-user <name|uid>.");
+        }
+        goto harden;
+    }
+
+    /*
+     * NAME or NUMERIC.  A container has no passwd entry for a uid picked at
+     * random, and picking at random is the point: the broker ends up as a uid
+     * that owns nothing on the system, rather than as the desktop user whose
+     * files, keys and autostart directory it would otherwise still reach.
+     */
+    if (user[0] >= '0' && user[0] <= '9') {
+        char *end = NULL;
+        unsigned long want = strtoul(user, &end, 10);
+
+        uid = (uid_t)want;
+        gid = (gid_t)want;
+        if (end && *end == ':') {
+            gid = (gid_t)strtoul(end + 1, &end, 10);
+        }
+        if (!end || *end != '\0' || want == 0) {
+            nb_err("--drop-user %s: expected a name, or UID[:GID] with UID != 0",
+                   user);
+            return -EINVAL;
+        }
+        have_target = true;
+        snprintf(label, sizeof(label), "uid %u gid %u",
+                 (unsigned)uid, (unsigned)gid);
+    } else {
         pw = getpwnam(user);
+        if (!pw) {
+            nb_err("--drop-user %s: no such user", user);
+            return -ENOENT;
+        }
+        if (pw->pw_uid == 0) {
+            nb_err("--drop-user %s resolves to uid 0 — refusing", user);
+            return -EINVAL;
+        }
+        uid = pw->pw_uid;
+        gid = pw->pw_gid;
+        have_target = true;
+        snprintf(label, sizeof(label), "%s (uid %u, gid %u)", user,
+                 (unsigned)uid, (unsigned)gid);
     }
-    if (geteuid() == 0 && !pw && user) {
-        nb_err("--drop-user %s: no such user", user);
-        return -ENOENT;
+
+    if (!have_target) {
+        goto harden;
     }
-    if (pw && pw->pw_uid == 0) {
-        nb_err("--drop-user %s resolves to uid 0 — refusing", user);
-        return -EINVAL;
-    }
-    if (pw && (initgroups(pw->pw_name, pw->pw_gid) < 0 ||
-               setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0)) {
-        nb_err("dropping to %s: %s", user, strerror(errno));
+
+    /*
+     * Everything the broker needs is already an OPEN FD by the time this runs:
+     * the display-server connection, the input devices behind it, and the bound
+     * listening socket.  That is what lets the drop be this blunt -- nothing
+     * after this point needs to open anything by name.
+     *
+     * It also means the drop works from a NON-root start, which is the
+     * container case: the entrypoint hands us CAP_SETUID/CAP_SETGID and nothing
+     * else, we spend them here, and clear them below.  Dropping later than
+     * startup is deliberate; dropping earlier would mean connecting to the
+     * compositor as a uid that cannot reach its socket.
+     */
+    if (pw ? initgroups(pw->pw_name, gid) < 0 : setgroups(0, NULL) < 0) {
+        nb_err("dropping to %s: clearing groups: %s", label, strerror(errno));
         return -errno;
     }
-    /* setuid(2) is not allowed to fail silently here; prove it took.  Run the
-     * prctl hardening afterwards because a credential transition is allowed
-     * to change the process's dumpable state. */
-    if (pw && (setuid(0) == 0 || geteuid() != pw->pw_uid)) {
+    if (setgid(gid) < 0 || setuid(uid) < 0) {
+        nb_err("dropping to %s: %s%s", label, strerror(errno),
+               errno == EPERM
+                   ? " (no CAP_SETUID: start the broker as root, or grant it "
+                     "ambient CAP_SETUID/CAP_SETGID so it can drop after the "
+                     "window is up)"
+                   : "");
+        return -errno;
+    }
+
+    /*
+     * SPEND THE CAPABILITY, THEN THROW IT AWAY.
+     *
+     * A root->nonroot setuid clears the permitted set for free, but a
+     * nonroot->nonroot one does NOT: ambient CAP_SETUID survives it, and a
+     * broker that can still setuid(0) has not dropped anything.  Clear the
+     * ambient set and then the whole capability set explicitly, before the
+     * check below -- otherwise the check would pass while the capability is
+     * still held.
+     */
+    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    {
+        struct __user_cap_header_struct hdr = {
+            .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0
+        };
+        struct __user_cap_data_struct data[2] = { { 0, 0, 0 }, { 0, 0, 0 } };
+
+        if (syscall(SYS_capset, &hdr, data) < 0 && errno != EPERM) {
+            nb_err("clearing capabilities after the drop: %s", strerror(errno));
+            return -errno;
+        }
+    }
+
+    /* Not allowed to fail silently: prove it took, rather than announce it. */
+    if (setuid(0) == 0 || geteuid() != uid) {
         nb_err("privilege drop did not take — refusing to continue");
         _exit(1);
     }
-    if (pw) {
-        nb_log("dropped privileges to %s (uid %u, gid %u), no capabilities held",
-               user, (unsigned)pw->pw_uid, (unsigned)pw->pw_gid);
-    }
+    nb_log("dropped privileges to %s, no capabilities held", label);
 
+harden:
     /* These are advertised security properties, not best-effort tuning.  A
      * failure must be visible and must stop before the broker accepts a peer. */
     if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0) {
@@ -2431,11 +2515,11 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
         else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }
         else if (!strncmp(a, "--present-mode=", 15)) {
-            const char *v = a + 15;
-            if      (!strcmp(v, "auto"))   { nb_tier = NB_TIER_AUTO;   }
-            else if (!strcmp(v, "native")) { nb_tier = NB_TIER_NATIVE; }
-            else if (!strcmp(v, "linear")) { nb_tier = NB_TIER_LINEAR; }
-            else if (!strcmp(v, "shm"))    { nb_tier = NB_TIER_SHM;    }
+            const char *mode = a + 15;
+            if      (!strcmp(mode, "auto"))   { nb_tier = NB_TIER_AUTO;   }
+            else if (!strcmp(mode, "native")) { nb_tier = NB_TIER_NATIVE; }
+            else if (!strcmp(mode, "linear")) { nb_tier = NB_TIER_LINEAR; }
+            else if (!strcmp(mode, "shm"))    { nb_tier = NB_TIER_SHM;    }
             else {
                 nb_err("--present-mode must be auto, native, linear or shm");
                 return 2;
