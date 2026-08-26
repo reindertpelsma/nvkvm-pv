@@ -388,6 +388,21 @@ struct nb_wl {
     int                            fetch_fd;   /* pipe being read, or -1     */
     uint64_t                       fetch_generation;
     uint64_t                       clip_notice_until;  /* title-bar notice   */
+    /*
+     * A guest copy is only PUT ON THE HOST CLIPBOARD while this window has
+     * keyboard focus.  Wayland enforces half of that anyway -- setting a
+     * selection needs a serial from a real input event -- but the policy is
+     * the point: a background VM must not be able to reach across and replace
+     * what you just copied somewhere else.
+     *
+     * Dropping it instead would be worse than it sounds: the guest believes
+     * the copy succeeded, so nothing re-sends it, and the text only reappears
+     * if the user copies something ELSE in the guest.  So hold the last one
+     * and apply it on focus-in.
+     */
+    bool                           focused;
+    char                          *clip_pending;
+    size_t                         clip_pending_len;
     char                           fetch_buf[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
     size_t                         fetch_len;
 
@@ -1139,6 +1154,8 @@ static void tb_paint(struct nb_wl *w, int width)
     const uint32_t fg  = 0xffe6edf3U;
     const uint32_t hot = 0xffffb454U;
     const char *txt;
+    char composed[192];
+    bool hot_txt;
     unsigned tw, scale = 2, x;
 
     if (!px) {
@@ -1155,11 +1172,33 @@ static void tb_paint(struct nb_wl *w, int width)
      * release gesture by design -- every other key is going to the guest -- so
      * the bar says so, in the accent colour, for as long as the grab is held.
      */
-    if (w->clip_notice_until && nb_now_ms_wl() < w->clip_notice_until) {
-        txt = "THE VM CHANGED YOUR CLIPBOARD";
-    } else {
-        w->clip_notice_until = 0;
-        txt = w->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE" : w->title;
+    {
+        /*
+         * STATUS AND TITLE, not status INSTEAD OF title.  Losing the window
+         * name is a real cost when several are open -- but a status line is
+         * only worth having if it is legible, so when both do not fit the
+         * status keeps the space and the title is what goes.
+         */
+        const char *status = NULL;
+
+        if (w->clip_notice_until && nb_now_ms_wl() < w->clip_notice_until) {
+            status = "THE VM CHANGED YOUR CLIPBOARD";
+        } else {
+            w->clip_notice_until = 0;
+            if (w->grabbed) {
+                status = "GRABBED - CTRL+ALT+G TO RELEASE";
+            }
+        }
+        hot_txt = status != NULL;
+        if (status && w->title[0]) {
+            const unsigned avail = (unsigned)(width - 3 * NB_TB_BTN - 16);
+
+            snprintf(composed, sizeof composed, "%s - %s", status, w->title);
+            txt = nb_placeholder_text_w(composed, scale) <= avail
+                      ? composed : status;
+        } else {
+            txt = status ? status : w->title;
+        }
     }
     tw = nb_placeholder_text_w(txt, scale);
     while (scale > 1 && tw > (unsigned)(width - 3 * NB_TB_BTN - 16)) {
@@ -1168,7 +1207,7 @@ static void tb_paint(struct nb_wl *w, int width)
     }
     nb_placeholder_text(px, (unsigned)width, NB_TB_H, (unsigned)width,
                         10, (NB_TB_H - 7 * scale) / 2, txt, scale,
-                        w->grabbed ? hot : fg);
+                        hot_txt ? hot : fg);
 
     /*
      * Three buttons at the right, in the order every desktop puts them:
@@ -1497,6 +1536,30 @@ static const struct wl_data_source_listener dsrc_listener = {
     .action = dsrc_action,
 };
 
+static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len);
+static void wl_notify_clipboard(struct nb_session *s);
+
+/* Put a held guest copy on the clipboard now that the window has focus. */
+static void wl_clip_flush_pending(struct nb_wl *w)
+{
+    char *text;
+    size_t len;
+
+    if (!w->clip_pending || !w->focused) {
+        return;
+    }
+    /* Detach first: wl_set_clipboard() is about to be re-entered and must not
+     * see the pending copy again, or focus-in would loop. */
+    text = w->clip_pending; len = w->clip_pending_len;
+    w->clip_pending = NULL; w->clip_pending_len = 0;
+    if (w->sess && wl_set_clipboard(w->sess, text, len) == 0) {
+        nb_log("the VM's clipboard text is now on yours (it was held while "
+               "the window was not focused)");
+        wl_notify_clipboard(w->sess);
+    }
+    free(text);
+}
+
 static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
 {
     struct nb_wl *w = s->priv;
@@ -1511,6 +1574,21 @@ static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
     }
     memcpy(copy, text, len);
     copy[len] = '\0';
+
+    /*
+     * NOT FOCUSED: hold it, do not apply it.  Wayland would refuse the
+     * selection anyway (no input serial to justify it), so the alternative is
+     * not "apply it regardless" -- it is "fail silently and lose the copy".
+     * Only the most recent one is kept; a clipboard has room for one thing.
+     */
+    if (!w->focused) {
+        free(w->clip_pending);
+        w->clip_pending = copy;
+        w->clip_pending_len = len;
+        nb_log("the VM copied %zu bytes; holding them until this window has "
+               "focus", len);
+        return 0;
+    }
 
     if (w->source) {
         wl_data_source_destroy(w->source);
@@ -2191,6 +2269,30 @@ static void wl_notify_clipboard(struct nb_session *s)
     wl_display_flush(w->dpy);
 }
 
+/*
+ * Clock-driven work.  Only the title-bar notice qualifies today: it expires on
+ * a deadline, not on an event, and the main loop otherwise sleeps in poll()
+ * forever -- which is why a "transient" notice used to sit there until an
+ * unrelated event happened to redraw the bar.
+ */
+static int wl_tick(struct nb_session *s)
+{
+    struct nb_wl *w = s->priv;
+    uint64_t now;
+
+    if (!w->clip_notice_until) {
+        return -1;
+    }
+    now = nb_now_ms_wl();
+    if (now >= w->clip_notice_until) {
+        w->clip_notice_until = 0;
+        tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
+        wl_display_flush(w->dpy);
+        return -1;
+    }
+    return (int)(w->clip_notice_until - now);
+}
+
 static void wl_dismiss_dialog(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
@@ -2275,15 +2377,18 @@ static void kbd_enter(void *d, struct wl_keyboard *k, uint32_t serial,
 {
     struct nb_wl *w = d;
     (void)k; (void)serial; (void)s; (void)keys;
+    w->focused = true;
     if (w->sink) {
         nb_sink_focus(w->sink, true);
     }
+    wl_clip_flush_pending(w);
 }
 static void kbd_leave(void *d, struct wl_keyboard *k, uint32_t serial,
                       struct wl_surface *s)
 {
     struct nb_wl *w = d;
     (void)k; (void)serial; (void)s;
+    w->focused = false;
     /* The property that stops the grab being a keylogger. */
     if (w->sink) {
         nb_sink_focus(w->sink, false);
@@ -3538,6 +3643,8 @@ static void wl_close_session(struct nb_session *s)
         wl_data_source_destroy(w->source);
     }
     free(w->src_text);
+    free(w->clip_pending);
+    w->clip_pending = NULL;
     for (i = 0; i < NB_MAX_BUFS; i++) {
         wl_buf_destroy(w, i);
     }
@@ -3876,6 +3983,7 @@ static const struct nb_session_ops wl_ops = {
     .show_idle = wl_show_idle,
     .dismiss_dialog = wl_dismiss_dialog,
     .set_clipboard = wl_set_clipboard,
+    .tick = wl_tick,
     .notify_clipboard = wl_notify_clipboard,
     .fetch_clipboard = wl_fetch_clipboard,
 };

@@ -2837,7 +2837,7 @@ int main(int argc, char **argv)
     }
 
     for (;;) {
-        int n = 0, nsess, r;
+        int n = 0, nsess, r, tmo;
 
         pfd[n].fd = sigfd;      pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
         pfd[n].fd = listen_fd;  pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
@@ -2853,7 +2853,10 @@ int main(int argc, char **argv)
             break;
         }
 
-        if (poll(pfd, (nfds_t)(n + nsess), -1) < 0) {
+        /* -1 unless a backend has clock-driven work pending; see ops->tick. */
+        tmo = sess->ops->tick ? sess->ops->tick(sess) : -1;
+
+        if (poll(pfd, (nfds_t)(n + nsess), tmo) < 0) {
             if (errno == EINTR) {
                 continue;
             }

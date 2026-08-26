@@ -383,6 +383,18 @@ struct nb_session_ops {
     /* Clipboard.  OPTIONAL -- NULL on a backend that has no selection, in
      * which case clipboard is simply unavailable rather than half-working. */
     int  (*set_clipboard)(struct nb_session *s, const char *text, size_t len);
+    /*
+     * Do any work that has come DUE ON A CLOCK rather than on an event, and
+     * return the milliseconds until the next such deadline, or -1 for none.
+     * OPTIONAL.
+     *
+     * The main loop polls with an infinite timeout, which is right: it should
+     * sleep until something happens.  But a title-bar notice that expires
+     * after four seconds is something happening with no fd behind it, so
+     * without this it stayed on screen until an unrelated event redrew the
+     * bar -- a transient message that was not, in practice, transient.
+     */
+    int  (*tick)(struct nb_session *s);
     void (*notify_clipboard)(struct nb_session *s);
     /* Begin an asynchronous read of the host selection.  The backend captures
      * `generation`, queues content with nb_sink_send_clipboard(), then calls
