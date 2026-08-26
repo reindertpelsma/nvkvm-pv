@@ -408,6 +408,13 @@ static void x11_size_content(struct nb_x11 *x, int w, int h)
                          vals);
     x->con_w = w;
     x->con_h = h;
+    /*
+     * Repaint the letterbox NOW.  The background above makes the exposed area
+     * a colour, but X only paints it on expose, and shrinking a child does not
+     * always generate one for the parent.  Clearing explicitly is one request
+     * and removes the whole class of "stale pixels beside the guest".
+     */
+    xcb_clear_area(x->c, 0, x->win, 0, 0, 0, 0);
 }
 
 static int x11_commit(struct nb_session *s, struct nb_sink *sink)
@@ -1111,8 +1118,19 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
 
     /* The toplevel: input, focus, grab, fullscreen. */
     x->win = xcb_generate_id(x->c);
-    mask = XCB_CW_EVENT_MASK;
-    vals[0] = XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
+    /*
+     * A BACKGROUND, so the letterbox is a colour and not whatever was last on
+     * screen.  X does not clear a parent when a child shrinks, and the content
+     * child is exactly that -- letterboxed inside this window at the guest's
+     * mode size.  Without a background, narrowing the guest left the newly
+     * exposed columns holding stale pixels: REPORTED as "left/right resize
+     * leaves glitches, top/bottom resize is clean and repairs them", which is
+     * precisely the asymmetry, because only a width change exposes new area
+     * that nothing else happens to repaint.
+     */
+    mask = XCB_CW_BACK_PIXEL | XCB_CW_EVENT_MASK;
+    vals[0] = x->screen->black_pixel;
+    vals[1] = XCB_EVENT_MASK_KEY_PRESS | XCB_EVENT_MASK_KEY_RELEASE |
               XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
               XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_ENTER_WINDOW |
               XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE |
