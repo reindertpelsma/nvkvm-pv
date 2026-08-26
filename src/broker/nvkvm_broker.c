@@ -1538,10 +1538,24 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             s->clip_in_bad = true;  /* a mode, not a protocol violation */
         }
-        if (!s->focused) {
-            s->clip_in_bad = true;
-        }
+        /*
+         * NOT FOCUSED IS NOT A REASON TO DISCARD.  It used to be, silently:
+         * the text was dropped here, before the backend ever saw it, with no
+         * log and no title-bar notice -- so a copy in the guest simply did
+         * nothing and nothing said why.  Worse, the guest believes the copy
+         * succeeded, so nothing re-sends it; the text only reappears if the
+         * user copies something ELSE.
+         *
+         * The backend holds it instead and applies it on focus-in, which keeps
+         * the actual property this gate is for -- a background VM never
+         * silently replaces what you copied somewhere else -- without losing
+         * the copy.  See wl_set_clipboard().
+         */
         if (nb_clip_rate_exceeded(s)) {
+            /* Say so.  A silent rate-limit is indistinguishable from a bug,
+             * and this one discards a copy the user did make. */
+            nb_log("clipboard from the VM is arriving too fast; this one was "
+                   "dropped");
             s->clip_in_bad = true;
         }
         /* The cap is a count we keep and a checked sum, never a sender-supplied
@@ -1593,6 +1607,14 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                 if (ss->ops->notify_clipboard) {
                     ss->ops->notify_clipboard(ss);
                 }
+            } else if (r > 0) {
+                /* HELD, not applied: the window is not focused, so nothing has
+                 * been written to the user's clipboard yet.  No notice here --
+                 * the backend raises it when it applies the text on focus-in,
+                 * which is the first moment a title bar is something anyone
+                 * can read. */
+                nb_log("the VM copied %u bytes; holding them until the window "
+                       "is focused", len);
             } else {
                 nb_err("clipboard: backend '%s' rejected the VM's text: %s",
                        ss->ops->name, strerror(-r));

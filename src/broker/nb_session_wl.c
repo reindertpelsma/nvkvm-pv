@@ -1585,9 +1585,7 @@ static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
         free(w->clip_pending);
         w->clip_pending = copy;
         w->clip_pending_len = len;
-        nb_log("the VM copied %zu bytes; holding them until this window has "
-               "focus", len);
-        return 0;
+        return 1;               /* HELD -- see the ops contract */
     }
 
     if (w->source) {
@@ -2376,7 +2374,18 @@ static void kbd_enter(void *d, struct wl_keyboard *k, uint32_t serial,
                       struct wl_surface *s, struct wl_array *keys)
 {
     struct nb_wl *w = d;
-    (void)k; (void)serial; (void)s; (void)keys;
+    (void)k; (void)s; (void)keys;
+    /*
+     * KEYBOARD SERIALS COUNT TOO.  wl_data_device.set_selection needs a serial
+     * from a real input event, and only ptr_enter/ptr_button used to record
+     * one -- so a user working from the keyboard claimed the selection with
+     * whatever stale pointer serial was lying around, and the compositor
+     * silently ignored it.  That is why a guest copy "sometimes" did not
+     * reach the host clipboard, and why it failed most reliably right after a
+     * paste: Ctrl+V and Ctrl+C are both keyboard events, so neither refreshed
+     * the serial, and the one still on file had already been spent.
+     */
+    w->last_serial = serial;
     w->focused = true;
     if (w->sink) {
         nb_sink_focus(w->sink, true);
@@ -2398,7 +2407,9 @@ static void kbd_key(void *d, struct wl_keyboard *k, uint32_t serial,
                     uint32_t time, uint32_t key, uint32_t state)
 {
     struct nb_wl *w = d;
-    (void)k; (void)serial; (void)time;
+    (void)k; (void)time;
+
+    w->last_serial = serial;    /* see kbd_enter: set_selection needs a fresh one */
 
     /*
      * MODAL.  While the confirmation is up, no key reaches the guest --

@@ -382,6 +382,15 @@ struct nb_session_ops {
     void (*dismiss_dialog)(struct nb_session *s);
     /* Clipboard.  OPTIONAL -- NULL on a backend that has no selection, in
      * which case clipboard is simply unavailable rather than half-working. */
+    /*
+     * Put the guest's text on the host clipboard.
+     *   0   applied -- it IS the host clipboard now
+     *   1   HELD -- accepted, but not applied, because the window is not
+     *       focused.  The backend owns it and will apply it on focus-in, and
+     *       is responsible for the notice AT THAT MOMENT: a title-bar notice
+     *       raised while the window is unfocused is one nobody can see.
+     *   <0  -errno
+     */
     int  (*set_clipboard)(struct nb_session *s, const char *text, size_t len);
     /*
      * Do any work that has come DUE ON A CLOCK rather than on an event, and
