@@ -820,22 +820,31 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
     case NVKVM_BROKER_EV_SURFACE:
         RELAY_LOG("broker window is now %dx%d", p->x, p->y);
         /*
-         * FULLSCREEN ONLY, and that is a design rule rather than an
-         * optimisation.  A windowed resize must not reach the guest at all --
-         * the host scales the buffer it already has, and the guest goes on
-         * believing it is the same size, so nothing inside it reflows because
-         * someone dragged a window edge.  Fullscreen is the opposite case:
-         * propagating the size is exactly what makes the guest render at the
-         * output's resolution, which is 1:1 pixels and the precondition for
-         * the compositor scanning its buffer out directly.
+         * FORWARD EVERY HINT.  The broker decides what to suggest; this side
+         * carries it.
          *
-         * `delay` is true: entering fullscreen can produce more than one
-         * configure and only the last is worth a guest mode switch.  QEMU's
-         * own timer coalescing is the right tool and is already there.
+         * This used to fire only when the fullscreen flag was set, on the rule
+         * that "a windowed resize must not reach the guest at all -- the host
+         * scales the buffer it already has".  Two things were wrong with that.
+         *
+         * It stranded the guest on EXIT: leaving fullscreen clears the flag, so
+         * the hint that would have put the guest back to the windowed size was
+         * the one hint guaranteed to be discarded.  OBSERVED: the window
+         * returned to 2192x1237 while the guest stayed at the monitor's
+         * resolution, with no way back short of a re-mode from inside.
+         *
+         * And it put the policy in the wrong process.  Whether a windowed
+         * resize should re-mode the guest is exactly what --resolution answers,
+         * and the broker is where that flag lives; a second, hidden rule here
+         * could only disagree with it.  `--resolution none` is how someone asks
+         * for the old behaviour, and it now means it everywhere.
+         *
+         * `delay` stays true, and matters more now than it did: dragging a
+         * window edge produces a configure per motion event, and QEMU's timer
+         * coalescing is what turns that into one mode switch when the drag
+         * settles rather than a hundred during it.
          */
-        if (con && p->x > 0 && p->y > 0 &&
-            (p->flags & NVKVM_BROKER_F_FULLSCREEN) &&
-            dpy_ui_info_supported(con)) {
+        if (con && p->x > 0 && p->y > 0 && dpy_ui_info_supported(con)) {
             QemuUIInfo info = *dpy_get_ui_info(con);
 
             info.width  = (uint32_t)p->x;

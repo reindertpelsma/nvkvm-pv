@@ -432,7 +432,7 @@ struct nb_session *nb_session_open(const struct nb_config *cfg);
 /* Presentation tiers, worst-to-best fallback order.  See nb_common.c. */
 enum { NB_TIER_AUTO = 0, NB_TIER_NATIVE, NB_TIER_LINEAR, NB_TIER_SHM };
 /* Which resolution the broker SUGGESTS to the guest.  See nb_common.c. */
-enum { NB_RES_AUTO = 0, NB_RES_GUEST, NB_RES_FIXED };
+enum { NB_RES_AUTO = 0, NB_RES_NONE, NB_RES_FIXED };
 extern int      nb_res_mode;
 extern unsigned nb_res_w, nb_res_h;
 
