@@ -207,6 +207,7 @@ struct nb_wl {
     size_t                idle_sz;
     int                   idle_w, idle_h;
     bool                  idle_wanted;   /* show it as soon as configured */
+    bool                  client_attached; /* a VMM is connected, frames or not */
     bool                  idle_shown;
 
     struct zwp_keyboard_shortcuts_inhibit_manager_v1 *inhibit_mgr;
@@ -2244,8 +2245,14 @@ static int wl_idle_make(struct nb_wl *w, int wd, int ht)
     w->idle_sz = sz;
     w->idle_w  = wd;
     w->idle_h  = ht;
-    nb_placeholder_paint(px, (unsigned)wd, (unsigned)ht, (unsigned)wd,
-                         "NVKVM DISPLAY BROKER", "WAITING FOR A VM");
+    if (w->client_attached) {
+        nb_placeholder_paint(px, (unsigned)wd, (unsigned)ht, (unsigned)wd,
+                             "VM ATTACHED - NO PICTURE YET",
+                             "THE GUEST HAS NOT PRESENTED A FRAME");
+    } else {
+        nb_placeholder_paint(px, (unsigned)wd, (unsigned)ht, (unsigned)wd,
+                             "NVKVM DISPLAY BROKER", "WAITING FOR A VM");
+    }
     return 0;
 }
 
@@ -2275,15 +2282,32 @@ static void wl_notify_clipboard(struct nb_session *s)
  */
 /* Same contract as the X11 backend: a client that attaches after the edges
  * happened is told the current state rather than left guessing. */
+static int wl_show_idle(struct nb_session *s);
+
 static void wl_resync(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
 
+    /* Same trap as the X11 backend: resync runs at ATTACH, which can be before
+     * the first dispatch that assigns w->sink, and then this returns having
+     * re-emitted nothing.  Take it from the session. */
+    if (!w->sink) {
+        w->sink = s->sink;
+    }
     if (!w->sink) {
         return;
     }
     nb_sink_focus(w->sink, w->focused);
     wl_clip_flush_pending(w);
+    /*
+     * Name the state the user is actually looking at.  A guest that is attached
+     * but has never presented is not "waiting for a VM" -- the VM is right
+     * there and silent, which is a different thing to go and debug.
+     */
+    w->client_attached = true;
+    if (w->idle_wanted || w->idle_shown) {
+        wl_show_idle(s);
+    }
 }
 
 static int wl_tick(struct nb_session *s)

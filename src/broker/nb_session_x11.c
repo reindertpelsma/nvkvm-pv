@@ -634,6 +634,22 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         x11_cursor_policy(x);
         /* PutImage copies, so the buffer is the guest's again immediately. */
         nb_sink_release(sink, sl->id);
+        /*
+         * AND PACE THE NEXT FRAME.  On the dma-buf path this comes from
+         * Present's CompleteNotify, which the shm tier deliberately never
+         * selects for -- so without this there is NO source of FRAME events at
+         * all and the VMM waits forever for permission to draw the next one.
+         *
+         * MEASURED: the guest froze the instant it began presenting, with QEMU
+         * so wedged its main loop stopped answering QMP and the vCPU burned
+         * zero ticks.  It looked exactly like a bootloader hang, and cost a
+         * long detour through GRUB before the missing pacing turned up here.
+         *
+         * Immediately, not on a vblank: PutImage has already copied the pixels
+         * and there is no flip to wait for.  Wayland's shm tier stays smooth
+         * for the same reason -- its frame callbacks keep firing.
+         */
+        nb_sink_frame(sink);
         return 0;
     }
 
