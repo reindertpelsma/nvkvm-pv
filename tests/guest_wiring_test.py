@@ -82,6 +82,7 @@ assert "NVKVM_UVM_REGISTER_GPU_FD_OFF" in qemu_isolate
 stub = (ROOT / "src/stub/nvkvm_stub.c").read_text(encoding="utf-8")
 assert "case NVKVM_STUB_UVM_REGISTER_GPU:" in stub
 assert "UVM_REGISTER_GPU_PARAMS rmCtrlFd moved" in stub
+proto = (ROOT / "src/common/nvkvm_proto.h").read_text(encoding="utf-8")
 assert "#define NVKVM_PROTO_VERSION     3" in proto
 assert "REALIZE REGISTER_GPU replay size drifted" in stub
 

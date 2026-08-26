@@ -594,7 +594,7 @@ own protocol, not NVIDIA ABI.
 | guest module, installed kernels 7.0.0-29 and 7.0.0-30, `NVKVM_GRAPHICS=0` | pass; directly closes the linked CI failure mode |
 | ABI parity | pass; includes the pre-545 common-prefix regression and universal REGISTER_GPU size/fd/status offsets |
 | VMA lifetime reproducer | warning-clean compilation; execution requires nvkvm GPU hardware |
-| broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 43/43, adopted socket, clipboard and lifecycle suites |
+| broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 46/46, adopted socket, clipboard and lifecycle suites |
 | rental safety harness | pass: 73/73 offline cases |
 | ShellCheck 0.10 at blocking severity | pass |
 
