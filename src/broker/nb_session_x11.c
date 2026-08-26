@@ -135,6 +135,7 @@ struct nb_x11 {
     int  win_w, win_h;              /* toplevel size, from ConfigureNotify    */
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
+    bool ptr_inside;            /* pointer is over the CONTENT window     */
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
@@ -638,11 +639,20 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             break;
         }
         case XCB_ENTER_NOTIFY:
-            nb_sink_pointer(sink, true);
+            /* Deliberately NOT asserting "inside" here: entering the toplevel
+             * may mean entering the letterbox.  Motion decides, above. */
             break;
-        case XCB_LEAVE_NOTIFY:
-            nb_sink_pointer(sink, false);
+        case XCB_LEAVE_NOTIFY: {
+            xcb_leave_notify_event_t *l = (void *)ev;
+
+            /* NotifyInferior means the pointer moved from this window INTO its
+             * own child -- the content window.  That is not leaving. */
+            if (l->detail != XCB_NOTIFY_DETAIL_INFERIOR && x->ptr_inside) {
+                x->ptr_inside = false;
+                nb_sink_pointer(sink, false);
+            }
             break;
+        }
         case XCB_KEY_PRESS:
         case XCB_KEY_RELEASE: {
             xcb_key_press_event_t *k = (void *)ev;
@@ -656,6 +666,24 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
              */
             x->last_time = k->time;
 
+            /*
+             * RECEIVING A KEY IS PROOF OF FOCUS.  The X server only routes key
+             * events to the focus window, so if we are holding one and still
+             * believe we are unfocused, our belief is what is wrong.
+             *
+             * That happens for real: FocusIn is edge-triggered, openbox
+             * focuses a window when it maps -- before the VM has connected --
+             * and comparing GetInputFocus against our own window id fails
+             * under a REPARENTING window manager, which is most of them.
+             * MEASURED: CTRL+ALT+G toggled the grab (handled before the focus
+             * gate) while no key or pointer event ever reached the guest, and
+             * the log carried not one "window active" line.
+             */
+            if (!x->focused) {
+                x->focused = true;
+                nb_sink_focus(sink, true);
+                x11_clip_flush_pending(x);
+            }
             nb_sink_key(sink, x11_kc_to_evdev(k->detail),
                         (ev->response_type & 0x7f) == XCB_KEY_PRESS);
             break;
@@ -685,9 +713,37 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
         }
         case XCB_MOTION_NOTIFY: {
             xcb_motion_notify_event_t *m = (void *)ev;
+            int cx = m->event_x, cy = m->event_y;
 
-            nb_sink_abs(sink, m->event_x, m->event_y,
-                        (unsigned)x->win_w, (unsigned)x->win_h);
+            /*
+             * Map into the CONTENT window, which is the guest's framebuffer.
+             * Motion arrives from whichever window it happened over, and the
+             * content child is letterboxed inside the toplevel -- so reporting
+             * toplevel coordinates against the toplevel size put the guest
+             * pointer at the wrong place by exactly the letterbox offset, and
+             * scaled it wrongly too.
+             */
+            if (m->event != x->content) {
+                cx -= (x->win_w - x->con_w) / 2;
+                cy -= (x->win_h - x->con_h) / 2;
+            }
+            if (x->con_w <= 0 || x->con_h <= 0) {
+                break;
+            }
+            if (cx < 0 || cy < 0 || cx >= x->con_w || cy >= x->con_h) {
+                /* Over the letterbox, not over the guest. */
+                if (x->ptr_inside) {
+                    x->ptr_inside = false;
+                    nb_sink_pointer(sink, false);
+                }
+                break;
+            }
+            /* Motion over the content IS the pointer being inside it. */
+            if (!x->ptr_inside) {
+                x->ptr_inside = true;
+                nb_sink_pointer(sink, true);
+            }
+            nb_sink_abs(sink, cx, cy, (unsigned)x->con_w, (unsigned)x->con_h);
             break;
         }
         case XCB_CONFIGURE_NOTIFY: {
@@ -1362,26 +1418,47 @@ static void x11_resync(struct nb_session *s)
     }
     f = xcb_get_input_focus_reply(x->c, xcb_get_input_focus(x->c), NULL);
     if (f) {
-        /* Focus sits on the toplevel, or on a descendant of it when a child
-         * holds it; both mean this window has the keyboard. */
-        x->focused = (f->focus == x->win || f->focus == x->content);
+        /*
+         * WALK UP, do not compare ids.  Under a reparenting window manager --
+         * which is nearly all of them, openbox included -- the focus window is
+         * our window, but it may equally be a frame the WM wrapped around it,
+         * and a bare `focus == win` test then answers "not focused" forever.
+         */
+        xcb_window_t w = f->focus;
+        int hops = 0;
+
+        x->focused = false;
+        while (w != XCB_WINDOW_NONE && hops++ < 8) {
+            if (w == x->win || w == x->content) {
+                x->focused = true;
+                break;
+            }
+            xcb_query_tree_reply_t *t =
+                xcb_query_tree_reply(x->c, xcb_query_tree(x->c, w), NULL);
+            if (!t) {
+                break;
+            }
+            w = (t->parent == t->root) ? XCB_WINDOW_NONE : t->parent;
+            free(t);
+        }
         free(f);
         nb_sink_focus(x->sink, x->focused);
     }
-    q = xcb_query_pointer_reply(x->c, xcb_query_pointer(x->c, x->win), NULL);
-    if (q) {
-        bool inside = q->same_screen && q->child != XCB_WINDOW_NONE
-                      ? true
-                      : (q->win_x >= 0 && q->win_y >= 0 &&
-                         q->win_x < x->win_w && q->win_y < x->win_h);
+    q = xcb_query_pointer_reply(x->c, xcb_query_pointer(x->c, x->content),
+                                NULL);
+    if (q && x->con_w > 0 && x->con_h > 0) {
+        bool inside = q->same_screen &&
+                      q->win_x >= 0 && q->win_y >= 0 &&
+                      q->win_x < x->con_w && q->win_y < x->con_h;
 
+        x->ptr_inside = inside;
         nb_sink_pointer(x->sink, inside);
         if (inside) {
             nb_sink_abs(x->sink, q->win_x, q->win_y,
-                        (unsigned)x->win_w, (unsigned)x->win_h);
+                        (unsigned)x->con_w, (unsigned)x->con_h);
         }
-        free(q);
     }
+    free(q);
     x11_clip_flush_pending(x);
 }
 
