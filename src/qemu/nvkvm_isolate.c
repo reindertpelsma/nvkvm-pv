@@ -39,7 +39,6 @@
  * security test in tests/security/uid_isolate_test.c exercises the same code
  * this device runs, not a copy of it). */
 #include "nvkvm_isolate_uid.h"
-#include "nvkvm_uidmap.h"
 
 #ifndef MS_REC
 #define MS_REC      16384
@@ -405,6 +404,7 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 #include "virtio_nvgpu.h"
 #include "nvkvm_present_egl.h"   /* S-4: nvkvm_present_forget_isolate() */
 
+#include "../../src/common/nvkvm_uidmap.h"
 #include "../../src/common/nvkvm_isolate_proto.h"
 #include "../../src/common/nvkvm_ring.h"
 
