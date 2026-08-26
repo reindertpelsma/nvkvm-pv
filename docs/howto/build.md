@@ -303,9 +303,10 @@ default launch this `make` fails with a read-only filesystem error. That is
 deliberate: a writable export is a guest-root → host-root path, so it is opt-in
 and announced.
 
-`scripts/setup_guest.sh` arranges for cloud-init to do exactly this on first
-boot (`scripts/setup_guest.sh:86-89`), including installing
-`linux-headers-virtual` (`:80`).
+`scripts/setup_guest.sh` instead copies the read-only source into a private
+temporary directory before building, both on first boot and later boots
+(`scripts/setup_guest.sh:277-316`). Cloud-init installs headers matching the
+running kernel, with distro-specific fallbacks (`:349-359`).
 
 Unload is `sudo rmmod nvkvm_guest` — note the underscore; the module file is
 `nvkvm-guest.ko` but the module name is `nvkvm_guest`.

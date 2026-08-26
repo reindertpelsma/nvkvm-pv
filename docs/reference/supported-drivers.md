@@ -390,7 +390,7 @@ disabled on the host. `NVKVM_ISOLATE_NO_HARDEN=1` skips all of it
 
 The guest module is an out-of-tree kernel module built against the running guest
 kernel's headers (`src/guest/Makefile:1`). It was developed and tested against
-Ubuntu 24.04 / kernel 6.8 (`scripts/setup_guest.sh:16`, `:80`).
+Ubuntu 24.04 / kernel 6.8 (`scripts/setup_guest.sh:4-5`).
 
 Two guest-side kernel dependencies are worth knowing about:
 

@@ -71,6 +71,9 @@ jobs:
       - name: paid-sweep GPU quiesce wiring
         run: python3 tests/sweep_matrix_offline_test.py
 
+      - name: guest cloud-image cache interruption safety
+        run: bash tests/setup_guest_image_offline_test.sh
+
       # run_tests.sh, not `make run`.  `make run` exits non-zero by design --
       # test_isolate fails 5 of its 7 cases at runtime on pre-existing API
       # drift -- which makes it useless as a pass/fail signal.  run_tests.sh
