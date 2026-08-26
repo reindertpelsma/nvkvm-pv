@@ -48,6 +48,11 @@ struct VirtIONvgpu;
  */
 int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier);
 
+bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t stride, uint32_t fourcc,
+                                      uint64_t modifier, bool shm);
+
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                                 uint32_t width, uint32_t height,
                                 uint32_t stride, uint32_t fourcc,

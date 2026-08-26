@@ -329,6 +329,22 @@ enum {
     NVKVM_BROKER_CMD_QUERY_FORMAT = 6,
 };
 
+/*
+ * ATTACH flags.
+ *
+ * F_SHM says the fd is a memfd to be presented through wl_shm, not a dma-buf.
+ * DECLARED rather than sniffed from the fd type: a memfd is a legitimate
+ * carrier for other things -- the broker's own test client sends one for every
+ * frame -- so inferring intent from st.f_type misclassifies honest clients.
+ * The broker still CHECKS that the fd really is a memfd when this is set; the
+ * flag states intent, the check enforces it.
+ *
+ * The field was `reserved0`, always zero, so an older client reads as "not
+ * shm", which is what it meant.
+ */
+#define NVKVM_BROKER_CMD_F_SHM (1u << 0)
+#define NVKVM_BROKER_CMD_F_ALL NVKVM_BROKER_CMD_F_SHM
+
 /* NVKVM_BROKER_CMD_CAPS `width` bits. */
 #define NVKVM_BROKER_CLIENT_CLIPBOARD (1u << 0)
 
@@ -339,7 +355,7 @@ enum {
  */
 struct nvkvm_broker_cmd {
     uint16_t type;      /* NVKVM_BROKER_CMD_*                       offset  0 */
-    uint16_t reserved0; /* must be 0                                        2 */
+    uint16_t flags;     /* NVKVM_BROKER_CMD_F_*; 0 for every older client   2 */
     uint32_t width;     /*                                                  4 */
     uint32_t height;    /*                                                  8 */
     uint32_t stride;    /* bytes per row of plane 0                        12 */
@@ -354,7 +370,7 @@ struct nvkvm_broker_cmd {
  * `type` and `reserved0` in the same places. */
 struct nvkvm_broker_clip_cmd {
     uint16_t type;      /* NVKVM_BROKER_CMD_CLIPBOARD */
-    uint16_t reserved0; /* must be 0                  */
+    uint16_t flags;     /* must be 0 on this layout   */
     uint32_t chunk;     /* 0-based; bounded by the receiver's own count */
     uint32_t reserved1; /* must be 0                  */
     uint8_t  info;      /* NVKVM_BROKER_CLIP_NBYTES / _LAST */

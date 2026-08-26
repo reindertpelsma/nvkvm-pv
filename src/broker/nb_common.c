@@ -145,13 +145,37 @@ const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
  * DRM_FORMAT_MOD_INVALID is dropped too: implicit modifiers mean "whatever the
  * driver chose", which is exactly the uncertainty this option exists to remove.
  */
+/*
+ * Which presentation tier the broker will offer.  ONE ordered option rather
+ * than a flag per tier: the tiers are a fallback LADDER, so the only sensible
+ * restriction is naming one rung, and six booleans would give sixty-four states
+ * of which most are meaningless ("--no-linear --linear-only").
+ *
+ *   NB_TIER_AUTO   walk the ladder: the guest's own modifier, then LINEAR
+ *                  dma-buf, then wl_shm.  The default.
+ *   NB_TIER_NATIVE advertise only what the display really offers; no LINEAR
+ *                  narrowing.  Zero-copy or nothing.
+ *   NB_TIER_LINEAR advertise only DRM_FORMAT_MOD_LINEAR, forcing the VMM to
+ *                  detile.  Reproduces a cross-vendor host on a single-GPU one.
+ *   NB_TIER_SHM    refuse dma-buf outright, so only shared memory is left.
+ *                  Slowest and universal; the honest floor.
+ */
+int nb_tier = NB_TIER_AUTO;
+
+/* Back-compat: --linear-only is the old spelling of --present-mode=linear. */
 bool nb_linear_only;
 
 void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier)
 {
     unsigned i;
 
-    if (nb_linear_only && modifier != 0) {
+    /* LINEAR tier: hide every vendor modifier so the VMM must detile. */
+    if ((nb_linear_only || nb_tier == NB_TIER_LINEAR) && modifier != 0) {
+        return;
+    }
+    /* SHM tier: advertise no dma-buf format at all.  The VMM then has nothing
+     * left but a memfd, which is exactly the point. */
+    if (nb_tier == NB_TIER_SHM) {
         return;
     }
 

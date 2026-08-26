@@ -169,6 +169,10 @@ struct nb_buf_desc {
     uint32_t width, height, stride, offset, fourcc;
     uint64_t modifier;
     uint32_t bpp;               /* bytes per pixel implied by fourcc          */
+    bool     is_shm;            /* the fd is a memfd, not a dma-buf: the only
+                                 * buffer type a Wayland compositor CANNOT
+                                 * refuse, so it is the universal last tier
+                                 * when even LINEAR dma-buf import fails      */
     uint32_t seq;               /* the client's own frame counter (cmd.seq).
                                  * ADVISORY — it comes from the untrusted VMM
                                  * and is used for nothing but log lines, so a
@@ -425,8 +429,10 @@ struct nb_session *nb_session_open(const struct nb_config *cfg);
 /* Bytes per pixel for the single-plane 32-bit formats the nvkvm head can
  * flip, or 0 for anything else.  0 means "reject": a format whose pitch we
  * cannot compute is a format whose bounds we cannot check. */
-/* --linear-only: advertise only DRM_FORMAT_MOD_LINEAR.  See nb_common.c. */
-extern bool nb_linear_only;
+/* Presentation tiers, worst-to-best fallback order.  See nb_common.c. */
+enum { NB_TIER_AUTO = 0, NB_TIER_NATIVE, NB_TIER_LINEAR, NB_TIER_SHM };
+extern int  nb_tier;
+extern bool nb_linear_only;   /* deprecated alias for NB_TIER_LINEAR */
 
 uint32_t nb_fourcc_bpp(uint32_t fourcc);
 /* The opaque twin of an alpha format (AR24->XR24), or 0 if there is none.

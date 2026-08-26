@@ -506,6 +506,20 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                                 uint32_t stride, uint32_t fourcc,
                                 uint64_t modifier)
 {
+    return nvkvm_display_relay_submit_flags(nv, dmabuf_fd, width, height,
+                                            stride, fourcc, modifier, false);
+}
+
+/*
+ * `shm` declares that the fd is a memfd to be shown through wl_shm rather than
+ * imported as a dma-buf.  Declared, not inferred: the broker enforces that the
+ * fd really is a memfd, but it must not have to GUESS what the VMM meant.
+ */
+bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t stride, uint32_t fourcc,
+                                      uint64_t modifier, bool shm)
+{
     NvkvmRelay *r = nvkvm_relay;
     struct nvkvm_broker_cmd cmd;
     uint32_t cmd_seq = 0;
@@ -585,6 +599,7 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = NVKVM_BROKER_CMD_ATTACH;
+    cmd.flags = shm ? NVKVM_BROKER_CMD_F_SHM : 0;
     cmd.width = width;
     cmd.height = height;
     cmd.stride = stride;

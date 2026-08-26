@@ -144,6 +144,9 @@ struct nb_wl_buf {
 
 /* Distinct pairs whose importability we remember.  Two occur in practice:
  * the guest's own tiling and the LINEAR fallback. */
+/* DRM_FORMAT_ARGB8888, spelled locally like the XR24 one. */
+#define NB_FOURCC_AR24_LOCAL 0x34325241u
+
 #define NB_PROVEN_SLOTS 4
 
 struct nb_wl {
@@ -595,6 +598,65 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
     }
     if (victim < 0) {
         return -ENOSPC;         /* cannot happen with NB_MAX_BUFS >= 3 */
+    }
+
+    /*
+     * TIER 3: SHARED MEMORY.  The VMM sends a memfd when the dma-buf tiers have
+     * been refused.  wl_shm is a core Wayland global -- every compositor must
+     * implement it -- so this cannot fail for want of import support, which is
+     * exactly why it is the floor under a display that advertises a modifier it
+     * will not bind.  It costs the compositor an upload per frame; that is the
+     * price of universality and the reason the VMM tries it last.
+     *
+     * No modifier is involved and none was checked: shm is linear by
+     * definition, and the geometry bounds nb_validate_desc() already enforced
+     * are what keep the compositor from reading past the mapping.
+     */
+    if (d->is_shm) {
+        struct wl_shm_pool *pool;
+        struct wl_buffer *sb;
+        size_t need = (size_t)d->stride * d->height + d->offset;
+
+        if (!w->shm) {
+            nb_err("ATTACH: this compositor offers no wl_shm, so there is no "
+                   "buffer type left to try");
+            return -EINVAL;
+        }
+        pool = wl_shm_create_pool(w->shm, d->fd, (int32_t)need);
+        if (!pool) {
+            return -EIO;
+        }
+        sb = wl_shm_pool_create_buffer(pool, (int32_t)d->offset,
+                                       (int32_t)d->width, (int32_t)d->height,
+                                       (int32_t)d->stride,
+                                       d->fourcc == NB_FOURCC_AR24_LOCAL
+                                           ? WL_SHM_FORMAT_ARGB8888
+                                           : WL_SHM_FORMAT_XRGB8888);
+        wl_shm_pool_destroy(pool);
+        if (!sb) {
+            return -EIO;
+        }
+        {
+            static bool told;
+
+            if (!told) {
+                told = true;
+                nb_log("presenting through wl_shm: the display refused every "
+                       "dma-buf layout offered, so frames are shared as plain "
+                       "memory.  This works everywhere and costs the "
+                       "compositor one upload per frame.");
+            }
+        }
+        wl_buf_destroy(w, victim);
+        w->bufs[victim] = (struct nb_wl_buf){
+            .valid = true, .id = d->id, .buf = sb,
+            .w = d->width, .h = d->height, .stride = d->stride,
+            .offset = d->offset, .fourcc = d->fourcc, .modifier = d->modifier,
+            .used = w->tick, .owner = w, .seq = d->seq,
+        };
+        wl_buffer_add_listener(sb, &buf_listener, &w->bufs[victim]);
+        w->pending = victim;
+        return 0;
     }
 
     /*
@@ -3566,6 +3628,23 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                                       "under grab); ");
     }
     nb_formats_log(&w->formats, "the compositor");
+
+    /*
+     * ACCEPT SHARED MEMORY TOO.
+     *
+     * wl_shm is a core Wayland global that every compositor must implement, so
+     * a shm buffer is the one thing a display CANNOT refuse.  That makes it the
+     * universal last tier for the VMM, after a display has advertised a
+     * modifier it then would not import -- MEASURED on GNOME/Mutter with
+     * NVIDIA 595.84, which advertises XR24+LINEAR through
+     * eglQueryDmaBufModifiersEXT and answers the import with "Could not bind
+     * the given EGLImage to a CoglTexture2D".
+     *
+     * It costs the compositor an upload per frame, which is why it is the LAST
+     * tier and not the first.  The VMM only reaches for it when the dma-buf
+     * tiers have been refused.
+     */
+    s->accept_memfd = true;
     return 0;
 
 fail:

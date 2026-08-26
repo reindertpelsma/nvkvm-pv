@@ -22,6 +22,11 @@
  *   --query-format     ask CMD_QUERY_FORMAT about three pairs and print the
  *                      answers: one advertised, one only via its opaque twin,
  *                      one NVIDIA block-linear that no test display can take
+ *   --shm              declare the buffer as shared memory (F_SHM).  The client
+ *                      always sends a memfd; this says to PRESENT it as one,
+ *                      which no compositor can refuse
+ *   --unadvertised-mod send a modifier no display advertises.  With --shm the
+ *                      frame must still be presented: shm carries no modifier
  *   --alpha-fourcc     send AR24 where only its opaque twin XR24 is
  *                      advertised: must be ACCEPTED and shown as XR24
  *   --bad-dim          claim dimensions past NVKVM_BROKER_MAX_DIM
@@ -132,7 +137,7 @@ int main(int argc, char **argv)
     int sock, i;
     unsigned pw = 0, ph = 0, ww = 0, wh = 0;
     int bad_size = 0, bad_fourcc = 0, bad_dim = 0, bad_fd = 0, bad_frame = 0;
-    int alpha_fourcc = 0, query_format = 0;
+    int alpha_fourcc = 0, query_format = 0, unadv_mod = 0, shm_mode = 0;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
     int quiet_after = 0, caps_clipboard = 0;
 
@@ -158,6 +163,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--bad-fourcc"))   { bad_fourcc = 1; }
         else if (!strcmp(a, "--alpha-fourcc")) { alpha_fourcc = 1; }
         else if (!strcmp(a, "--query-format")) { query_format = 1; }
+        else if (!strcmp(a, "--unadvertised-mod")) { unadv_mod = 1; }
+        else if (!strcmp(a, "--shm")) { shm_mode = 1; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
         else if (!strcmp(a, "--bad-frame"))    { bad_frame = 1; }
@@ -345,6 +352,16 @@ int main(int argc, char **argv)
             if (bad_fourcc) {
                 c.fourcc = FOURCC('N', 'V', '1', '2');
                 printf("  -> ATTACH claiming an unadvertised fourcc\n");
+            }
+            if (shm_mode) {
+                c.flags = NVKVM_BROKER_CMD_F_SHM;
+                printf("  -> ATTACH declaring F_SHM (shared memory)\n");
+            }
+            if (unadv_mod) {
+                /* NVIDIA block-linear: never advertised by the test backend.
+                 * The fd is a memfd, so the shm tier must take it regardless. */
+                c.modifier = 0x0300000000606014ull;
+                printf("  -> ATTACH memfd carrying an unadvertised modifier\n");
             }
             if (alpha_fourcc) {
                 /* Only XR24 is advertised by the test backend.  AR24 is the

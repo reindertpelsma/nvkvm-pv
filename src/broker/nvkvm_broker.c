@@ -1069,6 +1069,9 @@ void nb_sink_bye(struct nb_sink *s, int reason)
  * all and exists precisely so the accept side of this validator can be
  * exercised without a GPU.  It is unreachable from --backend auto.
  */
+#define NB_FOURCC_XR24 0x34325258u
+#define NB_FOURCC_AR24 0x34325241u
+
 static bool nb_fd_is_dmabuf(int fd, bool allow_memfd)
 {
     struct statfs sfs;
@@ -1166,6 +1169,25 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         nb_err("ATTACH: the fd is not a dma-buf");
         return -EINVAL;
     }
+    /*
+     * The VMM DECLARES shared memory; it is not inferred from the fd.  A memfd
+     * is a legitimate carrier for other things (the test client sends one every
+     * frame), so sniffing st.f_type would misread honest clients as asking for
+     * a tier they never requested.
+     *
+     * The declaration is then ENFORCED: a client that claims shm must really
+     * hand over a memfd, or the broker would map something else into a wl_shm
+     * pool on the strength of an assertion from an untrusted VMM.
+     */
+    d->is_shm = (c->flags & NVKVM_BROKER_CMD_F_SHM) != 0;
+    if (d->is_shm) {
+        struct statfs sfs;
+
+        if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC) {
+            nb_err("ATTACH: F_SHM was set but the fd is not a memfd");
+            return -EINVAL;
+        }
+    }
     /* HARDENING 2: same bound as NVKVM_PRESENT_MAX_DIM in the VMM, restated
      * here because the VMM is the attacker in this model. */
     if (c->width == 0 || c->height == 0 ||
@@ -1175,8 +1197,38 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         return -EINVAL;
     }
     /* HARDENING 3: not a hardcoded list — what the GPU advertises.  Shared
-     * with CMD_QUERY_FORMAT so the promise and the frame cannot disagree. */
-    if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
+     * with CMD_QUERY_FORMAT so the promise and the frame cannot disagree.
+     * Not applicable to shm, which carries no modifier. */
+    /*
+     * For shm the MODIFIER is not a question -- shared memory is linear by
+     * definition and carries none -- but the FOURCC still is: the broker has to
+     * map it to a WL_SHM_FORMAT, and a format nothing advertises is one it
+     * cannot present.  So ask the same resolver the same way, about LINEAR.
+     * Skipping the check entirely (which the first version of this did) also
+     * silently disabled the NV12 rejection and the opaque-twin substitution for
+     * every shm client.
+     */
+    fourcc = c->fourcc;
+    /*
+     * SHM IS A SEPARATE ADVERTISEMENT CHANNEL.  Wayland announces shm formats
+     * with wl_shm.format events, not through zwp_linux_dmabuf_v1, so validating
+     * a memfd against the dma-buf table is the wrong question -- and under
+     * --present-mode=shm that table is deliberately empty, which would reject
+     * every frame.
+     *
+     * What must be true is that we can name the format to wl_shm at all.  Only
+     * the two 32-bit layouts the guest head flips are mapped, and requiring
+     * that keeps the NV12-style rejection that the dma-buf path gets from its
+     * own gate.  No modifier is involved: shm is linear by definition.
+     */
+    if (d->is_shm) {
+        if (fourcc != NB_FOURCC_XR24 && fourcc != NB_FOURCC_AR24) {
+            nb_err("ATTACH: fourcc %s cannot be presented as shared memory; "
+                   "only XR24 and AR24 are mapped to wl_shm formats",
+                   nb_fourcc_name(fourcc, fcc));
+            return -EINVAL;
+        }
+    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
         /*
          * Name the VENDOR.  A rejection that lists only the pair reads as
          * "one entry is missing"; when the vendor differs from everything
@@ -1277,7 +1329,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     int r;
 
     /*
-     * reserved0 ONLY, and that is not a shortcut.
+     * FLAGS (was reserved0) ONLY, and that is not a shortcut.
      *
      * This check used to cover reserved1 as well, which was correct while
      * every command shared one layout.  CLIPBOARD does not: its payload runs
@@ -1286,17 +1338,17 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
      * payload bytes were non-zero was rejected as a malformed header.  Found
      * by the hostile-client harness, which sent 27 bytes of 'A'.
      *
-     * reserved0 is at the same offset and means the same thing in BOTH
+     * flags is at the same offset and means the same thing in BOTH
      * layouts, so it stays here.  reserved1 belongs to the layouts that
      * actually have it, and is checked in their own cases -- the alternative
      * is a control keyed on a layout that is no longer universal, which is how
      * A-1 and R-1 happened.
      */
-    if (c->reserved0 != 0) {
+    if ((c->flags & ~(uint16_t)NVKVM_BROKER_CMD_F_ALL) != 0) {
         if (fd >= 0) {
             close(fd);
         }
-        nb_violation(s, "reserved0 is not zero");
+        nb_violation(s, "unknown bits set in the command flags");
         return;
     }
 
@@ -2135,12 +2187,18 @@ static void usage(void)
 "                       chosen from a MENU cannot be caught this way\n"
 "  --trace-frames       log one line per commit: frame counter, dma-buf\n"
 "                       inode, cache slot, buffers the compositor still holds\n"
-"  --linear-only        advertise ONLY DRM_FORMAT_MOD_LINEAR, so the VMM must\n"
-"                       read frames back into a linear buffer instead of\n"
-"                       handing over the guest's native tiling.  Use it to\n"
-"                       reproduce a cross-vendor host on a single-GPU one, or\n"
-"                       when a compositor advertises a modifier it then fails\n"
-"                       to import.  Costs one GPU transfer per frame.\n"
+"  --present-mode=MODE  which presentation tier to offer.  The tiers are a\n"
+"                       fallback ladder, cheapest first:\n"
+"                         auto    (default) the guest's own modifier if the\n"
+"                                 display takes it, else a LINEAR dma-buf, else\n"
+"                                 shared memory\n"
+"                         native  zero-copy or nothing\n"
+"                         linear  advertise only LINEAR, forcing the VMM to\n"
+"                                 detile.  Reproduces a cross-vendor host on a\n"
+"                                 single-GPU one.  Costs one GPU transfer\n"
+"                         shm     no dma-buf at all: plain shared memory, which\n"
+"                                 no compositor can refuse.  Slowest, universal\n"
+"  --linear-only        deprecated alias for --present-mode=linear\n"
 "  --verbose\n"
 "\n"
 "The broker owns the window, the compositor connection and the input grab.\n"
@@ -2372,6 +2430,17 @@ int main(int argc, char **argv)
             if (add_group(&cfg, v)) { return 2; } }
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
         else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }
+        else if (!strncmp(a, "--present-mode=", 15)) {
+            const char *v = a + 15;
+            if      (!strcmp(v, "auto"))   { nb_tier = NB_TIER_AUTO;   }
+            else if (!strcmp(v, "native")) { nb_tier = NB_TIER_NATIVE; }
+            else if (!strcmp(v, "linear")) { nb_tier = NB_TIER_LINEAR; }
+            else if (!strcmp(v, "shm"))    { nb_tier = NB_TIER_SHM;    }
+            else {
+                nb_err("--present-mode must be auto, native, linear or shm");
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
         else if (!strcmp(a, "--persist"))    { cfg.persist = true; }

@@ -179,6 +179,32 @@ run_case '' --present 320x240 --query-format
 check   "without it, both advertised pairs are kept" \
         'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
 
+# TIER 3: a memfd must be accepted and presented through wl_shm.  This is the
+# floor under a display that advertises a modifier it will not import, so it
+# must work with NO modifier agreement at all -- even under --linear-only.
+# --present-mode names one rung of the fallback ladder.  Each must narrow what
+# is advertised, and `shm` must leave nothing at all -- that is what forces the
+# VMM onto shared memory, the one buffer type a compositor cannot refuse.
+BROKER_EXTRA=--present-mode=native
+run_case '' --present 320x240
+check   "--present-mode=native keeps every advertised pair" \
+        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
+BROKER_EXTRA=--present-mode=linear
+run_case '' --present 320x240
+check   "--present-mode=linear narrows to LINEAR alone" \
+        'advertises 1 \(format, modifier\) pair' "$CASE_LOG"
+BROKER_EXTRA=--present-mode=shm
+run_case '' --present 320x240
+check   "--present-mode=shm advertises no dma-buf format at all" \
+        'advertises 0 \(format, modifier\) pairs' "$CASE_LOG"
+run_case '' --present 320x240 --shm
+check   "and an F_SHM frame is still presented" 'TEST attach' "$CASE_LOG"
+BROKER_EXTRA=
+
+run_case '' --present 320x240 --shm --unadvertised-mod
+check   "an F_SHM frame is accepted despite an unadvertised modifier" 'TEST attach' "$CASE_LOG"
+nocheck "and is not rejected for that modifier" 'not advertised by' "$CASE_LOG"
+
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"
 nocheck "and do not reach attach"                     'TEST attach'     "$CASE_LOG"

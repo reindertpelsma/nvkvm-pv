@@ -1412,11 +1412,37 @@ static void nvkvm_present_bh(void *opaque)
 
         if (have && p->stage_buf[idx].size) {
             /*
-             * dup(): relay_submit takes ownership of the fd it is given and
-             * retains it as the last frame, but this one is ours for the life
-             * of the staging pair and gets reused every frame.
+             * TIER 3.  If the display has told us it cannot take even
+             * XR24 + LINEAR as a dma-buf -- which happens when it advertised
+             * the modifier and then refused the import -- fall to the SAME
+             * pages as a plain memfd.  wl_shm is a core Wayland global, so a
+             * compositor cannot refuse it for want of import support; it just
+             * pays an upload per frame.
+             *
+             * udmabuf gives us both handles to one allocation, so this costs
+             * nothing but choosing a different fd.
              */
-            int fd = dup(p->stage_buf[idx].dmabuf);
+            bool shm = nvkvm_display_relay_format_verdict(DRM_FORMAT_XR24_LOCAL,
+                                                          0) == 0;
+            /*
+             * dup(): relay_submit takes ownership of the fd it is given and
+             * retains it as the last frame, but ours belongs to the staging
+             * set and is reused every frame.
+             */
+            int fd = dup(shm ? p->stage_buf[idx].memfd
+                             : p->stage_buf[idx].dmabuf);
+
+            if (shm) {
+                static bool told;
+
+                if (!told) {
+                    told = true;
+                    fprintf(stderr, "nvkvm present: the display refused a "
+                            "LINEAR dma-buf as well, so frames go over wl_shm "
+                            "-- the same pages, shared as plain memory.  Works "
+                            "on any compositor; costs it one upload a frame.\n");
+                }
+            }
 
             if (fd < 0) {
                 fprintf(stderr, "nvkvm present: dup of the staging dma-buf "
@@ -1428,8 +1454,9 @@ static void nvkvm_present_bh(void *opaque)
              * buffer is opaque, and XR24 is what every compositor advertises
              * against LINEAR.  Stride is tight -- glReadPixels was told so.
              */
-            if (!nvkvm_display_relay_submit(p->nv, fd, w, h, w * 4,
-                                            DRM_FORMAT_XR24_LOCAL, 0)) {
+            if (!nvkvm_display_relay_submit_flags(p->nv, fd, w, h, w * 4,
+                                                  DRM_FORMAT_XR24_LOCAL, 0,
+                                                  shm)) {
                 close(fd);
             }
         }
