@@ -137,6 +137,9 @@ struct nb_x11 {
     bool grabbed, fullscreen;
     bool ptr_inside;            /* pointer is over the CONTENT window     */
     unsigned hint_w, hint_h;    /* last size we asked the guest to render */
+    char      title[128];       /* the plain window name, without status  */
+    xcb_cursor_t blank_cursor;  /* shown while the pointer is the guest's */
+    uint64_t  notice_until_ms;  /* title-bar clipboard notice deadline    */
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
@@ -896,6 +899,52 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
     return 0;
 }
 
+/*
+ * STATUS IN THE WINDOW TITLE.  The Wayland backend draws its own title bar and
+ * writes the status into it; on X11 the window manager owns the decoration, so
+ * the only channel is the name itself.  Same rule as there: status AND title
+ * when both fit, status alone when they do not, because a status nobody can
+ * read is not worth the space.
+ */
+static void x11_set_status(struct nb_x11 *x, const char *status)
+{
+    char buf[256];
+    const char *txt = x->title;
+
+    if (status && x->title[0]) {
+        snprintf(buf, sizeof buf, "%s - %s", status, x->title);
+        txt = buf;
+    } else if (status) {
+        txt = status;
+    }
+    xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_net_wm_name,
+                        x->a_utf8, 8, (uint32_t)strlen(txt), txt);
+    xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, XCB_ATOM_WM_NAME,
+                        XCB_ATOM_STRING, 8, (uint32_t)strlen(txt), txt);
+    xcb_flush(x->c);
+}
+
+/* An empty cursor, so the host pointer disappears over the guest's own. */
+static void x11_cursor_init(struct nb_x11 *x)
+{
+    xcb_pixmap_t pix = xcb_generate_id(x->c);
+
+    x->blank_cursor = xcb_generate_id(x->c);
+    xcb_create_pixmap(x->c, 1, pix, x->win, 1, 1);
+    xcb_create_cursor(x->c, x->blank_cursor, pix, pix, 0, 0, 0, 0, 0, 0, 0, 0);
+    xcb_free_pixmap(x->c, pix);
+}
+
+static void x11_show_cursor(struct nb_x11 *x, bool show)
+{
+    uint32_t v = show ? XCB_CURSOR_NONE : x->blank_cursor;
+
+    /* On the CONTENT window only: the letterbox and the frame are the host's,
+     * and taking the pointer away there would hide the way out. */
+    xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
+    xcb_flush(x->c);
+}
+
 static int x11_set_grab(struct nb_session *s, bool on)
 {
     struct nb_x11 *x = s->priv;
@@ -903,6 +952,10 @@ static int x11_set_grab(struct nb_session *s, bool on)
     if (x->grabbed == on) {
         return 0;
     }
+    /* Both are how the user knows the grab is on -- and the hidden pointer is
+     * also the point: under grab the guest draws its own. */
+    x11_show_cursor(x, !on);
+    x11_set_status(x, on ? "GRABBED - CTRL+ALT+G TO RELEASE" : NULL);
     if (on) {
         xcb_grab_keyboard_reply_t *kr;
         xcb_grab_pointer_reply_t *pr;
@@ -1157,6 +1210,7 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
      */
     x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
     x->a_utf8        = x11_atom(x->c, "UTF8_STRING");
+    snprintf(x->title, sizeof x->title, "%s", cfg->title);
     xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_net_wm_name,
                         x->a_utf8, 8, (uint32_t)strlen(cfg->title),
                         cfg->title);
@@ -1182,6 +1236,8 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
                       0, NULL);
     x->con_w = x->win_w;
     x->con_h = x->win_h;
+    /* Build the empty cursor now; the grab shows it and hides the host's. */
+    x11_cursor_init(x);
     xcb_map_window(x->c, x->content);
     xcb_map_window(x->c, x->win);
 
@@ -1521,6 +1577,42 @@ static void x11_resync(struct nb_session *s)
     x11_clip_flush_pending(x);
 }
 
+static uint64_t x11_now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)(ts.tv_nsec / 1000000);
+}
+
+/* The guest changed the host clipboard: say so, briefly. */
+static void x11_notify_clipboard(struct nb_session *s)
+{
+    struct nb_x11 *x = s->priv;
+
+    x->notice_until_ms = x11_now_ms() + 4000u;
+    x11_set_status(x, "THE VM CHANGED YOUR CLIPBOARD");
+}
+
+/* Clock-driven work: expire that notice.  Without this the main loop sleeps in
+ * poll() forever and a "transient" notice is permanent. */
+static int x11_tick(struct nb_session *s)
+{
+    struct nb_x11 *x = s->priv;
+    uint64_t now;
+
+    if (!x->notice_until_ms) {
+        return -1;
+    }
+    now = x11_now_ms();
+    if (now >= x->notice_until_ms) {
+        x->notice_until_ms = 0;
+        x11_set_status(x, x->grabbed ? "GRABBED - CTRL+ALT+G TO RELEASE" : NULL);
+        return -1;
+    }
+    return (int)(x->notice_until_ms - now);
+}
+
 static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
 {
     struct nb_x11 *x = s->priv;
@@ -1544,6 +1636,8 @@ static const struct nb_session_ops x11_ops = {
     .commit = x11_commit,
     .resize = x11_resize,
     .resync = x11_resync,
+    .tick = x11_tick,
+    .notify_clipboard = x11_notify_clipboard,
     .set_clipboard = x11_set_clipboard,
     .fetch_clipboard = x11_fetch_clipboard,
     .client_detach = x11_client_detach_clip,
