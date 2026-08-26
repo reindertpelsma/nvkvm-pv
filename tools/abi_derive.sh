@@ -141,6 +141,8 @@ uvm_sem_pool_size|uvm_types.h,uvm_ioctl.h|sizeof(UVM_ALLOC_SEMAPHORE_POOL_PARAMS
 uvm_register_gpu_size|uvm_types.h,uvm_ioctl.h|sizeof(UVM_REGISTER_GPU_PARAMS)
 uvm_register_gpu_fd_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_REGISTER_GPU_PARAMS, rmCtrlFd)
 uvm_register_gpu_status_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_REGISTER_GPU_PARAMS, rmStatus)
+uvm_register_gpu_hclient_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_REGISTER_GPU_PARAMS, hClient)
+uvm_register_gpu_hsmcpart_off|uvm_types.h,uvm_ioctl.h|offsetof(UVM_REGISTER_GPU_PARAMS, hSmcPartRef)
 chan_alloc_size|nvtypes.h,nvos.h,alloc/alloc_channel.h|sizeof(NV_CHANNEL_ALLOC_PARAMS)|nvtypes.h,nvos.h|sizeof(NV_CHANNELGPFIFO_ALLOCATION_PARAMETERS)
 vaspace_alloc_size|nvtypes.h,nvos.h|sizeof(NV_VASPACE_ALLOCATION_PARAMETERS)
 mem_alloc_size|nvtypes.h,nvos.h|sizeof(NV_MEMORY_ALLOCATION_PARAMS)
