@@ -518,7 +518,8 @@ void nvkvm_kms_activate(struct drm_device *ddev);
 void nvkvm_kms_fini(struct drm_device *ddev);
 /* The host's window changed size (ui_info, forwarded over VQ_EVT).  Offers it
  * as the head's preferred mode and hotplugs; the guest compositor decides. */
-void nvkvm_kms_set_host_size(unsigned int w, unsigned int h);
+void nvkvm_kms_set_host_size(unsigned int w, unsigned int h,
+			     unsigned int refresh_mhz);
 
 /* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);

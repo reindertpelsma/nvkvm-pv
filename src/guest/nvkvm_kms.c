@@ -190,6 +190,16 @@ struct nvkvm_kms {
 	struct work_struct              resize_work;
 	struct drm_framebuffer          *pending_fb;
 	spinlock_t                      pending_lock;
+	/*
+	 * The host output's refresh in whole Hz, 0 when the host did not say.
+	 * Written from the ui_info event and read when synthesising a mode:
+	 * without it the head sits at the kms_hz module parameter (default 60)
+	 * whatever the host is running at, so a 144 Hz host drives a 60 Hz guest
+	 * and neither side is aware.  Not part of the pending/cur size compare --
+	 * a refresh change alone is not a resize.
+	 */
+	unsigned int                    host_hz;
+
 	unsigned int                    cur_w;
 	unsigned int                    cur_h;
 	unsigned int                    pending_w;
@@ -232,7 +242,7 @@ static int nvkvm_conn_get_modes(struct drm_connector *conn)
 {
 	struct nvkvm_kms *kms = container_of(conn, struct nvkvm_kms, conn);
 	unsigned long flags;
-	unsigned int w, h;
+	unsigned int w, h, hz;
 	struct drm_display_mode *mode;
 	int count;
 
@@ -270,7 +280,10 @@ static int nvkvm_conn_get_modes(struct drm_connector *conn)
 	 * "close to 3840x2160" is worth exactly as much as 1600x900.
 	 */
 	if (w && h && !nvkvm_mode_listed(conn, w, h)) {
-		mode = drm_cvt_mode(conn->dev, w, h, nvkvm_kms_hz, true, false,
+		/* The host's rate when it told us one, else the module
+		 * parameter.  drm_cvt_mode() wants whole Hz. */
+		hz = kms->host_hz ? kms->host_hz : nvkvm_kms_hz;
+		mode = drm_cvt_mode(conn->dev, w, h, hz, true, false,
 				    false);
 		if (mode) {
 			mode->type |= DRM_MODE_TYPE_DRIVER;
@@ -328,10 +341,12 @@ static void nvkvm_resize_work_fn(struct work_struct *work)
 	drm_kms_helper_hotplug_event(kms->conn.dev);
 }
 
-void nvkvm_kms_set_host_size(unsigned int w, unsigned int h)
+void nvkvm_kms_set_host_size(unsigned int w, unsigned int h,
+			     unsigned int refresh_mhz)
 {
 	struct nvkvm_kms *kms;
 	unsigned long head_flags, pending_flags;
+	unsigned int hz = refresh_mhz / 1000;   /* mHz on the wire, Hz here */
 
 	/* Bound it before it reaches the mode list: this number comes from
 	 * outside the guest, and mode_config.max_* is what the rest of DRM will
@@ -357,6 +372,14 @@ void nvkvm_kms_set_host_size(unsigned int w, unsigned int h)
 		return;
 	}
 	spin_lock_irqsave(&kms->pending_lock, pending_flags);
+	/*
+	 * Recorded even when the size did not change: a host that moved a window
+	 * between outputs of different refresh keeps the same geometry, and the
+	 * next mode we synthesise should still use the new rate.  Bounded by the
+	 * same min/max the module parameter is checked against.
+	 */
+	if (hz >= NVKVM_KMS_HZ_MIN && hz <= NVKVM_KMS_HZ_MAX)
+		kms->host_hz = hz;
 	if (!kms->stopping &&
 	    (w != kms->pending_w || h != kms->pending_h)) {
 		kms->pending_w = w;

@@ -292,7 +292,8 @@ void nb_sink_pointer(struct nb_sink *s, bool inside);
  */
 void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
                             bool usable);
-void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h);
+void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h,
+                     unsigned refresh_mhz);
 void nb_sink_frame(struct nb_sink *s);
 void nb_sink_release(struct nb_sink *s, uint64_t buf_id);
 /* The user closed the display.  Reports it to the client and returns; the

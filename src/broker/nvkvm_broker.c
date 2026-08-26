@@ -689,7 +689,8 @@ void nb_sink_pointer(struct nb_sink *s, bool inside)
     nb_emit(s, NVKVM_BROKER_EV_POINTER, inside, 0, 0, 0);
 }
 
-void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h)
+void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h,
+                     unsigned refresh_mhz)
 {
     if (w == 0 || h == 0) {
         return;
@@ -699,7 +700,10 @@ void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h)
     }
     s->sess->width = w;
     s->sess->height = h;
-    nb_emit(s, NVKVM_BROKER_EV_SURFACE, (int)w, (int)h, 0, 0);
+    /* w0 carries the host's refresh in MILLIHERTZ, 0 when unknown.  It was
+     * a reserved zero, so an older VMM reads it as 'unknown' -- which is
+     * what it meant. */
+    nb_emit(s, NVKVM_BROKER_EV_SURFACE, (int)w, (int)h, refresh_mhz, 0);
 }
 
 void nb_sink_frame(struct nb_sink *s)

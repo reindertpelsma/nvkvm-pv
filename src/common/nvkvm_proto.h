@@ -562,7 +562,16 @@ struct nvkvm_evt_poll {
 struct nvkvm_evt_ui_info {
 	__le32 width;
 	__le32 height;
-	__le32 reserved;
+	/*
+	 * The host output's refresh in MILLIHERTZ, 0 when unknown.  Was
+	 * `reserved` and always zero, so an older guest reads it as unknown --
+	 * which is what it meant.
+	 *
+	 * Worth carrying: the virtual head is otherwise pinned by the kms_hz
+	 * module parameter (default 60) whatever the host is doing, so a 144 Hz
+	 * host drives a 60 Hz guest and neither side knows.
+	 */
+	__le32 refresh_mhz;
 	__le32 type;            /* NVKVM_EVT_TYPE_UI_INFO (1) */
 };
 

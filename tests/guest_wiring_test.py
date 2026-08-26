@@ -93,3 +93,47 @@ ordered(
 assert "cd /mnt/nvkvm/src/guest && make" not in module_unit
 
 print("guest_wiring_test: PASS")
+
+
+# ── the host's refresh reaches the mode, or the head stays pinned at kms_hz ──
+#
+# The chain is broker -> EV_SURFACE.w0 -> QemuUIInfo.refresh_rate ->
+# nvkvm_evt_ui_info.refresh_mhz -> nvkvm_kms_set_host_size -> drm_cvt_mode.
+# Every link is a separate file, so a rename in any one of them silently
+# reverts the guest to its module-parameter default with nothing failing.
+conn_modes = section(
+    "src/guest/nvkvm_kms.c",
+    "static int nvkvm_conn_get_modes(",
+    "\nvoid nvkvm_kms_set_host_size(",
+)
+# The synthesised mode must prefer the host's rate, and fall back, in that order.
+assert "kms->host_hz ? kms->host_hz : nvkvm_kms_hz" in conn_modes, \
+    "the synthesised mode no longer prefers the host's refresh"
+assert "drm_cvt_mode(conn->dev, w, h, hz," in conn_modes, \
+    "drm_cvt_mode is not being given the resolved refresh"
+
+set_host = section(
+    "src/guest/nvkvm_kms.c",
+    "void nvkvm_kms_set_host_size(",
+    "\n/*",
+)
+# Recorded even when the geometry did not change: moving a window between
+# outputs of different refresh keeps the same size.
+ordered(
+    set_host,
+    "unsigned int hz = refresh_mhz / 1000;",
+    "kms->host_hz = hz;",
+)
+assert "if (hz >= NVKVM_KMS_HZ_MIN && hz <= NVKVM_KMS_HZ_MAX)" in set_host, \
+    "an out-of-range refresh from the host is no longer bounded"
+
+# And the event carries it at all.
+virtio = section(
+    "src/guest/nvkvm_virtio.c",
+    "case NVKVM_EVT_TYPE_UI_INFO:",
+    "case NVKVM_EVT_TYPE_POLL:",
+)
+assert "le32_to_cpu(ui->refresh_mhz)" in virtio, \
+    "the ui_info event's refresh is not being read"
+
+print("guest wiring: refresh-rate chain intact")

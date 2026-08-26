@@ -1377,7 +1377,8 @@ static void nvkvm_present_ui_info(void *opaque, uint32_t head,
     if (!p || !info) {
         return;
     }
-    nvkvm_virtio_push_ui_info(p->nv, info->width, info->height);
+    nvkvm_virtio_push_ui_info(p->nv, info->width, info->height,
+                              info->refresh_rate);
 }
 
 static const GraphicHwOps nvkvm_present_hwops = {

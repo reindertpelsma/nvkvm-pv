@@ -486,7 +486,8 @@ static void nvkvm_evt_callback(struct virtqueue *vq)
 
 #ifdef NVKVM_GRAPHICS
 				nvkvm_kms_set_host_size(le32_to_cpu(ui->width),
-							le32_to_cpu(ui->height));
+							le32_to_cpu(ui->height),
+							le32_to_cpu(ui->refresh_mhz));
 #else
 				/* The compute-only module deliberately links no KMS object.
 				 * Still consume and recycle a host UI event so a mismatched

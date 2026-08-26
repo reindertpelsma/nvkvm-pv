@@ -414,7 +414,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
 
     x->current = x->pending;
     x->pending = -1;
-    nb_sink_surface(sink, sl->w, sl->h);
+    nb_sink_surface(sink, sl->w, sl->h, 0 /* no refresh source here */);
     return 0;
 }
 
@@ -629,7 +629,7 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             if (c->window == x->win) {
                 x->win_w = c->width;
                 x->win_h = c->height;
-                nb_sink_surface(sink, c->width, c->height);
+                nb_sink_surface(sink, c->width, c->height, 0 /* no refresh source */);
                 /* Keep the content window centred in its new parent. */
                 if (x->con_w > 0) {
                     x11_size_content(x, x->con_w, x->con_h);
