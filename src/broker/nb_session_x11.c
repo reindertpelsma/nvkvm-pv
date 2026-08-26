@@ -154,6 +154,7 @@ struct nb_x11 {
     xcb_render_picture_t    dst_pic;    /* the content window as a Picture */
 #endif
     bool      idle_shown;
+    bool      client_attached;  /* a VMM is connected, frames or not      */
     xcb_window_t dlg;           /* close-confirmation child, 0 = never made */
     bool      dlg_mapped;
     int       dlg_hot;          /* hovered row, -1 = none                 */
@@ -1442,13 +1443,31 @@ static int x11_show_idle(struct nb_session *s)
     if (!px) {
         return -ENOMEM;
     }
-    nb_placeholder_paint(px, (unsigned)w, (unsigned)h, (unsigned)w,
-                         "NO VM ATTACHED", "WAITING FOR THE VMM TO CONNECT");
+    /*
+     * SHRINK FIRST, PAINT SECOND.  x11_size_content() ends in a clear_area --
+     * added so a narrowing guest cannot leave stale pixels beside itself -- so
+     * running it after the blit wiped the placeholder to black the instant it
+     * was drawn.  Two changes each correct alone.
+     */
+    x11_size_content(x, 1, 1);
+    /*
+     * "ATTACHED BUT SILENT" IS ITS OWN STATE, and the one a user actually
+     * meets: a guest still booting, wedged, or with a broken present path looks
+     * exactly like a broken broker if the window is simply black.  Say which it
+     * is.
+     */
+    if (x->client_attached) {
+        nb_placeholder_paint(px, (unsigned)w, (unsigned)h, (unsigned)w,
+                             "VM ATTACHED - NO PICTURE YET",
+                             "THE GUEST HAS NOT PRESENTED A FRAME");
+    } else {
+        nb_placeholder_paint(px, (unsigned)w, (unsigned)h, (unsigned)w,
+                             "NO VM ATTACHED",
+                             "WAITING FOR THE VMM TO CONNECT");
+    }
     /* Onto the TOPLEVEL: the content child is the guest's and may still be
      * holding the last frame at the guest's size, not the window's. */
     x11_blit(x, x->win, x->idle_gc, px, w, h);
-    /* Shrink the content out of the way so the placeholder is what shows. */
-    x11_size_content(x, 1, 1);
     xcb_flush(x->c);
     free(px);
     x->idle_shown = true;
@@ -1640,6 +1659,27 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
         goto fail;
     }
 
+    /*
+     * THE SHM TIER NEEDS NEITHER DRI3 NOR PRESENT.  It hands the guest's
+     * pixels over as plain shared memory and puts them on screen with core
+     * PutImage, importing no dma-buf and flipping no pixmap -- so demanding
+     * these extensions here refused to start on exactly the servers the tier
+     * exists to serve: an X server with no DRI3 at all (Xvfb, VNC/remote X,
+     * anything old or software-only).
+     *
+     * MEASURED: `--backend x11 --present-mode=shm` against Xvfb died with "the
+     * X server has no DRI3 extension" before opening a window.  That is the
+     * fallback rung failing for the one reason the rung exists.
+     *
+     * This mirrors the same gate on the Wayland side, where requiring dma-buf
+     * formats in shm mode was the identical bug.
+     */
+    if (nb_tier == NB_TIER_SHM) {
+        nb_log("shm tier: not requiring DRI3 or Present (frames arrive as "
+               "shared memory and are put on screen with core PutImage)");
+        goto skip_dmabuf_extensions;
+    }
+
     /* DRI3 >= 1.0 is required at all; >= 1.2 buys explicit modifiers. */
     ext = xcb_get_extension_data(x->c, &xcb_dri3_id);
     if (!ext || !ext->present) {
@@ -1681,6 +1721,8 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     }
     nb_log("Present %u.%u", pv->major_version, pv->minor_version);
     free(pv);
+
+skip_dmabuf_extensions:
 
     /* The toplevel: input, focus, grab, fullscreen. */
     x->win = xcb_generate_id(x->c);
@@ -1783,11 +1825,20 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     xcb_map_window(x->c, x->content);
     xcb_map_window(x->c, x->win);
 
-    /* Present event stream: pacing (complete) and buffer release (idle). */
-    x->present_eid = xcb_generate_id(x->c);
-    xcb_present_select_input(x->c, x->present_eid, x->content,
-                             XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY |
-                             XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+    /*
+     * Present event stream: pacing (complete) and buffer release (idle).
+     * NOT IN THE SHM TIER: there is no Present extension to select on, and
+     * merely ISSUING a request for an absent extension makes xcb tear the
+     * whole connection down (XCB_CONN_CLOSED_EXT_NOTSUPPORTED = 2) -- it does
+     * not fail the one call.  Skipping the version *check* while still making
+     * the call is therefore not a fallback, it is a delayed crash.
+     */
+    if (nb_tier != NB_TIER_SHM) {
+        x->present_eid = xcb_generate_id(x->c);
+        xcb_present_select_input(x->c, x->present_eid, x->content,
+                                 XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY |
+                                 XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+    }
 
     x->a_wm_state  = x11_atom(x->c, "_NET_WM_STATE");
     x->a_fs        = x11_atom(x->c, "_NET_WM_STATE_FULLSCREEN");
@@ -1805,6 +1856,17 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     }
     xcb_flush(x->c);
 
+    /*
+     * Same reason: x11_collect_formats() asks DRI3 for modifiers, and on a
+     * server with no DRI3 that request alone closes the connection.  The shm
+     * tier advertises nothing and imports nothing, so there is nothing to ask.
+     */
+    if (nb_tier == NB_TIER_SHM) {
+        nb_log("shm tier: advertising no dma-buf format (frames are shared "
+               "memory), so no modifier query is made");
+        have_mods = false;
+        goto formats_done;
+    }
     have_mods = x11_collect_formats(x) > 0;
     nb_formats_log(&x->formats, "the X server");
     if (!have_mods) {
@@ -1812,6 +1874,7 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
                "modified (DRM_FORMAT_MOD_INVALID) buffers will be accepted, "
                "and a guest that flips a block-linear bo will be rejected");
     }
+formats_done:
 
     s->width = (uint32_t)x->win_w;
     s->height = (uint32_t)x->win_h;
@@ -1866,6 +1929,20 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
                  "window-manager bindings included; input the kernel handles "
                  "below X (SysRq, and VT switching on some setups) is not "
                  "interceptable by any X client");
+    }
+    /*
+     * THE SHM TIER'S BUFFER IS A MEMFD, NOT A DMA-BUF, so the shared ATTACH
+     * validator has to be told this backend can take one -- otherwise every
+     * shm frame is refused with "the fd is not a dma-buf" and the tier that
+     * exists to work anywhere works nowhere.  The Wayland and test backends
+     * already set this; X11 never did, which is why shm-on-X presented a
+     * rejection for every frame it was handed.
+     *
+     * Only in the shm tier: on the dma-buf tiers a memfd really is a bug, and
+     * accepting one there would silently drop the import path's guarantees.
+     */
+    if (nb_tier == NB_TIER_SHM) {
+        s->accept_memfd = true;
     }
     return 0;
 
@@ -2070,6 +2147,12 @@ static void x11_resync(struct nb_session *s)
     xcb_get_input_focus_reply_t *f;
     xcb_query_pointer_reply_t *q;
 
+    /* resync runs BEFORE the first dispatch, which is where x->sink is
+     * normally set, so take it from the session or this returns having done
+     * nothing at all -- which is exactly what it used to do. */
+    if (!x->sink) {
+        x->sink = s->sink;
+    }
     if (!x->sink || !x->c || xcb_connection_has_error(x->c)) {
         return;
     }
@@ -2117,6 +2200,15 @@ static void x11_resync(struct nb_session *s)
     }
     free(q);
     x11_clip_flush_pending(x);
+    /*
+     * A client just attached.  Until it presents something there is nothing of
+     * the guest on screen, so keep the placeholder up and change what it says,
+     * rather than leaving a black rectangle nobody can interpret.
+     */
+    x->client_attached = true;
+    if (x->current < 0) {
+        x11_show_idle(s);
+    }
 }
 
 static uint64_t x11_now_ms(void)
@@ -2159,6 +2251,7 @@ static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
 {
     struct nb_x11 *x = s->priv;
 
+    x->client_attached = false;
     if (x->fetch_active && x->fetch_generation == generation) {
         x->fetch_active = false;
         x->fetch_generation = 0;

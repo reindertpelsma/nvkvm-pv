@@ -127,6 +127,30 @@ static int make_buffer(unsigned w, unsigned h, unsigned *stride_out)
         close(fd);
         return -1;
     }
+    /*
+     * PAINT SOMETHING RECOGNISABLE.  A zero-filled buffer is indistinguishable
+     * from "the frame never arrived" once it reaches a real X server or
+     * compositor, so a shm present test could only ever assert on log lines.
+     * A known colour lets the test assert on PIXELS instead: green field with
+     * a red square at the origin, so both the fill and the row stride are
+     * checkable from a screenshot.
+     */
+    {
+        void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+        if (m != MAP_FAILED) {
+            uint32_t *px = m;
+            unsigned y, x;
+
+            for (y = 0; y < h; y++) {
+                for (x = 0; x < w; x++) {
+                    px[(size_t)y * (stride / 4) + x] =
+                        (y < h / 4 && x < w / 4) ? 0xffff0000u : 0xff00ff00u;
+                }
+            }
+            munmap(m, size);
+        }
+    }
     *stride_out = stride;
     return fd;
 }
@@ -138,6 +162,10 @@ int main(int argc, char **argv)
     unsigned pw = 0, ph = 0, ww = 0, wh = 0;
     int bad_size = 0, bad_fourcc = 0, bad_dim = 0, bad_fd = 0, bad_frame = 0;
     int alpha_fourcc = 0, query_format = 0, unadv_mod = 0, shm_mode = 0;
+    /* --hold keeps the client ATTACHED after the frame, so a screenshot can
+     * catch what is actually on screen: on detach the broker repaints its
+     * placeholder, which would otherwise erase the very frame under test. */
+    int hold_s = 0;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
     int quiet_after = 0, caps_clipboard = 0;
 
@@ -165,6 +193,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--query-format")) { query_format = 1; }
         else if (!strcmp(a, "--unadvertised-mod")) { unadv_mod = 1; }
         else if (!strcmp(a, "--shm")) { shm_mode = 1; }
+        else if (!strcmp(a, "--hold") && v) { hold_s = atoi(v); i++; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
         else if (!strcmp(a, "--bad-frame"))    { bad_frame = 1; }
@@ -403,6 +432,11 @@ int main(int argc, char **argv)
 
             printf("  -> COMMIT\n");
             send_cmd(sock, &c, NULL, 0, sizeof(c));
+            if (hold_s > 0) {
+                printf("  -> holding the connection open for %ds\n", hold_s);
+                fflush(stdout);
+                sleep((unsigned)hold_s);
+            }
         }
     }
     return 0;

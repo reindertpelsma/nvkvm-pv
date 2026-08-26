@@ -428,8 +428,20 @@ struct nb_session_ops {
 #define NB_SESSION_CLIP_G2H (1u << 0)
 #define NB_SESSION_CLIP_H2G (1u << 1)
 
+struct nb_sink;
+
 struct nb_session {
     const struct nb_session_ops *ops;
+    /*
+     * The connected client's sink, set at ATTACH -- before any event has been
+     * dispatched.  A backend that only learns its sink inside dispatch cannot
+     * re-emit anything during ->resync(), which is the one moment resync
+     * exists for: MEASURED on X11, x11_resync() returned at its first guard on
+     * every first attach, so focus and pointer state that predated the client
+     * were never re-sent and the backend could not tell "attached" from "no
+     * client" at all.
+     */
+    struct nb_sink *sink;
     void    *priv;
 
     uint32_t width, height;     /* current window size, in pixels             */

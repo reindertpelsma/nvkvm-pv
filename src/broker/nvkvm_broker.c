@@ -434,6 +434,7 @@ int nb_sink_attach(struct nb_sink *s, int fd)
            ss->grab_caveat[0] ? ss->grab_caveat
                               : "all keyboard input is captured under grab.");
     /* The client missed every edge that happened before it connected. */
+    ss->sink = s;
     if (ss->ops->resync) {
         ss->ops->resync(ss);
     }
