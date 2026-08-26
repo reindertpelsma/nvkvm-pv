@@ -332,7 +332,10 @@ enum {
 /*
  * ATTACH flags.
  *
- * F_SHM says the fd is a memfd to be presented through wl_shm, not a dma-buf.
+ * F_SHM says the fd is a memfd to be presented from shared memory rather than
+ * imported as a dma-buf.  How that happens is the backend's business: Wayland
+ * wraps it in a wl_shm_pool, X11 pushes it with core-protocol PutImage.  The
+ * point of the rung is that NEITHER can refuse it.
  * DECLARED rather than sniffed from the fd type: a memfd is a legitimate
  * carrier for other things -- the broker's own test client sends one for every
  * frame -- so inferring intent from st.f_type misclassifies honest clients.

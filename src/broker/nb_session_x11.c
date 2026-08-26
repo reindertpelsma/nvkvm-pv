@@ -45,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
 
 #include "nvkvm_broker.h"
 
@@ -87,6 +88,9 @@ struct nb_x11_buf {
     uint32_t     w, h, stride, offset, fourcc;
     uint64_t     modifier;
     uint64_t     used;
+    /* SHM tier: no pixmap at all, just a mapping we blit from. */
+    void        *map;
+    size_t       map_len;
 };
 
 struct nb_x11 {
@@ -164,6 +168,8 @@ static void x11_dlg_hide(struct nb_x11 *x);
 static void x11_dlg_paint(struct nb_x11 *x);
 static int  x11_dlg_hit(int px, int py);
 static void x11_cursor_policy(struct nb_x11 *x);
+static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
+                     const uint32_t *px, int w, int h);
 static void x11_clip_serve(struct nb_x11 *x,
                            const xcb_selection_request_event_t *rq);
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
@@ -297,6 +303,9 @@ static void x11_buf_free(struct nb_x11 *x, int i)
     if (x->bufs[i].pixmap) {
         xcb_free_pixmap(x->c, x->bufs[i].pixmap);
     }
+    if (x->bufs[i].map) {
+        munmap(x->bufs[i].map, x->bufs[i].map_len);
+    }
     memset(&x->bufs[i], 0, sizeof(x->bufs[i]));
 }
 
@@ -310,6 +319,55 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
     uint64_t oldest = UINT64_MAX;
 
     x->tick++;
+    /*
+     * THE TIER THAT CANNOT BE REFUSED, on X11 too.
+     *
+     * `is_shm` was documented as "presented through wl_shm", and only Wayland
+     * implemented it -- so the universal last resort was universal on exactly
+     * one backend.  On X11 the equivalent is core-protocol PutImage from the
+     * mapping: not MIT-SHM, deliberately, because an SHM pixmap derives its
+     * stride from its width and cannot express the guest's, and a tier whose
+     * job is to always work must not depend on the stride happening to match
+     * or on an extension being present.  It copies; that is the price of the
+     * rung, and it is only reached when both dma-buf rungs have failed.
+     */
+    if (d->is_shm) {
+        size_t need = (size_t)d->stride * d->height + d->offset;
+        void *m;
+
+        if (d->size < need) {
+            nb_err("ATTACH: shm buffer is %llu bytes, needs %zu",
+                   (unsigned long long)d->size, need);
+            return -EINVAL;
+        }
+        m = mmap(NULL, need, PROT_READ, MAP_SHARED, d->fd, 0);
+        if (m == MAP_FAILED) {
+            nb_err("ATTACH: could not map the shm buffer: %s", strerror(errno));
+            return -errno;
+        }
+        for (i = 0; i < NB_MAX_BUFS; i++) {
+            if (i != x->current && i != x->pending) {
+                break;
+            }
+        }
+        if (i >= NB_MAX_BUFS) {
+            munmap(m, need);
+            return -EBUSY;
+        }
+        x11_buf_free(x, i);
+        x->bufs[i].valid  = true;
+        x->bufs[i].id     = d->id;
+        x->bufs[i].w      = d->width;
+        x->bufs[i].h      = d->height;
+        x->bufs[i].stride = d->stride;
+        x->bufs[i].offset = d->offset;
+        x->bufs[i].fourcc = d->fourcc;
+        x->bufs[i].map     = m;
+        x->bufs[i].map_len = need;
+        x->bufs[i].used   = x->tick;
+        x->pending = i;
+        return 0;
+    }
     for (i = 0; i < NB_MAX_BUFS; i++) {
         struct nb_x11_buf *sl = &x->bufs[i];
 
@@ -528,6 +586,54 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
     if (!sl->valid) {
         x->pending = -1;
         return -ENOENT;
+    }
+
+    /*
+     * SHM tier: there is no pixmap to present, only bytes to push.  Packed
+     * into a temporary first when the guest's stride is not width*4, because
+     * PutImage carries rows packed and cannot be told otherwise.
+     */
+    if (sl->map) {
+        const uint8_t *src = (const uint8_t *)sl->map + sl->offset;
+        unsigned packed = sl->w * 4u;
+        uint32_t *tmp = NULL;
+        int dw, dh;
+
+        x11_dest_rect(x, (int)sl->w, (int)sl->h, &dw, &dh);
+        if (x->con_w != (int)sl->w || x->con_h != (int)sl->h) {
+            /* No scaler on this rung: XRender needs a Picture and there is no
+             * pixmap here.  1:1 and centred, which is what "it always works"
+             * costs. */
+            x11_size_content(x, (int)sl->w, (int)sl->h);
+        }
+        if (!x->idle_gc) {
+            x->idle_gc = xcb_generate_id(x->c);
+            xcb_create_gc(x->c, x->idle_gc, x->win, 0, NULL);
+        }
+        if (sl->stride != packed) {
+            unsigned y;
+
+            tmp = malloc((size_t)packed * sl->h);
+            if (!tmp) {
+                return -ENOMEM;
+            }
+            for (y = 0; y < sl->h; y++) {
+                memcpy((uint8_t *)tmp + (size_t)y * packed,
+                       src + (size_t)y * sl->stride, packed);
+            }
+            src = (const uint8_t *)tmp;
+        }
+        x11_blit(x, x->content, x->idle_gc, (const uint32_t *)src,
+                 (int)sl->w, (int)sl->h);
+        xcb_flush(x->c);
+        free(tmp);
+        x->current = x->pending;
+        x->pending = -1;
+        x->idle_shown = false;
+        x11_cursor_policy(x);
+        /* PutImage copies, so the buffer is the guest's again immediately. */
+        nb_sink_release(sink, sl->id);
+        return 0;
     }
 
     {
