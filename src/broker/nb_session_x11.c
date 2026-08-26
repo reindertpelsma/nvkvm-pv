@@ -438,7 +438,22 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
 
     x->current = x->pending;
     x->pending = -1;
-    nb_sink_surface(sink, sl->w, sl->h, 0 /* no refresh source here */);
+    /*
+     * DO NOT REPORT THE SIZE WE JUST PRESENTED.
+     *
+     * EV_SURFACE is an INSTRUCTION -- "guest, render this size" -- and the
+     * only thing entitled to issue it is the WINDOW, from ConfigureNotify.
+     * What arrives here is an OBSERVATION: the size the guest already chose.
+     * Sending it back told the guest to render what it had just rendered, so
+     * on any window whose size differs from the guest's mode the two traded
+     * places on every frame -- the content child was reconfigured and the
+     * pixmaps recreated each time, which is what the corruption after a resize
+     * actually was.
+     *
+     * The Wayland backend carries the same rule and the same warning; this
+     * call is the one that was left behind.
+     */
+    (void)sink;
     return 0;
 }
 
