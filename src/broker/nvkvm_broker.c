@@ -670,6 +670,13 @@ void nb_sink_focus(struct nb_sink *s, bool active)
     }
 }
 
+void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
+                            bool usable)
+{
+    nb_emit(s, NVKVM_BROKER_EV_FORMAT, usable ? 1 : 0, (int)fourcc,
+            (uint32_t)(mod & 0xffffffffu), (uint32_t)(mod >> 32));
+}
+
 void nb_sink_pointer(struct nb_sink *s, bool inside)
 {
     if (s->pointer_in == inside) {

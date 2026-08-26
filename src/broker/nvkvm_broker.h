@@ -278,6 +278,16 @@ void nb_sink_rel(struct nb_sink *s, int dx, int dy);
 void nb_sink_wheel(struct nb_sink *s, int v, int h);
 void nb_sink_focus(struct nb_sink *s, bool active);
 void nb_sink_pointer(struct nb_sink *s, bool inside);
+/*
+ * Tell the client a (fourcc, modifier) turned out to be unusable AFTER we said
+ * it was advertised.  A compositor can advertise a modifier its own driver then
+ * refuses to bind -- MEASURED on GNOME/Mutter with NVIDIA 595.84, which
+ * advertises XR24+LINEAR and answers the import with "Could not bind the given
+ * EGLImage to a CoglTexture2D".  Without this the VMM would keep sending a pair
+ * we have proven does not work.
+ */
+void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
+                            bool usable);
 void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h);
 void nb_sink_frame(struct nb_sink *s);
 void nb_sink_release(struct nb_sink *s, uint64_t buf_id);

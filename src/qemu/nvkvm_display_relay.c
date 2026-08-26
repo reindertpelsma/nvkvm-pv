@@ -74,6 +74,9 @@
 #define RELAY_LOG(fmt, ...) \
     fprintf(stderr, "nvkvm-broker: " fmt "\n", ##__VA_ARGS__)
 
+/* Distinct (fourcc, modifier) pairs whose verdict we remember per connection. */
+#define RELAY_FMT_SLOTS 4
+
 #define RELAY_CLIP_MAX_CMDS \
     ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_CMD_BYTES - 1u) / \
      NVKVM_BROKER_CLIP_CMD_BYTES)
@@ -169,10 +172,25 @@ typedef struct NvkvmRelay {
      * reconnected broker may be a different display entirely.  Carrying a
      * verdict across a reconnect is the RR-07 class of bug.
      */
-    uint32_t    fmt_asked_fourcc;
-    uint64_t    fmt_asked_mod;
-    bool        fmt_asked;      /* a query is outstanding or answered      */
-    int         fmt_verdict;    /* -1 unknown, 0 needs readback, 1 usable  */
+    /*
+     * A TABLE, not one slot.  Two pairs are in play at once on a
+     * cross-vendor host: what the guest renders (its GPU's tiling) and what
+     * the readback produces (XR24 + LINEAR).  With a single slot the second
+     * submit evicted the first, so the next guest frame read "unknown", went
+     * zero-copy, was rejected, re-queried, and the mode oscillated
+     * CANNOT -> CAN -> CANNOT forever.  OBSERVED on the physical box: 4
+     * CANNOT and 5 CAN lines for one guest session.
+     *
+     * Four entries is deliberate headroom over the two that occur; a fifth
+     * distinct pair in one connection would mean the guest is changing format
+     * repeatedly, which is worth the re-query.
+     */
+    struct {
+        uint32_t fourcc;
+        uint64_t mod;
+        bool     used;
+        int      verdict;       /* -1 asked, awaiting reply; 0 no; 1 yes */
+    } fmt[RELAY_FMT_SLOTS];
 
     /* Partial packet accumulator.  Fixed size: a packet is always exactly
      * NVKVM_BROKER_PKT_SIZE bytes, so nothing here is length-driven. */
@@ -381,25 +399,34 @@ static void relay_schedule_retry(NvkvmRelay *r)
 static void relay_query_format(NvkvmRelay *r, uint32_t fourcc, uint64_t mod)
 {
     struct nvkvm_broker_cmd cmd;
+    unsigned i, slot = RELAY_FMT_SLOTS;
 
-    if (r->fmt_asked && r->fmt_asked_fourcc == fourcc &&
-        r->fmt_asked_mod == mod) {
-        return;                         /* already asked about this pair */
+    for (i = 0; i < RELAY_FMT_SLOTS; i++) {
+        if (r->fmt[i].used && r->fmt[i].fourcc == fourcc &&
+            r->fmt[i].mod == mod) {
+            return;                     /* already asked about this pair */
+        }
+        if (!r->fmt[i].used && slot == RELAY_FMT_SLOTS) {
+            slot = i;
+        }
+    }
+    if (slot == RELAY_FMT_SLOTS) {
+        slot = 0;                       /* full: recycle the oldest */
     }
     memset(&cmd, 0, sizeof(cmd));
     cmd.type     = NVKVM_BROKER_CMD_QUERY_FORMAT;
     cmd.fourcc   = fourcc;
     cmd.modifier = mod;
 
-    r->fmt_asked_fourcc = fourcc;
-    r->fmt_asked_mod    = mod;
-    r->fmt_asked        = true;
-    r->fmt_verdict      = -1;
+    r->fmt[slot].fourcc  = fourcc;
+    r->fmt[slot].mod     = mod;
+    r->fmt[slot].used    = true;
+    r->fmt[slot].verdict = -1;
 
     if (relay_send(r, &cmd, -1) != 0) {
-        /* Not fatal and not retried here: the next frame re-asks, because
-         * fmt_asked is only meaningful alongside a verdict. */
-        r->fmt_asked = false;
+        /* Not fatal and not retried here: freeing the slot makes the next
+         * frame ask again, which is the whole recovery needed. */
+        r->fmt[slot].used = false;
     }
 }
 
@@ -430,10 +457,7 @@ static void relay_drop(NvkvmRelay *r, const char *why)
  */
 static void relay_forget_format_verdict(NvkvmRelay *r)
 {
-    r->fmt_asked        = false;
-    r->fmt_verdict      = -1;
-    r->fmt_asked_fourcc = 0;
-    r->fmt_asked_mod    = 0;
+    memset(r->fmt, 0, sizeof(r->fmt));
 }
 
 static void relay_attempt_failed(NvkvmRelay *r, const char *why)
@@ -463,14 +487,18 @@ static void relay_attempt_failed(NvkvmRelay *r, const char *why)
 int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier)
 {
     NvkvmRelay *r = nvkvm_relay;
+    unsigned i;
 
-    if (!r || !r->fmt_asked) {
+    if (!r) {
         return -1;
     }
-    if (r->fmt_asked_fourcc != fourcc || r->fmt_asked_mod != modifier) {
-        return -1;              /* the verdict is for a different pair */
+    for (i = 0; i < RELAY_FMT_SLOTS; i++) {
+        if (r->fmt[i].used && r->fmt[i].fourcc == fourcc &&
+            r->fmt[i].mod == modifier) {
+            return r->fmt[i].verdict;
+        }
     }
-    return r->fmt_verdict;
+    return -1;
 }
 
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
@@ -813,27 +841,36 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
         break;
     case NVKVM_BROKER_EV_FORMAT: {
         /*
-         * The question is echoed back, so a stale answer for a pair we are no
-         * longer asking about is discarded rather than latched.  That matters
-         * across a mode change: the guest can switch format between our query
-         * and the reply, and adopting the old verdict would pick the wrong
-         * path permanently.
+         * The question is echoed back, so the reply is matched to its slot by
+         * (fourcc, modifier) rather than by arrival order.  A reply for a pair
+         * we are no longer tracking is discarded, not latched: the guest can
+         * change format between query and answer, and adopting a stale verdict
+         * would pin the wrong present path.
          */
         uint64_t mod = (uint64_t)p->w0 | ((uint64_t)p->w1 << 32);
+        uint32_t fourcc = (uint32_t)p->y;
+        unsigned i;
 
-        if (!r->fmt_asked || (uint32_t)p->y != r->fmt_asked_fourcc ||
-            mod != r->fmt_asked_mod) {
+        for (i = 0; i < RELAY_FMT_SLOTS; i++) {
+            if (r->fmt[i].used && r->fmt[i].fourcc == fourcc &&
+                r->fmt[i].mod == mod) {
+                break;
+            }
+        }
+        if (i == RELAY_FMT_SLOTS) {
             RELAY_LOG("stale EV_FORMAT for fourcc 0x%x modifier 0x%llx, "
-                      "ignored", (unsigned)p->y, (unsigned long long)mod);
+                      "ignored", (unsigned)fourcc, (unsigned long long)mod);
             break;
         }
-        r->fmt_verdict = p->x ? 1 : 0;
-        info_report("nvkvm-broker: the display %s show the guest's buffers "
-                    "(fourcc 0x%08x modifier 0x%016llx)%s",
-                    r->fmt_verdict ? "CAN" : "CANNOT",
-                    (unsigned)r->fmt_asked_fourcc,
-                    (unsigned long long)r->fmt_asked_mod,
-                    r->fmt_verdict ? "" :
+        if (r->fmt[i].verdict != -1) {
+            break;                      /* already answered; nothing new */
+        }
+        r->fmt[i].verdict = p->x ? 1 : 0;
+        info_report("nvkvm-broker: the display %s show fourcc 0x%08x "
+                    "modifier 0x%016llx%s",
+                    r->fmt[i].verdict ? "CAN" : "CANNOT",
+                    (unsigned)fourcc, (unsigned long long)mod,
+                    r->fmt[i].verdict ? "" :
                     " — frames must be read back through the guest's GPU into "
                     "a LINEAR buffer the display can import");
         break;

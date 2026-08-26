@@ -142,6 +142,10 @@ struct nb_wl_buf {
     uint64_t  commits;
 };
 
+/* Distinct pairs whose importability we remember.  Two occur in practice:
+ * the guest's own tiling and the LINEAR fallback. */
+#define NB_PROVEN_SLOTS 4
+
 struct nb_wl {
     struct wl_display    *dpy;
     struct wl_registry   *reg;
@@ -155,6 +159,38 @@ struct nb_wl {
     struct xdg_toplevel  *toplevel;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     uint32_t              dmabuf_ver;
+
+    /*
+     * PAIRS PROVEN BY IMPORT, not by advertisement.
+     *
+     * A compositor can advertise a (fourcc, modifier) its own driver then
+     * refuses to bind.  MEASURED on GNOME/Mutter with NVIDIA 595.84: it
+     * advertises XR24 + LINEAR and answers the import with
+     *   [destroyed object]: error 7: failed to import supplied dmabufs:
+     *   Could not bind the given EGLImage to a CoglTexture2D
+     * -- which is a WAYLAND PROTOCOL ERROR, so the connection dies and the
+     * broker exits.  Under a restart policy that is a spin: OBSERVED 15
+     * restarts in a few minutes on the physical box.
+     *
+     * So the first buffer of an unproven pair goes through the ASYNCHRONOUS
+     * zwp_linux_buffer_params_v1.create, which reports failure as a `failed`
+     * EVENT instead of killing the connection.  Once a pair is proven, every
+     * later buffer uses create_immed, which is why the roundtrip is paid once
+     * per pair and never on the steady-state frame path -- the objection the
+     * create_immed comment below is about.
+     */
+    struct {
+        uint32_t fourcc;
+        uint64_t mod;
+        int      state;       /* 0 unproven, 1 importable, -1 refused */
+        bool     probing;
+    } proven[NB_PROVEN_SLOTS];
+    uint32_t probe_fourcc;   /* the pair the outstanding probe is about */
+    uint64_t probe_mod;
+    /* A probe that failed and the client has not been told about yet. */
+    bool     probe_bad_pending;
+    uint32_t probe_bad_fourcc;
+    uint64_t probe_bad_mod;
     /* Only ever used for the idle placeholder.  The guest path never touches
      * shm — its frames are dma-bufs and are never copied. */
     struct wl_shm        *shm;
@@ -439,6 +475,82 @@ static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
 
 /* ── ops: attach / commit ────────────────────────────────────────────────── */
 
+/* Slot for this pair, allocating one if there is room. */
+static int wl_pair_slot(struct nb_wl *w, uint32_t fourcc, uint64_t mod,
+                        bool create)
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < NB_PROVEN_SLOTS; i++) {
+        if (w->proven[i].fourcc == fourcc && w->proven[i].mod == mod &&
+            (w->proven[i].state || w->proven[i].probing)) {
+            return i;
+        }
+        if (free_slot < 0 && !w->proven[i].state && !w->proven[i].probing) {
+            free_slot = i;
+        }
+    }
+    if (!create || free_slot < 0) {
+        return -1;
+    }
+    w->proven[free_slot].fourcc = fourcc;
+    w->proven[free_slot].mod    = mod;
+    return free_slot;
+}
+
+/*
+ * The probe answered.  `created` means this display really can import the pair;
+ * `failed` means it advertised something it cannot bind, and the whole point of
+ * probing is that we learn this WITHOUT the connection being torn down.
+ *
+ * The probe buffer itself is discarded either way.  Showing it would mean
+ * threading a deferred attach through the commit path for one frame's benefit;
+ * dropping it costs a single frame the first time a pair is seen.
+ */
+static void probe_created(void *data, struct zwp_linux_buffer_params_v1 *params,
+                          struct wl_buffer *buf)
+{
+    struct nb_wl *w = data;
+    int i = wl_pair_slot(w, w->probe_fourcc, w->probe_mod, false);
+
+    if (i >= 0) {
+        w->proven[i].state   = 1;
+        w->proven[i].probing = false;
+        nb_log("this display CAN import %.4s modifier 0x%016llx — proven by "
+               "import, not by advertisement",
+               (const char *)&w->proven[i].fourcc,
+               (unsigned long long)w->proven[i].mod);
+    }
+    wl_buffer_destroy(buf);
+    zwp_linux_buffer_params_v1_destroy(params);
+}
+
+static void probe_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
+{
+    struct nb_wl *w = data;
+    int i = wl_pair_slot(w, w->probe_fourcc, w->probe_mod, false);
+
+    if (i >= 0) {
+        w->proven[i].state   = -1;
+        w->proven[i].probing = false;
+        nb_err("this display ADVERTISED %.4s modifier 0x%016llx and then "
+               "refused to import it.  Frames in that layout will be rejected "
+               "rather than retried; the VMM is being told so it can send "
+               "something else.",
+               (const char *)&w->proven[i].fourcc,
+               (unsigned long long)w->proven[i].mod);
+        w->probe_bad_pending = true;
+        w->probe_bad_fourcc  = w->proven[i].fourcc;
+        w->probe_bad_mod     = w->proven[i].mod;
+    }
+    zwp_linux_buffer_params_v1_destroy(params);
+}
+
+static const struct zwp_linux_buffer_params_v1_listener probe_listener = {
+    .created = probe_created,
+    .failed  = probe_failed,
+};
+
 static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
 {
     struct nb_wl *w = s->priv;
@@ -483,6 +595,48 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
     }
     if (victim < 0) {
         return -ENOSPC;         /* cannot happen with NB_MAX_BUFS >= 3 */
+    }
+
+    /*
+     * ADVERTISED IS NOT IMPORTABLE.  Gate on what this display has actually
+     * proven it can bind; see the `proven` table's comment for the Mutter case
+     * that makes this necessary.
+     */
+    {
+        int ps = wl_pair_slot(w, d->fourcc, d->modifier, true);
+
+        if (ps >= 0 && w->proven[ps].state == -1) {
+            return -EINVAL;         /* known-refused: reject, do not retry */
+        }
+        if (ps >= 0 && w->proven[ps].probing) {
+            return 0;               /* a probe is in flight; nothing to show */
+        }
+        if (ps >= 0 && w->proven[ps].state == 0) {
+            /* First buffer of this pair: probe it asynchronously, so a refusal
+             * arrives as an event rather than as a fatal protocol error. */
+            struct zwp_linux_buffer_params_v1 *pp =
+                zwp_linux_dmabuf_v1_create_params(w->dmabuf);
+
+            if (!pp) {
+                return -EIO;
+            }
+            zwp_linux_buffer_params_v1_add(pp, d->fd, 0, d->offset, d->stride,
+                                           (uint32_t)(d->modifier >> 32),
+                                           (uint32_t)(d->modifier & 0xffffffffu));
+            zwp_linux_buffer_params_v1_add_listener(pp, &probe_listener, w);
+            w->probe_fourcc      = d->fourcc;
+            w->probe_mod         = d->modifier;
+            w->proven[ps].probing = true;
+            zwp_linux_buffer_params_v1_create(pp, (int32_t)d->width,
+                                              (int32_t)d->height, d->fourcc,
+                                              0 /* flags */);
+            nb_log("probing whether this display can import %.4s modifier "
+                   "0x%016llx (one frame is dropped to find out)",
+                   (const char *)&d->fourcc,
+                   (unsigned long long)d->modifier);
+            w->pending = -1;
+            return 0;
+        }
     }
 
     params = zwp_linux_dmabuf_v1_create_params(w->dmabuf);
@@ -646,6 +800,17 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     struct nb_wl_buf *sl;
     struct wl_callback *cb;
     int new_w, new_h;
+
+    /*
+     * A probe came back refused.  Told here rather than from the listener
+     * because this is where the sink is in scope, and it is called often
+     * enough that the news is never more than a frame late.
+     */
+    if (w->probe_bad_pending) {
+        w->probe_bad_pending = false;
+        nb_sink_format_verdict(sink, w->probe_bad_fourcc, w->probe_bad_mod,
+                               false);
+    }
 
     if (w->pending < 0) {
         return -ENOENT;         /* COMMIT with nothing attached; not fatal */
