@@ -819,15 +819,15 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
          * and the reply, and adopting the old verdict would pick the wrong
          * path permanently.
          */
-        uint64_t mod = (uint64_t)pkt->w0 | ((uint64_t)pkt->w1 << 32);
+        uint64_t mod = (uint64_t)p->w0 | ((uint64_t)p->w1 << 32);
 
-        if (!r->fmt_asked || (uint32_t)pkt->y != r->fmt_asked_fourcc ||
+        if (!r->fmt_asked || (uint32_t)p->y != r->fmt_asked_fourcc ||
             mod != r->fmt_asked_mod) {
             NVKVM_DBG("nvkvm-broker: stale EV_FORMAT for 0x%x/0x%llx, ignored\n",
-                      (unsigned)pkt->y, (unsigned long long)mod);
+                      (unsigned)p->y, (unsigned long long)mod);
             break;
         }
-        r->fmt_verdict = pkt->x ? 1 : 0;
+        r->fmt_verdict = p->x ? 1 : 0;
         info_report("nvkvm-broker: the display %s show the guest's buffers "
                     "(fourcc 0x%08x modifier 0x%016llx)%s",
                     r->fmt_verdict ? "CAN" : "CANNOT",

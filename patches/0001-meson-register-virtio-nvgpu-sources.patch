@@ -38,7 +38,7 @@ diff --git a/hw/misc/meson.build b/hw/misc/meson.build
 index d02d96e..ef97efc 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -151,4 +151,18 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
+@@ -151,4 +151,19 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
  system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
  
  # HPPA devices
@@ -55,5 +55,6 @@ index d02d96e..ef97efc 100644
 +  'nvkvm_isolate_handlers.c',
 +  'nvkvm_tables.c',
 +  'nvkvm_present_egl.c',
++  'nvkvm_udmabuf.c',
 +))
  system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))
