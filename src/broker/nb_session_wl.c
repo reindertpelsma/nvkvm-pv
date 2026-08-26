@@ -97,7 +97,12 @@ static const char *const nb_dlg_label[NB_DLG_N] = {
     "CANCEL",
 };
 #define NB_CUR_N     5          /* arrow + four resize cursors            */
-#define NB_BORDER    8          /* px of grabbable edge outside the window */
+/*
+ * Px of grabbable edge OUTSIDE the window.  Invisible and outside the visible
+ * bounds, so width costs nothing but the ease of hitting it -- and 8 was hard
+ * to hit, which is the whole purpose of the thing.
+ */
+#define NB_BORDER    14
 #define NB_TITLE_MAX ((size_t)48)
 /* Cursor slots: 0 arrow, 1 horizontal, 2 vertical, 3 NW-SE, 4 NE-SW. */
 #define NB_CUR_ARROW 0
@@ -299,6 +304,13 @@ struct nb_wl {
      * and a theme lookup, for one arrow that is only ever seen over a 28px
      * bar. */
     struct wl_surface       *cur_surf[NB_CUR_N];
+    /* Per-cursor hotspot, in SURFACE coordinates (so already magnified).  It
+     * used to be a single hardcoded 6,5 for all four resize cursors while
+     * cur_make() took the real ones and dropped them -- so the glyph was drawn
+     * offset from the actual pointer, and for the 7px-wide bottom cursor 6 was
+     * nearly off the image.  Aiming with a cursor that lies about where it
+     * points is most of "the resize edge is hard to hit". */
+    int                      cur_hx[NB_CUR_N], cur_hy[NB_CUR_N];
     struct wl_buffer        *cur_buf[NB_CUR_N];
     void                    *cur_px[NB_CUR_N];
     size_t                   cur_sz[NB_CUR_N];
@@ -2325,8 +2337,12 @@ static void ptr_enter(void *d, struct wl_pointer *p, uint32_t serial,
     w->bd_hot = bd_index(w, s);
     if (w->bd_hot >= 0) {
         w->ptr_on_content = false;
-        wl_pointer_set_cursor(p, serial, w->cur_surf[nb_bd_cursor[w->bd_hot]],
-                              6, 5);
+        {
+            const int c = nb_bd_cursor[w->bd_hot];
+
+            wl_pointer_set_cursor(p, serial, w->cur_surf[c],
+                                  w->cur_hx[c], w->cur_hy[c]);
+        }
         return;
     }
     if (s && s == w->dlg_surf) {
@@ -2852,12 +2868,19 @@ static void cur_build(struct nb_wl *w)
 static void cur_make(struct nb_wl *w, int slot, const char *const *art,
                      int aw, int ah, int hx, int hy)
 {
+    /*
+     * The art is a 7x12-ish bitmap, which next to a normal ~24px theme cursor
+     * reads as a speck -- the bottom-edge one worst, being the smallest.
+     * Nearest-neighbour doubled: still no theme lookup and no new dependency,
+     * but a size someone can see.
+     */
+    const int mag = 2;
     struct wl_shm_pool *pool;
-    size_t stride = (size_t)aw * 4, sz = stride * (size_t)ah;
+    const int bwd = aw * mag, bht = ah * mag;
+    size_t stride = (size_t)bwd * 4, sz = stride * (size_t)bht;
     uint32_t *px;
     int fd, x, y;
 
-    (void)hx; (void)hy;
     if (!w->shm || !w->comp || slot < 0 || slot >= NB_CUR_N) {
         return;
     }
@@ -2874,15 +2897,17 @@ static void cur_make(struct nb_wl *w, int slot, const char *const *art,
         close(fd);
         return;
     }
-    for (y = 0; y < ah; y++) {
-        int len = (int)strlen(art[y]);
+    for (y = 0; y < bht; y++) {
+        const char *row = art[y / mag];
+        int len = (int)strlen(row);
 
-        for (x = 0; x < aw; x++) {
-            char c = x < len ? art[y][x] : ' ';
+        for (x = 0; x < bwd; x++) {
+            int sx = x / mag;
+            char c = sx < len ? row[sx] : ' ';
 
-            px[(size_t)y * aw + x] = c == '1' ? 0xff000000U
-                                   : c == '2' ? 0xffffffffU
-                                   : 0x00000000U;
+            px[(size_t)y * bwd + x] = c == '1' ? 0xff000000U
+                                    : c == '2' ? 0xffffffffU
+                                    : 0x00000000U;
         }
     }
     pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
@@ -2891,7 +2916,9 @@ static void cur_make(struct nb_wl *w, int slot, const char *const *art,
         munmap(px, sz);
         return;
     }
-    w->cur_buf[slot] = wl_shm_pool_create_buffer(pool, 0, aw, ah,
+    w->cur_hx[slot] = hx * mag;
+    w->cur_hy[slot] = hy * mag;
+    w->cur_buf[slot] = wl_shm_pool_create_buffer(pool, 0, bwd, bht,
                                                  (int32_t)stride,
                                                  WL_SHM_FORMAT_ARGB8888);
     wl_shm_pool_destroy(pool);
@@ -2927,20 +2954,34 @@ static void cur_make(struct nb_wl *w, int slot, const char *const *art,
 static void bd_geometry(const struct nb_wl *w, int i, int *x, int *y,
                         int *bw, int *bh)
 {
-    int top = -(w->tb_mapped ? NB_TB_H : 0);
+    /*
+     * THESE ARE CHILDREN OF THE CONTENT SURFACE, so their positions are in
+     * CONTENT-local coordinates -- and the content is not the window.  When
+     * --scale aspect is drawing letterbox bars the content sits off_x/off_y
+     * in from the window's edge, so a border placed at content x=0 lands
+     * off_x inside the window instead of on its edge.
+     *
+     * OBSERVED: the resize edges were wrong ONLY on the axis that had
+     * whitespace, and by exactly the bar's width.  The title bar already
+     * compensates the same way (-off_x, -off_y - NB_TB_H); the borders did
+     * not.
+     */
+    const int tb   = w->tb_mapped ? NB_TB_H : 0;
+    const int left = -w->off_x;                 /* window's left edge   */
+    const int top  = -w->off_y - tb;            /* window's top, incl. the bar */
     int ww = w->win_w > 0 ? w->win_w : 1;
-    int wh = (w->win_h > 0 ? w->win_h : 1) - top;
+    int wh = (w->win_h > 0 ? w->win_h : 1) + tb;
     const int b = NB_BORDER;
 
     switch (i) {
-    case 0: *x = 0;   *y = top - b; *bw = ww; *bh = b;  break;   /* top    */
-    case 1: *x = 0;   *y = top + wh; *bw = ww; *bh = b; break;   /* bottom */
-    case 2: *x = -b;  *y = top;     *bw = b;  *bh = wh; break;   /* left   */
-    case 3: *x = ww;  *y = top;     *bw = b;  *bh = wh; break;   /* right  */
-    case 4: *x = -b;  *y = top - b; *bw = b;  *bh = b;  break;
-    case 5: *x = ww;  *y = top - b; *bw = b;  *bh = b;  break;
-    case 6: *x = -b;  *y = top + wh; *bw = b; *bh = b;  break;
-    default:*x = ww;  *y = top + wh; *bw = b; *bh = b;  break;
+    case 0: *x = left;     *y = top - b;  *bw = ww; *bh = b;  break; /* top    */
+    case 1: *x = left;     *y = top + wh; *bw = ww; *bh = b;  break; /* bottom */
+    case 2: *x = left - b; *y = top;      *bw = b;  *bh = wh; break; /* left   */
+    case 3: *x = left + ww; *y = top;     *bw = b;  *bh = wh; break; /* right  */
+    case 4: *x = left - b; *y = top - b;  *bw = b;  *bh = b;  break;
+    case 5: *x = left + ww; *y = top - b; *bw = b;  *bh = b;  break;
+    case 6: *x = left - b; *y = top + wh; *bw = b;  *bh = b;  break;
+    default:*x = left + ww; *y = top + wh; *bw = b; *bh = b;  break;
     }
 }
 
