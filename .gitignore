@@ -4,7 +4,6 @@
 *.mod
 *.mod.c
 *.mod.o
-*.cmd
 # ...but *.mod is a kernel build artifact rule (nvkvm-guest.mod) and it also
 # matches go.mod, which is how tests/abi_parity/go.mod got left behind when this
 # repo was extracted — the Go package then had no module file and `go test`
@@ -51,9 +50,6 @@ tests/unit/test_stub_ptr_sanitize
 tests/unit/test_kvm_slot
 tests/unit/test_r1_type_dev
 tests/unit/test_transport_ready
-tests/unit/test_relay_state
-tests/unit/test_relay_clip
-tests/unit/test_relay_wiring
 
 # generated at build time by tests/unit/Makefile (the U-5 function, extracted
 # from src/stub/nvkvm_stub.c so the test cannot drift from the code it pins)
@@ -75,16 +71,15 @@ tests/unit/drm_param_structs.inc
 # from the QEMU handler and from the stub between explicit markers
 tests/unit/r1_type_dev.inc
 tests/unit/r1_stub_type_dev.inc
-# Relay recovery/clipboard helpers extracted from the production QEMU source.
-tests/unit/relay_state_helpers.inc
-tests/unit/relay_clip_batch.inc
-tests/unit/relay_fd_ownership.inc
-tests/unit/relay_clip_wiring.inc
-tests/unit/relay_writable_wiring.inc
-tests/unit/relay_connect_wiring.inc
 
 # scripts/sweep.sh run output: results, raw logs pulled off rented boxes,
 # and the instance registry the auto-destroy timer reads.
 sweep-runs/
 # ...and the guest device-presence guard, extracted from src/guest/nvkvm_virtio.c
 tests/unit/transport_ready.inc
+
+# Operator-supplied SSH keys for the SteamOS guest (steamos_boot.sh gates sshd on
+# the presence of these). Public keys are not secrets, but this repo is PUBLIC and
+# someone's key landing in it via a stray `git add -A` is hard to walk back.
+data/authorized_keys
+data/root_authorized_keys
