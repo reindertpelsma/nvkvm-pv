@@ -745,6 +745,31 @@ struct nv503c_alloc_parameters {
 	__u32 flags;         /* [IN] @0 — NV503C_ALLOC_PARAMETERS_FLAGS_TYPE */
 };
 
+/* -- NV2081_ALLOC_PARAMETERS -- for NV2081_BINAPI (0x2081) ---------------- */
+/*    4 bytes; from class/cl2081.h ("typedef struct NV2081_ALLOC_PARAMETERS {
+ *    NvU32 reserved; } NV2081_ALLOC_PARAMETERS;" -- a single reserved field,
+ *    no padding ambiguity possible).  Read directly off open-gpu-kernel-
+ *    modules tags 550.54.14, 575.51.03, 580.159.04 and 610.43.02 -- byte-
+ *    identical in all four, spanning (and including) this host's 580 ABI
+ *    profile.  Do NOT hand-derive this.
+ *
+ *    CONTEXT (SteamOS/nvkvm-guest bring-up, 2026-08-23): nvidia-smi's RM
+ *    session was observed allocating this class with alloc_parms_size=0;
+ *    without an entry here the forwarder fell back to a guessed 256-byte
+ *    window -- 252 bytes past the guest's real 4-byte params buffer.  Adding
+ *    this row measurably removed nvkvm's "has no alloc-param size entry"
+ *    warning for that session (confirmed before/after in the kernel log).
+ *    It did NOT, on its own, fix a separately-observed Vulkan
+ *    vkEnumeratePhysicalDevices failure (VK_ERROR_INITIALIZATION_FAILED, -3)
+ *    -- tracing showed that failure occurs before the guest ever opens a new
+ *    RM session, i.e. upstream of any RM_ALLOC call, so it is a different
+ *    bug. This row is still correct and worth keeping on its own: it is a
+ *    genuine missing-size gap for a real class nvidia-smi hits. */
+#define NV2081_BINAPI 0x00002081U
+struct nv2081_alloc_parameters {
+	__u32 reserved;       /* [IN] @0 -- unused, per cl2081.h */
+};
+
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */
 /*    several other generic memory classes. V545 layout (driver >= 545.23.06,
  *    matches our 575.51.03): adds numa_node + pad. */

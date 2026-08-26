@@ -2431,6 +2431,17 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * cuInit fails CUDA_ERROR_NOT_SUPPORTED (801). */
 				ap_size = sizeof(struct nv503c_alloc_parameters);
 				break;
+			case NV2081_BINAPI:
+				/* 0x2081: 4B; nvidia-smi's RM session allocs this
+				 * with alloc_parms_size=0.  Without this case the
+				 * probe below guesses a bounded window -- measured
+				 * at 256 bytes, i.e. 252 past the guest's real
+				 * 4-byte params buffer.  Sized from cl2081.h and
+				 * read off OGKM tags 550.54.14, 575.51.03,
+				 * 580.159.04 and 610.43.02: byte-identical in all
+				 * four. */
+				ap_size = sizeof(struct nv2081_alloc_parameters);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -2581,6 +2592,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 						 * -> host RM returns NV_ERR_NOT_SUPPORTED (0x56) and
 						 * cuInit fails CUDA_ERROR_NOT_SUPPORTED (801). */
 						ap_size = sizeof(struct nv503c_alloc_parameters);
+						break;
+					case NV2081_BINAPI:
+						/* 0x2081: 4B; see the sibling switch above. */
+						ap_size = sizeof(struct nv2081_alloc_parameters);
 						break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
