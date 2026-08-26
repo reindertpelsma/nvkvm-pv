@@ -153,6 +153,7 @@ struct nb_x11 {
     xcb_window_t dlg;           /* close-confirmation child, 0 = never made */
     bool      dlg_mapped;
     int       dlg_hot;          /* hovered row, -1 = none                 */
+    bool      cursor_hidden;    /* what the content window currently shows */
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
@@ -162,6 +163,7 @@ static void x11_dlg_show(struct nb_x11 *x);
 static void x11_dlg_hide(struct nb_x11 *x);
 static void x11_dlg_paint(struct nb_x11 *x);
 static int  x11_dlg_hit(int px, int py);
+static void x11_cursor_policy(struct nb_x11 *x);
 static void x11_clip_serve(struct nb_x11 *x,
                            const xcb_selection_request_event_t *rq);
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
@@ -547,6 +549,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
             x->current = x->pending;
             x->pending = -1;
             x->idle_shown = false;
+            x11_cursor_policy(x);
             /* Composite copies, so the buffer is free the moment the server
              * has read it -- there is no PresentIdleNotify coming for it. */
             nb_sink_release(sink, sl->id);
@@ -566,6 +569,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
     x->current = x->pending;
     x->pending = -1;
     x->idle_shown = false;
+    x11_cursor_policy(x);       /* a frame is up: the guest draws the cursor */
     /*
      * DO NOT REPORT THE SIZE WE JUST PRESENTED.
      *
@@ -1123,14 +1127,40 @@ static void x11_cursor_init(struct nb_x11 *x)
     xcb_free_pixmap(x->c, pix);
 }
 
-static void x11_show_cursor(struct nb_x11 *x, bool show)
+/*
+ * WHO OWNS THE POINTER, decided in one place.
+ *
+ * The blank cursor is an attribute of the CONTENT window, so X applies it
+ * exactly while the pointer is over the guest's picture and hands the normal
+ * one back over the letterbox and the window manager's frame -- no enter/leave
+ * bookkeeping, and no way for the two to disagree.
+ *
+ * Hidden whenever the guest is drawing its own cursor underneath, which is any
+ * time a real frame is on screen: the guest gets absolute positions in normal
+ * mode just as it does under grab, so "two cursors" is not a grab-only
+ * problem.  It was, however, only fixed for grab first time round.
+ *
+ * Visible again for the placeholder (no guest, no guest cursor) and for the
+ * close dialog (the user is being asked a question and has to answer it).
+ */
+static void x11_cursor_policy(struct nb_x11 *x)
 {
-    uint32_t v = show ? XCB_CURSOR_NONE : x->blank_cursor;
+    bool hide = x->current >= 0 && !x->idle_shown && !x->dlg_mapped;
+    uint32_t v;
 
-    /* On the CONTENT window only: the letterbox and the frame are the host's,
-     * and taking the pointer away there would hide the way out. */
+    if (!x->blank_cursor || hide == x->cursor_hidden) {
+        return;                 /* idempotent: this runs on every frame */
+    }
+    x->cursor_hidden = hide;
+    v = hide ? x->blank_cursor : XCB_CURSOR_NONE;
     xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
     xcb_flush(x->c);
+}
+
+static void x11_show_cursor(struct nb_x11 *x, bool show)
+{
+    (void)show;
+    x11_cursor_policy(x);
 }
 
 /*
