@@ -33,6 +33,24 @@
 
 /* DRM_FORMAT_XRGB8888, spelled locally so this file needs no drm_fourcc.h. */
 #define DRM_FORMAT_XR24_LOCAL 0x34325258u
+
+/*
+ * How many staging buffers the readback rotates through.
+ *
+ * The console path needs two: the main loop consumes a frame before the thread
+ * can come back around to the one being shown.  THE BROKER PATH DOES NOT --
+ * a compositor HOLDS a dma-buf across frames and releases it on its own
+ * schedule, so writing into it while it is still being read is a real
+ * corruption, not a theoretical one.  OBSERVED on the physical box with two
+ * buffers: the broker's own glitch detector fired on EVERY frame
+ *   "REUSE-IN-FLIGHT seq=3 buf=233 slot=2 (the compositor never released it)"
+ * alternating between the two slots forever.
+ *
+ * Four gives the compositor room to hold one while another is in flight and a
+ * third is being written, at 8 MB each for a 1080p head.
+ */
+#define NVKVM_STAGE_MAX 4u
+#define NVKVM_STAGE_CONSOLE 2u
 #include "nvkvm_display_relay.h"
 
 #include "nvkvm_present_egl.h"
@@ -447,9 +465,10 @@ typedef struct NvkvmPresent {
      * compositor upload -- see nvkvm_udmabuf.h for the measurements.
      */
     bool      relay_readback;      /* stage into udmabuf and submit to relay */
-    struct nvkvm_udmabuf stage_buf[2];
+    struct nvkvm_udmabuf stage_buf[NVKVM_STAGE_MAX];
 
-    uint8_t  *stage[2];
+    uint8_t  *stage[NVKVM_STAGE_MAX];
+    unsigned  stage_n;       /* buffers actually in rotation */
     uint32_t  stage_w, stage_h;
     unsigned  stage_write;   /* buffer the thread writes next */
     unsigned  stage_ready;   /* buffer holding the newest finished frame */
@@ -822,7 +841,7 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, uint8_t *dst,
 /* Size the staging pair for this geometry.  Returns false on OOM. */
 static void nvkvm_stage_release(NvkvmPresent *p)
 {
-    for (int i = 0; i < 2; i++) {
+    for (unsigned i = 0; i < NVKVM_STAGE_MAX; i++) {
         if (p->stage_buf[i].size) {
             nvkvm_udmabuf_free(&p->stage_buf[i]);   /* also unmaps stage[i] */
             p->stage[i] = NULL;
@@ -844,19 +863,20 @@ static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
 
     if (p->relay_readback) {
         /*
-         * Both buffers must succeed or neither is usable: a single-buffered
-         * readback would hand the compositor the buffer the GPU is writing.
+         * ALL of them must succeed or none is usable: too few buffers hands
+         * the compositor one the GPU is still writing into.
          */
-        if (!nvkvm_udmabuf_alloc(&p->stage_buf[0], sz) ||
-            !nvkvm_udmabuf_alloc(&p->stage_buf[1], sz)) {
-            nvkvm_stage_release(p);
-            fprintf(stderr, "nvkvm present: could not allocate udmabuf staging "
-                            "for %ux%u; the cross-vendor path is unavailable\n",
-                    w, h);
-            return false;
+        p->stage_n = NVKVM_STAGE_MAX;
+        for (unsigned i = 0; i < p->stage_n; i++) {
+            if (!nvkvm_udmabuf_alloc(&p->stage_buf[i], sz)) {
+                nvkvm_stage_release(p);
+                fprintf(stderr, "nvkvm present: could not allocate udmabuf "
+                                "staging for %ux%u; the cross-vendor path is "
+                                "unavailable\n", w, h);
+                return false;
+            }
+            p->stage[i] = p->stage_buf[i].ptr;
         }
-        p->stage[0] = p->stage_buf[0].ptr;
-        p->stage[1] = p->stage_buf[1].ptr;
         p->stage_w = w;
         p->stage_h = h;
         p->stage_write = 0;
@@ -864,6 +884,7 @@ static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
         return true;
     }
 
+    p->stage_n = NVKVM_STAGE_CONSOLE;
     p->stage[0] = g_malloc0(sz);
     p->stage[1] = g_malloc0(sz);
     p->stage_w = w;
@@ -920,7 +941,7 @@ static bool nvkvm_readback_to_stage(NvkvmPresent *p, int fd, uint32_t owner,
         pthread_mutex_lock(&p->lock);
         p->stage_ready     = p->stage_write;
         p->stage_has_frame = true;
-        p->stage_write    ^= 1u;
+        p->stage_write     = (p->stage_write + 1u) % p->stage_n;
         pthread_mutex_unlock(&p->lock);
     }
     close(fd);                             /* readback owns + consumes the fd */
