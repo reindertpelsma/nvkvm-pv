@@ -76,7 +76,6 @@ extern int nb_trace_frames;
                              * clipboard is never readable by the guest      */
 #define NB_CLIP_CONSENT  2  /* G2H, plus host->guest ONLY on an explicit
                              * paste trigger.  RECOMMENDED.                  */
-#define NB_CLIP_FULL     3  /* bidirectional automatic sync.  The risky one. */
 
 /* Keys that mean "paste" and so trigger a host->guest send. */
 #define NB_CLIP_MAX_TRIGGERS 8
@@ -170,6 +169,10 @@ struct nb_buf_desc {
     uint32_t width, height, stride, offset, fourcc;
     uint64_t modifier;
     uint32_t bpp;               /* bytes per pixel implied by fourcc          */
+    bool     is_shm;            /* the fd is a memfd, not a dma-buf: the only
+                                 * buffer type a Wayland compositor CANNOT
+                                 * refuse, so it is the universal last tier
+                                 * when even LINEAR dma-buf import fails      */
     uint32_t seq;               /* the client's own frame counter (cmd.seq).
                                  * ADVISORY — it comes from the untrusted VMM
                                  * and is used for nothing but log lines, so a
@@ -185,6 +188,8 @@ struct nb_sink {
 
     int      client_fd;         /* -1 when nobody is connected                */
     pid_t    client_pid;        /* from SO_PEERCRED, for log lines only       */
+    uint64_t client_generation; /* changes across every attach/detach; async
+                                 * backend work must match before delivery    */
     uint32_t seq;
 
     /*
@@ -208,6 +213,8 @@ struct nb_sink {
     char     clip_in[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
     unsigned clip_in_len;
     unsigned clip_in_chunks;
+    uint32_t clip_in_next_chunk;
+    bool     clip_in_active;
     bool     clip_in_bad;       /* this transfer already failed; drain it   */
     uint64_t clip_rate_ms;      /* separate 1s window for clipboard         */
     unsigned clip_rate_count;
@@ -218,8 +225,10 @@ struct nb_sink {
     bool     clip_told_off;
     bool     clip_told_noclient;
     bool     clip_told_noagent;
-    bool     clip_want_paste;   /* set by the core, consumed by the backend */
     unsigned clip_held_key;     /* paste key held until content is queued   */
+    bool     clip_held_ctrl;
+    bool     clip_held_shift;
+    uint64_t clip_held_generation;
     unsigned caps_seen;         /* what the client told us it can do        */
     const struct nb_config *cfg;
     bool     focused;
@@ -238,6 +247,7 @@ struct nb_sink {
      * synthesise a release for each: a grab that ends with keys latched down
      * in the guest is both a bug and, for modifiers, a security surprise. */
     unsigned char key_down[768 / 8];
+    unsigned char consumed[768 / 8]; /* broker-owned chord key-ups           */
 
     struct nvkvm_broker_pkt tx[NB_TXRING];
     unsigned tx_head, tx_tail;  /* head==tail ⇒ empty                         */
@@ -272,6 +282,16 @@ void nb_sink_rel(struct nb_sink *s, int dx, int dy);
 void nb_sink_wheel(struct nb_sink *s, int v, int h);
 void nb_sink_focus(struct nb_sink *s, bool active);
 void nb_sink_pointer(struct nb_sink *s, bool inside);
+/*
+ * Tell the client a (fourcc, modifier) turned out to be unusable AFTER we said
+ * it was advertised.  A compositor can advertise a modifier its own driver then
+ * refuses to bind -- MEASURED on GNOME/Mutter with NVIDIA 595.84, which
+ * advertises XR24+LINEAR and answers the import with "Could not bind the given
+ * EGLImage to a CoglTexture2D".  Without this the VMM would keep sending a pair
+ * we have proven does not work.
+ */
+void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
+                            bool usable);
 void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h);
 void nb_sink_frame(struct nb_sink *s);
 void nb_sink_release(struct nb_sink *s, uint64_t buf_id);
@@ -292,18 +312,22 @@ bool nb_sink_has_client(const struct nb_sink *s);
  * while the guest holds the keyboard is incoherent, and it is the state a
  * stuck grab is least recoverable from. */
 void nb_sink_force_ungrab(struct nb_sink *s);
-/* Host clipboard text on its way to the guest, already size-checked.  Returns
- * false if it could not be queued (ring pressure), so the caller can say so
- * rather than let a paste silently produce nothing. */
-bool nb_sink_send_clipboard(struct nb_sink *s, const char *text, size_t len);
+/* Host clipboard text on its way to the guest, already size-checked.  The
+ * generation captured when the fetch began must still name the current
+ * connection and held paste operation.  Returns false for stale completion or
+ * ring pressure, so neither can disclose or paste the wrong content. */
+bool nb_sink_send_clipboard(struct nb_sink *s, uint64_t generation,
+                            const char *text, size_t len);
 /* A backend telling the core a paste trigger fired.  The core owns the policy:
  * which mode we are in, whether anyone is connected, and what to say when the
  * answer is no. */
 void nb_sink_paste_trigger(struct nb_sink *s);
-/* Release the paste keystroke held while the host selection was fetched.  Safe
- * to call when nothing is held, and MUST be called on every path out of a
- * fetch -- including failure -- or the key is swallowed. */
-void nb_sink_clip_release(struct nb_sink *s);
+/* Complete an asynchronous host-selection fetch.  `generation` is the value
+ * captured when it began; stale completion from an old persistent client is
+ * ignored.  When `paste` is true a coherent, balanced paste chord is replayed
+ * after the clipboard packets.  False cancels it visibly without pasting stale
+ * guest content. */
+void nb_sink_clip_finish(struct nb_sink *s, uint64_t generation, bool paste);
 void nb_sink_bye(struct nb_sink *s, int reason);
 
 /* ── session backends ────────────────────────────────────────────────────── */
@@ -336,6 +360,10 @@ struct nb_session_ops {
     /* Ask for a window of this size.  Advisory; may be ignored. */
     int  (*resize)(struct nb_session *s, unsigned w, unsigned h);
 
+    /* Cancel connection-scoped asynchronous work before the sink generation
+     * changes.  Optional on backends with no such work. */
+    void (*client_detach)(struct nb_session *s, uint64_t generation);
+
     /*
      * Show the "no VM attached" placeholder.  Called once before the first
      * client can connect and again whenever one goes away, so that an idle
@@ -355,11 +383,15 @@ struct nb_session_ops {
      * which case clipboard is simply unavailable rather than half-working. */
     int  (*set_clipboard)(struct nb_session *s, const char *text, size_t len);
     void (*notify_clipboard)(struct nb_session *s);
-    /* Begin an asynchronous read of the host selection.  The backend calls
-     * nb_sink_send_clipboard() then nb_sink_clip_release() when it completes,
-     * and nb_sink_clip_release() alone if it fails. */
-    int  (*fetch_clipboard)(struct nb_session *s);
+    /* Begin an asynchronous read of the host selection.  The backend captures
+     * `generation`, queues content with nb_sink_send_clipboard(), then calls
+     * nb_sink_clip_finish() with the same generation. */
+    int  (*fetch_clipboard)(struct nb_session *s, struct nb_sink *sink,
+                            uint64_t generation);
 };
+
+#define NB_SESSION_CLIP_G2H (1u << 0)
+#define NB_SESSION_CLIP_H2G (1u << 1)
 
 struct nb_session {
     const struct nb_session_ops *ops;
@@ -367,6 +399,7 @@ struct nb_session {
 
     uint32_t width, height;     /* current window size, in pixels             */
     uint32_t caps;              /* NVKVM_BROKER_CAP_*                         */
+    uint32_t clipboard_caps;    /* NB_SESSION_CLIP_* actually implemented     */
     /*
      * Backends whose import path cannot tell a dma-buf from any other fd are
      * not a thing — but the TEST backend has no import path at all and must be
@@ -396,7 +429,17 @@ struct nb_session *nb_session_open(const struct nb_config *cfg);
 /* Bytes per pixel for the single-plane 32-bit formats the nvkvm head can
  * flip, or 0 for anything else.  0 means "reject": a format whose pitch we
  * cannot compute is a format whose bounds we cannot check. */
+/* Presentation tiers, worst-to-best fallback order.  See nb_common.c. */
+enum { NB_TIER_AUTO = 0, NB_TIER_NATIVE, NB_TIER_LINEAR, NB_TIER_SHM };
+extern int  nb_tier;
+extern bool nb_linear_only;   /* deprecated alias for NB_TIER_LINEAR */
+
 uint32_t nb_fourcc_bpp(uint32_t fourcc);
+/* The opaque twin of an alpha format (AR24->XR24), or 0 if there is none.
+ * Same byte layout; only the alpha channel's meaning differs. */
+uint32_t nb_fourcc_opaque_twin(uint32_t fourcc);
+/* Human name for a modifier's vendor half — INTEL/NVIDIA/AMD/LINEAR/... */
+const char *nb_modifier_vendor(uint64_t modifier);
 const char *nb_fourcc_name(uint32_t fourcc, char buf[8]);
 
 /*

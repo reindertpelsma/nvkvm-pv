@@ -57,7 +57,6 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
-#include "block/aio.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
@@ -75,9 +74,27 @@
 #define RELAY_LOG(fmt, ...) \
     fprintf(stderr, "nvkvm-broker: " fmt "\n", ##__VA_ARGS__)
 
+/* Distinct (fourcc, modifier) pairs whose verdict we remember per connection. */
+#define RELAY_FMT_SLOTS 4
+
+#define RELAY_CLIP_MAX_CMDS \
+    ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_CMD_BYTES - 1u) / \
+     NVKVM_BROKER_CLIP_CMD_BYTES)
+
+typedef enum RelayConnState {
+    RELAY_CONN_DOWN,
+    RELAY_CONN_CONNECTING,
+    RELAY_CONN_HELLO,
+    RELAY_CONN_SYNC_CAPS,
+    RELAY_CONN_SYNC_WINDOW,
+    RELAY_CONN_SYNC_ATTACH,
+    RELAY_CONN_SYNC_COMMIT,
+    RELAY_CONN_ACTIVE,
+} RelayConnState;
+
 typedef struct NvkvmRelay {
     int         sock;           /* the broker connection, or -1               */
-    QemuMutex   lock;           /* serialises sends; the virtio worker sends  */
+    RelayConnState conn_state;  /* owned by the main loop under the BQL       */
     QemuConsole *con;           /* where input is injected                    */
     uint32_t    caps;           /* from HELLO                                 */
 
@@ -103,8 +120,10 @@ typedef struct NvkvmRelay {
     /* Reconnect.  A display process restarting must never be a VM-affecting
      * event, so a lost socket is a transient, not the end. */
     QEMUTimer  *retry;
+    QEMUTimer  *handshake_deadline;
     unsigned    retry_ms;
     bool        retry_logged;   /* first failure is loud, the rest are silent */
+    bool        attempt_is_retry;
     uint64_t    n_reconnects;
 
     /*
@@ -133,10 +152,45 @@ typedef struct NvkvmRelay {
     unsigned    clip_in_len;
     unsigned    clip_in_chunks;
     bool        clip_in_bad;
+    struct nvkvm_broker_clip_cmd clip_out[RELAY_CLIP_MAX_CMDS];
+    size_t      clip_out_count;
+    size_t      clip_out_next;
 
     int         last_fd;
     uint32_t    last_bw, last_bh, last_stride, last_fourcc;
     uint64_t    last_modifier;
+
+    /*
+     * CAN THE DISPLAY SHOW WHAT THE GUEST RENDERS?
+     *
+     * On a cross-vendor host it cannot, at any price: the guest's tiling is its
+     * GPU's own, and the compositor's GPU has no way to read it.  We cannot see
+     * the broker's advertised set and a rejected ATTACH is not reported back,
+     * so we ASK -- once per (fourcc, modifier), not per frame.
+     *
+     * Connection-generation state: cleared on every disconnect, because a
+     * reconnected broker may be a different display entirely.  Carrying a
+     * verdict across a reconnect is the RR-07 class of bug.
+     */
+    /*
+     * A TABLE, not one slot.  Two pairs are in play at once on a
+     * cross-vendor host: what the guest renders (its GPU's tiling) and what
+     * the readback produces (XR24 + LINEAR).  With a single slot the second
+     * submit evicted the first, so the next guest frame read "unknown", went
+     * zero-copy, was rejected, re-queried, and the mode oscillated
+     * CANNOT -> CAN -> CANNOT forever.  OBSERVED on the physical box: 4
+     * CANNOT and 5 CAN lines for one guest session.
+     *
+     * Four entries is deliberate headroom over the two that occur; a fifth
+     * distinct pair in one connection would mean the guest is changing format
+     * repeatedly, which is worth the re-query.
+     */
+    struct {
+        uint32_t fourcc;
+        uint64_t mod;
+        bool     used;
+        int      verdict;       /* -1 asked, awaiting reply; 0 no; 1 yes */
+    } fmt[RELAY_FMT_SLOTS];
 
     /* Partial packet accumulator.  Fixed size: a packet is always exactly
      * NVKVM_BROKER_PKT_SIZE bytes, so nothing here is length-driven. */
@@ -170,9 +224,13 @@ bool nvkvm_display_relay_active(void)
 /* ── sending ─────────────────────────────────────────────────────────────── */
 
 /*
- * One command, optionally carrying one fd.  MSG_DONTWAIT throughout: this can
- * be called from a virtio worker thread, and a display that has stopped
- * draining must cost a dropped frame, never a blocked vCPU.
+ * One command, optionally carrying one fd.  MSG_DONTWAIT throughout: PRESENT
+ * runs inline in the BQL-held virtqueue callback, so a display that has stopped
+ * draining must cost a dropped frame, never a stalled VM.
+ *
+ * Connection and descriptor ownership is deliberately BQL/main-loop-only.
+ * Moving PRESENT to a worker therefore requires an explicit handoff to the
+ * main loop; it must not make this function a multi-threaded socket owner.
  *
  * Returns 0, -EAGAIN when the socket is full, or another -errno (fatal).
  */
@@ -227,81 +285,52 @@ static int relay_send(NvkvmRelay *r, const struct nvkvm_broker_cmd *cmd, int fd)
 #define RELAY_RETRY_MIN_MS   200u
 #define RELAY_RETRY_MAX_MS  5000u
 
-static void relay_arm_retry_bh(void *opaque);
 static void relay_retry(void *opaque);
-static int  relay_connect(NvkvmRelay *r, const char *path, Error **errp);
 static void relay_readable(void *opaque);
-static void relay_replay(NvkvmRelay *r);
-static void relay_send_caps(NvkvmRelay *r);
+static void relay_forget_format_verdict(NvkvmRelay *r);
+static void relay_writable(void *opaque);
+static void relay_handshake_timeout(void *opaque);
+static int  relay_start_connect(NvkvmRelay *r, const char *path, Error **errp);
+static void relay_sync_flush(NvkvmRelay *r);
+static int  relay_send_caps(NvkvmRelay *r);
 static void relay_clip_recv(NvkvmRelay *r, const struct nvkvm_broker_pkt *p);
 
-static void relay_close_bh(void *opaque)
+/* NVKVM_RELAY_STATE_HELPERS_BEGIN -- extracted by test_relay_state. */
+/*
+ * Everything below is knowledge held about ONE broker connection.  A stream
+ * disconnect is both the packet-framing boundary and the clipboard transaction
+ * boundary, so none of it may survive into a new broker process.  The retained
+ * frame is deliberately absent: it belongs to the VM and is what the next
+ * connection must replay.
+ */
+static void relay_connection_state_reset(NvkvmRelay *r)
 {
-    int fd = (int)(intptr_t)opaque;
-
-    qemu_set_fd_handler(fd, NULL, NULL, NULL);
-    close(fd);
+    r->caps = 0;
+    r->last_w = 0;
+    r->last_h = 0;
+    r->rxlen = 0;
+    r->clip_in_len = 0;
+    r->clip_in_chunks = 0;
+    r->clip_in_bad = false;
+    r->clip_out_count = 0;
+    r->clip_out_next = 0;
 }
 
-static void relay_drop(NvkvmRelay *r, const char *why)
+/*
+ * Consume and retain a frame whenever broker mode is enabled, independently
+ * of whether a broker is connected at this instant.  False leaves ownership
+ * with the caller; true transfers ownership of dmabuf_fd to r.  Like every
+ * connection-state operation, this runs under the BQL; the relay has no
+ * worker-side socket owner.
+ */
+static bool relay_frame_retain(NvkvmRelay *r, int dmabuf_fd,
+                               uint32_t width, uint32_t height,
+                               uint32_t stride, uint32_t fourcc,
+                               uint64_t modifier)
 {
-    int fd;
-
-    if (r->sock < 0) {
-        return;
-    }
-    fd = r->sock;
-    r->sock = -1;
-    /* A NEW broker has been told nothing, so nothing may be elided later. */
-    r->last_w = r->last_h = 0;
-    /*
-     * The fd is in the main loop's iohandler set, and relay_drop() is
-     * reachable from a virtio WORKER thread (a failed send).  Unregistering
-     * and closing a polled fd out from under the main loop is a
-     * use-after-close, so the teardown is bounced to the main loop.  Setting
-     * r->sock = -1 first is what makes every other path stop using it
-     * immediately, so the delay costs nothing.
-     */
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), relay_close_bh,
-                            (void *)(intptr_t)fd);
-    error_report("nvkvm-broker: %s; the display and input are gone for now "
-                 "(%" PRIu64 " frames relayed, %" PRIu64 " dropped, "
-                 "%" PRIu64 " attached without a commit). "
-                 "The VM keeps running; reconnecting in the background.",
-                 why, r->n_sent, r->n_dropped, r->n_uncommitted);
-    /*
-     * RESTARTING A DISPLAY PROCESS MUST NOT BE A VM-AFFECTING EVENT.  Arm the
-     * retry from the main loop -- relay_drop() is reachable from a virtio
-     * worker thread and QEMUTimer is not thread-safe.
-     */
-    r->retry_ms = RELAY_RETRY_MIN_MS;
-    r->retry_logged = false;
-    aio_bh_schedule_oneshot(qemu_get_aio_context(), relay_arm_retry_bh, r);
-}
-
-bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
-                                uint32_t width, uint32_t height,
-                                uint32_t stride, uint32_t fourcc,
-                                uint64_t modifier)
-{
-    NvkvmRelay *r = nvkvm_relay;
-    struct nvkvm_broker_cmd cmd;
-    uint32_t cmd_seq = 0;
-    int rc;
-
-    if (!r || r->sock < 0 || dmabuf_fd < 0) {
+    if (!r || !r->enabled || dmabuf_fd < 0) {
         return false;
     }
-
-    qemu_mutex_lock(&r->lock);
-
-    /*
-     * RETAIN THE NEWEST, DROP THE REST.  This runs whether or not the socket is
-     * up: while the broker is away the frames still arrive (the guest does not
-     * know), and keeping the latest is what lets a reconnect paint immediately.
-     * Replacing rather than queueing is deliberate -- a backlog of stale frames
-     * delivered on reconnect is worse than a brief blank, and unbounded.
-     */
     if (r->last_fd >= 0) {
         close(r->last_fd);
     }
@@ -311,11 +340,242 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     r->last_stride   = stride;
     r->last_fourcc   = fourcc;
     r->last_modifier = modifier;
+    return true;
+}
+/* NVKVM_RELAY_STATE_HELPERS_END */
 
+/* NVKVM_RELAY_FD_OWNERSHIP_BEGIN -- extracted by test_relay_wiring. */
+static void relay_set_fd_handlers(NvkvmRelay *r, bool writable)
+{
+    assert(bql_locked());
+    assert(r->sock >= 0);
+    qemu_set_fd_handler(r->sock, relay_readable,
+                        writable ? relay_writable : NULL, r);
+}
+
+/*
+ * The main loop owns registration and closure.  Removing the handler before
+ * close means there is no deferred raw descriptor that can be reused between
+ * scheduling and teardown.  aio_set_fd_handler(), which backs this API, is
+ * explicitly safe when called while the handler list is being walked.
+ */
+static void relay_close_connection(NvkvmRelay *r)
+{
+    int fd;
+
+    assert(bql_locked());
+    if (r->handshake_deadline) {
+        timer_del(r->handshake_deadline);
+    }
     if (r->sock < 0) {
-        /* Disconnected: consumed and remembered, nothing to send.  Returning
-         * true keeps the caller from falling through to the GL import path. */
-        qemu_mutex_unlock(&r->lock);
+        r->conn_state = RELAY_CONN_DOWN;
+        relay_connection_state_reset(r);
+        return;
+    }
+    fd = r->sock;
+    r->sock = -1;
+    r->conn_state = RELAY_CONN_DOWN;
+    qemu_set_fd_handler(fd, NULL, NULL, NULL);
+    close(fd);
+    relay_connection_state_reset(r);
+}
+/* NVKVM_RELAY_FD_OWNERSHIP_END */
+
+static void relay_schedule_retry(NvkvmRelay *r)
+{
+    assert(bql_locked());
+    timer_mod(r->retry,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + r->retry_ms);
+}
+
+/*
+ * Ask the broker whether it can display this (fourcc, modifier).
+ *
+ * Sent once per distinct pair.  While the answer is outstanding the caller
+ * keeps submitting zero-copy: that is the right optimism, because the pair the
+ * guest flips is displayable on every same-vendor host, and being wrong costs
+ * one round trip's worth of dropped frames rather than a wrong permanent mode.
+ */
+static void relay_query_format(NvkvmRelay *r, uint32_t fourcc, uint64_t mod)
+{
+    struct nvkvm_broker_cmd cmd;
+    unsigned i, slot = RELAY_FMT_SLOTS;
+
+    for (i = 0; i < RELAY_FMT_SLOTS; i++) {
+        if (r->fmt[i].used && r->fmt[i].fourcc == fourcc &&
+            r->fmt[i].mod == mod) {
+            return;                     /* already asked about this pair */
+        }
+        if (!r->fmt[i].used && slot == RELAY_FMT_SLOTS) {
+            slot = i;
+        }
+    }
+    if (slot == RELAY_FMT_SLOTS) {
+        slot = 0;                       /* full: recycle the oldest */
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type     = NVKVM_BROKER_CMD_QUERY_FORMAT;
+    cmd.fourcc   = fourcc;
+    cmd.modifier = mod;
+
+    r->fmt[slot].fourcc  = fourcc;
+    r->fmt[slot].mod     = mod;
+    r->fmt[slot].used    = true;
+    r->fmt[slot].verdict = -1;
+
+    if (relay_send(r, &cmd, -1) != 0) {
+        /* Not fatal and not retried here: freeing the slot makes the next
+         * frame ask again, which is the whole recovery needed. */
+        r->fmt[slot].used = false;
+    }
+}
+
+static void relay_drop(NvkvmRelay *r, const char *why)
+{
+    assert(bql_locked());
+    if (r->sock < 0) {
+        return;
+    }
+    relay_close_connection(r);
+    relay_forget_format_verdict(r);
+    error_report("nvkvm-broker: %s; the display and input are gone for now "
+                 "(%" PRIu64 " frames relayed, %" PRIu64 " dropped, "
+                 "%" PRIu64 " attached without a commit). "
+                 "The VM keeps running; reconnecting in the background.",
+                 why, r->n_sent, r->n_dropped, r->n_uncommitted);
+    r->retry_ms = RELAY_RETRY_MIN_MS;
+    r->retry_logged = false;
+    relay_schedule_retry(r);
+}
+
+/*
+ * Connection-generation reset for the format verdict.  A reconnected broker may
+ * be a completely different display -- a different compositor, a different GPU
+ * -- so an answer from the previous connection says nothing about this one.
+ * Carrying it across is the RR-07 class of bug (reconnect inheriting partial
+ * protocol state), and here it would silently pin the wrong present path.
+ */
+static void relay_forget_format_verdict(NvkvmRelay *r)
+{
+    memset(r->fmt, 0, sizeof(r->fmt));
+}
+
+static void relay_attempt_failed(NvkvmRelay *r, const char *why)
+{
+    assert(bql_locked());
+    relay_close_connection(r);
+    relay_forget_format_verdict(r);
+    if (!r->retry_logged) {
+        error_report("nvkvm-broker: connection attempt failed: %s", why);
+        RELAY_LOG("retrying in the background (up to every %ums); the VM "
+                  "continues running", RELAY_RETRY_MAX_MS);
+        r->retry_logged = true;
+    }
+    r->retry_ms = r->retry_ms * 2 > RELAY_RETRY_MAX_MS
+                      ? RELAY_RETRY_MAX_MS : r->retry_ms * 2;
+    relay_schedule_retry(r);
+}
+
+/*
+ * -1 not answered yet, 0 the display cannot show this pair, 1 it can.
+ *
+ * The caller uses 0 to switch to the readback path.  While the answer is
+ * outstanding it should keep going zero-copy: on every same-vendor host the
+ * answer is yes, and being briefly wrong costs a few dropped frames instead of
+ * a permanently wrong mode.
+ */
+int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier)
+{
+    NvkvmRelay *r = nvkvm_relay;
+    unsigned i;
+
+    if (!r) {
+        return -1;
+    }
+    for (i = 0; i < RELAY_FMT_SLOTS; i++) {
+        if (r->fmt[i].used && r->fmt[i].fourcc == fourcc &&
+            r->fmt[i].mod == modifier) {
+            return r->fmt[i].verdict;
+        }
+    }
+    return -1;
+}
+
+bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                uint32_t width, uint32_t height,
+                                uint32_t stride, uint32_t fourcc,
+                                uint64_t modifier)
+{
+    return nvkvm_display_relay_submit_flags(nv, dmabuf_fd, width, height,
+                                            stride, fourcc, modifier, false);
+}
+
+/*
+ * `shm` declares that the fd is a memfd to be shown through wl_shm rather than
+ * imported as a dma-buf.  Declared, not inferred: the broker enforces that the
+ * fd really is a memfd, but it must not have to GUESS what the VMM meant.
+ */
+bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t stride, uint32_t fourcc,
+                                      uint64_t modifier, bool shm)
+{
+    NvkvmRelay *r = nvkvm_relay;
+    struct nvkvm_broker_cmd cmd;
+    uint32_t cmd_seq = 0;
+    int rc;
+
+    if (!r) {
+        return false;
+    }
+    /* See the ownership contract in nvkvm_display_relay.h.  This assertion is
+     * load-bearing: a future worker offload must marshal the whole operation to
+     * the main loop instead of creating a second socket owner. */
+    assert(bql_locked());
+
+    /*
+     * Ask -- once per pair -- whether the display can show this at all.  Done
+     * here rather than at mode-set because this is where the actual (fourcc,
+     * modifier) the guest flips first becomes known; a mode-set only tells us
+     * the geometry.  The helper returns immediately once the pair has been
+     * asked about, so this is not per-frame work.
+     */
+    if (r->sock >= 0) {
+        relay_query_format(r, fourcc, modifier);
+    }
+
+    /*
+     * RETAIN THE NEWEST, DROP THE REST.  This runs whether or not the socket is
+     * up: while the broker is away the frames still arrive (the guest does not
+     * know), and keeping the latest is what lets a reconnect paint immediately.
+     * Replacing rather than queueing is deliberate -- a backlog of stale frames
+     * delivered on reconnect is worse than a brief blank, and unbounded.
+     */
+    if (!relay_frame_retain(r, dmabuf_fd, width, height, stride, fourcc,
+                            modifier)) {
+        return false;
+    }
+
+    if (r->conn_state == RELAY_CONN_SYNC_COMMIT) {
+        /* ATTACH for the previous retained frame is already on the stream.
+         * Closing and replaying is the only way to avoid committing that stale
+         * prefix while claiming the newest frame was retained. */
+        relay_attempt_failed(r,
+            "a newer frame replaced one attached during connection replay");
+        return true;
+    }
+    if (r->conn_state == RELAY_CONN_SYNC_ATTACH ||
+        r->conn_state == RELAY_CONN_SYNC_CAPS) {
+        /* ATTACH/CAPS has not been accepted yet (otherwise the state already
+         * advanced), so replay the newly retained metadata and frame before
+         * finishing the handshake. */
+        r->conn_state = RELAY_CONN_SYNC_WINDOW;
+        relay_sync_flush(r);
+        return true;
+    }
+    if (r->conn_state != RELAY_CONN_ACTIVE) {
+        /* Down or still handshaking: consumed and remembered, nothing to send.
+         * Returning true keeps the caller from falling through to GL import. */
         return true;
     }
 
@@ -339,6 +599,7 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
 
     memset(&cmd, 0, sizeof(cmd));
     cmd.type = NVKVM_BROKER_CMD_ATTACH;
+    cmd.flags = shm ? NVKVM_BROKER_CMD_F_SHM : 0;
     cmd.width = width;
     cmd.height = height;
     cmd.stride = stride;
@@ -355,13 +616,11 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
          * carries a newer buffer.  Counted, not silent.
          */
         r->n_dropped++;
-        qemu_mutex_unlock(&r->lock);
         return true;        /* we consumed the fd; do not fall through */
     }
     if (rc != 0) {
         relay_drop(r, rc == -EPROTO ? "short write on the broker socket"
                                     : "the broker socket failed");
-        qemu_mutex_unlock(&r->lock);
         return true;
     }
     /*
@@ -399,7 +658,6 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
         relay_drop(r, "the broker socket failed on commit");
     }
     r->n_sent++;
-    qemu_mutex_unlock(&r->lock);
     return true;
 }
 
@@ -596,6 +854,43 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
          * has them without a protocol change.
          */
         break;
+    case NVKVM_BROKER_EV_FORMAT: {
+        /*
+         * The question is echoed back, so the reply is matched to its slot by
+         * (fourcc, modifier) rather than by arrival order.  A reply for a pair
+         * we are no longer tracking is discarded, not latched: the guest can
+         * change format between query and answer, and adopting a stale verdict
+         * would pin the wrong present path.
+         */
+        uint64_t mod = (uint64_t)p->w0 | ((uint64_t)p->w1 << 32);
+        uint32_t fourcc = (uint32_t)p->y;
+        unsigned i;
+
+        for (i = 0; i < RELAY_FMT_SLOTS; i++) {
+            if (r->fmt[i].used && r->fmt[i].fourcc == fourcc &&
+                r->fmt[i].mod == mod) {
+                break;
+            }
+        }
+        if (i == RELAY_FMT_SLOTS) {
+            RELAY_LOG("stale EV_FORMAT for fourcc 0x%x modifier 0x%llx, "
+                      "ignored", (unsigned)fourcc, (unsigned long long)mod);
+            break;
+        }
+        if (r->fmt[i].verdict != -1) {
+            break;                      /* already answered; nothing new */
+        }
+        r->fmt[i].verdict = p->x ? 1 : 0;
+        info_report("nvkvm-broker: the display %s show fourcc 0x%08x "
+                    "modifier 0x%016llx%s",
+                    r->fmt[i].verdict ? "CAN" : "CANNOT",
+                    (unsigned)fourcc, (unsigned long long)mod,
+                    r->fmt[i].verdict ? "" :
+                    " — frames must be read back through the guest's GPU into "
+                    "a LINEAR buffer the display can import");
+        break;
+    }
+
     case NVKVM_BROKER_EV_POINTER:
     case NVKVM_BROKER_EV_HELLO:
         break;
@@ -679,6 +974,13 @@ static void relay_readable(void *opaque)
 {
     NvkvmRelay *r = opaque;
 
+    assert(bql_locked());
+    if (r->conn_state == RELAY_CONN_CONNECTING) {
+        relay_writable(r);
+        if (r->conn_state == RELAY_CONN_CONNECTING || r->sock < 0) {
+            return;
+        }
+    }
     for (;;) {
         ssize_t n;
 
@@ -688,7 +990,12 @@ static void relay_readable(void *opaque)
         n = recv(r->sock, r->rxbuf + r->rxlen,
                  NVKVM_BROKER_PKT_SIZE - r->rxlen, MSG_DONTWAIT);
         if (n == 0) {
-            relay_drop(r, "the display broker closed the connection");
+            if (r->conn_state == RELAY_CONN_ACTIVE) {
+                relay_drop(r, "the display broker closed the connection");
+            } else {
+                relay_attempt_failed(r,
+                    "the display broker closed during the handshake");
+            }
             return;
         }
         if (n < 0) {
@@ -698,7 +1005,12 @@ static void relay_readable(void *opaque)
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return;
             }
-            relay_drop(r, "read error on the broker socket");
+            if (r->conn_state == RELAY_CONN_ACTIVE) {
+                relay_drop(r, "read error on the broker socket");
+            } else {
+                relay_attempt_failed(r,
+                    "read error during the broker handshake");
+            }
             return;
         }
         r->rxlen += (size_t)n;
@@ -707,60 +1019,59 @@ static void relay_readable(void *opaque)
 
             memcpy(&pkt, r->rxbuf, sizeof(pkt));
             r->rxlen = 0;
-            relay_handle(r, &pkt);
+            if (r->conn_state == RELAY_CONN_HELLO) {
+                if (pkt.type != NVKVM_BROKER_EV_HELLO) {
+                    relay_attempt_failed(r,
+                        "the first broker packet was not HELLO");
+                    return;
+                }
+                if (pkt.w0 != NVKVM_BROKER_PROTO_VERSION) {
+                    relay_attempt_failed(r,
+                        "the broker reported an incompatible protocol version");
+                    return;
+                }
+                if (!(pkt.w1 & NVKVM_BROKER_CAP_DMABUF)) {
+                    relay_attempt_failed(r,
+                        "the broker cannot accept dma-buf buffers");
+                    return;
+                }
+                r->caps = pkt.w1;
+                RELAY_LOG("connected to %s, capabilities 0x%x",
+                          nvkvm_relay_sock_path, pkt.w1);
+                if (!(pkt.w1 & NVKVM_BROKER_CAP_FOCUS_EVENTS)) {
+                    RELAY_LOG("NOTE: the broker cannot observe focus loss on "
+                              "this session, so it will not offer a keyboard "
+                              "grab. Absolute pointer and keyboard still work "
+                              "while the window is active.");
+                }
+                r->conn_state = RELAY_CONN_SYNC_WINDOW;
+                relay_sync_flush(r);
+                if (r->sock < 0) {
+                    return;
+                }
+            } else {
+                relay_handle(r, &pkt);
+            }
         }
     }
 }
 
 /* ── connection ──────────────────────────────────────────────────────────── */
 
-static int relay_recv_blocking(int sock, struct nvkvm_broker_pkt *pkt)
-{
-    size_t got = 0;
-    /*
-     * BOUNDED.  This runs on the main loop -- at startup, and now on every
-     * reconnect attempt -- so a broker that accepts the connection and then
-     * says nothing must not wedge QEMU.  Two seconds is far longer than a
-     * local unix-socket handshake and short enough that nobody watches it.
-     */
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    while (got < NVKVM_BROKER_PKT_SIZE) {
-        ssize_t n = recv(sock, (char *)pkt + got,
-                         NVKVM_BROKER_PKT_SIZE - got, 0);
-
-        if (n == 0) {
-            return -EPIPE;
-        }
-        if (n < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -errno;         /* EAGAIN here is the 2s timeout above */
-        }
-        got += (size_t)n;
-    }
-    {   /* Back to blocking for the rest of the connection's life. */
-        struct timeval off = { .tv_sec = 0, .tv_usec = 0 };
-
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &off, sizeof(off));
-    }
-    return 0;
-}
-
-static int relay_connect(NvkvmRelay *r, const char *path, Error **errp)
+/* NVKVM_RELAY_CONNECT_WIRING_BEGIN -- extracted by test_relay_wiring. */
+static int relay_start_connect(NvkvmRelay *r, const char *path, Error **errp)
 {
     struct sockaddr_un sa;
-    struct nvkvm_broker_pkt pkt;
-    int fd, rc;
+    bool connecting = false;
+    int fd;
 
+    assert(bql_locked());
+    assert(r->sock < 0 && r->conn_state == RELAY_CONN_DOWN);
     if (strlen(path) >= sizeof(sa.sun_path)) {
         error_setg(errp, "nvkvm-broker: socket path too long");
         return -1;
     }
-    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) {
         error_setg_errno(errp, errno, "nvkvm-broker: socket");
         return -1;
@@ -769,56 +1080,34 @@ static int relay_connect(NvkvmRelay *r, const char *path, Error **errp)
     sa.sun_family = AF_UNIX;
     strncpy(sa.sun_path, path, sizeof(sa.sun_path) - 1);
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-        error_setg_errno(errp, errno,
-                         "nvkvm-broker: cannot connect to %s. Is the display "
-                         "broker running, and is the socket bind-mounted into "
-                         "this container?", path);
-        close(fd);
-        return -1;
+        if (errno == EINPROGRESS || errno == EALREADY || errno == EAGAIN) {
+            connecting = true;
+        } else {
+            error_setg_errno(errp, errno,
+                             "nvkvm-broker: cannot connect to %s. Is the "
+                             "display broker running, and is the socket "
+                             "bind-mounted into this container?", path);
+            close(fd);
+            return -1;
+        }
     }
 
-    /* HELLO is unconditionally the first packet, sent immediately on accept.
-     * If it does not arrive, SO_PEERCRED rejected us. */
-    rc = relay_recv_blocking(fd, &pkt);
-    if (rc || pkt.type != NVKVM_BROKER_EV_HELLO) {
-        error_setg(errp, "nvkvm-broker: no HELLO from %s (%s). The broker "
-                   "validates SO_PEERCRED before it sends anything, so this "
-                   "is usually 'this uid is not on its allow list'.",
-                   path, rc ? strerror(-rc) : "wrong packet type");
-        close(fd);
-        return -1;
-    }
-    if (pkt.w0 != NVKVM_BROKER_PROTO_VERSION) {
-        error_setg(errp, "nvkvm-broker: protocol version %u, expected %u",
-                   pkt.w0, NVKVM_BROKER_PROTO_VERSION);
-        close(fd);
-        return -1;
-    }
-    r->caps = pkt.w1;
-    RELAY_LOG("connected to %s, capabilities 0x%x", path, pkt.w1);
-    if (!(pkt.w1 & NVKVM_BROKER_CAP_DMABUF)) {
-        error_setg(errp, "nvkvm-broker: the broker reports it cannot accept "
-                   "dma-buf buffers, so nothing would ever be displayed");
-        close(fd);
-        return -1;
-    }
-    if (!(pkt.w1 & NVKVM_BROKER_CAP_FOCUS_EVENTS)) {
-        RELAY_LOG("NOTE: the broker cannot observe focus loss on this "
-                  "session, so it will not offer a keyboard grab. Absolute "
-                  "pointer and keyboard still work while the window is "
-                  "active.");
-    }
-    /* Non-blocking from here on, in both directions: the send side runs on a
-     * virtio worker thread and must never stall a vCPU, and the receive side
-     * runs on the main loop and must never stall the VM. */
-    if (!g_unix_set_fd_nonblocking(fd, true, NULL)) {
-        error_setg(errp, "nvkvm-broker: cannot set O_NONBLOCK");
-        close(fd);
-        return -1;
-    }
+    /*
+     * No connect(), HELLO read, CAPS send, or replay operation may wait under
+     * the BQL.  Readiness advances this state machine; the timer bounds a peer
+     * that accepts and then stops at any handshake phase.
+     */
+    relay_connection_state_reset(r);
     r->sock = fd;
+    r->conn_state = connecting ? RELAY_CONN_CONNECTING : RELAY_CONN_HELLO;
+    qemu_set_fd_handler(fd,
+                        connecting ? relay_writable : relay_readable,
+                        connecting ? relay_writable : NULL, r);
+    timer_mod(r->handshake_deadline,
+              qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + 2000);
     return 0;
 }
+/* NVKVM_RELAY_CONNECT_WIRING_END */
 
 /* ── clipboard ───────────────────────────────────────────────────────────── */
 
@@ -830,7 +1119,7 @@ static int relay_connect(NvkvmRelay *r, const char *path, Error **errp)
  * "there is no guest agent"; without it both look like nothing happening and
  * the user is left to guess which knob to turn.
  */
-static void relay_send_caps(NvkvmRelay *r)
+static int relay_send_caps(NvkvmRelay *r)
 {
     struct nvkvm_broker_cmd cmd;
 
@@ -845,18 +1134,128 @@ static void relay_send_caps(NvkvmRelay *r)
      * there; CAPS is re-sent at that point.
      */
     cmd.width = r->clip_agent_seen ? NVKVM_BROKER_CLIENT_CLIPBOARD : 0;
-    (void)relay_send(r, &cmd, -1);
+    return relay_send(r, &cmd, -1);
 }
+
+/* NVKVM_RELAY_CLIP_BATCH_BEGIN -- extracted by test_relay_clip. */
+/*
+ * Build one complete clipboard transaction in memory before writing any of
+ * it.  Separate nonblocking sends can accept a prefix and then return EAGAIN;
+ * abandoning that prefix makes the next transfer's LAST commit concatenated
+ * text.  The bounded batch and its cursor stay live until POLLOUT drains the
+ * remainder, and no newer clipboard transaction begins in between.
+ */
+static size_t relay_clip_batch_build(struct nvkvm_broker_clip_cmd *out,
+                                     size_t out_count,
+                                     const char *text, size_t len)
+{
+    size_t ncmds, off = 0;
+    uint32_t chunk = 0;
+
+    if (!out || !text || !len || len > NVKVM_BROKER_CLIP_MAX_BYTES) {
+        return 0;
+    }
+    ncmds = (len + NVKVM_BROKER_CLIP_CMD_BYTES - 1) /
+            NVKVM_BROKER_CLIP_CMD_BYTES;
+    if (out_count < ncmds) {
+        return 0;
+    }
+
+    memset(out, 0, ncmds * sizeof(*out));
+    while (off < len) {
+        struct nvkvm_broker_clip_cmd *cc = &out[chunk];
+        size_t n = len - off;
+
+        if (n > NVKVM_BROKER_CLIP_CMD_BYTES) {
+            n = NVKVM_BROKER_CLIP_CMD_BYTES;
+        }
+        cc->type = NVKVM_BROKER_CMD_CLIPBOARD;
+        cc->chunk = chunk++;
+        cc->info = (uint8_t)n;
+        if (off + n == len) {
+            cc->info |= NVKVM_BROKER_CLIP_LAST;
+        }
+        memcpy(cc->data, text + off, n);
+        off += n;
+    }
+    return ncmds;
+}
+
+typedef int (*RelayClipSendOne)(void *opaque,
+                                const struct nvkvm_broker_clip_cmd *cmd);
+
+/*
+ * Drain whole 40-byte commands from an already-built transaction.  EAGAIN
+ * leaves `next` at the first unsent chunk, so POLLOUT resumes the SAME
+ * transaction; a later clipboard update cannot append or interleave chunks.
+ */
+static int relay_clip_batch_flush(const struct nvkvm_broker_clip_cmd *cmds,
+                                  size_t ncmds, size_t *next,
+                                  RelayClipSendOne send_one, void *opaque)
+{
+    int rc;
+
+    if (!cmds || !next || !send_one || *next > ncmds) {
+        return -EINVAL;
+    }
+    while (*next < ncmds) {
+        rc = send_one(opaque, &cmds[*next]);
+        if (rc != 0) {
+            return rc;
+        }
+        (*next)++;
+    }
+    return 0;
+}
+/* NVKVM_RELAY_CLIP_BATCH_END */
 
 /* ── clipboard ───────────────────────────────────────────────────────────── */
 
-/* Guest -> host: chunk the guest's clipboard text out to the broker. */
+/* NVKVM_RELAY_CLIP_WIRING_BEGIN -- extracted by test_relay_wiring. */
+static int relay_clip_send_one(void *opaque,
+                               const struct nvkvm_broker_clip_cmd *cmd)
+{
+    NvkvmRelay *r = opaque;
+
+    return relay_send(r, (const struct nvkvm_broker_cmd *)cmd, -1);
+}
+
+static void relay_clip_flush(NvkvmRelay *r)
+{
+    int rc;
+
+    assert(bql_locked());
+    if (r->conn_state != RELAY_CONN_ACTIVE) {
+        return;
+    }
+    if (r->clip_out_next >= r->clip_out_count) {
+        r->clip_out_count = 0;
+        r->clip_out_next = 0;
+        relay_set_fd_handlers(r, false);
+        return;
+    }
+    rc = relay_clip_batch_flush(r->clip_out, r->clip_out_count,
+                                &r->clip_out_next, relay_clip_send_one, r);
+    if (rc == 0) {
+        r->clip_out_count = 0;
+        r->clip_out_next = 0;
+        relay_set_fd_handlers(r, false);
+    } else if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
+        relay_set_fd_handlers(r, true);
+    } else {
+        relay_drop(r, rc == -EPROTO
+                          ? "short write in a clipboard command"
+                          : "the broker socket failed during clipboard send");
+    }
+}
+/* NVKVM_RELAY_CLIP_WIRING_END */
+
+/* Guest -> host: queue one complete transaction, then drain it in order. */
 static void relay_clip_send(NvkvmRelay *r, const char *text, size_t len)
 {
-    size_t off = 0;
-    uint32_t chunk = 0;
+    size_t built;
 
-    if (r->sock < 0 || len == 0) {
+    if (r->conn_state != RELAY_CONN_ACTIVE || len == 0) {
         return;
     }
     if (len > NVKVM_BROKER_CLIP_MAX_BYTES) {
@@ -864,29 +1263,59 @@ static void relay_clip_send(NvkvmRelay *r, const char *text, size_t len)
                   "not forwarding it", len, NVKVM_BROKER_CLIP_MAX_BYTES);
         return;
     }
-    do {
-        struct nvkvm_broker_clip_cmd cc;
-        size_t n = len - off;
+    if (r->clip_out_next < r->clip_out_count) {
+        /* The bounded older transaction already owns the stream.  Beginning
+         * another one would interleave chunk indices and poison both. */
+        RELAY_LOG("clipboard: a previous guest clipboard transaction is "
+                  "still queued; dropped the newer update before it began");
+        return;
+    }
+    built = relay_clip_batch_build(r->clip_out, RELAY_CLIP_MAX_CMDS,
+                                   text, len);
+    if (built == 0) {
+        RELAY_LOG("clipboard: internal transaction build failed");
+        return;
+    }
+    r->clip_out_count = built;
+    r->clip_out_next = 0;
+    relay_clip_flush(r);
+}
 
-        if (n > NVKVM_BROKER_CLIP_CMD_BYTES) {
-            n = NVKVM_BROKER_CLIP_CMD_BYTES;
+/* NVKVM_RELAY_WRITABLE_WIRING_BEGIN -- extracted by test_relay_wiring. */
+static void relay_writable(void *opaque)
+{
+    NvkvmRelay *r = opaque;
+    int err = 0;
+    socklen_t errlen = sizeof(err);
+
+    assert(bql_locked());
+    if (r->sock < 0) {
+        return;
+    }
+    if (r->conn_state == RELAY_CONN_CONNECTING) {
+        if (getsockopt(r->sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0) {
+            err = errno;
         }
-        memset(&cc, 0, sizeof(cc));
-        cc.type  = NVKVM_BROKER_CMD_CLIPBOARD;
-        cc.chunk = chunk++;
-        cc.info  = (uint8_t)n;
-        if (off + n == len) {
-            cc.info |= NVKVM_BROKER_CLIP_LAST;
-        }
-        memcpy(cc.data, text + off, n);
-        if (relay_send(r, (const struct nvkvm_broker_cmd *)&cc, -1) != 0) {
-            RELAY_LOG("clipboard: the broker socket would not take the "
-                      "guest's clipboard; dropped");
+        if (err != 0) {
+            relay_attempt_failed(r, strerror(err));
             return;
         }
-        off += n;
-    } while (off < len);
+        r->conn_state = RELAY_CONN_HELLO;
+        relay_set_fd_handlers(r, false);
+        /* HELLO may already be queued; consume it without another poll turn. */
+        relay_readable(r);
+        return;
+    }
+    if (r->conn_state >= RELAY_CONN_SYNC_CAPS &&
+        r->conn_state <= RELAY_CONN_SYNC_COMMIT) {
+        relay_sync_flush(r);
+        return;
+    }
+    if (r->conn_state == RELAY_CONN_ACTIVE) {
+        relay_clip_flush(r);
+    }
 }
+/* NVKVM_RELAY_WRITABLE_WIRING_END */
 
 /* The guest's clipboard changed (vdagent -> ui/clipboard.c -> us). */
 static void relay_clip_notify(Notifier *notifier, void *data)
@@ -898,6 +1327,7 @@ static void relay_clip_notify(Notifier *notifier, void *data)
     if (!r || notify->type != QEMU_CLIPBOARD_UPDATE_INFO) {
         return;
     }
+    assert(bql_locked());
     info = notify->info;
     if (!info || info->owner == &r->clip_peer) {
         return;                 /* our own update coming back around */
@@ -907,10 +1337,15 @@ static void relay_clip_notify(Notifier *notifier, void *data)
      * Tell the broker once, so it can stop blaming the mode.
      */
     if (!r->clip_agent_seen) {
+        int rc;
+
         r->clip_agent_seen = true;
-        qemu_mutex_lock(&r->lock);
-        relay_send_caps(r);
-        qemu_mutex_unlock(&r->lock);
+        rc = r->conn_state == RELAY_CONN_ACTIVE ? relay_send_caps(r) : 0;
+        if (rc != 0) {
+            /* Reconnect re-sends CAPS from clip_agent_seen, so dropping is a
+             * bounded retry rather than losing the capability transition. */
+            relay_drop(r, "the broker socket would not take updated CAPS");
+        }
     }
     if (info->selection != QEMU_CLIPBOARD_SELECTION_CLIPBOARD) {
         return;                 /* PRIMARY is not what a paste key means */
@@ -923,10 +1358,8 @@ static void relay_clip_notify(Notifier *notifier, void *data)
         qemu_clipboard_request(info, QEMU_CLIPBOARD_TYPE_TEXT);
         return;
     }
-    qemu_mutex_lock(&r->lock);
     relay_clip_send(r, (const char *)info->types[QEMU_CLIPBOARD_TYPE_TEXT].data,
                     info->types[QEMU_CLIPBOARD_TYPE_TEXT].size);
-    qemu_mutex_unlock(&r->lock);
 }
 
 /* Someone in QEMU wants the data behind a clipboard we announced.  We always
@@ -978,14 +1411,20 @@ static void relay_clip_recv(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
 
 /* ── reconnect ───────────────────────────────────────────────────────────── */
 
-static void relay_arm_retry_bh(void *opaque)
+static void relay_activate(NvkvmRelay *r)
 {
-    NvkvmRelay *r = opaque;
-
-    if (!r->retry) {
-        r->retry = timer_new_ms(QEMU_CLOCK_REALTIME, relay_retry, r);
+    assert(bql_locked());
+    assert(r->sock >= 0);
+    r->conn_state = RELAY_CONN_ACTIVE;
+    timer_del(r->handshake_deadline);
+    relay_set_fd_handlers(r, false);
+    if (r->attempt_is_retry) {
+        r->n_reconnects++;
+        RELAY_LOG("reconnected to the display broker (reconnect #%" PRIu64 ")",
+                  r->n_reconnects);
     }
-    timer_mod(r->retry, qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + r->retry_ms);
+    r->retry_ms = RELAY_RETRY_MIN_MS;
+    r->retry_logged = false;
 }
 
 /*
@@ -995,46 +1434,96 @@ static void relay_arm_retry_bh(void *opaque)
  * what resolution the guest is running.  Nothing may be elided on the grounds
  * that it was already sent -- it was sent to a different process.
  *
- * Called with r->lock held.
+ * Every send is nonblocking.  EAGAIN leaves the state at the first unsent
+ * command and enables POLLOUT; the same connection generation resumes there.
+ * CAPS is last, so a clipboard-agent notification that arrives during replay
+ * is reflected without needing a second capability transaction.
  */
-static void relay_replay(NvkvmRelay *r)
+static void relay_sync_flush(NvkvmRelay *r)
 {
     struct nvkvm_broker_cmd cmd;
+    int rc;
 
-    if (r->sock < 0 || r->last_fd < 0) {
+    assert(bql_locked());
+    while (r->sock >= 0) {
+        memset(&cmd, 0, sizeof(cmd));
+        switch (r->conn_state) {
+        case RELAY_CONN_SYNC_WINDOW:
+            if (r->last_fd < 0) {
+                r->conn_state = RELAY_CONN_SYNC_CAPS;
+                continue;
+            }
+            cmd.type = NVKVM_BROKER_CMD_WINDOW;
+            cmd.width = r->last_bw;
+            cmd.height = r->last_bh;
+            rc = relay_send(r, &cmd, -1);
+            if (rc == 0) {
+                r->last_w = r->last_bw;
+                r->last_h = r->last_bh;
+                r->conn_state = RELAY_CONN_SYNC_ATTACH;
+                continue;
+            }
+            break;
+        case RELAY_CONN_SYNC_ATTACH:
+            if (r->last_fd < 0) {
+                r->conn_state = RELAY_CONN_SYNC_CAPS;
+                continue;
+            }
+            cmd.type = NVKVM_BROKER_CMD_ATTACH;
+            cmd.width = r->last_bw;
+            cmd.height = r->last_bh;
+            cmd.stride = r->last_stride;
+            cmd.offset = 0;
+            cmd.fourcc = r->last_fourcc;
+            cmd.modifier = r->last_modifier;
+            cmd.seq = (uint32_t)r->n_sent;
+            rc = relay_send(r, &cmd, r->last_fd);
+            if (rc == 0) {
+                r->conn_state = RELAY_CONN_SYNC_COMMIT;
+                continue;
+            }
+            break;
+        case RELAY_CONN_SYNC_COMMIT:
+            cmd.type = NVKVM_BROKER_CMD_COMMIT;
+            rc = relay_send(r, &cmd, -1);
+            if (rc == 0) {
+                RELAY_LOG("reconnect: re-sent geometry %ux%u and the last "
+                          "frame", r->last_bw, r->last_bh);
+                r->conn_state = RELAY_CONN_SYNC_CAPS;
+                continue;
+            }
+            break;
+        case RELAY_CONN_SYNC_CAPS:
+            rc = relay_send_caps(r);
+            if (rc == 0) {
+                relay_activate(r);
+                return;
+            }
+            break;
+        default:
+            return;
+        }
+        if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
+            relay_set_fd_handlers(r, true);
+            return;
+        }
+        relay_attempt_failed(r,
+            rc == -EPROTO ? "short write during connection state replay"
+                          : "socket failure during connection state replay");
         return;
     }
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.type   = NVKVM_BROKER_CMD_WINDOW;
-    cmd.width  = r->last_bw;
-    cmd.height = r->last_bh;
-    if (relay_send(r, &cmd, -1) == 0) {
-        r->last_w = r->last_bw;
-        r->last_h = r->last_bh;
-    }
+}
 
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.type     = NVKVM_BROKER_CMD_ATTACH;
-    cmd.width    = r->last_bw;
-    cmd.height   = r->last_bh;
-    cmd.stride   = r->last_stride;
-    cmd.offset   = 0;
-    cmd.fourcc   = r->last_fourcc;
-    cmd.modifier = r->last_modifier;
-    cmd.seq      = (uint32_t)r->n_sent;
-    if (relay_send(r, &cmd, r->last_fd) != 0) {
-        RELAY_LOG("reconnect: could not re-attach the last frame");
-        return;
+static void relay_handshake_timeout(void *opaque)
+{
+    NvkvmRelay *r = opaque;
+
+    assert(bql_locked());
+    if (r->conn_state != RELAY_CONN_DOWN &&
+        r->conn_state != RELAY_CONN_ACTIVE) {
+        relay_attempt_failed(r,
+            "the nonblocking connect/HELLO/state replay deadline expired");
     }
-    memset(&cmd, 0, sizeof(cmd));
-    cmd.type = NVKVM_BROKER_CMD_COMMIT;
-    if (relay_send(r, &cmd, -1) != 0) {
-        RELAY_LOG("reconnect: could not commit the last frame");
-        return;
-    }
-    RELAY_LOG("reconnect: re-sent geometry %ux%u and the last frame, so the "
-              "new window is correct without waiting for the guest to flip",
-              r->last_bw, r->last_bh);
 }
 
 static void relay_retry(void *opaque)
@@ -1042,12 +1531,12 @@ static void relay_retry(void *opaque)
     NvkvmRelay *r = opaque;
     Error *err = NULL;
 
-    qemu_mutex_lock(&r->lock);
-    if (r->sock >= 0) {                 /* raced with something else */
-        qemu_mutex_unlock(&r->lock);
+    assert(bql_locked());
+    if (r->conn_state != RELAY_CONN_DOWN) {
         return;
     }
-    if (relay_connect(r, nvkvm_relay_sock_path, &err) < 0) {
+    r->attempt_is_retry = true;
+    if (relay_start_connect(r, nvkvm_relay_sock_path, &err) < 0) {
         /*
          * LOUD ONCE, THEN SILENT.  A broker that is down for a minute would
          * otherwise produce a line every retry, which buries the one line that
@@ -1057,25 +1546,15 @@ static void relay_retry(void *opaque)
             r->retry_logged = true;
             warn_report_err(err);
             RELAY_LOG("retrying in the background (up to every %ums); "
-                      "the VM is unaffected", RELAY_RETRY_MAX_MS);
+                      "the VM continues running", RELAY_RETRY_MAX_MS);
         } else {
             error_free(err);
         }
         r->retry_ms = r->retry_ms * 2 > RELAY_RETRY_MAX_MS
                           ? RELAY_RETRY_MAX_MS : r->retry_ms * 2;
-        qemu_mutex_unlock(&r->lock);
-        relay_arm_retry_bh(r);
+        relay_schedule_retry(r);
         return;
     }
-    qemu_set_fd_handler(r->sock, relay_readable, NULL, r);
-    relay_send_caps(r);
-    r->n_reconnects++;
-    r->retry_ms = RELAY_RETRY_MIN_MS;
-    r->retry_logged = false;
-    RELAY_LOG("reconnected to the display broker (reconnect #%" PRIu64 ")",
-              r->n_reconnects);
-    relay_replay(r);
-    qemu_mutex_unlock(&r->lock);
 }
 
 /* ── QemuDisplay registration ────────────────────────────────────────────── */
@@ -1112,11 +1591,14 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
 
     r = g_new0(NvkvmRelay, 1);
     r->sock = -1;
+    r->conn_state = RELAY_CONN_DOWN;
     r->last_fd = -1;
     r->enabled = true;
     r->con = con;
     r->retry_ms = RELAY_RETRY_MIN_MS;
-    qemu_mutex_init(&r->lock);
+    r->retry = timer_new_ms(QEMU_CLOCK_REALTIME, relay_retry, r);
+    r->handshake_deadline = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                         relay_handshake_timeout, r);
     /*
      * Register as an ordinary clipboard peer.  If no vdagent chardev exists
      * this simply never fires, which is the honest outcome -- and the broker
@@ -1128,7 +1610,8 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
     qemu_clipboard_peer_register(&r->clip_peer);
     r->clip_registered = true;
     nvkvm_relay = r;
-    if (relay_connect(r, nvkvm_relay_sock_path, &err) < 0) {
+    r->attempt_is_retry = false;
+    if (relay_start_connect(r, nvkvm_relay_sock_path, &err) < 0) {
         /*
          * NOT FATAL ANY MORE.  This used to exit(1), which makes the display
          * process a startup dependency of the VM -- wrong on its own terms, and
@@ -1141,10 +1624,7 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
                   "The VM boots regardless -- this is not a startup "
                   "dependency.");
         r->retry_logged = true;
-        relay_arm_retry_bh(r);
-        RELAY_LOG("broker mode active: this QEMU holds no display-server "
-                  "connection and imports nothing.");
-        return;
+        relay_schedule_retry(r);
     }
     /*
      * NOTHING ELSE IS REGISTERED.  No DisplayChangeListener, because there is
@@ -1153,8 +1633,6 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
      * nvkvm_display_relay_submit().  A DCL here would only invite the very
      * dpy_gl_scanout_dmabuf import this design exists to remove.
      */
-    qemu_set_fd_handler(r->sock, relay_readable, NULL, r);
-    relay_send_caps(r);
     RELAY_LOG("broker mode active: this QEMU holds no display-server "
               "connection and imports nothing.");
 }

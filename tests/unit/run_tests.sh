@@ -59,10 +59,14 @@ declare -A TALLY_SUITES=(
     [test_drm_devinfo]=67
     [test_r1_type_dev]=33
     [test_transport_ready]=6
+    [test_relay_state]=17
+    [test_relay_clip]=35
+    [test_relay_wiring]=22
 )
 
 # Suites with their own ad-hoc output.  Value is a line that must appear.
 declare -A MARKER_SUITES=(
+    [test_uidmap]="test_uidmap passed"
     [test_open_scm]="ALL OPEN_SCM TESTS PASSED"
     [test_ctrl_gate]="test_ctrl_gate: PASS"
 )
@@ -129,7 +133,7 @@ ISOLATE_KNOWN_FAIL=""
 # is environment-dependent, name it here WITH the reason.
 ISOLATE_ENV_DEPENDENT=""
 
-ALL_BINARIES="test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready mock_stub"
+ALL_BINARIES="test_uidmap test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring mock_stub"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }
@@ -236,7 +240,6 @@ fi
 
 echo
 if [ "$rc" -eq 0 ]; then
-    echo "UNIT SUITE OK — all 9 suites built and ran; ${ISOLATE_TOTAL} isolate cases"
     # Counted, not hardcoded: the number said "8" for a while after a ninth
     # suite was added, which is exactly the kind of stale claim this file exists
     # to prevent.

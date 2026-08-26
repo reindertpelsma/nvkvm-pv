@@ -95,6 +95,21 @@ enum {
      * than length-prefixed.
      */
     NVKVM_BROKER_EV_CLIPBOARD = 15,
+
+    /*
+     * Answer to NVKVM_BROKER_CMD_QUERY_FORMAT.  The question is echoed back so
+     * the client needs no outstanding-query state and cannot mismatch a reply
+     * to a request:
+     *     x  = 1 the display can show it, 0 it cannot
+     *     y  = the fourcc that was asked about
+     *     w0 = modifier, low 32 bits
+     *     w1 = modifier, high 32 bits
+     *
+     * x=1 is the same judgement ATTACH would make, taken through the same code
+     * path -- including the opaque-twin substitution -- so an accepted answer
+     * cannot be followed by a rejected frame.
+     */
+    NVKVM_BROKER_EV_FORMAT    = 16,
 };
 
 /* ── Clipboard framing ───────────────────────────────────────────────────── *
@@ -133,15 +148,18 @@ enum {
 
 /*
  * The hard cap on one clipboard transfer, both directions.  A paste is text a
- * person selected; 16 KiB is far more than that and small enough that a
- * transfer cannot fill the outbound ring.  Enforced as a chunk count on the
+ * person selected; 7 KiB is far more than an ordinary paste and, unlike the
+ * old 16 KiB claim, it provably fits the broker's fixed 512-packet outbound
+ * ring with its four-packet control reserve.  Enforced as a chunk count on the
  * receiving side of each direction.
  */
-#define NVKVM_BROKER_CLIP_MAX_BYTES  16384u
+#define NVKVM_BROKER_CLIP_MAX_BYTES  7168u
 #define NVKVM_BROKER_CLIP_MAX_CHUNKS_PKT \
-    ((NVKVM_BROKER_CLIP_MAX_BYTES / NVKVM_BROKER_CLIP_PKT_BYTES) + 1u)
+    ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_PKT_BYTES - 1u) / \
+     NVKVM_BROKER_CLIP_PKT_BYTES)
 #define NVKVM_BROKER_CLIP_MAX_CHUNKS_CMD \
-    ((NVKVM_BROKER_CLIP_MAX_BYTES / NVKVM_BROKER_CLIP_CMD_BYTES) + 1u)
+    ((NVKVM_BROKER_CLIP_MAX_BYTES + NVKVM_BROKER_CLIP_CMD_BYTES - 1u) / \
+     NVKVM_BROKER_CLIP_CMD_BYTES)
 
 /*
  * EV_CLOSE.x — WHICH close the user asked for.  The broker asks the human and
@@ -286,7 +304,46 @@ enum {
      * mode up to `full` believing the mode was the problem.
      */
     NVKVM_BROKER_CMD_CAPS = 5,
+
+    /*
+     * "Can you display a buffer of this (fourcc, modifier)?"  Answered with
+     * NVKVM_BROKER_EV_FORMAT.  Uses the ordinary command record: `fourcc` and
+     * `modifier` are the question; every other field is ignored.
+     *
+     * WHY THIS EXISTS.  The guest renders in its GPU's native tiling, and on a
+     * CROSS-VENDOR host -- guest on NVIDIA, compositor scanning out on an
+     * Intel/AMD iGPU -- the compositor cannot import that at any price.
+     * MEASURED on a hybrid laptop: Mutter advertised 28 (format, modifier)
+     * pairs, every one of them Intel, LINEAR or INVALID, while the guest
+     * presented NVIDIA block-linear 0x0300000000606014.  Every ATTACH was
+     * refused and the window stayed black.
+     *
+     * The VMM cannot work that out for itself: the advertised set lives in the
+     * broker, and an ATTACH rejection is not reported back (it drops the frame
+     * and logs).  So it must be able to ASK, once, at mode-set -- and on "no"
+     * fall back to reading the frame back through the guest's own GPU into a
+     * LINEAR buffer that any compositor can take.
+     *
+     * Asked once per mode change, never per frame.
+     */
+    NVKVM_BROKER_CMD_QUERY_FORMAT = 6,
 };
+
+/*
+ * ATTACH flags.
+ *
+ * F_SHM says the fd is a memfd to be presented through wl_shm, not a dma-buf.
+ * DECLARED rather than sniffed from the fd type: a memfd is a legitimate
+ * carrier for other things -- the broker's own test client sends one for every
+ * frame -- so inferring intent from st.f_type misclassifies honest clients.
+ * The broker still CHECKS that the fd really is a memfd when this is set; the
+ * flag states intent, the check enforces it.
+ *
+ * The field was `reserved0`, always zero, so an older client reads as "not
+ * shm", which is what it meant.
+ */
+#define NVKVM_BROKER_CMD_F_SHM (1u << 0)
+#define NVKVM_BROKER_CMD_F_ALL NVKVM_BROKER_CMD_F_SHM
 
 /* NVKVM_BROKER_CMD_CAPS `width` bits. */
 #define NVKVM_BROKER_CLIENT_CLIPBOARD (1u << 0)
@@ -298,7 +355,7 @@ enum {
  */
 struct nvkvm_broker_cmd {
     uint16_t type;      /* NVKVM_BROKER_CMD_*                       offset  0 */
-    uint16_t reserved0; /* must be 0                                        2 */
+    uint16_t flags;     /* NVKVM_BROKER_CMD_F_*; 0 for every older client   2 */
     uint32_t width;     /*                                                  4 */
     uint32_t height;    /*                                                  8 */
     uint32_t stride;    /* bytes per row of plane 0                        12 */
@@ -313,7 +370,7 @@ struct nvkvm_broker_cmd {
  * `type` and `reserved0` in the same places. */
 struct nvkvm_broker_clip_cmd {
     uint16_t type;      /* NVKVM_BROKER_CMD_CLIPBOARD */
-    uint16_t reserved0; /* must be 0                  */
+    uint16_t flags;     /* must be 0 on this layout   */
     uint32_t chunk;     /* 0-based; bounded by the receiver's own count */
     uint32_t reserved1; /* must be 0                  */
     uint8_t  info;      /* NVKVM_BROKER_CLIP_NBYTES / _LAST */

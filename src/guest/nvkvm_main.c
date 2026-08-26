@@ -862,6 +862,8 @@ static int nvkvm_open(struct inode *inode, struct file *filp)
 		}
 		mutex_init(&ctx->uvm_state->lock);
 		mutex_init(&ctx->uvm_state->ext_lock);
+		ctx->uvm_state->shadow_valid = true;
+		ctx->uvm_state->realize_valid = true;
 		INIT_LIST_HEAD(&ctx->uvm_state->registered_gpus);
 		INIT_LIST_HEAD(&ctx->uvm_state->registered_va_spaces);
 		INIT_LIST_HEAD(&ctx->uvm_state->range_groups);
@@ -1123,6 +1125,576 @@ static size_t nvkvm_alloc_parms_probe_len(__u64 uptr)
 	return min_t(size_t, (size_t)NVKVM_ALLOC_PARMS_PROBE, to_page_end);
 }
 
+/* Free only the bounded shadow state protected by st->lock.  Realized mappings
+ * have their own mapping lifetime and are intentionally not part of this
+ * configuration reset. */
+static void nvkvm_uvm_realize_clear_locked(struct nvkvm_uvm_fd_state *st)
+{
+	struct nvkvm_uvm_vas_reg *v, *vtmp;
+	struct nvkvm_uvm_range_group *r, *rtmp;
+	struct nvkvm_uvm_mapping_intent *m;
+
+	list_for_each_entry_safe(v, vtmp, &st->registered_va_spaces, list) {
+		list_del(&v->list);
+		kfree(v);
+	}
+	list_for_each_entry_safe(r, rtmp, &st->range_groups, list) {
+		list_del(&r->list);
+		kfree(r);
+	}
+	/* Keep the small range records used by live mmap classification.  Only
+	 * their replay blobs belong to the dormant REALIZE mirror. */
+	list_for_each_entry(m, &st->intents, list) {
+		kfree(m->params);
+		m->params = NULL;
+		m->params_size = 0;
+	}
+	st->n_registered_va_spaces = 0;
+	st->n_range_groups = 0;
+	st->realize_bytes = 0;
+}
+
+static void nvkvm_uvm_shadow_clear_locked(struct nvkvm_uvm_fd_state *st)
+{
+	struct nvkvm_uvm_gpu_reg *g, *gtmp;
+	struct nvkvm_uvm_mapping_intent *m, *mtmp;
+
+	list_for_each_entry_safe(g, gtmp, &st->registered_gpus, list) {
+		list_del(&g->list);
+		kfree(g);
+	}
+	nvkvm_uvm_realize_clear_locked(st);
+	list_for_each_entry_safe(m, mtmp, &st->intents, list) {
+		list_del(&m->list);
+		kfree(m->params);
+		kfree(m);
+	}
+	st->n_registered_gpus = 0;
+	st->n_intents = 0;
+	st->intent_bytes = 0;
+}
+
+/*
+ * Update the UVM state shadow only after the forwarded ioctl succeeded.
+ *
+ * This state feeds managed-mmap classification today and the dormant batched
+ * REALIZE path.  It is not an ioctl log: one logical object gets one entry,
+ * the fixed wire limits cap each list, failed host registrations leave no
+ * residue, and successful unregister/destroy calls remove their key.  That
+ * keeps a hostile process from turning rejected UVM calls into an unbounded
+ * guest-kernel allocator.
+ */
+static void nvkvm_uvm_shadow_invalidate_locked(struct nvkvm_uvm_fd_state *st,
+					       unsigned int cmd)
+{
+	if (st->shadow_valid)
+		pr_warn_ratelimited(
+			"nvkvm: UVM shadow lost after accepted cmd 0x%x; managed mmap disabled on this fd\n",
+			cmd);
+	st->shadow_valid = false;
+	st->realize_valid = false;
+	nvkvm_uvm_shadow_clear_locked(st);
+}
+
+static void nvkvm_uvm_realize_invalidate_locked(
+	struct nvkvm_uvm_fd_state *st, unsigned int cmd)
+{
+	if (st->realize_valid)
+		pr_warn_ratelimited(
+			"nvkvm: UVM REALIZE shadow lost after accepted cmd 0x%x; dormant REALIZE disabled on this fd\n",
+			cmd);
+	st->realize_valid = false;
+	nvkvm_uvm_realize_clear_locked(st);
+}
+
+/* State-changing UVM ioctls share one transaction boundary with mmap.  Linux
+ * does not serialize ioctl calls made concurrently on one struct file, and the
+ * QEMU/stub workers can complete them out of issue order.  Holding ext_lock
+ * across the host round trip and the shadow commit gives both the host state
+ * and its local mirror the same order; mmap takes the same lock before deciding
+ * whether a range is a semaphore pool or MANAGED. */
+static bool nvkvm_uvm_shadow_cmd(unsigned int cmd)
+{
+	switch (cmd) {
+	case UVM_INITIALIZE:
+	case UVM_DEINITIALIZE:
+	case UVM_REGISTER_GPU:
+	case UVM_UNREGISTER_GPU:
+	case UVM_REGISTER_GPU_VASPACE:
+	case UVM_UNREGISTER_GPU_VASPACE:
+	case UVM_CREATE_RANGE_GROUP:
+	case UVM_DESTROY_RANGE_GROUP:
+	case UVM_ALLOC_SEMAPHORE_POOL:
+	case UVM_FREE:
+		return true;
+	default:
+		return false;
+	}
+}
+
+struct nvkvm_uvm_shadow_pending {
+	void *node;
+	bool lose_realize;
+};
+
+static void nvkvm_uvm_pending_discard(unsigned int cmd,
+				      struct nvkvm_uvm_shadow_pending *pending)
+{
+	if (!pending->node)
+		return;
+	if (cmd == UVM_ALLOC_SEMAPHORE_POOL) {
+		struct nvkvm_uvm_mapping_intent *m = pending->node;
+
+		kfree(m->params);
+	}
+	kfree(pending->node);
+	pending->node = NULL;
+}
+
+/* Prepare any memory needed to mirror a successful response before sending the
+ * ioctl.  Caller holds ext_lock; short lock acquisitions inspect only the
+ * already-committed mirror.  Optional dormant REALIZE state may be abandoned,
+ * but the GPU list and intent metadata used by managed mmap may not. */
+static int nvkvm_uvm_shadow_prepare(struct nvkvm_fd_ctx *ctx,
+				    unsigned int cmd, void *buf, size_t size,
+				    struct nvkvm_uvm_shadow_pending *pending)
+{
+	struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+
+	lockdep_assert_held(&st->ext_lock);
+	memset(pending, 0, sizeof(*pending));
+
+	switch (cmd) {
+	case UVM_REGISTER_GPU: {
+		struct uvm_register_gpu_params *p = buf;
+		struct nvkvm_uvm_gpu_reg *g, *new;
+		bool found = false;
+
+		if (size < sizeof(*p))
+			return -EINVAL;
+		new = kzalloc(sizeof(*new), GFP_KERNEL);
+		if (!new)
+			return -ENOMEM;
+		memcpy(new->gpu_uuid, p->gpu_uuid.uuid, sizeof(new->gpu_uuid));
+		mutex_lock(&st->lock);
+		if (st->shadow_valid) {
+			list_for_each_entry(g, &st->registered_gpus, list) {
+				if (!memcmp(g->gpu_uuid, new->gpu_uuid,
+					    sizeof(g->gpu_uuid))) {
+					found = true;
+					break;
+				}
+			}
+			if (!found &&
+			    st->n_registered_gpus >= NVKVM_UVM_MAX_REG_GPUS) {
+				mutex_unlock(&st->lock);
+				kfree(new);
+				return -ENOSPC;
+			}
+		}
+		mutex_unlock(&st->lock);
+		pending->node = new;
+		break;
+	}
+	case UVM_REGISTER_GPU_VASPACE: {
+		struct uvm_register_gpu_vaspace_params *p = buf;
+		struct nvkvm_uvm_vas_reg *new;
+
+		if (size < sizeof(*p))
+			return -EINVAL;
+		new = kzalloc(sizeof(*new), GFP_KERNEL);
+		if (!new) {
+			pending->lose_realize = true;
+			break;
+		}
+		memcpy(new->gpu_uuid, p->gpu_uuid.uuid, sizeof(new->gpu_uuid));
+		/* Sanitization has already replaced a non-negative guest fd with
+		 * the QEMU handle id needed by the dormant snapshot. */
+		new->rm_ctrl_fd_handle_id =
+			((int32_t)p->rm_ctrl_fd >= 0) ? p->rm_ctrl_fd : 0;
+		new->h_client = p->h_client;
+		new->h_va_space = p->h_va_space;
+		pending->node = new;
+		break;
+	}
+	case UVM_CREATE_RANGE_GROUP: {
+		struct uvm_create_range_group_params *p = buf;
+		struct nvkvm_uvm_range_group *new;
+
+		if (size < sizeof(*p))
+			return -EINVAL;
+		new = kzalloc(sizeof(*new), GFP_KERNEL);
+		if (!new) {
+			pending->lose_realize = true;
+			break;
+		}
+		new->range_group_id = p->range_group_id;
+		pending->node = new;
+		break;
+	}
+	case UVM_ALLOC_SEMAPHORE_POOL: {
+		struct nvkvm_uvm_mapping_intent *m, *new;
+		__u64 base, length;
+		bool found = false, keep_realize = false;
+
+		/* base/length are the tag-verified common prefix. */
+		if (size < 24)
+			return -EINVAL;
+		memcpy(&base, buf, sizeof(base));
+		memcpy(&length, (char *)buf + 8, sizeof(length));
+		new = kzalloc(sizeof(*new), GFP_KERNEL);
+		if (!new)
+			return -ENOMEM;
+		new->mode = NVKVM_UVM_REALIZE_MODE_SEM_POOL;
+		new->base = base;
+		new->length = length;
+
+		mutex_lock(&st->lock);
+		if (st->shadow_valid) {
+			list_for_each_entry(m, &st->intents, list) {
+				if (m->mode == new->mode && m->base == new->base) {
+					found = true;
+					break;
+				}
+			}
+			if (!found &&
+			    st->intent_bytes >
+				NVKVM_UVM_MAX_INTENT_META_BYTES - sizeof(*new)) {
+				mutex_unlock(&st->lock);
+				kfree(new);
+				return -ENOSPC;
+			}
+			keep_realize = st->realize_valid &&
+				size <= NVKVM_UVM_MAX_REALIZE_BYTES -
+					st->realize_bytes;
+		}
+		mutex_unlock(&st->lock);
+
+		if (keep_realize) {
+			new->params = kmemdup(buf, size, GFP_KERNEL);
+			if (new->params)
+				new->params_size = size;
+			else
+				pending->lose_realize = true;
+		} else {
+			pending->lose_realize = true;
+		}
+		pending->node = new;
+		break;
+	}
+	default:
+		break;
+	}
+	return 0;
+}
+
+static void nvkvm_uvm_record_response(struct nvkvm_fd_ctx *ctx,
+				      unsigned int cmd, void *buf,
+				      size_t size, long ioctl_ret,
+				      struct nvkvm_uvm_shadow_pending *pending)
+{
+	struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
+
+	if (!st)
+		return;
+	lockdep_assert_held(&st->ext_lock);
+	if (!buf || ioctl_ret)
+		goto out;
+
+	switch (cmd) {
+	case UVM_INITIALIZE: {
+		struct uvm_initialize_params *p = buf;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		mutex_lock(&st->lock);
+		st->init_flags = p->flags;
+		st->initialized = true;
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_DEINITIALIZE: {
+		struct uvm_deinitialize_params *p = buf;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		mutex_lock(&st->lock);
+		nvkvm_uvm_shadow_clear_locked(st);
+		st->initialized = false;
+		st->init_flags = 0;
+		st->shadow_valid = true;
+		st->realize_valid = true;
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_REGISTER_GPU: {
+		struct uvm_register_gpu_params *p = buf;
+		struct nvkvm_uvm_gpu_reg *g, *new = pending->node;
+		bool found = false;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		if (!new)
+			break;
+		mutex_lock(&st->lock);
+		if (!st->shadow_valid) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_for_each_entry(g, &st->registered_gpus, list) {
+			if (!memcmp(g->gpu_uuid, new->gpu_uuid,
+				    sizeof(g->gpu_uuid))) {
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		/* prepare() admitted this before the host call while ext_lock kept
+		 * the key set stable.  Treat a mismatch as a local invariant break,
+		 * never as permission to append past the wire limit. */
+		if (WARN_ON_ONCE(st->n_registered_gpus >=
+				 NVKVM_UVM_MAX_REG_GPUS)) {
+			nvkvm_uvm_shadow_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_add_tail(&new->list, &st->registered_gpus);
+		st->n_registered_gpus++;
+		pending->node = NULL;
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_UNREGISTER_GPU: {
+		struct uvm_unregister_gpu_params *p = buf;
+		struct nvkvm_uvm_gpu_reg *g, *tmp;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		mutex_lock(&st->lock);
+		list_for_each_entry_safe(g, tmp, &st->registered_gpus, list) {
+			if (!memcmp(g->gpu_uuid, p->gpu_uuid.uuid,
+				    sizeof(g->gpu_uuid))) {
+				list_del(&g->list);
+				st->n_registered_gpus--;
+				kfree(g);
+				break;
+			}
+		}
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_REGISTER_GPU_VASPACE: {
+		struct uvm_register_gpu_vaspace_params *p = buf;
+		struct nvkvm_uvm_vas_reg *v, *new = pending->node;
+		bool found = false;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		if (pending->lose_realize || !new) {
+			mutex_lock(&st->lock);
+			nvkvm_uvm_realize_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			break;
+		}
+		mutex_lock(&st->lock);
+		if (!st->realize_valid) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_for_each_entry(v, &st->registered_va_spaces, list) {
+			if (!memcmp(v->gpu_uuid, new->gpu_uuid,
+				    sizeof(v->gpu_uuid))) {
+				v->rm_ctrl_fd_handle_id = new->rm_ctrl_fd_handle_id;
+				v->h_client = new->h_client;
+				v->h_va_space = new->h_va_space;
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		if (st->n_registered_va_spaces >= NVKVM_UVM_MAX_VA_SPACES) {
+			nvkvm_uvm_realize_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_add_tail(&new->list, &st->registered_va_spaces);
+		st->n_registered_va_spaces++;
+		pending->node = NULL;
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_UNREGISTER_GPU_VASPACE: {
+		struct uvm_unregister_gpu_vaspace_params *p = buf;
+		struct nvkvm_uvm_vas_reg *v, *tmp;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		mutex_lock(&st->lock);
+		list_for_each_entry_safe(v, tmp, &st->registered_va_spaces, list) {
+			if (!memcmp(v->gpu_uuid, p->gpu_uuid.uuid,
+				    sizeof(v->gpu_uuid))) {
+				list_del(&v->list);
+				st->n_registered_va_spaces--;
+				kfree(v);
+				break;
+			}
+		}
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_CREATE_RANGE_GROUP: {
+		struct uvm_create_range_group_params *p = buf;
+		struct nvkvm_uvm_range_group *r, *new = pending->node;
+		bool found = false;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		if (pending->lose_realize || !new) {
+			mutex_lock(&st->lock);
+			nvkvm_uvm_realize_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			break;
+		}
+		mutex_lock(&st->lock);
+		if (!st->realize_valid) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_for_each_entry(r, &st->range_groups, list) {
+			if (r->range_group_id == new->range_group_id) {
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		if (st->n_range_groups >= NVKVM_UVM_MAX_RANGE_GROUPS) {
+			nvkvm_uvm_realize_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_add_tail(&new->list, &st->range_groups);
+		st->n_range_groups++;
+		pending->node = NULL;
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_DESTROY_RANGE_GROUP: {
+		struct uvm_destroy_range_group_params *p = buf;
+		struct nvkvm_uvm_range_group *r, *tmp;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		mutex_lock(&st->lock);
+		list_for_each_entry_safe(r, tmp, &st->range_groups, list) {
+			if (r->range_group_id == p->range_group_id) {
+				list_del(&r->list);
+				st->n_range_groups--;
+				kfree(r);
+				break;
+			}
+		}
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_ALLOC_SEMAPHORE_POOL: {
+		struct nvkvm_uvm_mapping_intent *m, *new = pending->node;
+		void *old_params = NULL;
+		size_t old_params_size = 0;
+		__u32 rm_status;
+		bool found = false;
+
+		/* The semaphore-pool tail changes at the V550 profile boundary;
+		 * rmStatus is the u32 immediately before the ABI's final pad. */
+		if (size < 24)
+			break;
+		memcpy(&rm_status, (char *)buf + size - 8, sizeof(rm_status));
+		if (rm_status)
+			break;
+		if (!new)
+			break;
+		if (new->params)
+			memcpy(new->params, buf, size);
+		mutex_lock(&st->lock);
+		if (!st->shadow_valid) {
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_for_each_entry(m, &st->intents, list) {
+			if (m->mode == new->mode && m->base == new->base) {
+				old_params = m->params;
+				old_params_size = m->params_size;
+				m->length = new->length;
+				m->params = new->params;
+				m->params_size = new->params_size;
+				st->realize_bytes -= old_params_size;
+				st->realize_bytes += new->params_size;
+				new->params = NULL;
+				new->params_size = 0;
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			if (pending->lose_realize)
+				nvkvm_uvm_realize_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			kfree(old_params);
+			break;
+		}
+		if (WARN_ON_ONCE(st->intent_bytes >
+				 NVKVM_UVM_MAX_INTENT_META_BYTES - sizeof(*new))) {
+			nvkvm_uvm_shadow_invalidate_locked(st, cmd);
+			mutex_unlock(&st->lock);
+			break;
+		}
+		list_add_tail(&new->list, &st->intents);
+		st->n_intents++;
+		st->intent_bytes += sizeof(*new);
+		st->realize_bytes += new->params_size;
+		pending->node = NULL;
+		if (pending->lose_realize)
+			nvkvm_uvm_realize_invalidate_locked(st, cmd);
+		mutex_unlock(&st->lock);
+		break;
+	}
+	case UVM_FREE: {
+		struct uvm_free_params *p = buf;
+		struct nvkvm_uvm_mapping_intent *m, *tmp;
+
+		if (size < sizeof(*p) || p->rm_status)
+			break;
+		mutex_lock(&st->lock);
+		list_for_each_entry_safe(m, tmp, &st->intents, list) {
+			if (m->base == p->base && m->length == p->length) {
+				list_del(&m->list);
+				st->n_intents--;
+				st->intent_bytes -= sizeof(*m);
+				st->realize_bytes -= m->params_size;
+				kfree(m->params);
+				kfree(m);
+				break;
+			}
+		}
+		mutex_unlock(&st->lock);
+		break;
+	}
+	default:
+		break;
+	}
+
+out:
+	nvkvm_uvm_pending_discard(cmd, pending);
+}
+
 static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	struct nvkvm_fd_ctx *ctx = filp->private_data;
@@ -1134,6 +1706,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	void __user *aux_uptr = NULL;
 	__u32 *gpi_save = NULL;          /* GET_PID_INFO original pids to restore */
 	__u32 gpi_n = 0;
+	struct nvkvm_uvm_shadow_pending uvm_pending = { 0 };
+	bool uvm_shadow_txn = false;
 	long ret;
 
 	if (!ctx)
@@ -1291,118 +1865,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		}
 	}
 
-	/*
-	 * State-machine Steps B+C: record UVM config + state-registration
-	 * cmds into ctx->uvm_state.  ALSO still forward each so the
-	 * kernel side stays functional — recording is additive between
-	 * Step B and Step E.  The full short-circuit lands at Step E
-	 * along with REALIZE_UVM_MAPPING.  Per docs/STATE_MACHINE_PLAN.md.
-	 *
-	 * Per-cmd recording — these are tiny structs the guest module
-	 * trivially digests.  All allocations are GFP_KERNEL; mutex
-	 * held only across the recording, not across the forward.
-	 */
-	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state && params_buf) {
-		struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
-		switch (cmd) {
-		case UVM_INITIALIZE:
-			if (param_size >= sizeof(struct uvm_initialize_params)) {
-				struct uvm_initialize_params *p = params_buf;
-				mutex_lock(&st->lock);
-				st->init_flags  = p->flags;
-				st->initialized = true;
-				mutex_unlock(&st->lock);
-			}
-			break;
-		case UVM_REGISTER_GPU:
-			if (param_size >= sizeof(struct uvm_register_gpu_params)) {
-				struct uvm_register_gpu_params *p = params_buf;
-				struct nvkvm_uvm_gpu_reg *g =
-					kzalloc(sizeof(*g), GFP_KERNEL);
-				if (g) {
-					memcpy(g->gpu_uuid, p->gpu_uuid.uuid, 16);
-					mutex_lock(&st->lock);
-					list_add_tail(&g->list, &st->registered_gpus);
-					mutex_unlock(&st->lock);
-				}
-			}
-			break;
-		case UVM_REGISTER_GPU_VASPACE:
-			if (param_size >= sizeof(struct uvm_register_gpu_vaspace_params)) {
-				struct uvm_register_gpu_vaspace_params *p = params_buf;
-				struct nvkvm_uvm_vas_reg *v =
-					kzalloc(sizeof(*v), GFP_KERNEL);
-				if (v) {
-					/* p->rm_ctrl_fd is the guest userspace fd.
-					 * Translate to QEMU-side handle_id so the
-					 * stub can resolve it via handle_lookup at
-					 * realize time. */
-					__s32 hid = ((int32_t)p->rm_ctrl_fd >= 0)
-						? guest_fd_to_handle_id((int)p->rm_ctrl_fd)
-						: -1;
-					memcpy(v->gpu_uuid, p->gpu_uuid.uuid, 16);
-					v->rm_ctrl_fd_handle_id =
-						(hid >= 0) ? (__u32)hid : 0;
-					v->h_client    = p->h_client;
-					v->h_va_space  = p->h_va_space;
-					mutex_lock(&st->lock);
-					list_add_tail(&v->list,
-						      &st->registered_va_spaces);
-					mutex_unlock(&st->lock);
-				}
-			}
-			break;
-		case UVM_CREATE_RANGE_GROUP:
-			if (param_size >= sizeof(struct uvm_create_range_group_params)) {
-				struct uvm_create_range_group_params *p = params_buf;
-				struct nvkvm_uvm_range_group *r =
-					kzalloc(sizeof(*r), GFP_KERNEL);
-				if (r) {
-					r->range_group_id = p->range_group_id;
-					mutex_lock(&st->lock);
-					list_add_tail(&r->list, &st->range_groups);
-					mutex_unlock(&st->lock);
-				}
-			}
-			break;
-		/* UVM_REGISTER_CHANNEL also fits here; skip until needed
-		 * (libcuda calls it but the kernel-side channel is already
-		 * known via RM handles — recording is for parity, not
-		 * correctness). */
-		case UVM_ALLOC_SEMAPHORE_POOL:
-			if (param_size >=
-			    sizeof(struct uvm_alloc_semaphore_pool_params)) {
-				struct uvm_alloc_semaphore_pool_params *p = params_buf;
-				struct nvkvm_uvm_mapping_intent *m =
-					kzalloc(sizeof(*m), GFP_KERNEL);
-				if (m) {
-					m->mode  = NVKVM_UVM_REALIZE_MODE_SEM_POOL;
-					m->base  = p->base;
-					m->length = p->length;
-					m->params_size = sizeof(*p);
-					m->params = kmemdup(p, sizeof(*p), GFP_KERNEL);
-					if (!m->params) {
-						kfree(m);
-					} else {
-						mutex_lock(&st->lock);
-						list_add_tail(&m->list, &st->intents);
-						mutex_unlock(&st->lock);
-					}
-				}
-				/* Step E plan was to short-circuit here and
-				 * replay on a fresh UVM fd at mmap time.  That
-				 * model loses the kernel-side RM↔UVM bindings
-				 * built on the original fd (NV_ERR_PAGE_TABLE_-
-				 * NOT_AVAIL).  Until realize-on-existing-fd is
-				 * implemented, keep recording but still forward
-				 * SEM_POOL so the original fd is the live one. */
-			}
-			break;
-		default:
-			break;
-		}
-		/* Fall through to normal forward path. */
-	}
+	/* UVM configuration is shadowed only after the forwarded response proves
+	 * the host accepted it; see nvkvm_uvm_record_response(). */
 
 	/*
 	 * Save caller-supplied user-space pointer / size fields BEFORE any
@@ -2266,6 +2730,24 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		return ret;
 	}
 
+	/* Serialize a state-changing UVM call from just before admission through
+	 * its blocking host round trip and shadow commit.  st->lock is acquired
+	 * only briefly inside prepare/record; the sleeping transport runs with
+	 * ext_lock, never the inner state lock. */
+	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state &&
+	    nvkvm_uvm_shadow_cmd(cmd)) {
+		mutex_lock(&ctx->uvm_state->ext_lock);
+		uvm_shadow_txn = true;
+		ret = nvkvm_uvm_shadow_prepare(ctx, cmd, params_buf, param_size,
+					       &uvm_pending);
+		if (ret) {
+			mutex_unlock(&ctx->uvm_state->ext_lock);
+			kfree(aux_buf);
+			kfree(params_buf);
+			return ret;
+		}
+	}
+
 	/* Forward to host via the appropriate path */
 	if (ctx->handle_id && ctx->session->isolate_id) {
 		/*
@@ -2413,6 +2895,16 @@ forwarded:;
 		 * an ioctl on a ctx missing either is a logic bug. The legacy
 		 * non-isolate fallback (NVKVM_REQ_IOCTL) was removed in Step 3d. */
 		ret = -EBADF;
+	}
+
+	/* Host acceptance, not an accepted-shaped request, creates shadow state.
+	 * This commit is still inside the same ext_lock transaction as the host
+	 * call, so a concurrent same-fd ioctl or mmap cannot observe the two in
+	 * different orders. */
+	if (uvm_shadow_txn) {
+		nvkvm_uvm_record_response(ctx, cmd, params_buf, param_size, ret,
+					  &uvm_pending);
+		mutex_unlock(&ctx->uvm_state->ext_lock);
 	}
 
 	/*
@@ -2705,7 +3197,6 @@ forwarded:;
 done_aux_copy:
 		;
 	}
-
 	kfree(gpi_save);
 	kfree(aux_buf);
 	kfree(params_buf);

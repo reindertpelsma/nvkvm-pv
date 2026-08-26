@@ -26,10 +26,11 @@ diff --git a/hw/misc/meson.build b/hw/misc/meson.build
 index ef97efc..8039450 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -166,5 +166,6 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
+@@ -166,5 +166,7 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
    'nvkvm_isolate_handlers.c',
    'nvkvm_tables.c',
    'nvkvm_present_egl.c',
 +  'nvkvm_display_relay.c',
++  'nvkvm_udmabuf.c',
  ))
  system_ss.add(when: 'CONFIG_LASI', if_true: files('lasi.c'))

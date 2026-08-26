@@ -41,7 +41,11 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <limits.h>
 #include <pwd.h>
+#include <sys/syscall.h>
+#include <linux/capability.h>
+#include "nvkvm_uidmap.h"
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -106,14 +110,6 @@ void nb_err(const char *fmt, ...)
 
 /* ── the policy core ─────────────────────────────────────────────────────── */
 
-/*
- * Keys the broker swallowed as part of a hotkey chord.  The release must be
- * swallowed too, and it must be swallowed even if the modifiers came up first
- * — otherwise the guest sees a key-up it never saw a key-down for, which some
- * guest input stacks latch on forever.
- */
-static unsigned char nb_consumed[768 / 8];
-
 static bool bit_get(const unsigned char *m, unsigned b)
 {
     return b < 768 && (m[b >> 3] & (1u << (b & 7))) != 0;
@@ -138,6 +134,49 @@ void nb_sink_init(struct nb_sink *s, struct nb_session *sess)
     s->rxfd = -1;
 }
 
+/*
+ * One definition of "belongs to a client connection".  This deliberately
+ * excludes host-window facts (`focused`, `pointer_in`, `fullscreen`) and the
+ * backend objects themselves; everything a VMM supplied or caused is reset
+ * here.  Before this helper existed each new clipboard flag was easy to miss,
+ * and --persist let the next VMM inherit partial transfers and paste state.
+ */
+static void nb_client_state_reset(struct nb_sink *s)
+{
+    s->seq = 0;
+    s->tx_head = s->tx_tail = 0;
+    s->tx_partial = 0;
+    s->rxlen = 0;
+    if (s->rxfd >= 0) {
+        close(s->rxfd);
+        s->rxfd = -1;
+    }
+    s->window_established = false;
+    s->rate_ms = 0;
+    s->rate_count = 0;
+    memset(s->clip_in, 0, sizeof(s->clip_in));
+    s->clip_in_len = 0;
+    s->clip_in_chunks = 0;
+    s->clip_in_next_chunk = 0;
+    s->clip_in_active = false;
+    s->clip_in_bad = false;
+    s->clip_rate_ms = 0;
+    s->clip_rate_count = 0;
+    s->clip_last_ms = 0;
+    s->clip_told_off = false;
+    s->clip_told_noclient = false;
+    s->clip_told_noagent = false;
+    s->clip_held_key = 0;
+    s->clip_held_ctrl = false;
+    s->clip_held_shift = false;
+    s->clip_held_generation = 0;
+    s->caps_seen = 0;
+    s->ctrl_down = s->alt_down = s->shift_down = false;
+    memset(s->key_down, 0, sizeof(s->key_down));
+    memset(s->consumed, 0, sizeof(s->consumed));
+    s->n_attach = s->n_commit = s->n_reject = 0;
+}
+
 bool nb_sink_want_write(const struct nb_sink *s)
 {
     return s->client_fd >= 0 && s->tx_head != s->tx_tail;
@@ -145,7 +184,8 @@ bool nb_sink_want_write(const struct nb_sink *s)
 
 /* Forward: the clipboard helpers are defined with the rest of the clipboard
  * code, below the input path that uses them. */
-static bool nb_clip_is_trigger(const struct nb_sink *s, unsigned code);
+static const struct nb_clip_trigger *
+nb_clip_trigger(const struct nb_sink *s, unsigned code);
 static uint64_t nb_now_ms(void);
 
 static unsigned nb_tx_used(const struct nb_sink *s)
@@ -199,8 +239,13 @@ static void nb_tx_coalesce(struct nb_sink *s)
             continue;
         }
         if (p->type == NVKVM_BROKER_EV_REL && rel_slot >= 0) {
-            out[rel_slot].x += p->x;
-            out[rel_slot].y += p->y;
+            int64_t x = (int64_t)out[rel_slot].x + p->x;
+            int64_t y = (int64_t)out[rel_slot].y + p->y;
+
+            out[rel_slot].x = x > INT32_MAX ? INT32_MAX :
+                              x < INT32_MIN ? INT32_MIN : (int32_t)x;
+            out[rel_slot].y = y > INT32_MAX ? INT32_MAX :
+                              y < INT32_MIN ? INT32_MIN : (int32_t)y;
             out[rel_slot].seq = p->seq;
             continue;
         }
@@ -339,24 +384,8 @@ int nb_sink_attach(struct nb_sink *s, int fd)
     struct nvkvm_broker_pkt p;
     int r;
 
-    /* State that must not survive the previous client. */
-    s->seq = 0;
-    s->tx_head = s->tx_tail = 0;
-    s->tx_partial = 0;
-    s->rxlen = 0;
-    if (s->rxfd >= 0) {
-        close(s->rxfd);
-        s->rxfd = -1;
-    }
-    s->n_attach = s->n_commit = s->n_reject = 0;
-    /*
-     * AUDIT B-2.  Per-connection, and it must be: it gates "the guest may size
-     * the window once".  Left set from a previous client, the NEXT VM's WINDOW
-     * is ignored and it inherits the dead one's window size forever.
-     */
-    s->window_established = false;
-    memset(s->key_down, 0, sizeof(s->key_down));
-    memset(nb_consumed, 0, sizeof(nb_consumed));
+    nb_client_state_reset(s);
+    s->client_generation++;
     /*
      * A new client never inherits a grab.  If the previous client died while
      * grabbed we would otherwise hand a fresh, unproven process a keyboard
@@ -394,6 +423,8 @@ int nb_sink_attach(struct nb_sink *s, int fd)
     if (r != 0) {
         nb_err("handshake failed: %s", strerror(-r));
         s->client_fd = -1;
+        s->client_generation++;
+        nb_client_state_reset(s);
         return r;
     }
 
@@ -410,15 +441,11 @@ void nb_sink_detach(struct nb_sink *s, const char *why)
     if (s->client_fd < 0) {
         return;
     }
+    if (s->sess->ops->client_detach) {
+        s->sess->ops->client_detach(s->sess, s->client_generation);
+    }
     close(s->client_fd);
     s->client_fd = -1;
-    s->tx_head = s->tx_tail = 0;
-    s->tx_partial = 0;
-    s->rxlen = 0;
-    if (s->rxfd >= 0) {
-        close(s->rxfd);
-        s->rxfd = -1;
-    }
     if (s->grabbed) {
         /* Never leave the host's keyboard grabbed because the VMM died. */
         s->sess->ops->set_grab(s->sess, false);
@@ -437,6 +464,9 @@ void nb_sink_detach(struct nb_sink *s, const char *why)
            (unsigned long long)s->n_attach,
            (unsigned long long)s->n_commit,
            (unsigned long long)s->n_reject);
+    s->client_pid = 0;
+    s->client_generation++;
+    nb_client_state_reset(s);
 }
 
 static void nb_release_all(struct nb_sink *s)
@@ -489,6 +519,8 @@ static void nb_set_grab(struct nb_sink *s, bool on)
 
 void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
 {
+    const struct nb_clip_trigger *trigger;
+
     if (code >= 768) {
         return;
     }
@@ -507,7 +539,7 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
     /* Hotkeys are the broker's, never the client's. */
     if (down && s->ctrl_down && s->alt_down &&
         (code == KEY_G || code == KEY_F)) {
-        bit_set(nb_consumed, code, true);
+        bit_set(s->consumed, code, true);
         /*
          * TURNING EITHER ON CANCELS A DIALOG.  Grabbing while a host dialog is
          * up, or going fullscreen over it, are contradictory states; the later
@@ -535,24 +567,27 @@ void nb_sink_key(struct nb_sink *s, unsigned code, bool down)
      * The guest's paste handler runs the moment it sees the keystroke, so
      * content that arrives afterwards finds stale or empty data.  Reading the
      * host selection on Wayland is asynchronous (an offer, a pipe, a read), so
-     * the key is HELD and released by nb_sink_clip_release() once the content
+     * the key is HELD and replayed by nb_sink_clip_finish() once the content
      * is queued -- or immediately, if nothing is going to be sent.
      */
-    if (down && s->focused && nb_clip_is_trigger(s, code)) {
-        s->clip_held_key = code;
-        s->clip_want_paste = false;
-        nb_sink_paste_trigger(s);
-        if (!s->clip_want_paste) {
-            /* No content is coming: release it now so paste still behaves
-             * normally inside the guest (its own clipboard may well have
-             * something in it). */
-            nb_sink_clip_release(s);
+    trigger = down && s->focused ? nb_clip_trigger(s, code) : NULL;
+    if (trigger) {
+        /* Auto-repeat while an asynchronous fetch is pending is still the same
+         * physical keypress.  Consume it; never replace the in-flight chord. */
+        bit_set(s->consumed, code, true);
+        if (s->clip_held_key) {
+            return;
         }
+        s->clip_held_key = code;
+        s->clip_held_ctrl = trigger->need_ctrl;
+        s->clip_held_shift = trigger->need_shift;
+        s->clip_held_generation = s->client_generation;
+        nb_sink_paste_trigger(s);
         return;
     }
-    if (bit_get(nb_consumed, code)) {
+    if (bit_get(s->consumed, code)) {
         if (!down) {
-            bit_set(nb_consumed, code, false);
+            bit_set(s->consumed, code, false);
         }
         return;
     }
@@ -638,6 +673,13 @@ void nb_sink_focus(struct nb_sink *s, bool active)
     }
 }
 
+void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
+                            bool usable)
+{
+    nb_emit(s, NVKVM_BROKER_EV_FORMAT, usable ? 1 : 0, (int)fourcc,
+            (uint32_t)(mod & 0xffffffffu), (uint32_t)(mod >> 32));
+}
+
 void nb_sink_pointer(struct nb_sink *s, bool inside)
 {
     if (s->pointer_in == inside) {
@@ -674,7 +716,8 @@ void nb_sink_release(struct nb_sink *s, uint64_t buf_id)
 /* ── clipboard ───────────────────────────────────────────────────────────── */
 
 /* Does this key, with the modifiers currently latched, mean "paste"? */
-static bool nb_clip_is_trigger(const struct nb_sink *s, unsigned code)
+static const struct nb_clip_trigger *
+nb_clip_trigger(const struct nb_sink *s, unsigned code)
 {
     const struct nb_config *cfg = s->cfg;
     int i;
@@ -682,32 +725,78 @@ static bool nb_clip_is_trigger(const struct nb_sink *s, unsigned code)
     if (cfg->clip_mode == NB_CLIP_OFF && s->clip_told_off) {
         /* Still recognised once, so the first attempt can explain itself;
          * after that it is an ordinary key and belongs to the guest. */
-        return false;
+        return NULL;
     }
     for (i = 0; i < cfg->n_clip_trigger; i++) {
         const struct nb_clip_trigger *t = &cfg->clip_trigger[i];
 
         if (t->code == code && t->need_ctrl == s->ctrl_down &&
             t->need_shift == s->shift_down) {
-            return true;
+            return t;
         }
     }
-    return false;
+    return NULL;
 }
 
-/* Forward the keystroke that was held while the clipboard was fetched. */
-void nb_sink_clip_release(struct nb_sink *s)
+static bool nb_guest_modifier_down(const struct nb_sink *s,
+                                   unsigned left, unsigned right)
+{
+    return bit_get(s->key_down, left) || bit_get(s->key_down, right);
+}
+
+static void nb_clip_key_edge(struct nb_sink *s, unsigned code, bool down)
+{
+    bit_set(s->key_down, code, down);
+    nb_emit(s, NVKVM_BROKER_EV_KEY, (int)code, down, 0, 0);
+}
+
+/*
+ * Finish the chord held while the host selection was fetched.  A physical
+ * key-up may have arrived meanwhile, and its modifiers may have gone up too.
+ * Replaying one balanced chord here means neither timing can leave V/Insert
+ * stuck or turn CTRL+V into an unmodified V.
+ */
+void nb_sink_clip_finish(struct nb_sink *s, uint64_t generation, bool paste)
 {
     unsigned code = s->clip_held_key;
+    bool need_ctrl = s->clip_held_ctrl;
+    bool need_shift = s->clip_held_shift;
+    bool synth_ctrl, synth_shift;
 
-    if (!code) {
+    if (!code || generation != s->client_generation ||
+        generation != s->clip_held_generation) {
         return;
     }
     s->clip_held_key = 0;
-    s->clip_want_paste = false;
-    if (s->focused) {
-        bit_set(s->key_down, code, true);
-        nb_emit(s, NVKVM_BROKER_EV_KEY, (int)code, 1, 0, 0);
+    s->clip_held_ctrl = false;
+    s->clip_held_shift = false;
+    s->clip_held_generation = 0;
+    if (!paste) {
+        nb_log("clipboard: host selection was not queued; paste key cancelled "
+               "rather than pasting stale guest content");
+        return;
+    }
+    if (!s->focused || s->client_fd < 0) {
+        return;
+    }
+
+    synth_ctrl = need_ctrl &&
+        !nb_guest_modifier_down(s, KEY_LEFTCTRL, KEY_RIGHTCTRL);
+    synth_shift = need_shift &&
+        !nb_guest_modifier_down(s, KEY_LEFTSHIFT, KEY_RIGHTSHIFT);
+    if (synth_ctrl) {
+        nb_clip_key_edge(s, KEY_LEFTCTRL, true);
+    }
+    if (synth_shift) {
+        nb_clip_key_edge(s, KEY_LEFTSHIFT, true);
+    }
+    nb_clip_key_edge(s, code, true);
+    nb_clip_key_edge(s, code, false);
+    if (synth_shift) {
+        nb_clip_key_edge(s, KEY_LEFTSHIFT, false);
+    }
+    if (synth_ctrl) {
+        nb_clip_key_edge(s, KEY_LEFTCTRL, false);
     }
 }
 
@@ -719,12 +808,20 @@ void nb_sink_clip_release(struct nb_sink *s)
  * Refuses rather than truncates on ring pressure: half a paste is worse than
  * none, and a silent partial one is worse than either.
  */
-bool nb_sink_send_clipboard(struct nb_sink *s, const char *text, size_t len)
+bool nb_sink_send_clipboard(struct nb_sink *s, uint64_t generation,
+                            const char *text, size_t len)
 {
+    /* A delayed ctrl+shift+V may need both modifiers synthesized around the
+     * balanced key press after the physical keys were released: ctrl down,
+     * shift down, key down/up, shift up, ctrl up.  Reserve all six slots before
+     * queuing any clipboard chunk so ring pressure cannot split that chord or
+     * disconnect the client halfway through it. */
+    const unsigned replay_reserve = 6u;
     size_t off = 0;
     unsigned chunks;
 
-    if (s->client_fd < 0) {
+    if (s->client_fd < 0 || generation != s->client_generation ||
+        generation != s->clip_held_generation || !s->clip_held_key) {
         return false;
     }
     if (len > NVKVM_BROKER_CLIP_MAX_BYTES) {
@@ -732,8 +829,10 @@ bool nb_sink_send_clipboard(struct nb_sink *s, const char *text, size_t len)
                len, NVKVM_BROKER_CLIP_MAX_BYTES);
         return false;
     }
-    chunks = (unsigned)(len / NVKVM_BROKER_CLIP_PKT_BYTES) + 1u;
-    if (nb_tx_used(s) + chunks + 4u >= NB_TXRING) {
+    chunks = len == 0 ? 1u :
+        (unsigned)((len + NVKVM_BROKER_CLIP_PKT_BYTES - 1u) /
+                   NVKVM_BROKER_CLIP_PKT_BYTES);
+    if (nb_tx_used(s) + chunks + replay_reserve >= NB_TXRING) {
         nb_log("clipboard: the client is not draining; dropping this paste "
                "rather than sending half of it");
         return false;
@@ -834,7 +933,6 @@ static const char *nb_clip_mode_name(int m)
     case NB_CLIP_OFF:     return "off";
     case NB_CLIP_G2H:     return "guest-to-host";
     case NB_CLIP_CONSENT: return "consent";
-    case NB_CLIP_FULL:    return "full";
     default:              return "?";
     }
 }
@@ -851,6 +949,8 @@ static const char *nb_clip_mode_name(int m)
 void nb_sink_paste_trigger(struct nb_sink *s)
 {
     const struct nb_config *cfg = s->cfg;
+    uint64_t generation = s->clip_held_generation;
+    int r;
 
     if (cfg->clip_mode == NB_CLIP_OFF) {
         if (!s->clip_told_off) {
@@ -858,8 +958,9 @@ void nb_sink_paste_trigger(struct nb_sink *s)
             nb_log("clipboard is disabled, so this paste sent nothing. "
                    "--clipboard=consent allows host->guest paste on exactly "
                    "this trigger, and nothing else. (off | guest-to-host | "
-                   "consent | full)");
+                   "consent)");
         }
+        nb_sink_clip_finish(s, generation, true);
         return;
     }
     if (cfg->clip_mode == NB_CLIP_G2H) {
@@ -869,6 +970,7 @@ void nb_sink_paste_trigger(struct nb_sink *s)
                    "lets the guest read the host clipboard. "
                    "--clipboard=consent adds host->guest on this trigger.");
         }
+        nb_sink_clip_finish(s, generation, true);
         return;
     }
     if (!nb_sink_has_client(s)) {
@@ -877,6 +979,7 @@ void nb_sink_paste_trigger(struct nb_sink *s)
             nb_log("clipboard is enabled but no VM is connected, so there is "
                    "nothing to paste into.");
         }
+        nb_sink_clip_finish(s, generation, false);
         return;
     }
     /*
@@ -893,9 +996,25 @@ void nb_sink_paste_trigger(struct nb_sink *s)
                    "-chardev qemu-vdagent and the guest needs spice-vdagent "
                    "running.", nb_clip_mode_name(cfg->clip_mode));
         }
+        nb_sink_clip_finish(s, generation, true);
         return;
     }
-    s->clip_want_paste = true;      /* the backend reads the selection */
+    if (!s->sess->ops->fetch_clipboard) {
+        nb_err("clipboard: backend '%s' cannot read the host selection",
+               s->sess->ops->name);
+        nb_sink_clip_finish(s, generation, false);
+        return;
+    }
+    r = s->sess->ops->fetch_clipboard(s->sess, s, generation);
+    if (r == -ENOENT) {
+        nb_log("clipboard: the host selection is empty or is not text, so "
+               "this paste uses the guest's existing clipboard");
+        nb_sink_clip_finish(s, generation, true);
+    } else if (r != 0) {
+        nb_err("clipboard: could not read the host selection: %s",
+               strerror(-r));
+        nb_sink_clip_finish(s, generation, false);
+    }
 }
 
 bool nb_sink_has_client(const struct nb_sink *s)
@@ -953,6 +1072,9 @@ void nb_sink_bye(struct nb_sink *s, int reason)
  * all and exists precisely so the accept side of this validator can be
  * exercised without a GPU.  It is unreachable from --backend auto.
  */
+#define NB_FOURCC_XR24 0x34325258u
+#define NB_FOURCC_AR24 0x34325241u
+
 static bool nb_fd_is_dmabuf(int fd, bool allow_memfd)
 {
     struct statfs sfs;
@@ -974,6 +1096,48 @@ static void nb_violation(struct nb_sink *s, const char *why)
     nb_err("protocol violation from pid %d: %s", (int)s->client_pid, why);
     nb_sink_bye(s, NVKVM_BROKER_BYE_PROTOCOL);
     nb_sink_detach(s, "protocol violation");
+}
+
+/*
+ * Resolve a requested (fourcc, modifier) to one the display actually
+ * advertises, or refuse.
+ *
+ * ONE code path, used by ATTACH and by CMD_QUERY_FORMAT, so the answer the VMM
+ * is given can never disagree with what the next frame does.  A query that says
+ * "yes" followed by a rejected ATTACH would be worse than no query at all: the
+ * VMM would settle on zero-copy and every frame would vanish.
+ *
+ * Returns true and writes the fourcc to USE (possibly the opaque twin) to
+ * *use_fourcc; false means no description of this buffer is displayable.
+ */
+static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
+                              uint64_t modifier, uint32_t *use_fourcc)
+{
+    if (ss->ops->format_ok(ss, fourcc, modifier)) {
+        *use_fourcc = fourcc;
+        return true;
+    }
+    /*
+     * Try the OPAQUE TWIN of an alpha format.
+     *
+     * This is not a relaxation of HARDENING 3: the pair we fall back to must
+     * ITSELF be advertised, so the compositor is still only ever handed
+     * something it said it could import.  What changes is which of two
+     * bit-identical descriptions of the same buffer it gets.
+     *
+     * A guest head flips AR24; the compositor advertises the modifier for XR24
+     * only, because alpha goes through its blend path and block-linear is not
+     * always wired up there.  The bytes are the same either way and a scanout
+     * has no meaningful alpha, so describing it as opaque is both correct and
+     * cheaper for the compositor -- it may skip blending altogether.
+     */
+    uint32_t twin = nb_fourcc_opaque_twin(fourcc);
+
+    if (twin && ss->ops->format_ok(ss, twin, modifier)) {
+        *use_fourcc = twin;
+        return true;
+    }
+    return false;
 }
 
 /*
@@ -1000,12 +1164,32 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     struct stat st;
     off_t size;
     uint32_t bpp;
+    uint32_t fourcc;
     uint64_t need;
-    char fcc[8];
+    char fcc[8], fcc2[8];
 
     if (!nb_fd_is_dmabuf(fd, ss->accept_memfd)) {
         nb_err("ATTACH: the fd is not a dma-buf");
         return -EINVAL;
+    }
+    /*
+     * The VMM DECLARES shared memory; it is not inferred from the fd.  A memfd
+     * is a legitimate carrier for other things (the test client sends one every
+     * frame), so sniffing st.f_type would misread honest clients as asking for
+     * a tier they never requested.
+     *
+     * The declaration is then ENFORCED: a client that claims shm must really
+     * hand over a memfd, or the broker would map something else into a wl_shm
+     * pool on the strength of an assertion from an untrusted VMM.
+     */
+    d->is_shm = (c->flags & NVKVM_BROKER_CMD_F_SHM) != 0;
+    if (d->is_shm) {
+        struct statfs sfs;
+
+        if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC) {
+            nb_err("ATTACH: F_SHM was set but the fd is not a memfd");
+            return -EINVAL;
+        }
     }
     /* HARDENING 2: same bound as NVKVM_PRESENT_MAX_DIM in the VMM, restated
      * here because the VMM is the attacker in this model. */
@@ -1015,17 +1199,74 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                c->width, c->height, NVKVM_BROKER_MAX_DIM);
         return -EINVAL;
     }
-    /* HARDENING 3: not a hardcoded list — what the GPU advertises. */
-    if (!ss->ops->format_ok(ss, c->fourcc, c->modifier)) {
-        nb_err("ATTACH: fourcc %s modifier 0x%016llx is not advertised by "
-               "this display", nb_fourcc_name(c->fourcc, fcc),
-               (unsigned long long)c->modifier);
+    /* HARDENING 3: not a hardcoded list — what the GPU advertises.  Shared
+     * with CMD_QUERY_FORMAT so the promise and the frame cannot disagree.
+     * Not applicable to shm, which carries no modifier. */
+    /*
+     * For shm the MODIFIER is not a question -- shared memory is linear by
+     * definition and carries none -- but the FOURCC still is: the broker has to
+     * map it to a WL_SHM_FORMAT, and a format nothing advertises is one it
+     * cannot present.  So ask the same resolver the same way, about LINEAR.
+     * Skipping the check entirely (which the first version of this did) also
+     * silently disabled the NV12 rejection and the opaque-twin substitution for
+     * every shm client.
+     */
+    fourcc = c->fourcc;
+    /*
+     * SHM IS A SEPARATE ADVERTISEMENT CHANNEL.  Wayland announces shm formats
+     * with wl_shm.format events, not through zwp_linux_dmabuf_v1, so validating
+     * a memfd against the dma-buf table is the wrong question -- and under
+     * --present-mode=shm that table is deliberately empty, which would reject
+     * every frame.
+     *
+     * What must be true is that we can name the format to wl_shm at all.  Only
+     * the two 32-bit layouts the guest head flips are mapped, and requiring
+     * that keeps the NV12-style rejection that the dma-buf path gets from its
+     * own gate.  No modifier is involved: shm is linear by definition.
+     */
+    if (d->is_shm) {
+        if (fourcc != NB_FOURCC_XR24 && fourcc != NB_FOURCC_AR24) {
+            nb_err("ATTACH: fourcc %s cannot be presented as shared memory; "
+                   "only XR24 and AR24 are mapped to wl_shm formats",
+                   nb_fourcc_name(fourcc, fcc));
+            return -EINVAL;
+        }
+    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
+        /*
+         * Name the VENDOR.  A rejection that lists only the pair reads as
+         * "one entry is missing"; when the vendor differs from everything
+         * the display offers, NO pair can ever match and the answer is a
+         * copy, not a different format.  Saying so here is the difference
+         * between a one-line diagnosis and an evening of bisecting.
+         */
+        nb_err("ATTACH: fourcc %s modifier 0x%016llx (%s) is not "
+               "advertised by this display.  If the compositor runs on a "
+               "different GPU than the guest's, no modifier will ever "
+               "match and a readback/copy path is required — the VMM can "
+               "ask first with CMD_QUERY_FORMAT; run the broker with "
+               "--verbose to see what it does advertise.",
+               nb_fourcc_name(c->fourcc, fcc),
+               (unsigned long long)c->modifier,
+               nb_modifier_vendor(c->modifier));
         return -EINVAL;
     }
-    bpp = nb_fourcc_bpp(c->fourcc);
+    if (fourcc != c->fourcc) {
+        static bool told;
+
+        if (!told) {
+            told = true;
+            nb_log("ATTACH: %s modifier 0x%016llx is not advertised, but its "
+                   "opaque twin %s is — presenting as %s (same bytes; a "
+                   "scanout has no alpha).  Logged once.",
+                   nb_fourcc_name(c->fourcc, fcc),
+                   (unsigned long long)c->modifier,
+                   nb_fourcc_name(fourcc, fcc2), nb_fourcc_name(fourcc, fcc2));
+        }
+    }
+    bpp = nb_fourcc_bpp(fourcc);
     if (bpp == 0) {
         nb_err("ATTACH: fourcc %s has no known bytes-per-pixel, so its extent "
-               "cannot be bounded", nb_fourcc_name(c->fourcc, fcc));
+               "cannot be bounded", nb_fourcc_name(fourcc, fcc));
         return -EINVAL;
     }
     /* A row must hold the pixels it claims to. */
@@ -1067,7 +1308,7 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     d->height   = c->height;
     d->stride   = c->stride;
     d->offset   = c->offset;
-    d->fourcc   = c->fourcc;
+    d->fourcc   = fourcc;   /* possibly the opaque twin, see above */
     d->modifier = c->modifier;
     d->bpp      = bpp;
     d->seq      = c->seq;
@@ -1091,7 +1332,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     int r;
 
     /*
-     * reserved0 ONLY, and that is not a shortcut.
+     * FLAGS (was reserved0) ONLY, and that is not a shortcut.
      *
      * This check used to cover reserved1 as well, which was correct while
      * every command shared one layout.  CLIPBOARD does not: its payload runs
@@ -1100,17 +1341,17 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
      * payload bytes were non-zero was rejected as a malformed header.  Found
      * by the hostile-client harness, which sent 27 bytes of 'A'.
      *
-     * reserved0 is at the same offset and means the same thing in BOTH
+     * flags is at the same offset and means the same thing in BOTH
      * layouts, so it stays here.  reserved1 belongs to the layouts that
      * actually have it, and is checked in their own cases -- the alternative
      * is a control keyed on a layout that is no longer universal, which is how
      * A-1 and R-1 happened.
      */
-    if (c->reserved0 != 0) {
+    if ((c->flags & ~(uint16_t)NVKVM_BROKER_CMD_F_ALL) != 0) {
         if (fd >= 0) {
             close(fd);
         }
-        nb_violation(s, "reserved0 is not zero");
+        nb_violation(s, "unknown bits set in the command flags");
         return;
     }
 
@@ -1155,6 +1396,50 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             nb_err("ATTACH: the display refused the buffer: %s", strerror(-r));
         }
         return;
+
+    case NVKVM_BROKER_CMD_QUERY_FORMAT: {
+        /*
+         * "Can you display this?"  Answered from the SAME resolver ATTACH
+         * uses, so a yes here is binding.
+         *
+         * The VMM needs this because it cannot see the advertised set and a
+         * rejected ATTACH is not reported back to it -- the frame is dropped
+         * and the reason goes to our stderr.  Without the question, a
+         * cross-vendor host is a black window with an explanation the VMM
+         * never hears.
+         *
+         * No fd, no state, no side effects: a query cannot change what the
+         * next frame does.  reserved1 is checked because this uses the
+         * ordinary command layout, which has one.
+         */
+        uint32_t use = 0;
+        bool ok;
+
+        if (c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "QUERY_FORMAT reserved1 is not zero");
+            return;
+        }
+        if (fd >= 0) {
+            close(fd);          /* a query carries no buffer; drop any fd */
+        }
+        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use);
+        {
+            char fcc[8];
+            nb_log("QUERY_FORMAT %s modifier 0x%016llx (%s) -> %s%s",
+                   nb_fourcc_name(c->fourcc, fcc),
+                   (unsigned long long)c->modifier,
+                   nb_modifier_vendor(c->modifier),
+                   ok ? "YES" : "NO",
+                   (ok && use != c->fourcc) ? " (as its opaque twin)" : "");
+        }
+        nb_emit(s, NVKVM_BROKER_EV_FORMAT, ok ? 1 : 0, (int)c->fourcc,
+                (uint32_t)(c->modifier & 0xffffffffu),
+                (uint32_t)(c->modifier >> 32));
+        return;
+    }
 
     case NVKVM_BROKER_CMD_COMMIT:
         if (c->reserved1 != 0) {
@@ -1216,6 +1501,30 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             nb_violation(s, "CLIPBOARD chunk claims more bytes than it has");
             return;
         }
+        /*
+         * TRANSACTION FRAMING.  QEMU's nonblocking sender can abandon a
+         * transfer after a prefix.  Chunk zero therefore starts a fresh
+         * transaction and discards any abandoned prefix; every continuation
+         * must then be monotonic.  Without this, the next transfer's LAST
+         * committed a concatenation of two unrelated clipboards.
+         */
+        if (cc->chunk == 0) {
+            s->clip_in_len = 0;
+            s->clip_in_chunks = 0;
+            s->clip_in_next_chunk = 0;
+            s->clip_in_bad = false;
+            s->clip_in_active = true;
+        }
+        if (!s->clip_in_active || cc->chunk != s->clip_in_next_chunk) {
+            nb_violation(s, "CLIPBOARD chunks are not a monotonic transaction");
+            return;
+        }
+        s->clip_in_next_chunk++;
+        s->clip_in_chunks++;
+
+        /* Policy rejection still advances framing and still reaches LAST.
+         * Returning early here used to poison the following transaction; the
+         * size-cap branch could wedge it permanently. */
         if (s->cfg->clip_mode == NB_CLIP_OFF) {
             if (!s->clip_told_off) {
                 s->clip_told_off = true;
@@ -1223,28 +1532,23 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                        "off, so it was discarded. --clipboard=guest-to-host "
                        "or =consent would accept it.");
             }
-            return;                 /* not a violation: a mode, not a lie */
+            s->clip_in_bad = true;  /* a mode, not a protocol violation */
         }
         if (!s->focused) {
-            s->clip_in_bad = true;  /* drain the rest of this transfer */
-            return;
+            s->clip_in_bad = true;
         }
         if (nb_clip_rate_exceeded(s)) {
             s->clip_in_bad = true;
-            return;
         }
-        /*
-         * The cap is a CHUNK COUNT WE KEEP, not a size the client sends: it
-         * cannot be lied about because the client never states it.
-         */
-        if (++s->clip_in_chunks > NVKVM_BROKER_CLIP_MAX_CHUNKS_CMD ||
-            s->clip_in_len + n > NVKVM_BROKER_CLIP_MAX_BYTES) {
+        /* The cap is a count we keep and a checked sum, never a sender-supplied
+         * allocation size. */
+        if (s->clip_in_chunks > NVKVM_BROKER_CLIP_MAX_CHUNKS_CMD ||
+            n > NVKVM_BROKER_CLIP_MAX_BYTES - s->clip_in_len) {
             if (!s->clip_in_bad) {
                 nb_log("clipboard from the VM exceeds the %u-byte cap; "
                        "discarding it", NVKVM_BROKER_CLIP_MAX_BYTES);
             }
             s->clip_in_bad = true;
-            return;
         }
         if (!s->clip_in_bad) {
             memcpy(s->clip_in + s->clip_in_len, cc->data, n);
@@ -1256,6 +1560,8 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 
             s->clip_in_len = 0;
             s->clip_in_chunks = 0;
+            s->clip_in_next_chunk = 0;
+            s->clip_in_active = false;
             s->clip_in_bad = false;
             if (bad || len == 0) {
                 return;
@@ -1268,14 +1574,24 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                 nb_log("clipboard from the VM is not valid UTF-8; discarding");
                 return;
             }
-            if (ss->ops->set_clipboard &&
-                ss->ops->set_clipboard(ss, s->clip_in, len) == 0) {
+            if (!(ss->clipboard_caps & NB_SESSION_CLIP_G2H) ||
+                !ss->ops->set_clipboard) {
+                nb_err("clipboard: backend '%s' lost guest-to-host support; "
+                       "discarding instead of pretending the copy worked",
+                       ss->ops->name);
+                return;
+            }
+            r = ss->ops->set_clipboard(ss, s->clip_in, len);
+            if (r == 0) {
                 /* VISIBLE.  A guest silently replacing the host clipboard is
                  * the attack; saying so is the control. */
                 nb_log("the VM put %u bytes on YOUR clipboard", len);
                 if (ss->ops->notify_clipboard) {
                     ss->ops->notify_clipboard(ss);
                 }
+            } else {
+                nb_err("clipboard: backend '%s' rejected the VM's text: %s",
+                       ss->ops->name, strerror(-r));
             }
         }
         return;
@@ -1593,16 +1909,32 @@ static int nb_listen_fds_take(void)
  */
 static int nb_adopt_fd(int fd)
 {
+    struct sockaddr_storage addr;
     struct stat st;
-    int val = 0;
-    socklen_t len = sizeof(val);
+    int val = 0, type = 0;
+    socklen_t len;
 
     if (fstat(fd, &st) < 0 || !S_ISSOCK(st.st_mode)) {
         nb_err("--socket-fd %d is not a socket", fd);
         return -EINVAL;
     }
+    len = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &len) < 0 ||
+        type != SOCK_STREAM) {
+        nb_err("--socket-fd %d is not a SOCK_STREAM socket", fd);
+        return -EINVAL;
+    }
+    memset(&addr, 0, sizeof(addr));
+    len = sizeof(addr);
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) < 0 ||
+        addr.ss_family != AF_UNIX) {
+        nb_err("--socket-fd %d is not an AF_UNIX socket; network listeners "
+               "can never authenticate with SO_PEERCRED", fd);
+        return -EINVAL;
+    }
     /* Refuse anything that is not already listening: adopting a connected or
      * unbound socket would fail later and much less clearly. */
+    len = sizeof(val);
     if (getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &val, &len) < 0 || !val) {
         nb_err("--socket-fd %d is not a listening socket", fd);
         return -EINVAL;
@@ -1613,8 +1945,9 @@ static int nb_adopt_fd(int fd)
                fd, strerror(errno));
         return -errno;
     }
-    nb_log("using a pre-bound listening socket (fd %d); its path, mode and "
-           "ownership are whoever created it's business, not ours", fd);
+    nb_log("using an adopted AF_UNIX SOCK_STREAM listener (fd %d); its "
+           "filesystem mode is external, so SO_PEERCRED remains mandatory",
+           fd);
     return fd;
 }
 
@@ -1759,42 +2092,187 @@ static bool nb_peer_allowed(int fd, const struct nb_config *cfg,
  */
 static int nb_drop_privs(const char *user)
 {
-    struct passwd *pw;
+    struct passwd *pw = NULL;
+    uid_t uid = 0;
+    gid_t gid = 0;
+    bool have_target = false;
+    char label[64];
 
-    /* Do this unconditionally: it costs nothing and it closes ptrace-attach
-     * and core-dump reads of a process holding the keyboard grab. */
-    prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
-    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-
-    if (geteuid() != 0) {
-        return 0;
-    }
     if (!user) {
-        nb_log("WARNING: running as root and --drop-user was not given. "
-               "The broker will stay root. Pass --drop-user <name>.");
-        return 0;
+        if (geteuid() == 0) {
+            nb_log("WARNING: running as root and --drop-user was not given. "
+                   "The broker will stay root. Pass --drop-user <name|uid>.");
+        }
+        goto harden;
     }
-    pw = getpwnam(user);
-    if (!pw) {
-        nb_err("--drop-user %s: no such user", user);
-        return -ENOENT;
+
+    /*
+     * NAME or NUMERIC.  A container has no passwd entry for a uid picked at
+     * random, and picking at random is the point: the broker ends up as a uid
+     * that owns nothing on the system, rather than as the desktop user whose
+     * files, keys and autostart directory it would otherwise still reach.
+     */
+    /*
+     * "auto": pick a uid nothing owns, from INSIDE this namespace's uid map.
+     *
+     * Done here rather than in the launcher because only this process can read
+     * /proc/self/uid_map, and a uid outside it fails setuid() with EINVAL --
+     * which is what a hardcoded high offset does under `dockerd --userns-remap`
+     * or sysbox-runc, where the container typically maps just 65536 uids.
+     *
+     * Chosen from the TOP half of the usable range: real accounts, system users
+     * and /etc/subuid allocations all live low, so the top collides with least.
+     * Deliberately not 65534 -- `nobody` is shared by half the sandboxed daemons
+     * on a desktop, and while PR_SET_DUMPABLE(0) below stops a same-uid process
+     * ptracing us for the display fd, it does not stop one signalling us dead.
+     */
+    if (!strcmp(user, "auto")) {
+        struct nvkvm_uidmap map;
+        uint32_t span, pick;
+        unsigned int seed = 0;
+        FILE *rnd = fopen("/dev/urandom", "re");
+
+        nvkvm_uidmap_get(&map);
+        if (rnd) {
+            if (fread(&seed, sizeof(seed), 1, rnd) != 1) {
+                seed = (unsigned int)getpid();
+            }
+            fclose(rnd);
+        } else {
+            seed = (unsigned int)getpid();
+        }
+        /* Top half, but never uid 0 and never below the map's floor. */
+        uint32_t lo = map.lo + (map.hi - map.lo) / 2;
+
+        if (lo == 0) {
+            lo = 1;
+        }
+        span = map.hi > lo ? map.hi - lo : 0;
+        pick = span ? lo + (seed % span) : lo;
+        if (pick == 0 || pick == geteuid()) {
+            pick = lo ? lo : 1;
+        }
+        uid = (uid_t)pick;
+        gid = (gid_t)pick;
+        have_target = true;
+        snprintf(label, sizeof(label), "uid %u gid %u (auto, map %u..%u)",
+                 (unsigned)uid, (unsigned)gid, map.lo, map.hi);
+        goto do_drop;
     }
-    if (pw->pw_uid == 0) {
-        nb_err("--drop-user %s resolves to uid 0 — refusing", user);
-        return -EINVAL;
+
+    if (user[0] >= '0' && user[0] <= '9') {
+        char *end = NULL;
+        unsigned long want = strtoul(user, &end, 10);
+
+        uid = (uid_t)want;
+        gid = (gid_t)want;
+        if (end && *end == ':') {
+            gid = (gid_t)strtoul(end + 1, &end, 10);
+        }
+        if (!end || *end != '\0' || want == 0) {
+            nb_err("--drop-user %s: expected a name, or UID[:GID] with UID != 0",
+                   user);
+            return -EINVAL;
+        }
+        have_target = true;
+        snprintf(label, sizeof(label), "uid %u gid %u",
+                 (unsigned)uid, (unsigned)gid);
+    } else {
+        pw = getpwnam(user);
+        if (!pw) {
+            nb_err("--drop-user %s: no such user", user);
+            return -ENOENT;
+        }
+        if (pw->pw_uid == 0) {
+            nb_err("--drop-user %s resolves to uid 0 — refusing", user);
+            return -EINVAL;
+        }
+        uid = pw->pw_uid;
+        gid = pw->pw_gid;
+        have_target = true;
+        snprintf(label, sizeof(label), "%s (uid %u, gid %u)", user,
+                 (unsigned)uid, (unsigned)gid);
     }
-    if (initgroups(pw->pw_name, pw->pw_gid) < 0 ||
-        setgid(pw->pw_gid) < 0 || setuid(pw->pw_uid) < 0) {
-        nb_err("dropping to %s: %s", user, strerror(errno));
+
+    if (!have_target) {
+        goto harden;
+    }
+
+do_drop:
+
+    /*
+     * Everything the broker needs is already an OPEN FD by the time this runs:
+     * the display-server connection, the input devices behind it, and the bound
+     * listening socket.  That is what lets the drop be this blunt -- nothing
+     * after this point needs to open anything by name.
+     *
+     * It also means the drop works from a NON-root start, which is the
+     * container case: the entrypoint hands us CAP_SETUID/CAP_SETGID and nothing
+     * else, we spend them here, and clear them below.  Dropping later than
+     * startup is deliberate; dropping earlier would mean connecting to the
+     * compositor as a uid that cannot reach its socket.
+     */
+    if (pw ? initgroups(pw->pw_name, gid) < 0 : setgroups(0, NULL) < 0) {
+        nb_err("dropping to %s: clearing groups: %s", label, strerror(errno));
         return -errno;
     }
-    /* setuid(2) is not allowed to fail silently here; prove it took. */
-    if (setuid(0) == 0 || geteuid() != pw->pw_uid) {
+    if (setgid(gid) < 0 || setuid(uid) < 0) {
+        nb_err("dropping to %s: %s%s", label, strerror(errno),
+               errno == EPERM
+                   ? " (no CAP_SETUID: start the broker as root, or grant it "
+                     "ambient CAP_SETUID/CAP_SETGID so it can drop after the "
+                     "window is up)"
+                   : "");
+        return -errno;
+    }
+
+    /*
+     * SPEND THE CAPABILITY, THEN THROW IT AWAY.
+     *
+     * A root->nonroot setuid clears the permitted set for free, but a
+     * nonroot->nonroot one does NOT: ambient CAP_SETUID survives it, and a
+     * broker that can still setuid(0) has not dropped anything.  Clear the
+     * ambient set and then the whole capability set explicitly, before the
+     * check below -- otherwise the check would pass while the capability is
+     * still held.
+     */
+    prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+    {
+        struct __user_cap_header_struct hdr = {
+            .version = _LINUX_CAPABILITY_VERSION_3, .pid = 0
+        };
+        struct __user_cap_data_struct data[2] = { { 0, 0, 0 }, { 0, 0, 0 } };
+
+        if (syscall(SYS_capset, &hdr, data) < 0 && errno != EPERM) {
+            nb_err("clearing capabilities after the drop: %s", strerror(errno));
+            return -errno;
+        }
+    }
+
+    /* Not allowed to fail silently: prove it took, rather than announce it. */
+    if (setuid(0) == 0 || geteuid() != uid) {
         nb_err("privilege drop did not take — refusing to continue");
         _exit(1);
     }
-    nb_log("dropped privileges to %s (uid %u, gid %u), no capabilities held",
-           user, (unsigned)pw->pw_uid, (unsigned)pw->pw_gid);
+    nb_log("dropped privileges to %s, no capabilities held", label);
+
+harden:
+    /* These are advertised security properties, not best-effort tuning.  A
+     * failure must be visible and must stop before the broker accepts a peer. */
+    if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0) {
+        int e = errno;
+
+        nb_err("PR_SET_DUMPABLE failed: %s; refusing to serve clients",
+               strerror(e));
+        return -e;
+    }
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+        int e = errno;
+
+        nb_err("PR_SET_NO_NEW_PRIVS failed: %s; refusing to serve clients",
+               strerror(e));
+        return -e;
+    }
     return 0;
 }
 
@@ -1812,7 +2290,7 @@ static void usage(void)
 "                       readable mode grants nobody anything new\n"
 "  --no-peercred        serve any peer the socket permissions admit, instead\n"
 "                       of checking SO_PEERCRED against the allow list.\n"
-"                       Refused together with a world-accessible mode\n"
+"                       Refused for adopted fds and world-accessible modes\n"
 "  --socket-fd N        use an already-bound listening fd instead of\n"
 "                       creating one.  LISTEN_FDS socket activation is also\n"
 "                       honoured, and takes precedence over --socket\n"
@@ -1820,23 +2298,25 @@ static void usage(void)
 "  --size WxH           initial window size (default 1920x1080)\n"
 "  --title TEXT         window title\n"
 "  --allow-user NAME    additional user allowed to connect (repeatable)\n"
-"  --allow-group NAME   additional group allowed to connect (repeatable)\n"
-"  --drop-user NAME     become this user after the window is up\n"
+"  --allow-group NAME   additional PRIMARY gid allowed to connect; SO_PEERCRED\n"
+"                       does not report a peer's supplementary groups\n"
+"  --drop-user WHO      become this user after the window is up: a name, a\n"
+"                       numeric UID[:GID], or `auto` to pick a uid nothing\n"
+"                       owns from inside this namespace's uid map\n"
 "  --fullscreen         start fullscreen (CTRL+ALT+F toggles)\n"
 "  --scale MODE         aspect (default) keeps the guest's aspect ratio and\n"
 "                       fills the remainder with black; stretch fills the\n"
 "                       window and distorts; none is 1:1, no scaling\n"
 "  --persist            keep the window when the VMM disconnects and wait\n"
 "                       for another (default: exit with it)\n"
-"  --clipboard MODE     off (default) | guest-to-host | consent | full\n"
+"  --clipboard MODE     off (default) | guest-to-host | consent\n"
 "                         off            nothing crosses\n"
 "                         guest-to-host  the guest may write YOUR clipboard;\n"
 "                                        it can never read it\n"
 "                         consent        the above, plus host->guest on an\n"
 "                                        explicit paste key.  RECOMMENDED\n"
-"                         full           bidirectional and automatic. The\n"
-"                                        guest sees everything you copy\n"
-"                       Text only, UTF-8, 16384 bytes max, rate limited\n"
+"                       Automatic/full sync is deliberately not implemented.\n"
+"                       Text only, UTF-8, 7 KiB (7168 bytes) max, rate limited\n"
 "                       both ways.  Needs QEMU -chardev qemu-vdagent and\n"
 "                       spice-vdagent in the guest as well\n"
 "  --clipboard-trigger LIST  keys that mean paste, replacing the default\n"
@@ -1844,6 +2324,18 @@ static void usage(void)
 "                       chosen from a MENU cannot be caught this way\n"
 "  --trace-frames       log one line per commit: frame counter, dma-buf\n"
 "                       inode, cache slot, buffers the compositor still holds\n"
+"  --present-mode=MODE  which presentation tier to offer.  The tiers are a\n"
+"                       fallback ladder, cheapest first:\n"
+"                         auto    (default) the guest's own modifier if the\n"
+"                                 display takes it, else a LINEAR dma-buf, else\n"
+"                                 shared memory\n"
+"                         native  zero-copy or nothing\n"
+"                         linear  advertise only LINEAR, forcing the VMM to\n"
+"                                 detile.  Reproduces a cross-vendor host on a\n"
+"                                 single-GPU one.  Costs one GPU transfer\n"
+"                         shm     no dma-buf at all: plain shared memory, which\n"
+"                                 no compositor can refuse.  Slowest, universal\n"
+"  --linear-only        deprecated alias for --present-mode=linear\n"
 "  --verbose\n"
 "\n"
 "The broker owns the window, the compositor connection and the input grab.\n"
@@ -1976,6 +2468,42 @@ static void nb_announce(const struct nb_session *sess)
     }
 }
 
+static int nb_validate_clipboard_mode(const struct nb_config *cfg,
+                                      const struct nb_session *sess)
+{
+    const char *available;
+    uint32_t need = 0;
+
+    if (cfg->clip_mode == NB_CLIP_G2H) {
+        need = NB_SESSION_CLIP_G2H;
+    } else if (cfg->clip_mode == NB_CLIP_CONSENT) {
+        need = NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G;
+    }
+    if ((sess->clipboard_caps & need) == need) {
+        return 0;
+    }
+    switch (sess->clipboard_caps &
+            (NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G)) {
+    case NB_SESSION_CLIP_G2H:
+        available = "guest-to-host only";
+        break;
+    case NB_SESSION_CLIP_H2G:
+        available = "host-to-guest only";
+        break;
+    case NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G:
+        available = "guest-to-host and host-to-guest";
+        break;
+    default:
+        available = "no clipboard";
+        break;
+    }
+    nb_err("clipboard mode '%s' is unsupported by backend '%s' (%s). "
+           "Refusing instead of swallowing paste keys or clipboard data.",
+           nb_clip_mode_name(cfg->clip_mode), sess->ops->name,
+           available);
+    return -ENOTSUP;
+}
+
 int main(int argc, char **argv)
 {
     struct nb_config cfg;
@@ -2038,6 +2566,18 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--allow-group")) { NEEDVAL();
             if (add_group(&cfg, v)) { return 2; } }
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
+        else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }
+        else if (!strncmp(a, "--present-mode=", 15)) {
+            const char *mode = a + 15;
+            if      (!strcmp(mode, "auto"))   { nb_tier = NB_TIER_AUTO;   }
+            else if (!strcmp(mode, "native")) { nb_tier = NB_TIER_NATIVE; }
+            else if (!strcmp(mode, "linear")) { nb_tier = NB_TIER_LINEAR; }
+            else if (!strcmp(mode, "shm"))    { nb_tier = NB_TIER_SHM;    }
+            else {
+                nb_err("--present-mode must be auto, native, linear or shm");
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
         else if (!strcmp(a, "--persist"))    { cfg.persist = true; }
@@ -2058,10 +2598,15 @@ int main(int argc, char **argv)
             if (!strcmp(v, "off"))           { cfg.clip_mode = NB_CLIP_OFF; }
             else if (!strcmp(v, "guest-to-host")) { cfg.clip_mode = NB_CLIP_G2H; }
             else if (!strcmp(v, "consent"))  { cfg.clip_mode = NB_CLIP_CONSENT; }
-            else if (!strcmp(v, "full"))     { cfg.clip_mode = NB_CLIP_FULL; }
+            else if (!strcmp(v, "full")) {
+                nb_err("--clipboard=full is not implemented: automatic host "
+                       "clipboard reads were advertised without distinct "
+                       "behavior. Use 'consent' for explicit paste only.");
+                return 2;
+            }
             else {
-                nb_err("--clipboard must be off, guest-to-host, consent or "
-                       "full (got '%s'). `consent` is the recommended one.", v);
+                nb_err("--clipboard must be off, guest-to-host or consent "
+                       "(got '%s'). `consent` is the recommended one.", v);
                 return 2;
             } }
         else if (!strcmp(a, "--clipboard-trigger")) { NEEDVAL();
@@ -2098,6 +2643,24 @@ int main(int argc, char **argv)
         return 2;
     }
 
+    /* Resolve activation before evaluating authentication.  Configured mode
+     * bits say nothing about an adopted socket, which is exactly how a TCP
+     * listener once reached HELLO under --no-peercred while the log claimed
+     * it was protected by the default 0600. */
+    if (cfg.socket_fd < 0) {
+        cfg.socket_fd = nb_listen_fds_take();
+        if (cfg.socket_fd >= 0) {
+            nb_log("socket-activated: LISTEN_FDS gave us fd %d", cfg.socket_fd);
+        }
+    }
+    socket_is_ours = cfg.socket_fd < 0;
+    if (!socket_is_ours && cfg.no_peercred) {
+        nb_err("--no-peercred is refused for --socket-fd/socket activation: "
+               "the broker cannot prove an adopted listener's pathname, "
+               "owner and mode. Keep SO_PEERCRED enabled.");
+        return 2;
+    }
+
     /* Block the signals we want to see through a fd, so the main loop is one
      * poll() with no async-signal-safety questions anywhere. */
     sigemptyset(&mask);
@@ -2121,7 +2684,7 @@ int main(int argc, char **argv)
      * the machine can drive the process holding your keyboard, so it is
      * refused rather than warned about.
      */
-    if (cfg.no_peercred && (cfg.socket_mode & 0006)) {
+    if (socket_is_ours && cfg.no_peercred && (cfg.socket_mode & 0006)) {
         nb_err("--no-peercred with --socket-mode %04o would let ANY local user "
                "connect to the process that owns your display and can grab "
                "your keyboard. Refusing. Use a group (--socket-mode 0660 "
@@ -2129,17 +2692,17 @@ int main(int argc, char **argv)
                cfg.socket_mode);
         return 2;
     }
-    if (cfg.no_peercred) {
+    if (socket_is_ours && cfg.no_peercred) {
         nb_log("WARNING: --no-peercred: any peer the socket's permissions let "
                "through is served. The socket is mode %04o%s%s.",
                cfg.socket_mode, cfg.socket_group ? ", group " : "",
                cfg.socket_group ? cfg.socket_group : "");
     }
-    if (cfg.socket_mode & 0006) {
+    if (socket_is_ours && (cfg.socket_mode & 0006)) {
         nb_log("NOTE: socket mode %04o is world-accessible; only SO_PEERCRED "
                "is keeping other users out.", cfg.socket_mode);
     }
-    if (cfg.socket_group && !(cfg.socket_mode & 0060)) {
+    if (socket_is_ours && cfg.socket_group && !(cfg.socket_mode & 0060)) {
         nb_log("NOTE: --socket-group %s has no effect at mode %04o — the "
                "group has no access. Did you mean --socket-mode 0660?",
                cfg.socket_group, cfg.socket_mode);
@@ -2148,6 +2711,10 @@ int main(int argc, char **argv)
     sess = nb_session_open(&cfg);
     if (!sess) {
         return 1;               /* the backend already said why */
+    }
+    if (nb_validate_clipboard_mode(&cfg, sess) != 0) {
+        sess->ops->close(sess);
+        return 2;
     }
     nb_announce(sess);
     if (!(sess->caps & NVKVM_BROKER_CAP_FOCUS_EVENTS)) {
@@ -2162,12 +2729,6 @@ int main(int argc, char **argv)
      * listening fd has already decided the path, mode and ownership; binding
      * our own would quietly ignore all three.
      */
-    if (cfg.socket_fd < 0) {
-        cfg.socket_fd = nb_listen_fds_take();
-        if (cfg.socket_fd >= 0) {
-            nb_log("socket-activated: LISTEN_FDS gave us fd %d", cfg.socket_fd);
-        }
-    }
     if (cfg.socket_fd >= 0) {
         listen_fd = nb_adopt_fd(cfg.socket_fd);
         socket_is_ours = false;

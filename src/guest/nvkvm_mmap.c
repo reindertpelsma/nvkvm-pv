@@ -117,13 +117,26 @@ const struct vm_operations_struct nvkvm_vm_ops = {
 
 static void nvkvm_vma_open(struct vm_area_struct *vma)
 {
-	/* Nothing to do; reference counting is on the mmap_region. */
+	struct nvkvm_mmap_region *region = vma->vm_private_data;
+
+	if (region)
+		refcount_inc(&region->vma_refs);
 }
 
 static void nvkvm_vma_close(struct vm_area_struct *vma)
 {
 	struct nvkvm_mmap_region *region = vma->vm_private_data;
 	if (!region)
+		return;
+	vma->vm_private_data = NULL;
+
+	/*
+	 * fork() inheritance is supported deliberately: the child receives the
+	 * same CPU mapping and an inherited nvkvm fd still names the parent's
+	 * session.  VMA splits (including partial munmap) have the same callback
+	 * pattern.  Only the last copy may tear down the shared host/GPA backing.
+	 */
+	if (!refcount_dec_and_test(&region->vma_refs))
 		return;
 
 	/*
@@ -147,8 +160,12 @@ static void nvkvm_vma_close(struct vm_area_struct *vma)
 				mine = true;
 			}
 			spin_unlock(&ctx->mmap_lock);
+		} else {
+			/* Defensive fd-teardown fallback: mmap_release_fd detached
+			 * this still-live VMA from the fd list.  The region is now
+			 * self-contained, and the last VMA owns its teardown. */
+			mine = true;
 		}
-		vma->vm_private_data = NULL;
 		/* Losing the claim means the other side owns the region and may
 		 * already have freed it, so do not touch it again on the way
 		 * out — clearing vm_private_data above is all this side owes. */
@@ -291,6 +308,7 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 	region->length     = vma_len;
 	region->offset     = offset;
 	region->vma        = vma;
+	refcount_set(&region->vma_refs, 1);
 
 	spin_lock(&ctx->mmap_lock);
 	list_add_tail(&region->list, &ctx->mmap_regions);
@@ -316,16 +334,21 @@ static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
  * intent" is precisely "this is a managed allocation", which is the one case
  * the fallback handles.
  */
-static bool nvkvm_uvm_mmap_has_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
-				      unsigned long len)
+static int nvkvm_uvm_mmap_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
+				 unsigned long len)
 {
 	struct nvkvm_uvm_fd_state *st = ctx->uvm_state;
 	struct nvkvm_uvm_mapping_intent *m;
 	bool found = false;
 
 	if (!st)
-		return false;
+		return 0;
+	lockdep_assert_held(&st->ext_lock);
 	mutex_lock(&st->lock);
+	if (!st->shadow_valid) {
+		mutex_unlock(&st->lock);
+		return -EIO;
+	}
 	list_for_each_entry(m, &st->intents, list) {
 		if (m->base == gva && m->length == len) {
 			found = true;
@@ -333,12 +356,13 @@ static bool nvkvm_uvm_mmap_has_intent(struct nvkvm_fd_ctx *ctx, __u64 gva,
 		}
 	}
 	mutex_unlock(&st->lock);
-	return found;
+	return found ? 1 : 0;
 }
 
 int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 {
 	unsigned long vma_len = vma->vm_end - vma->vm_start;
+	int intent;
 
 	/* Basic validation: size must be page-aligned and non-zero */
 	if (!vma_len || (vma_len & ~PAGE_MASK))
@@ -365,9 +389,23 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * (semaphore pools, device-P2P) named its VA in an ioctl first, so it
 	 * already exists in the host va_space and keeps the forwarding path.
 	 */
-	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state &&
-	    !nvkvm_uvm_mmap_has_intent(ctx, vma->vm_start, vma_len))
-		return nvkvm_uvm_ext_mmap(ctx, vma);
+	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state) {
+		int ret;
+
+		/* One transaction with ALLOC_SEMAPHORE_POOL/FREE: classification
+		 * and the selected mmap must not straddle an ioctl whose host state
+		 * and local intent are committed under this same lock. */
+		mutex_lock(&ctx->uvm_state->ext_lock);
+		intent = nvkvm_uvm_mmap_intent(ctx, vma->vm_start, vma_len);
+		if (intent < 0)
+			ret = intent;
+		else if (!intent)
+			ret = nvkvm_uvm_ext_mmap(ctx, vma);
+		else
+			ret = nvkvm_mmap_request_isolate(ctx, vma);
+		mutex_unlock(&ctx->uvm_state->ext_lock);
+		return ret;
+	}
 
 	return nvkvm_mmap_request_isolate(ctx, vma);
 }
@@ -403,6 +441,10 @@ static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
 	int ret;
 
 	mutex_lock(&st->lock);
+	if (!st->shadow_valid || !st->realize_valid) {
+		mutex_unlock(&st->lock);
+		return -EIO;
+	}
 	list_for_each_entry(m, &st->intents, list) {
 		if (m->base == gva && m->length == vma_len) {
 			match = m;
@@ -1242,9 +1284,22 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 		if (region->ext_backed) {
 			/* Same teardown as vma_close: the GPU mapping goes
 			 * first, then the CPU mapping, then the RM object. */
+			/* A live file-backed VMA owns a struct-file reference, so
+			 * normal fd destruction cannot reach this branch before its
+			 * final vm_ops.close removed the region.  Never dereference
+			 * region->vma here: after a split it names only one of several
+			 * VMAs and may already be stale. */
+			if (WARN_ON_ONCE(refcount_read(&region->vma_refs) != 0)) {
+				/* This should be impossible because vm_file keeps the
+				 * fd alive.  If a future kernel/lifetime change violates
+				 * it, detach safely and let the last VMA close release the
+				 * backing instead of freeing beneath a live mapping. */
+				region->ctx = NULL;
+				region->ext_claimed = false;
+				list_del_init(&region->list);
+				continue;
+			}
 			list_del(&region->list);
-			if (region->vma)
-				region->vma->vm_private_data = NULL;
 			nvkvm_uvm_ext_release(region);
 			continue;
 		}

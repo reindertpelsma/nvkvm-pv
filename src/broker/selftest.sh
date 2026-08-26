@@ -53,7 +53,8 @@ run_case() {
     # to send to before that, and by design it does not buffer for a client
     # that does not exist.
     ( sleep 0.9; printf '%s' "$script"; sleep 1.2 ) | \
-        "$BROKER" --socket "$s" --backend test > "$CASE_LOG" 2>&1 &
+        "$BROKER" --socket "$s" --backend test ${BROKER_EXTRA:-} \
+            > "$CASE_LOG" 2>&1 &
     local bpid=$!
     sleep 0.4
     timeout 3 "$CLIENT" "$s" "$@" > "$CASE_OUT" 2>&1
@@ -136,6 +137,73 @@ nocheck "a rejected frame does not kill the client" 'protocol violation' "$CASE_
 run_case '' --present 320x240 --bad-fourcc
 check   "an unadvertised fourcc is rejected" 'is not advertised by this display' "$CASE_LOG"
 nocheck "and does not reach attach"          'TEST attach' "$CASE_LOG"
+
+# The opaque-twin fallback: an alpha format whose twin IS advertised must be
+# accepted and presented as the twin.  HARDENING 3 is not relaxed -- the pair
+# actually handed to the display is still one the display named.
+run_case '' --present 320x240 --alpha-fourcc
+check   "AR24 falls back to its advertised opaque twin XR24" \
+        'opaque twin' "$CASE_LOG"
+check   "and the frame is attached, not refused" 'TEST attach' "$CASE_LOG"
+nocheck "with no rejection"                      'not advertised by' "$CASE_LOG"
+
+# CMD_QUERY_FORMAT: the VMM must be able to ASK before it commits to zero-copy,
+# because a rejected ATTACH is not reported back to it.  The answer comes from
+# the same resolver ATTACH uses, so a YES here is binding.
+run_case '' --present 320x240 --query-format
+check   "an advertised pair answers USABLE" \
+        'fourcc=XR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
+check   "an alpha format its twin covers answers USABLE" \
+        'fourcc=AR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
+check   "a foreign-vendor modifier answers NOT USABLE" \
+        'modifier=0x0300000000606014 -> NOT USABLE' "$CASE_OUT"
+check   "the broker logs the query and its verdict" \
+        'QUERY_FORMAT .* -> NO' "$CASE_LOG"
+nocheck "a query is not treated as a protocol violation" \
+        'protocol violation' "$CASE_LOG"
+
+# --linear-only: the forcing switch.  The test backend advertises XR24 with
+# LINEAR *and* with MOD_INVALID; under the flag only LINEAR survives, so the
+# advertised set shrinks and an implicit-modifier buffer stops being displayable.
+# That is how the cross-vendor condition is reproduced on a single-GPU host.
+BROKER_EXTRA=--linear-only
+run_case '' --present 320x240 --query-format
+check   "--linear-only narrows the advertised set to one pair" \
+        'advertises 1 \(format, modifier\) pair' "$CASE_LOG"
+check   "and LINEAR itself is still USABLE" \
+        'fourcc=XR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
+check   "and a frame still reaches attach" 'TEST attach' "$CASE_LOG"
+
+BROKER_EXTRA=
+run_case '' --present 320x240 --query-format
+check   "without it, both advertised pairs are kept" \
+        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
+
+# TIER 3: a memfd must be accepted and presented through wl_shm.  This is the
+# floor under a display that advertises a modifier it will not import, so it
+# must work with NO modifier agreement at all -- even under --linear-only.
+# --present-mode names one rung of the fallback ladder.  Each must narrow what
+# is advertised, and `shm` must leave nothing at all -- that is what forces the
+# VMM onto shared memory, the one buffer type a compositor cannot refuse.
+BROKER_EXTRA=--present-mode=native
+run_case '' --present 320x240
+check   "--present-mode=native keeps every advertised pair" \
+        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
+BROKER_EXTRA=--present-mode=linear
+run_case '' --present 320x240
+check   "--present-mode=linear narrows to LINEAR alone" \
+        'advertises 1 \(format, modifier\) pair' "$CASE_LOG"
+BROKER_EXTRA=--present-mode=shm
+run_case '' --present 320x240
+check   "--present-mode=shm advertises no dma-buf format at all" \
+        'advertises 0 \(format, modifier\) pairs' "$CASE_LOG"
+run_case '' --present 320x240 --shm
+check   "and an F_SHM frame is still presented" 'TEST attach' "$CASE_LOG"
+BROKER_EXTRA=
+
+run_case '' --present 320x240 --shm --unadvertised-mod
+check   "an F_SHM frame is accepted despite an unadvertised modifier" 'TEST attach' "$CASE_LOG"
+nocheck "and is not rejected for that modifier" 'not advertised by' "$CASE_LOG"
 
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"

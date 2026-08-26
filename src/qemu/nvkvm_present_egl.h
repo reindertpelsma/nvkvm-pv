@@ -55,6 +55,18 @@ void nvkvm_present_console_set_device(struct VirtIONvgpu *nv,
  * `dmabuf_fd` (closes it when the frame is retired).  Returns true if the fd
  * was accepted (caller must not close it), false if the console is inactive
  * (caller still owns the fd). */
+/*
+ * Cross-vendor present.  Same frame, but read back through the guest's GPU into
+ * a LINEAR udmabuf and submitted to the display broker, for hosts whose
+ * compositor cannot import the guest's tiling.  Returns false if the frame was
+ * not taken (no udmabuf, no present context) and the caller still owns the fd.
+ */
+bool nvkvm_present_submit_readback(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                   uint32_t owner_isolate_id, uint32_t buf_key,
+                                   uint32_t width, uint32_t height,
+                                   uint32_t stride, uint32_t fourcc,
+                                   uint64_t modifier);
+
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                           uint32_t owner_isolate_id, uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,

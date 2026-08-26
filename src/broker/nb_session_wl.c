@@ -142,6 +142,13 @@ struct nb_wl_buf {
     uint64_t  commits;
 };
 
+/* Distinct pairs whose importability we remember.  Two occur in practice:
+ * the guest's own tiling and the LINEAR fallback. */
+/* DRM_FORMAT_ARGB8888, spelled locally like the XR24 one. */
+#define NB_FOURCC_AR24_LOCAL 0x34325241u
+
+#define NB_PROVEN_SLOTS 4
+
 struct nb_wl {
     struct wl_display    *dpy;
     struct wl_registry   *reg;
@@ -155,6 +162,38 @@ struct nb_wl {
     struct xdg_toplevel  *toplevel;
     struct zwp_linux_dmabuf_v1 *dmabuf;
     uint32_t              dmabuf_ver;
+
+    /*
+     * PAIRS PROVEN BY IMPORT, not by advertisement.
+     *
+     * A compositor can advertise a (fourcc, modifier) its own driver then
+     * refuses to bind.  MEASURED on GNOME/Mutter with NVIDIA 595.84: it
+     * advertises XR24 + LINEAR and answers the import with
+     *   [destroyed object]: error 7: failed to import supplied dmabufs:
+     *   Could not bind the given EGLImage to a CoglTexture2D
+     * -- which is a WAYLAND PROTOCOL ERROR, so the connection dies and the
+     * broker exits.  Under a restart policy that is a spin: OBSERVED 15
+     * restarts in a few minutes on the physical box.
+     *
+     * So the first buffer of an unproven pair goes through the ASYNCHRONOUS
+     * zwp_linux_buffer_params_v1.create, which reports failure as a `failed`
+     * EVENT instead of killing the connection.  Once a pair is proven, every
+     * later buffer uses create_immed, which is why the roundtrip is paid once
+     * per pair and never on the steady-state frame path -- the objection the
+     * create_immed comment below is about.
+     */
+    struct {
+        uint32_t fourcc;
+        uint64_t mod;
+        int      state;       /* 0 unproven, 1 importable, -1 refused */
+        bool     probing;
+    } proven[NB_PROVEN_SLOTS];
+    uint32_t probe_fourcc;   /* the pair the outstanding probe is about */
+    uint64_t probe_mod;
+    /* A probe that failed and the client has not been told about yet. */
+    bool     probe_bad_pending;
+    uint32_t probe_bad_fourcc;
+    uint64_t probe_bad_mod;
     /* Only ever used for the idle placeholder.  The guest path never touches
      * shm — its frames are dma-bufs and are never copied. */
     struct wl_shm        *shm;
@@ -317,10 +356,16 @@ struct nb_wl {
     struct wl_data_device         *ddev;
     struct wl_data_offer          *offer;      /* current selection, if text */
     bool                           offer_text; /* it advertised our mime     */
+    /* data_offer precedes the selection/enter event that says what the object
+     * is for.  Keep that candidate separate so an ignored DnD offer cannot
+     * replace the clipboard selection. */
+    struct wl_data_offer          *pending_offer;
+    bool                           pending_offer_text;
     struct wl_data_source         *source;     /* ours, when we own it       */
     char                          *src_text;   /* what we would send         */
     size_t                         src_len;
     int                            fetch_fd;   /* pipe being read, or -1     */
+    uint64_t                       fetch_generation;
     uint64_t                       clip_notice_until;  /* title-bar notice   */
     char                           fetch_buf[NVKVM_BROKER_CLIP_MAX_BYTES + 1];
     size_t                         fetch_len;
@@ -355,6 +400,15 @@ struct nb_wl {
     int    buf_w, buf_h;
     int    win_w, win_h;
     int    surf_w, surf_h;
+    /* A FOURTH, and it is the only one EV_SURFACE may ever carry: the window's
+     * CONTENT size -- win_* less the decorations we draw.  surf_* cannot serve
+     * because, per the note above, it becomes buf_* whenever no viewport is
+     * scaling: reporting it then tells the guest to render the size it just
+     * rendered, and on a fullscreen window the two disagree, so they trade
+     * places forever.  OBSERVED on a 4K display at scale 1.5: the guest flipped
+     * between 1920x1080 and 3760x2118 about every two seconds, indefinitely.
+     * (2160 - 42 is the 28px title bar at 1.5x, hence the odd number.) */
+    int    cont_w, cont_h;
     uint32_t deco_mode;
     bool   grabbed;
     bool   fullscreen;
@@ -433,6 +487,82 @@ static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
 
 /* ── ops: attach / commit ────────────────────────────────────────────────── */
 
+/* Slot for this pair, allocating one if there is room. */
+static int wl_pair_slot(struct nb_wl *w, uint32_t fourcc, uint64_t mod,
+                        bool create)
+{
+    int free_slot = -1;
+
+    for (int i = 0; i < NB_PROVEN_SLOTS; i++) {
+        if (w->proven[i].fourcc == fourcc && w->proven[i].mod == mod &&
+            (w->proven[i].state || w->proven[i].probing)) {
+            return i;
+        }
+        if (free_slot < 0 && !w->proven[i].state && !w->proven[i].probing) {
+            free_slot = i;
+        }
+    }
+    if (!create || free_slot < 0) {
+        return -1;
+    }
+    w->proven[free_slot].fourcc = fourcc;
+    w->proven[free_slot].mod    = mod;
+    return free_slot;
+}
+
+/*
+ * The probe answered.  `created` means this display really can import the pair;
+ * `failed` means it advertised something it cannot bind, and the whole point of
+ * probing is that we learn this WITHOUT the connection being torn down.
+ *
+ * The probe buffer itself is discarded either way.  Showing it would mean
+ * threading a deferred attach through the commit path for one frame's benefit;
+ * dropping it costs a single frame the first time a pair is seen.
+ */
+static void probe_created(void *data, struct zwp_linux_buffer_params_v1 *params,
+                          struct wl_buffer *buf)
+{
+    struct nb_wl *w = data;
+    int i = wl_pair_slot(w, w->probe_fourcc, w->probe_mod, false);
+
+    if (i >= 0) {
+        w->proven[i].state   = 1;
+        w->proven[i].probing = false;
+        nb_log("this display CAN import %.4s modifier 0x%016llx — proven by "
+               "import, not by advertisement",
+               (const char *)&w->proven[i].fourcc,
+               (unsigned long long)w->proven[i].mod);
+    }
+    wl_buffer_destroy(buf);
+    zwp_linux_buffer_params_v1_destroy(params);
+}
+
+static void probe_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
+{
+    struct nb_wl *w = data;
+    int i = wl_pair_slot(w, w->probe_fourcc, w->probe_mod, false);
+
+    if (i >= 0) {
+        w->proven[i].state   = -1;
+        w->proven[i].probing = false;
+        nb_err("this display ADVERTISED %.4s modifier 0x%016llx and then "
+               "refused to import it.  Frames in that layout will be rejected "
+               "rather than retried; the VMM is being told so it can send "
+               "something else.",
+               (const char *)&w->proven[i].fourcc,
+               (unsigned long long)w->proven[i].mod);
+        w->probe_bad_pending = true;
+        w->probe_bad_fourcc  = w->proven[i].fourcc;
+        w->probe_bad_mod     = w->proven[i].mod;
+    }
+    zwp_linux_buffer_params_v1_destroy(params);
+}
+
+static const struct zwp_linux_buffer_params_v1_listener probe_listener = {
+    .created = probe_created,
+    .failed  = probe_failed,
+};
+
 static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
 {
     struct nb_wl *w = s->priv;
@@ -477,6 +607,107 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
     }
     if (victim < 0) {
         return -ENOSPC;         /* cannot happen with NB_MAX_BUFS >= 3 */
+    }
+
+    /*
+     * TIER 3: SHARED MEMORY.  The VMM sends a memfd when the dma-buf tiers have
+     * been refused.  wl_shm is a core Wayland global -- every compositor must
+     * implement it -- so this cannot fail for want of import support, which is
+     * exactly why it is the floor under a display that advertises a modifier it
+     * will not bind.  It costs the compositor an upload per frame; that is the
+     * price of universality and the reason the VMM tries it last.
+     *
+     * No modifier is involved and none was checked: shm is linear by
+     * definition, and the geometry bounds nb_validate_desc() already enforced
+     * are what keep the compositor from reading past the mapping.
+     */
+    if (d->is_shm) {
+        struct wl_shm_pool *pool;
+        struct wl_buffer *sb;
+        size_t need = (size_t)d->stride * d->height + d->offset;
+
+        if (!w->shm) {
+            nb_err("ATTACH: this compositor offers no wl_shm, so there is no "
+                   "buffer type left to try");
+            return -EINVAL;
+        }
+        pool = wl_shm_create_pool(w->shm, d->fd, (int32_t)need);
+        if (!pool) {
+            return -EIO;
+        }
+        sb = wl_shm_pool_create_buffer(pool, (int32_t)d->offset,
+                                       (int32_t)d->width, (int32_t)d->height,
+                                       (int32_t)d->stride,
+                                       d->fourcc == NB_FOURCC_AR24_LOCAL
+                                           ? WL_SHM_FORMAT_ARGB8888
+                                           : WL_SHM_FORMAT_XRGB8888);
+        wl_shm_pool_destroy(pool);
+        if (!sb) {
+            return -EIO;
+        }
+        {
+            static bool told;
+
+            if (!told) {
+                told = true;
+                nb_log("presenting through wl_shm: the display refused every "
+                       "dma-buf layout offered, so frames are shared as plain "
+                       "memory.  This works everywhere and costs the "
+                       "compositor one upload per frame.");
+            }
+        }
+        wl_buf_destroy(w, victim);
+        w->bufs[victim] = (struct nb_wl_buf){
+            .valid = true, .id = d->id, .buf = sb,
+            .w = d->width, .h = d->height, .stride = d->stride,
+            .offset = d->offset, .fourcc = d->fourcc, .modifier = d->modifier,
+            .used = w->tick, .owner = w, .seq = d->seq,
+        };
+        wl_buffer_add_listener(sb, &buf_listener, &w->bufs[victim]);
+        w->pending = victim;
+        return 0;
+    }
+
+    /*
+     * ADVERTISED IS NOT IMPORTABLE.  Gate on what this display has actually
+     * proven it can bind; see the `proven` table's comment for the Mutter case
+     * that makes this necessary.
+     */
+    {
+        int ps = wl_pair_slot(w, d->fourcc, d->modifier, true);
+
+        if (ps >= 0 && w->proven[ps].state == -1) {
+            return -EINVAL;         /* known-refused: reject, do not retry */
+        }
+        if (ps >= 0 && w->proven[ps].probing) {
+            return 0;               /* a probe is in flight; nothing to show */
+        }
+        if (ps >= 0 && w->proven[ps].state == 0) {
+            /* First buffer of this pair: probe it asynchronously, so a refusal
+             * arrives as an event rather than as a fatal protocol error. */
+            struct zwp_linux_buffer_params_v1 *pp =
+                zwp_linux_dmabuf_v1_create_params(w->dmabuf);
+
+            if (!pp) {
+                return -EIO;
+            }
+            zwp_linux_buffer_params_v1_add(pp, d->fd, 0, d->offset, d->stride,
+                                           (uint32_t)(d->modifier >> 32),
+                                           (uint32_t)(d->modifier & 0xffffffffu));
+            zwp_linux_buffer_params_v1_add_listener(pp, &probe_listener, w);
+            w->probe_fourcc      = d->fourcc;
+            w->probe_mod         = d->modifier;
+            w->proven[ps].probing = true;
+            zwp_linux_buffer_params_v1_create(pp, (int32_t)d->width,
+                                              (int32_t)d->height, d->fourcc,
+                                              0 /* flags */);
+            nb_log("probing whether this display can import %.4s modifier "
+                   "0x%016llx (one frame is dropped to find out)",
+                   (const char *)&d->fourcc,
+                   (unsigned long long)d->modifier);
+            w->pending = -1;
+            return 0;
+        }
     }
 
     params = zwp_linux_dmabuf_v1_create_params(w->dmabuf);
@@ -641,6 +872,17 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     struct wl_callback *cb;
     int new_w, new_h;
 
+    /*
+     * A probe came back refused.  Told here rather than from the listener
+     * because this is where the sink is in scope, and it is called often
+     * enough that the news is never more than a frame late.
+     */
+    if (w->probe_bad_pending) {
+        w->probe_bad_pending = false;
+        nb_sink_format_verdict(sink, w->probe_bad_fourcc, w->probe_bad_mod,
+                               false);
+    }
+
     if (w->pending < 0) {
         return -ENOENT;         /* COMMIT with nothing attached; not fatal */
     }
@@ -782,11 +1024,29 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     w->current = w->pending;
     w->pending = -1;
-    if (new_w != w->surf_w || new_h != w->surf_h) {
-        w->surf_w = new_w;
-        w->surf_h = new_h;
-        wl_report_surface(w, new_w, new_h);
-    }
+    /*
+     * RECORD WHAT WE PRESENTED.  DO NOT REPORT IT.
+     *
+     * EV_SURFACE is an INSTRUCTION -- "guest, render this size" -- and it must
+     * only ever carry what the WINDOW can show.  What arrives here is the size
+     * the guest actually sent, which is an OBSERVATION.  Sending it back told
+     * the guest to render the size it had just rendered, and on a fullscreen
+     * window the two disagree, so they traded places forever:
+     *
+     *   configure: the window can show 3760x2118  -> "render 3760x2118"
+     *   commit:    the guest's buffer is 1920x1080 -> "render 1920x1080"
+     *   configure: the window can still show 3760x2118 -> ...
+     *
+     * OBSERVED on a 4K display at scale 1.5: the guest flipped between
+     * 1920x1080 and 3760x2118 about every two seconds, forever.  (2160 - 42 is
+     * the 28px title bar at 1.5x, which is why the number looks arbitrary.)
+     *
+     * This is the same rule the WINDOW handler states one layer up -- a guest
+     * re-mode does not move the user's window -- applied to the buffer layer:
+     * what the guest did is not an instruction to the guest.
+     */
+    w->surf_w = new_w;
+    w->surf_h = new_h;
     return 0;
 }
 
@@ -1051,6 +1311,8 @@ static void doffer_offer(void *d, struct wl_data_offer *o, const char *mime)
 
     if (w->offer == o && !strcmp(mime, NB_CLIP_MIME)) {
         w->offer_text = true;
+    } else if (w->pending_offer == o && !strcmp(mime, NB_CLIP_MIME)) {
+        w->pending_offer_text = true;
     }
 }
 static void doffer_source_actions(void *d, struct wl_data_offer *o, uint32_t a) {}
@@ -1066,10 +1328,14 @@ static void ddev_data_offer(void *d, struct wl_data_device *dev,
 {
     struct nb_wl *w = d;
 
-    /* A new offer supersedes any we were tracking; the compositor destroys the
-     * old one for us only when it sends selection(NULL). */
-    w->offer = o;
-    w->offer_text = false;
+    /* This event does not say whether `o` is a selection or drag-and-drop
+     * offer.  Association comes in selection()/enter(), so replacing the
+     * current selection here confuses the two object lifetimes. */
+    if (w->pending_offer && w->pending_offer != w->offer) {
+        wl_data_offer_destroy(w->pending_offer);
+    }
+    w->pending_offer = o;
+    w->pending_offer_text = false;
     wl_data_offer_add_listener(o, &doffer_listener, w);
 }
 static void ddev_selection(void *d, struct wl_data_device *dev,
@@ -1078,19 +1344,42 @@ static void ddev_selection(void *d, struct wl_data_device *dev,
     struct nb_wl *w = d;
 
     if (!o) {
+        if (w->offer) {
+            wl_data_offer_destroy(w->offer);
+        }
         w->offer = NULL;
         w->offer_text = false;
         return;
     }
     /* The offer we were told about in data_offer is now THE selection. */
-    if (w->offer != o) {
-        w->offer = o;
+    if (w->offer && w->offer != o) {
+        wl_data_offer_destroy(w->offer);
+    }
+    w->offer = o;
+    if (w->pending_offer == o) {
+        w->offer_text = w->pending_offer_text;
+        w->pending_offer = NULL;
+        w->pending_offer_text = false;
+    } else {
+        /* The protocol promises data_offer first.  Fail this offer closed if a
+         * compositor violates that ordering; it has no recorded MIME set. */
         w->offer_text = false;
     }
 }
 static void ddev_enter(void *d, struct wl_data_device *v, uint32_t s,
                        struct wl_surface *su, wl_fixed_t x, wl_fixed_t y,
-                       struct wl_data_offer *o) {}
+                       struct wl_data_offer *o)
+{
+    struct nb_wl *w = d;
+
+    /* Drag-and-drop is deliberately unsupported.  Destroy its offer now that
+     * the association is known, without disturbing the clipboard selection. */
+    if (o && o == w->pending_offer) {
+        wl_data_offer_destroy(o);
+        w->pending_offer = NULL;
+        w->pending_offer_text = false;
+    }
+}
 static void ddev_leave(void *d, struct wl_data_device *v) {}
 static void ddev_motion(void *d, struct wl_data_device *v, uint32_t t,
                         wl_fixed_t x, wl_fixed_t y) {}
@@ -1111,18 +1400,34 @@ static void dsrc_send(void *d, struct wl_data_source *src, const char *mime,
 {
     struct nb_wl *w = d;
     size_t off = 0;
+    int flags;
 
     if (!w->src_text || strcmp(mime, NB_CLIP_MIME)) {
         close(fd);
         return;
     }
-    /* Blocking write to a pipe the requester owns.  Bounded by the clipboard
-     * cap, and a reader that goes away gives EPIPE rather than a stall --
-     * SIGPIPE is ignored process-wide. */
+    /* The requester owns this fd.  It must not be allowed to stop the single
+     * display/input loop by declining to read.  The selection is bounded and
+     * normally fits in one pipe write; under pressure, fail this request
+     * instead of blocking the user's keyboard. */
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        nb_err("clipboard: cannot make a host requester's selection fd "
+               "nonblocking: %s; refusing that request", strerror(errno));
+        close(fd);
+        return;
+    }
     while (off < w->src_len) {
         ssize_t n = write(fd, w->src_text + off, w->src_len - off);
 
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
         if (n <= 0) {
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                nb_log("clipboard: a host requester stopped draining; "
+                       "abandoning its nonblocking selection transfer");
+            }
             break;
         }
         off += (size_t)n;
@@ -1195,7 +1500,8 @@ static int wl_set_clipboard(struct nb_session *s, const char *text, size_t len)
 
 /* ── host -> guest: read the selection, asynchronously ───────────────────── */
 
-static int wl_fetch_clipboard(struct nb_session *s)
+static int wl_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
+                              uint64_t generation)
 {
     struct nb_wl *w = s->priv;
     int fds[2];
@@ -1214,6 +1520,7 @@ static int wl_fetch_clipboard(struct nb_session *s)
     wl_display_flush(w->dpy);
     w->fetch_fd = fds[0];
     w->fetch_len = 0;
+    w->fetch_generation = generation;
     return 0;
 }
 
@@ -1225,14 +1532,15 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
 {
     for (;;) {
         ssize_t n = read(w->fetch_fd, w->fetch_buf + w->fetch_len,
-                         sizeof(w->fetch_buf) - 1 - w->fetch_len);
+                         sizeof(w->fetch_buf) - w->fetch_len);
 
         if (n > 0) {
             w->fetch_len += (size_t)n;
-            if (w->fetch_len >= sizeof(w->fetch_buf) - 1) {
+            if (w->fetch_len > NVKVM_BROKER_CLIP_MAX_BYTES) {
                 nb_log("clipboard: host selection is larger than the %u-byte "
                        "cap; not pasting it",
                        NVKVM_BROKER_CLIP_MAX_BYTES);
+                nb_sink_clip_finish(sink, w->fetch_generation, false);
                 break;
             }
             continue;
@@ -1243,16 +1551,42 @@ static bool wl_fetch_pump(struct nb_wl *w, struct nb_sink *sink)
         if (n < 0 && errno == EINTR) {
             continue;
         }
+        if (n < 0) {
+            nb_log("clipboard: reading the host selection failed: %s",
+                   strerror(errno));
+        }
         /* n == 0: EOF, the whole selection is here. */
         if (n == 0 && w->fetch_len > 0) {
-            nb_sink_send_clipboard(sink, w->fetch_buf, w->fetch_len);
+            bool sent = nb_sink_send_clipboard(sink, w->fetch_generation,
+                                               w->fetch_buf, w->fetch_len);
+
+            nb_sink_clip_finish(sink, w->fetch_generation, sent);
+        } else {
+            nb_sink_clip_finish(sink, w->fetch_generation, false);
         }
         break;
     }
     close(w->fetch_fd);
     w->fetch_fd = -1;
     w->fetch_len = 0;
+    w->fetch_generation = 0;
     return true;
+}
+
+static void wl_client_detach(struct nb_session *s, uint64_t generation)
+{
+    struct nb_wl *w = s->priv;
+
+    if (w->fetch_fd >= 0 && w->fetch_generation == generation) {
+        close(w->fetch_fd);
+        w->fetch_fd = -1;
+        w->fetch_len = 0;
+        w->fetch_generation = 0;
+    }
+    /* The warning/title state described the departed VM, not the persistent
+     * host window. */
+    w->clip_notice_until = 0;
+    tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
 }
 
 /* ── the output's fractional scale ───────────────────────────────────────── */
@@ -1295,9 +1629,10 @@ static void frac_scale(void *d, struct wp_fractional_scale_v1 *f,
     nb_log("output scale is %u.%03u — the guest is told PHYSICAL pixels, so a "
            "fullscreen guest buffer can cover the output",
            scale / 120, (scale % 120) * 1000 / 120);
-    /* Re-report the surface at the new scale; the size in logical pixels has
-     * not changed, but what the guest should render has. */
-    wl_report_surface(w, w->surf_w, w->surf_h);
+    /* Re-report at the new scale: the size in logical pixels has not changed,
+     * but what the guest should render has.  cont_*, not surf_* -- see the
+     * field's comment for why reporting surf_* oscillates. */
+    wl_report_surface(w, w->cont_w, w->cont_h);
 }
 static const struct wp_fractional_scale_v1_listener frac_listener = {
     .preferred_scale = frac_scale,
@@ -2360,7 +2695,9 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
         wl_show_idle(w->sess);  /* repaint the placeholder at the new size */
         return;
     }
-    if (wd != w->surf_w || ht != w->surf_h) {
+    if (wd != w->cont_w || ht != w->cont_h) {
+        w->cont_w = wd;
+        w->cont_h = ht;
         w->surf_w = wd;
         w->surf_h = ht;
         if (w->sink) {
@@ -2843,23 +3180,7 @@ static int wl_dispatch_session(struct nb_session *s, struct nb_sink *sink)
      * a separate fd and its readiness has nothing to do with the compositor's.
      */
     if (w->fetch_fd >= 0 && w->pfd && (w->pfd[1].revents & (POLLIN | POLLHUP))) {
-        if (wl_fetch_pump(w, sink)) {
-            /* Finished, however it ended.  Release the held paste key on EVERY
-             * path or the keystroke is swallowed and paste appears broken. */
-            nb_sink_clip_release(sink);
-        }
-    }
-    if (sink->clip_want_paste && w->fetch_fd < 0) {
-        int r = wl_fetch_clipboard(s);
-
-        sink->clip_want_paste = false;
-        if (r != 0) {
-            if (r == -ENOENT) {
-                nb_log("clipboard: the host selection is empty or is not "
-                       "text, so this paste sent nothing");
-            }
-            nb_sink_clip_release(sink);
-        }
+        (void)wl_fetch_pump(w, sink);
     }
 
     if (w->pfd && (w->pfd->revents & POLLOUT)) {
@@ -3029,6 +3350,19 @@ static void wl_close_session(struct nb_session *s)
         return;
     }
     wl_set_grab(s, false);
+    if (w->fetch_fd >= 0) {
+        close(w->fetch_fd);
+    }
+    if (w->pending_offer && w->pending_offer != w->offer) {
+        wl_data_offer_destroy(w->pending_offer);
+    }
+    if (w->offer) {
+        wl_data_offer_destroy(w->offer);
+    }
+    if (w->source) {
+        wl_data_source_destroy(w->source);
+    }
+    free(w->src_text);
     for (i = 0; i < NB_MAX_BUFS; i++) {
         wl_buf_destroy(w, i);
     }
@@ -3132,6 +3466,9 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     if (!w->ddev) {
         nb_log("no wl_data_device: clipboard is unavailable on this "
                "compositor, whatever --clipboard says");
+    }
+    if (w->ddev) {
+        s->clipboard_caps = NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G;
     }
 
     if (!w->comp || !w->wm_base) {
@@ -3321,6 +3658,23 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
                                       "under grab); ");
     }
     nb_formats_log(&w->formats, "the compositor");
+
+    /*
+     * ACCEPT SHARED MEMORY TOO.
+     *
+     * wl_shm is a core Wayland global that every compositor must implement, so
+     * a shm buffer is the one thing a display CANNOT refuse.  That makes it the
+     * universal last tier for the VMM, after a display has advertised a
+     * modifier it then would not import -- MEASURED on GNOME/Mutter with
+     * NVIDIA 595.84, which advertises XR24+LINEAR through
+     * eglQueryDmaBufModifiersEXT and answers the import with "Could not bind
+     * the given EGLImage to a CoglTexture2D".
+     *
+     * It costs the compositor an upload per frame, which is why it is the LAST
+     * tier and not the first.  The VMM only reaches for it when the dma-buf
+     * tiers have been refused.
+     */
+    s->accept_memfd = true;
     return 0;
 
 fail:
@@ -3343,6 +3697,7 @@ static const struct nb_session_ops wl_ops = {
     .attach = wl_attach,
     .commit = wl_commit,
     .resize = wl_resize,
+    .client_detach = wl_client_detach,
     .show_idle = wl_show_idle,
     .dismiss_dialog = wl_dismiss_dialog,
     .set_clipboard = wl_set_clipboard,

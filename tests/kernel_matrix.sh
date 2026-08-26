@@ -67,7 +67,11 @@ for G in 1 0; do
     if [ -f /build/src/guest/nvkvm-guest.ko ]; then
         echo "RESULT|${DISTRO_TAG}|${KVER}|PASS|gcc ${GCCV}, graphics=${G}"
     else
-        E=$(echo "$OUT" | grep -E 'error:' | head -1 | sed 's/|/ /g' | cut -c1-160)
+        # kbuild compiler diagnostics use "error:", while modpost (including
+        # the graphics=0 undefined-KMS regression) prints uppercase "ERROR:".
+        # Treat both as the same failure instead of falling through to the
+        # unhelpful final "make: Leaving directory" line.
+        E=$(echo "$OUT" | grep -Ei 'error:' | head -1 | sed 's/|/ /g' | cut -c1-160)
         [ -z "$E" ] && E=$(echo "$OUT" | tail -1 | cut -c1-160)
         echo "RESULT|${DISTRO_TAG}|${KVER}|FAIL|graphics=${G}: ${E}"
     fi

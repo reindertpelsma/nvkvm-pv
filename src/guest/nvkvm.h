@@ -119,6 +119,13 @@ struct nvkvm_session {
 
 struct nvkvm_mmap_region {
 	struct list_head list;
+	/*
+	 * One reference per VMA that carries this object in vm_private_data.
+	 * Linux calls vm_ops.open when a VMA is copied or split and close once
+	 * for every resulting VMA.  Managed fallback backing may therefore be
+	 * released only after this count reaches zero, not on the first close.
+	 */
+	refcount_t vma_refs;
 	__u32    mmap_token;       /* opaque token from host                */
 	__u32    handle_id;        /* QEMU-side handle (for isolate re-map) */
 	unsigned long gpa_base;    /* guest physical address                */
@@ -133,8 +140,9 @@ struct nvkvm_mmap_region {
 	 *
 	 * Everything teardown needs is cached HERE rather than reached through
 	 * the fd context, because teardown runs from vma_close(), which can fire
-	 * after the owning fd has been closed.  `ctx` is used for exactly one
-	 * thing -- the mmap_lock that arbitrates the claim below.
+	 * after close(2) removed the userspace descriptor.  The VMA's vm_file
+	 * reference keeps the struct file, and therefore `ctx`, alive until the
+	 * last VMA close.  `ctx` is used only for mmap_lock below.
 	 */
 	struct nvkvm_fd_ctx *ctx;   /* owning UVM fd, for the claim lock     */
 	/*
@@ -197,9 +205,9 @@ struct nvkvm_cpu_page {
  * docs/STATE_MACHINE_PLAN.md).  Only allocated when dev_id ==
  * NVKVM_DEV_UVM.  Holds the configuration state libcuda accumulates
  * via UVM_INITIALIZE / REGISTER_GPU / CREATE_RANGE_GROUP /
- * ALLOC_SEMAPHORE_POOL / ... ioctls — which we record without
- * forwarding, then replay in a single REALIZE_UVM_MAPPING when libcuda
- * mmap's the fd.
+ * ALLOC_SEMAPHORE_POOL / ... ioctls.  Calls are still forwarded; the live
+ * mirror distinguishes pre-created semaphore mappings from MANAGED mmap, and
+ * also retains the bounded state for the dormant REALIZE_UVM_MAPPING path.
  */
 struct nvkvm_uvm_gpu_reg {
 	struct list_head list;
@@ -225,6 +233,17 @@ struct nvkvm_uvm_mapping_intent {
 	void            *params;      /* mode-specific params blob  */
 	size_t           params_size;
 };
+
+/* The dormant REALIZE snapshot has fixed arrays of 16 GPUs, VA spaces and
+ * range groups.  Mapping intents are different: active mmap classification
+ * consumes them and UVM permits arbitrary non-overlapping semaphore pools.
+ * Account the two actual allocations separately instead of deriving a count
+ * from those unrelated wire arrays: small classification nodes are required,
+ * while the much larger dormant replay blobs are optional.  Admission happens
+ * before the host ioctl, so exhausting the metadata budget cannot leave a
+ * host-successful semaphore pool which a later mmap mistakes for MANAGED. */
+#define NVKVM_UVM_MAX_INTENT_META_BYTES (256U * 1024U)
+#define NVKVM_UVM_MAX_REALIZE_BYTES     (256U * 1024U)
 struct nvkvm_uvm_realization {
 	struct list_head list;
 	__u64            realize_token;
@@ -235,6 +254,15 @@ struct nvkvm_uvm_realization {
 struct nvkvm_uvm_fd_state {
 	struct mutex     lock;
 	bool             initialized;
+	/* A lost/capped bookkeeping update must not change the result of an
+	 * ioctl the host already accepted.  Instead it makes the shadow unusable
+	 * and managed mmap fails closed until a successful DEINITIALIZE resets
+	 * both the host state and this bounded mirror. */
+	bool             shadow_valid;
+	/* VA-space and range-group records are consumed only by the dormant
+	 * REALIZE snapshot.  Losing that bounded mirror must not disable the
+	 * ordinary managed-memory fallback, whose inputs remain intact. */
+	bool             realize_valid;
 	__u64            init_flags;
 	/*
 	 * Managed-memory fallback: the private RM object tree this UVM fd owns
@@ -246,6 +274,9 @@ struct nvkvm_uvm_fd_state {
 	 * is ONE-SHOT PER `struct file` (nv-mmap.c:503-509), so the
 	 * NV_ESC_RM_MAP_MEMORY that arms it and the mmap that consumes it must
 	 * not interleave with another thread's pair on the same ctl handle.
+	 * When both UVM locks are needed, the order is ext_lock -> lock.  The
+	 * tracked ioctl transaction and managed mmap both follow that order.
+	 * ext_lock may span a blocking host request; lock never does.
 	 */
 	struct mutex     ext_lock;
 	struct nvkvm_fd_ctx *ext_ctl;   /* private /dev/nvidiactl handle     */
@@ -259,6 +290,12 @@ struct nvkvm_uvm_fd_state {
 	struct list_head range_groups;        /* nvkvm_uvm_range_group */
 	struct list_head intents;             /* nvkvm_uvm_mapping_intent */
 	struct list_head realizations;        /* nvkvm_uvm_realization */
+	__u32            n_registered_gpus;
+	__u32            n_registered_va_spaces;
+	__u32            n_range_groups;
+	__u32            n_intents;
+	size_t           intent_bytes;
+	size_t           realize_bytes;
 };
 
 struct nvkvm_fd_ctx {
@@ -473,10 +510,12 @@ struct drm_framebuffer;
 bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
 			  struct nvkvm_fd_ctx **ctx);
 
-/* nvkvm_kms.c — guest-emulated virtual KMS head (#102). Called from
- * nvkvm_drm_init on the nvkvm drm_device before drm_dev_register. */
+/* nvkvm_kms.c — guest-emulated virtual KMS head (#102).  Init constructs the
+ * mode objects before drm_dev_register(); activate publishes them to the
+ * virtio event path only after registration succeeds. */
 int  nvkvm_kms_init(struct drm_device *ddev);
-void nvkvm_kms_fini(void);
+void nvkvm_kms_activate(struct drm_device *ddev);
+void nvkvm_kms_fini(struct drm_device *ddev);
 /* The host's window changed size (ui_info, forwarded over VQ_EVT).  Offers it
  * as the head's preferred mode and hotplugs; the guest compositor decides. */
 void nvkvm_kms_set_host_size(unsigned int w, unsigned int h);
@@ -601,7 +640,8 @@ void nvkvm_force_range_wb(struct mm_struct *mm,
 /* nvkvm_uvm_ext.c -- managed-memory fallback (docs/internal/uvm-va-decoupling.md
  * section 2e).  A UVM mmap that no range-creating ioctl asked for IS libcuda
  * creating a MANAGED range; we do not forward it, we synthesise an EXTERNAL
- * range over an RM sysmem object instead. */
+ * range over an RM sysmem object instead.  Caller holds uvm_state->ext_lock
+ * across classification and this whole synthesis. */
 int  nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma);
 void nvkvm_uvm_ext_release(struct nvkvm_mmap_region *region);
 void nvkvm_uvm_ext_fd_teardown(struct nvkvm_uvm_fd_state *st);

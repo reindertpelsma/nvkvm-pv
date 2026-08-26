@@ -40,6 +40,67 @@ uint32_t nb_fourcc_bpp(uint32_t fourcc)
     }
 }
 
+/*
+ * The opaque twin of an alpha format.
+ *
+ * ARGB8888 and XRGB8888 are the SAME bytes; the only difference is whether the
+ * fourth channel is honoured.  A scanout has no meaningful alpha -- a KMS
+ * primary plane ignores it -- so a guest head that flips AR24 can always be
+ * shown as XR24 without changing a single pixel.
+ *
+ * This exists because compositors routinely advertise a modifier for the
+ * opaque format and NOT for its alpha twin: alpha has to go through their
+ * blend path, and block-linear layouts are not always wired up there.  MEASURED
+ * on GNOME/Mutter with an RTX 4070: the guest presented AR24 with NVIDIA
+ * block-linear 0x0300000000606014, the compositor advertised that modifier for
+ * XR24 only, and every frame was refused as "not advertised by this display".
+ *
+ * Substituting is strictly MORE conservative than accepting: XR24 tells the
+ * compositor the surface is opaque, so it may skip blending entirely.
+ */
+uint32_t nb_fourcc_opaque_twin(uint32_t fourcc)
+{
+    switch (fourcc) {
+    case NB_FOURCC('A', 'R', '2', '4'): return NB_FOURCC('X', 'R', '2', '4');
+    case NB_FOURCC('A', 'B', '2', '4'): return NB_FOURCC('X', 'B', '2', '4');
+    default:                            return 0;
+    }
+}
+
+/*
+ * The vendor half of a DRM format modifier.
+ *
+ * Worth naming in an error, because the most confusing way this fails is a
+ * VENDOR mismatch: the guest's GPU produces a tiling its own driver
+ * understands, the host compositor enumerates a different vendor's tilings
+ * entirely, and the rejection reads as if one specific pair were missing when
+ * in fact no pair could ever match.  MEASURED on a hybrid laptop: Mutter
+ * RENDERS on the NVIDIA GPU (renderD128 -> 0000:01:00.0) but advertised 28
+ * pairs that were all Intel (0x01), LINEAR or INVALID, because its v3 list is
+ * built from the Intel SCANOUT device -- while the guest presented NVIDIA
+ * block-linear (0x03).  Nothing about the format was wrong; the two sides were
+ * describing different GPUs, and no fourcc substitution can bridge that.
+ */
+const char *nb_modifier_vendor(uint64_t modifier)
+{
+    if (modifier == 0x00ffffffffffffffULL) return "implicit"; /* MOD_INVALID */
+    if (modifier == 0)                         return "LINEAR";
+    switch ((unsigned)(modifier >> 56) & 0xff) {
+    case 0x00: return "none";
+    case 0x01: return "INTEL";
+    case 0x02: return "AMD";
+    case 0x03: return "NVIDIA";
+    case 0x04: return "SAMSUNG";
+    case 0x05: return "QCOM";
+    case 0x06: return "VIVANTE";
+    case 0x07: return "BROADCOM";
+    case 0x08: return "ARM";
+    case 0x09: return "ALLWINNER";
+    case 0x0a: return "AMLOGIC";
+    default:   return "unknown vendor";
+    }
+}
+
 const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
 {
     unsigned i;
@@ -63,9 +124,60 @@ const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
  * per src/guest/nvkvm_kms.c) are NVIDIA-specific and driver-version-specific,
  * so a hardcoded list would be wrong on the next driver.
  */
+/*
+ * --linear-only: advertise ONLY DRM_FORMAT_MOD_LINEAR.
+ *
+ * Two uses, and the second is why it stays supported rather than being a test
+ * hook.
+ *
+ * TESTING: the cross-vendor path is hard to reach on purpose -- it needs a host
+ * whose compositor scans out on a different GPU than the guest renders on.
+ * Forcing the advertised set down to LINEAR reproduces the CONDITION (the
+ * guest's tiling is not displayable) on any host, so the readback path can be
+ * exercised without a second GPU, a BIOS change or a cable move.
+ *
+ * COMPATIBILITY: a compositor can advertise a modifier it then fails to import.
+ * We have already measured NVIDIA accepting a LINEAR dma-buf into
+ * eglCreateImageKHR and refusing it at bind, so "advertised" and "works" are
+ * demonstrably not the same claim.  When a display lies, narrowing to the one
+ * layout every GPU can read is the escape hatch, at the cost of a readback.
+ *
+ * DRM_FORMAT_MOD_INVALID is dropped too: implicit modifiers mean "whatever the
+ * driver chose", which is exactly the uncertainty this option exists to remove.
+ */
+/*
+ * Which presentation tier the broker will offer.  ONE ordered option rather
+ * than a flag per tier: the tiers are a fallback LADDER, so the only sensible
+ * restriction is naming one rung, and six booleans would give sixty-four states
+ * of which most are meaningless ("--no-linear --linear-only").
+ *
+ *   NB_TIER_AUTO   walk the ladder: the guest's own modifier, then LINEAR
+ *                  dma-buf, then wl_shm.  The default.
+ *   NB_TIER_NATIVE advertise only what the display really offers; no LINEAR
+ *                  narrowing.  Zero-copy or nothing.
+ *   NB_TIER_LINEAR advertise only DRM_FORMAT_MOD_LINEAR, forcing the VMM to
+ *                  detile.  Reproduces a cross-vendor host on a single-GPU one.
+ *   NB_TIER_SHM    refuse dma-buf outright, so only shared memory is left.
+ *                  Slowest and universal; the honest floor.
+ */
+int nb_tier = NB_TIER_AUTO;
+
+/* Back-compat: --linear-only is the old spelling of --present-mode=linear. */
+bool nb_linear_only;
+
 void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier)
 {
     unsigned i;
+
+    /* LINEAR tier: hide every vendor modifier so the VMM must detile. */
+    if ((nb_linear_only || nb_tier == NB_TIER_LINEAR) && modifier != 0) {
+        return;
+    }
+    /* SHM tier: advertise no dma-buf format at all.  The VMM then has nothing
+     * left but a memfd, which is exactly the point. */
+    if (nb_tier == NB_TIER_SHM) {
+        return;
+    }
 
     /*
      * DROP WHAT WE COULD NEVER ACCEPT ANYWAY, BEFORE IT COSTS A SLOT.
@@ -134,8 +246,10 @@ void nb_formats_log(const struct nb_formats *f, const char *what)
     for (i = 0; i < f->n && shown < 64; i++, shown++) {
         char fcc[8];
 
-        nb_log("    %s  modifier 0x%016llx", nb_fourcc_name(f->e[i].fourcc, fcc),
-               (unsigned long long)f->e[i].modifier);
+        nb_log("    %s  modifier 0x%016llx (%s)",
+               nb_fourcc_name(f->e[i].fourcc, fcc),
+               (unsigned long long)f->e[i].modifier,
+               nb_modifier_vendor(f->e[i].modifier));
     }
 }
 

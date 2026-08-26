@@ -108,18 +108,17 @@ module_param_named(kms_max_height, nvkvm_kms_max_h, uint, 0444);
 MODULE_PARM_DESC(kms_max_height,
 		 "largest height the head can ever be asked for (default 2160)");
 
-/*
- * The mode the head is presenting RIGHT NOW.  Starts at kms_width/kms_height
- * and is moved by the host telling us how big its window is -- unlike the
- * module parameters, which are 0444 and fixed at insmod.
- */
-static unsigned int nvkvm_kms_cur_w;
-static unsigned int nvkvm_kms_cur_h;
-
-/* The single virtual head.  One head by construction, so a pointer rather than
- * a lookup; NULL until nvkvm_kms_init() has finished building it, which is why
- * nvkvm_kms_set_host_size() must tolerate that. */
+/* The single registered virtual head.  Init keeps the constructed object in
+ * ddev->dev_private; activate publishes it here only after drm_dev_register()
+ * succeeds.  The lock is the lifetime handoff between the softirq virtqueue
+ * callback and process-context teardown: shutdown unpublishes under it before
+ * synchronously cancelling resize work.  Host-size events arriving before
+ * registration are retained as a plain pair, never as a pointer to an
+ * unregistered drm_device. */
 static struct nvkvm_kms *nvkvm_kms_head;
+static DEFINE_SPINLOCK(nvkvm_kms_head_lock);
+static unsigned int nvkvm_pending_host_w;
+static unsigned int nvkvm_pending_host_h;
 
 static void nvkvm_kms_clamp_mode(void)
 {
@@ -162,8 +161,6 @@ static void nvkvm_kms_clamp_mode(void)
 	if (nvkvm_kms_max_h < nvkvm_kms_h)
 		nvkvm_kms_max_h = nvkvm_kms_h;
 
-	nvkvm_kms_cur_w = nvkvm_kms_w;
-	nvkvm_kms_cur_h = nvkvm_kms_h;
 }
 
 struct nvkvm_kms {
@@ -190,8 +187,15 @@ struct nvkvm_kms {
 	 */
 	struct workqueue_struct         *present_wq;
 	struct work_struct              present_work;
+	struct work_struct              resize_work;
 	struct drm_framebuffer          *pending_fb;
 	spinlock_t                      pending_lock;
+	unsigned int                    cur_w;
+	unsigned int                    cur_h;
+	unsigned int                    pending_w;
+	unsigned int                    pending_h;
+	bool                            active;
+	bool                            stopping;
 };
 
 /* ── Software vblank (vkms-style): an hrtimer drives the CRTC vblank at a fixed
@@ -200,6 +204,9 @@ struct nvkvm_kms {
 static enum hrtimer_restart nvkvm_vblank_fn(struct hrtimer *t)
 {
 	struct nvkvm_kms *kms = container_of(t, struct nvkvm_kms, vblank);
+
+	if (READ_ONCE(kms->stopping))
+		return HRTIMER_NORESTART;
 	drm_crtc_handle_vblank(&kms->pipe.crtc);
 	hrtimer_forward_now(t, kms->period);
 	return HRTIMER_RESTART;
@@ -223,10 +230,19 @@ static bool nvkvm_mode_listed(struct drm_connector *conn, unsigned int w,
 
 static int nvkvm_conn_get_modes(struct drm_connector *conn)
 {
-	unsigned int w = READ_ONCE(nvkvm_kms_cur_w);
-	unsigned int h = READ_ONCE(nvkvm_kms_cur_h);
+	struct nvkvm_kms *kms = container_of(conn, struct nvkvm_kms, conn);
+	unsigned long flags;
+	unsigned int w, h;
 	struct drm_display_mode *mode;
 	int count;
+
+	/* Width and height are one state transition.  Reading two unrelated
+	 * globals allowed get_modes() to observe a width from one broker event
+	 * and a height from the next. */
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	w = kms->cur_w;
+	h = kms->cur_h;
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
 
 	/*
 	 * The standard table, up to the CEILING -- not up to the mode we happen
@@ -285,12 +301,38 @@ static int nvkvm_conn_get_modes(struct drm_connector *conn)
  * it -- which is the right split, because a mode switch is the guest's business
  * and a window drag is the host's.
  */
+static void nvkvm_resize_work_fn(struct work_struct *work)
+{
+	struct nvkvm_kms *kms = container_of(work, struct nvkvm_kms,
+					     resize_work);
+	unsigned long flags;
+	unsigned int w, h;
+
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	if (kms->stopping ||
+	    (kms->cur_w == kms->pending_w && kms->cur_h == kms->pending_h)) {
+		spin_unlock_irqrestore(&kms->pending_lock, flags);
+		return;
+	}
+	w = kms->pending_w;
+	h = kms->pending_h;
+	kms->cur_w = w;
+	kms->cur_h = h;
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+
+	pr_info("nvkvm: host window is %ux%u; offering it as the preferred mode\n",
+		w, h);
+
+	/* Process context is mandatory for this helper.  The virtqueue callback
+	 * only coalesces into resize_work; it never calls DRM directly. */
+	drm_kms_helper_hotplug_event(kms->conn.dev);
+}
+
 void nvkvm_kms_set_host_size(unsigned int w, unsigned int h)
 {
-	struct nvkvm_kms *kms = READ_ONCE(nvkvm_kms_head);
+	struct nvkvm_kms *kms;
+	unsigned long head_flags, pending_flags;
 
-	if (!kms)
-		return;
 	/* Bound it before it reaches the mode list: this number comes from
 	 * outside the guest, and mode_config.max_* is what the rest of DRM will
 	 * enforce anyway.  Clamp rather than reject -- a window larger than the
@@ -302,17 +344,28 @@ void nvkvm_kms_set_host_size(unsigned int w, unsigned int h)
 		w = nvkvm_kms_max_w;
 	if (h > nvkvm_kms_max_h)
 		h = nvkvm_kms_max_h;
-	if (w == READ_ONCE(nvkvm_kms_cur_w) && h == READ_ONCE(nvkvm_kms_cur_h))
+
+	/* VQ_EVT runs in softirq context.  Hold the publication lock through
+	 * queue_work(), so fini either sees and cancels this generation or wins
+	 * first and leaves no pointer for us to queue through. */
+	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
+	kms = nvkvm_kms_head;
+	if (!kms) {
+		nvkvm_pending_host_w = w;
+		nvkvm_pending_host_h = h;
+		spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
 		return;
-
-	WRITE_ONCE(nvkvm_kms_cur_w, w);
-	WRITE_ONCE(nvkvm_kms_cur_h, h);
-	pr_info("nvkvm: host window is %ux%u; offering it as the preferred mode\n",
-		w, h);
-
-	/* Makes userspace re-run get_modes() and see the new preferred mode.
-	 * A compositor that ignores it simply keeps the mode it has. */
-	drm_kms_helper_hotplug_event(kms->conn.dev);
+	}
+	spin_lock_irqsave(&kms->pending_lock, pending_flags);
+	if (!kms->stopping &&
+	    (w != kms->pending_w || h != kms->pending_h)) {
+		kms->pending_w = w;
+		kms->pending_h = h;
+		if (kms->active)
+			schedule_work(&kms->resize_work);
+	}
+	spin_unlock_irqrestore(&kms->pending_lock, pending_flags);
+	spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
 }
 
 /* A virtual panel is always present: report connected on every probe so the
@@ -370,8 +423,7 @@ static void nvkvm_pipe_disable(struct drm_simple_display_pipe *pipe)
 
 	/* Nothing is scanned out any more: flush the queued present and drop
 	 * the framebuffer reference so the bo is not pinned past disable. */
-	if (kms->present_wq)
-		flush_workqueue(kms->present_wq);
+	flush_work(&kms->present_work);
 	spin_lock_irqsave(&kms->pending_lock, flags);
 	fb = kms->pending_fb;
 	kms->pending_fb = NULL;
@@ -383,8 +435,16 @@ static void nvkvm_pipe_disable(struct drm_simple_display_pipe *pipe)
 static int nvkvm_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 {
 	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
-	hrtimer_start(&kms->vblank, kms->period, HRTIMER_MODE_REL);
-	return 0;
+	unsigned long flags;
+	int ret = 0;
+
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	if (kms->stopping)
+		ret = -ENODEV;
+	else
+		hrtimer_start(&kms->vblank, kms->period, HRTIMER_MODE_REL);
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	return ret;
 }
 
 static void nvkvm_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
@@ -448,18 +508,24 @@ static void nvkvm_present_queue(struct nvkvm_kms *kms,
 	struct drm_framebuffer *old;
 	unsigned long flags;
 
-	if (!fb || !kms->present_wq)
+	if (!fb)
 		return;
 
 	drm_framebuffer_get(fb);
 	spin_lock_irqsave(&kms->pending_lock, flags);
+	if (kms->stopping || !kms->present_wq) {
+		spin_unlock_irqrestore(&kms->pending_lock, flags);
+		drm_framebuffer_put(fb);
+		return;
+	}
 	old = kms->pending_fb;
 	kms->pending_fb = fb;
+	/* Queue under the same lock shutdown uses to set stopping.  Once fini
+	 * observes the flag, no late producer can race behind cancel_work_sync(). */
+	queue_work(kms->present_wq, &kms->present_work);
 	spin_unlock_irqrestore(&kms->pending_lock, flags);
 	if (old)
 		drm_framebuffer_put(old);
-
-	queue_work(kms->present_wq, &kms->present_work);
 }
 
 static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
@@ -738,6 +804,11 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	/* Ordered: presents must reach QEMU in flip order. */
 	spin_lock_init(&kms->pending_lock);
 	INIT_WORK(&kms->present_work, nvkvm_present_work_fn);
+	INIT_WORK(&kms->resize_work, nvkvm_resize_work_fn);
+	kms->cur_w = nvkvm_kms_w;
+	kms->cur_h = nvkvm_kms_h;
+	kms->pending_w = nvkvm_kms_w;
+	kms->pending_h = nvkvm_kms_h;
 	kms->present_wq = alloc_ordered_workqueue("nvkvm-present", WQ_MEM_RECLAIM);
 	if (!kms->present_wq)
 		return -ENOMEM;
@@ -746,14 +817,14 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	ret = drm_connector_init(ddev, &kms->conn, &nvkvm_conn_funcs,
 				 DRM_MODE_CONNECTOR_VIRTUAL);
 	if (ret)
-		return ret;
+		goto err_workqueue;
 
 	ret = drm_simple_display_pipe_init(ddev, &kms->pipe, &nvkvm_pipe_funcs,
 					   nvkvm_pipe_formats,
 					   ARRAY_SIZE(nvkvm_pipe_formats),
 					   nvkvm_pipe_modifiers, &kms->conn);
 	if (ret)
-		return ret;
+		goto err_workqueue;
 
 	/* #110: drm_simple_display_pipe installs drm_simple_kms_format_mod_supported,
 	 * which accepts ONLY DRM_FORMAT_MOD_LINEAR and ignores the plane's modifier
@@ -781,18 +852,90 @@ int nvkvm_kms_init(struct drm_device *ddev)
 	}
 
 	drm_mode_config_reset(ddev);
-	/* Publish last: nvkvm_kms_set_host_size() may be called from the virtio
-	 * event path the moment the device goes live, and everything it touches
-	 * has to exist by then. */
-	WRITE_ONCE(nvkvm_kms_head, kms);
+	/* Do not expose this pointer to the virtio event path yet: a host-size
+	 * event is allowed to arrive while drm_dev_register() is still running,
+	 * and no DRM helper may observe the device before registration succeeds.
+	 * ddev owns the construction result until nvkvm_kms_activate(). */
+	ddev->dev_private = kms;
 	pr_info("nvkvm: virtual KMS head ready (%ux%u, up to %ux%u, 1 connector/crtc)\n",
-		nvkvm_kms_cur_w, nvkvm_kms_cur_h,
+		kms->cur_w, kms->cur_h,
 		nvkvm_kms_max_w, nvkvm_kms_max_h);
 	return 0;
+
+err_workqueue:
+	destroy_workqueue(kms->present_wq);
+	kms->present_wq = NULL;
+	return ret;
 }
 
-/* Torn down with the DRM device: stop the resize path finding a freed head. */
-void nvkvm_kms_fini(void)
+/* Called immediately after drm_dev_register() succeeds. */
+void nvkvm_kms_activate(struct drm_device *ddev)
 {
-	WRITE_ONCE(nvkvm_kms_head, NULL);
+	struct nvkvm_kms *kms = ddev->dev_private;
+	unsigned long head_flags, pending_flags;
+
+	if (!kms)
+		return;
+	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
+	if (WARN_ON_ONCE(nvkvm_kms_head && nvkvm_kms_head != kms)) {
+		spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
+		return;
+	}
+	spin_lock_irqsave(&kms->pending_lock, pending_flags);
+	if (!kms->stopping) {
+		if (nvkvm_pending_host_w && nvkvm_pending_host_h) {
+			/* An event can beat nvkvm_kms_clamp_mode() during probe,
+			 * so enforce the now-final mode_config ceiling again. */
+			kms->pending_w = min(nvkvm_pending_host_w,
+					     nvkvm_kms_max_w);
+			kms->pending_h = min(nvkvm_pending_host_h,
+					     nvkvm_kms_max_h);
+		}
+		kms->active = true;
+		nvkvm_kms_head = kms;
+		if (kms->cur_w != kms->pending_w ||
+		    kms->cur_h != kms->pending_h)
+			schedule_work(&kms->resize_work);
+	}
+	spin_unlock_irqrestore(&kms->pending_lock, pending_flags);
+	spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
+}
+
+/* Stop every path that can name drmm-owned KMS state before the DRM device or
+ * the virtio transport is released.  Publication and queueing share a lock;
+ * work/timer cancellation is synchronous after the pointer disappears. */
+void nvkvm_kms_fini(struct drm_device *ddev)
+{
+	struct nvkvm_kms *kms = ddev->dev_private;
+	struct workqueue_struct *present_wq;
+	struct drm_framebuffer *fb;
+	unsigned long head_flags, pending_flags;
+
+	if (!kms) {
+		return;
+	}
+	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
+	if (nvkvm_kms_head == kms)
+		nvkvm_kms_head = NULL;
+	spin_lock_irqsave(&kms->pending_lock, pending_flags);
+	kms->active = false;
+	kms->stopping = true;
+	spin_unlock_irqrestore(&kms->pending_lock, pending_flags);
+	spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
+
+	cancel_work_sync(&kms->resize_work);
+	hrtimer_cancel(&kms->vblank);
+	cancel_work_sync(&kms->present_work);
+
+	spin_lock_irqsave(&kms->pending_lock, pending_flags);
+	fb = kms->pending_fb;
+	kms->pending_fb = NULL;
+	present_wq = kms->present_wq;
+	kms->present_wq = NULL;
+	spin_unlock_irqrestore(&kms->pending_lock, pending_flags);
+	if (fb)
+		drm_framebuffer_put(fb);
+	if (present_wq)
+		destroy_workqueue(present_wq);
+	ddev->dev_private = NULL;
 }

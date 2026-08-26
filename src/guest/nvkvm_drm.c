@@ -1173,6 +1173,7 @@ int nvkvm_drm_init(struct device *fallback_parent)
 	struct pci_dev *pdev;
 	struct device *parent;
 	struct drm_device *ddev;
+	bool kms_ready = false;
 	int ret;
 
 	/* Bind the emulated NVIDIA-id device to the "nvidia" driver first, so it
@@ -1203,15 +1204,21 @@ int nvkvm_drm_init(struct device *fallback_parent)
 	ret = nvkvm_kms_init(ddev);
 	if (ret)
 		pr_warn("nvkvm: virtual KMS head init failed: %d (render-only)\n", ret);
+	else
+		kms_ready = true;
 
 	ret = drm_dev_register(ddev, 0);
 	if (ret) {
 		pr_warn("nvkvm: drm_dev_register failed: %d (graphics disabled)\n",
 			ret);
+		if (kms_ready)
+			nvkvm_kms_fini(ddev);
 		drm_dev_put(ddev);
 		pci_dev_put(pdev);
 		return ret;
 	}
+	if (kms_ready)
+		nvkvm_kms_activate(ddev);
 	nvkvm.drm_dev = ddev;
 	/* The drm_device now holds its own reference on the parent; drop ours. */
 	pci_dev_put(pdev);
@@ -1224,6 +1231,7 @@ int nvkvm_drm_init(struct device *fallback_parent)
 void nvkvm_drm_fini(void)
 {
 	if (nvkvm.drm_dev) {
+		nvkvm_kms_fini(nvkvm.drm_dev);
 		drm_dev_unregister(nvkvm.drm_dev);
 		drm_dev_put(nvkvm.drm_dev);
 		nvkvm.drm_dev = NULL;

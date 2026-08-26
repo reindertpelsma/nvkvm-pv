@@ -19,6 +19,16 @@
  *
  *   --bad-size H       claim height H for a buffer that is smaller (A-18)
  *   --bad-fourcc       claim a format the display never advertised
+ *   --query-format     ask CMD_QUERY_FORMAT about three pairs and print the
+ *                      answers: one advertised, one only via its opaque twin,
+ *                      one NVIDIA block-linear that no test display can take
+ *   --shm              declare the buffer as shared memory (F_SHM).  The client
+ *                      always sends a memfd; this says to PRESENT it as one,
+ *                      which no compositor can refuse
+ *   --unadvertised-mod send a modifier no display advertises.  With --shm the
+ *                      frame must still be presented: shm carries no modifier
+ *   --alpha-fourcc     send AR24 where only its opaque twin XR24 is
+ *                      advertised: must be ACCEPTED and shown as XR24
  *   --bad-dim          claim dimensions past NVKVM_BROKER_MAX_DIM
  *   --bad-fd           send a pipe instead of a dma-buf
  *   --bad-frame        send a truncated, wrongly sized message
@@ -63,6 +73,7 @@ static const char *evname(int t)
     case NVKVM_BROKER_EV_FOCUS:   return "FOCUS";
     case NVKVM_BROKER_EV_POINTER: return "POINTER";
     case NVKVM_BROKER_EV_BYE:     return "BYE";
+    case NVKVM_BROKER_EV_FORMAT:  return "FORMAT";
     default:                      return "?";
     }
 }
@@ -126,8 +137,9 @@ int main(int argc, char **argv)
     int sock, i;
     unsigned pw = 0, ph = 0, ww = 0, wh = 0;
     int bad_size = 0, bad_fourcc = 0, bad_dim = 0, bad_fd = 0, bad_frame = 0;
+    int alpha_fourcc = 0, query_format = 0, unadv_mod = 0, shm_mode = 0;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
-    int quiet_after = 0;
+    int quiet_after = 0, caps_clipboard = 0;
 
     /* Line-buffered: this tool is normally watched live and normally ended
      * with Ctrl-C or timeout(1), and a fully buffered pipe would throw away
@@ -136,9 +148,9 @@ int main(int argc, char **argv)
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s <socket> [--present WxH] [--window WxH]\n"
-                        "       [--bad-size H|--bad-fourcc|--bad-dim|"
+                        "       [--bad-size H|--bad-fourcc|--alpha-fourcc|--bad-dim|"
                         "--bad-fd|--bad-frame|--bad-two-fds|--bad-reserved|"
-                        "--bad-commit-fd]\n", argv[0]);
+                        "--bad-commit-fd|--caps-clipboard]\n", argv[0]);
         return 2;
     }
     for (i = 2; i < argc; i++) {
@@ -149,12 +161,17 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--window") && v)  { sscanf(v, "%ux%u", &ww, &wh); i++; }
         else if (!strcmp(a, "--bad-size") && v){ bad_size = atoi(v); i++; }
         else if (!strcmp(a, "--bad-fourcc"))   { bad_fourcc = 1; }
+        else if (!strcmp(a, "--alpha-fourcc")) { alpha_fourcc = 1; }
+        else if (!strcmp(a, "--query-format")) { query_format = 1; }
+        else if (!strcmp(a, "--unadvertised-mod")) { unadv_mod = 1; }
+        else if (!strcmp(a, "--shm")) { shm_mode = 1; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
         else if (!strcmp(a, "--bad-frame"))    { bad_frame = 1; }
         else if (!strcmp(a, "--bad-two-fds"))  { bad_two = 1; }
         else if (!strcmp(a, "--bad-reserved")) { bad_reserved = 1; }
         else if (!strcmp(a, "--bad-commit-fd")){ bad_commit_fd = 1; }
+        else if (!strcmp(a, "--caps-clipboard")){ caps_clipboard = 1; }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (!pw) { pw = 640; }
@@ -200,6 +217,13 @@ int main(int argc, char **argv)
                (p.flags & NVKVM_BROKER_F_FOCUSED) ? "F" : "-",
                p.x, p.y, p.w0, p.w1);
 
+        if (p.type == NVKVM_BROKER_EV_FORMAT) {
+            uint64_t m = (uint64_t)p.w0 | ((uint64_t)p.w1 << 32);
+            printf("  FORMAT ANSWER: fourcc=%.4s modifier=0x%016llx -> %s\n",
+                   (const char *)&p.y, (unsigned long long)m,
+                   p.x ? "USABLE" : "NOT USABLE (readback required)");
+        }
+
         if (p.type == NVKVM_BROKER_EV_HELLO) {
             printf("  proto v%u caps 0x%x: kbd=%d abs=%d rel=%d lock=%d "
                    "total-grab=%d focus=%d fs=%d dmabuf=%d modifiers=%d "
@@ -227,6 +251,40 @@ int main(int argc, char **argv)
             continue;
         }
         quiet_after = 1;
+
+        if (query_format) {
+            static const struct { uint32_t f; uint64_t m; const char *why; } q[] = {
+                { FOURCC('X','R','2','4'), 0,
+                  "advertised outright" },
+                { FOURCC('A','R','2','4'), 0,
+                  "only its opaque twin XR24 is advertised" },
+                { FOURCC('X','R','2','4'), 0x0300000000606014ull,
+                  "NVIDIA block-linear: no test display can take it" },
+            };
+            for (unsigned qi = 0; qi < 3; qi++) {
+                struct nvkvm_broker_cmd qc = {
+                    .type = NVKVM_BROKER_CMD_QUERY_FORMAT,
+                    .fourcc = q[qi].f, .modifier = q[qi].m,
+                };
+                printf("  -> QUERY_FORMAT %.4s 0x%016llx (%s)\n",
+                       (const char *)&q[qi].f, (unsigned long long)q[qi].m,
+                       q[qi].why);
+                if (send_cmd(sock, &qc, NULL, 0, sizeof qc) != 0) {
+                    perror("send QUERY_FORMAT");
+                    break;
+                }
+            }
+        }
+
+        if (caps_clipboard) {
+            struct nvkvm_broker_cmd c = {
+                .type = NVKVM_BROKER_CMD_CAPS,
+                .width = NVKVM_BROKER_CLIENT_CLIPBOARD,
+            };
+
+            printf("  -> CAPS clipboard-agent\n");
+            send_cmd(sock, &c, NULL, 0, sizeof(c));
+        }
 
         if (ww && wh) {
             struct nvkvm_broker_cmd c = {
@@ -294,6 +352,24 @@ int main(int argc, char **argv)
             if (bad_fourcc) {
                 c.fourcc = FOURCC('N', 'V', '1', '2');
                 printf("  -> ATTACH claiming an unadvertised fourcc\n");
+            }
+            if (shm_mode) {
+                c.flags = NVKVM_BROKER_CMD_F_SHM;
+                printf("  -> ATTACH declaring F_SHM (shared memory)\n");
+            }
+            if (unadv_mod) {
+                /* NVIDIA block-linear: never advertised by the test backend.
+                 * The fd is a memfd, so the shm tier must take it regardless. */
+                c.modifier = 0x0300000000606014ull;
+                printf("  -> ATTACH memfd carrying an unadvertised modifier\n");
+            }
+            if (alpha_fourcc) {
+                /* Only XR24 is advertised by the test backend.  AR24 is the
+                 * same bytes, so the broker must present it as XR24 rather
+                 * than refuse the frame. */
+                c.fourcc = FOURCC('A', 'R', '2', '4');
+                printf("  -> ATTACH with AR24, whose opaque twin XR24 is "
+                       "advertised\n");
             }
             if (bad_dim) {
                 c.width = NVKVM_BROKER_MAX_DIM + 1;

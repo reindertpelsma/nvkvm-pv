@@ -404,6 +404,7 @@ static inline int nvkvm_memfd_create(const char *name, unsigned int flags)
 #include "virtio_nvgpu.h"
 #include "nvkvm_present_egl.h"   /* S-4: nvkvm_present_forget_isolate() */
 
+#include "../../src/common/nvkvm_uidmap.h"
 #include "../../src/common/nvkvm_isolate_proto.h"
 #include "../../src/common/nvkvm_ring.h"
 
@@ -1323,6 +1324,72 @@ static void nvkvm_isolate_cfg_resolve(struct nvkvm_isolate_cfg *cfg,
 			return;
 		}
 		cfg->uid_base = (uint32_t)v;
+		cfg->uid_base_explicit = true;
+	}
+
+	/*
+	 * THE WINDOW MUST BE INSIDE THIS NAMESPACE'S UID MAP.
+	 *
+	 * uid+chroot gives every isolate its own uid out of a fixed window at
+	 * 500000.  That is fine on an ordinary host and wrong under
+	 * `dockerd --userns-remap` or sysbox-runc, where the container is given
+	 * a mapped range -- commonly 65536 uids, so 0..65535 inside.  setuid()
+	 * to an unmapped uid fails EINVAL, so the hardcoded window would fail
+	 * on exactly the deployments that enabled user namespaces.
+	 *
+	 * The kernel publishes the answer in /proc/self/uid_map, so ask.  An
+	 * explicit NVKVM_ISOLATE_UID_BASE is never overridden -- if an operator
+	 * named a base we tell them it will not work rather than silently using
+	 * a different one.
+	 */
+	{
+		struct nvkvm_uidmap map;
+
+		nvkvm_uidmap_get(&map);
+		if (!nvkvm_uidmap_fits(&map, cfg->uid_base,
+				       NVKVM_ISO_UID_SLOTS)) {
+			uint32_t placed = nvkvm_uidmap_place(&map,
+							     NVKVM_ISO_UID_SLOTS);
+
+			if (cfg->uid_base_explicit) {
+				snprintf(err, errsz,
+					 "NVKVM_ISOLATE_UID_BASE=%u does not fit "
+					 "this namespace's uid map (%u..%u): "
+					 "%u uids are needed",
+					 cfg->uid_base, map.lo, map.hi,
+					 NVKVM_ISO_UID_SLOTS);
+				return;
+			}
+			if (placed == 0) {
+				/*
+				 * Too small for a per-isolate uid at all.  Say
+				 * so and let mode selection fall to its next
+				 * rung, which announces itself -- rather than
+				 * inventing a mode where isolates share a uid,
+				 * which would remove the boundary BETWEEN guest
+				 * processes without anyone asking.
+				 */
+				snprintf(report, reportsz,
+					 "isolate uid window: this namespace maps "
+					 "only %u..%u, too few for %u per-isolate "
+					 "uids. uid+chroot is unavailable; a "
+					 "weaker rung will be selected and "
+					 "announced.",
+					 map.lo, map.hi, NVKVM_ISO_UID_SLOTS);
+			} else {
+				snprintf(report, reportsz,
+					 "isolate uid window: %u..%u is outside "
+					 "this namespace's uid map (%u..%u), so "
+					 "the window moves to %u..%u. This is a "
+					 "user namespace (userns-remap or "
+					 "sysbox); the isolation is unchanged.",
+					 cfg->uid_base,
+					 cfg->uid_base + NVKVM_ISO_UID_SLOTS - 1,
+					 map.lo, map.hi, placed,
+					 placed + NVKVM_ISO_UID_SLOTS - 1);
+				cfg->uid_base = placed;
+			}
+		}
 	}
 
 	/*

@@ -37,7 +37,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready
+all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_uidmap
 
 test_objects: $(OBJECTS_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
@@ -92,6 +92,9 @@ test_stub_ptr_sanitize: test_stub_ptr_sanitize.c stub_sanitize.inc
 # markers and the .inc comes back empty, which fails the link.
 kvm_slot_pool.inc: ../../src/qemu/nvkvm_mmap_host.c
 	awk '/NVKVM_KVM_SLOT_POOL_BEGIN/,/NVKVM_KVM_SLOT_POOL_END/' $< > $@
+
+test_uidmap: test_uidmap.c ../../src/common/nvkvm_uidmap.h
+	$(CC) $(CFLAGS) -I../../src/common -o $@ test_uidmap.c $(LDFLAGS)
 
 test_kvm_slot: test_kvm_slot.c kvm_slot_pool.inc
 	$(CC) $(CFLAGS) -I. -o $@ test_kvm_slot.c $(LDFLAGS)
@@ -150,6 +153,46 @@ transport_ready.inc: ../../src/guest/nvkvm_virtio.c
 test_transport_ready: test_transport_ready.c transport_ready.inc
 	$(CC) $(CFLAGS) -I. -Wno-unused-function -o $@ test_transport_ready.c
 
+# RR-06/RR-07.  Extract the production helpers so the test pins disconnected
+# frame ownership and connection-generation reset without needing QEMU's UI
+# headers.
+relay_state_helpers.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_STATE_HELPERS_BEGIN/,/NVKVM_RELAY_STATE_HELPERS_END/' $< > $@
+
+test_relay_state: test_relay_state.c relay_state_helpers.inc
+	$(CC) $(CFLAGS) -I. -o $@ test_relay_state.c
+
+# RR-08.  The QEMU display relay needs the full QEMU UI stack, so extract its
+# self-contained clipboard transaction builder.  This pins the real chunking
+# and resumable EAGAIN cursor; losing the markers makes the test fail to compile
+# rather than silently testing a copy.
+relay_clip_batch.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_CLIP_BATCH_BEGIN/,/NVKVM_RELAY_CLIP_BATCH_END/' $< > $@
+
+test_relay_clip: test_relay_clip.c relay_clip_batch.inc ../../src/common/nvkvm_broker_proto.h
+	$(CC) $(CFLAGS) -I. -o $@ test_relay_clip.c
+
+# RR-03/RR-07/RR-08 integration wiring.  These are the actual production
+# registration, teardown/reset and clipboard-flush functions with only their
+# QEMU event-loop dependencies stubbed.  The suite observes POLLIN/POLLOUT and
+# close/reset effects, so a correct pure cursor cannot mask a missing callsite.
+relay_fd_ownership.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_FD_OWNERSHIP_BEGIN/,/NVKVM_RELAY_FD_OWNERSHIP_END/' $< > $@
+
+relay_clip_wiring.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_CLIP_WIRING_BEGIN/,/NVKVM_RELAY_CLIP_WIRING_END/' $< > $@
+
+relay_writable_wiring.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_WRITABLE_WIRING_BEGIN/,/NVKVM_RELAY_WRITABLE_WIRING_END/' $< > $@
+
+relay_connect_wiring.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_CONNECT_WIRING_BEGIN/,/NVKVM_RELAY_CONNECT_WIRING_END/' $< > $@
+
+test_relay_wiring: test_relay_wiring.c relay_state_helpers.inc \
+		relay_clip_batch.inc relay_fd_ownership.inc relay_clip_wiring.inc \
+		relay_writable_wiring.inc relay_connect_wiring.inc
+	$(CC) $(CFLAGS) -I. -Wno-unused-function -o $@ test_relay_wiring.c
+
 # NOTE: test_isolate is the ONLY suite that drives a real spawned isolate over
 # the real socket protocol, so keep it green.  It failed 4 of its 9 cases at
 # runtime until 2026-08-21, and the note that used to sit here blamed "isolate
@@ -159,7 +202,7 @@ test_transport_ready: test_transport_ready.c transport_ready.inc
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready
+run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_uidmap
 	./test_objects
 	./test_dispatch
 	./test_frontend
@@ -170,11 +213,15 @@ run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_g
 	./test_ctrl_gate
 	./test_nvkms_allowlist
 	./test_stub_ptr_sanitize
+	./test_uidmap
 	./test_kvm_slot
 	./test_stub_window
 	./test_drm_devinfo
 	./test_r1_type_dev
 	./test_transport_ready
+	./test_relay_state
+	./test_relay_clip
+	./test_relay_wiring test_uidmap
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -187,7 +234,9 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev \
+	rm -f test_uidmap test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_relay_state test_relay_clip test_relay_wiring \
 	      stub_sanitize.inc kvm_slot_pool.inc stub_window.inc win_alloc.inc \
-	      drm_param_structs.inc r1_type_dev.inc r1_stub_type_dev.inc
-	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc
+	      drm_param_structs.inc r1_type_dev.inc r1_stub_type_dev.inc \
+	      relay_state_helpers.inc relay_clip_batch.inc relay_fd_ownership.inc \
+	      relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc
+	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc test_relay_state relay_state_helpers.inc test_relay_clip relay_clip_batch.inc test_relay_wiring relay_fd_ownership.inc relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc

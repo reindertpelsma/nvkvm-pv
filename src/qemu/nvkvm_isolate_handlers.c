@@ -1748,12 +1748,63 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 						  cr);
 			}
 		}
+		/*
+		 * CAN THE DISPLAY SHOW WHAT THE GUEST RENDERED?
+		 *
+		 * On a cross-vendor host it cannot: the guest's buffer is in its
+		 * own GPU's tiling and the compositor's GPU has no way to read
+		 * it.  MEASURED on a hybrid laptop -- Mutter advertised 28
+		 * (format, modifier) pairs, all Intel/LINEAR/INVALID, against a
+		 * guest presenting NVIDIA block-linear.  Every ATTACH was
+		 * refused and the window stayed black.
+		 *
+		 * A verdict of 0 means "no description of this buffer is
+		 * displayable", so the frame is detiled by the guest's own GPU
+		 * into a LINEAR udmabuf and THAT is submitted instead.  -1 means
+		 * the answer has not arrived; keep going zero-copy, because on
+		 * every same-vendor host it is yes and being briefly wrong costs
+		 * a round trip of frames rather than a permanently wrong mode.
+		 */
+		if (nvkvm_display_relay_format_verdict(req->format,
+						       req->modifier) == 0 &&
+		    nvkvm_present_submit_readback(nv, dmabuf_fd, iso_id,
+						  req->stub_handle,
+						  req->width, req->height,
+						  req->pitch, req->format,
+						  req->modifier)) {
+			resp->status = 0;
+			return 0;      /* readback owns the fd now */
+		}
 		if (nvkvm_display_relay_submit(nv, dmabuf_fd, req->width,
 					       req->height, req->pitch,
 					       req->format, req->modifier)) {
 			resp->status = 0;
 			return 0;
 		}
+		/*
+		 * BROKER MODE IS TERMINAL.  Do NOT fall through to the QEMU
+		 * console below.
+		 *
+		 * That path imports the buffer with EGL and reads it back, and
+		 * a broker-mode VMM is built to need no EGL, no GL and no
+		 * /dev/dri/renderD* -- the container ships none of them.
+		 * OBSERVED on the physical box: the broker was restarted, the
+		 * relay reported "the display and input are gone for now ...
+		 * The VM keeps running", the next frame fell through here, and
+		 * QEMU printed
+		 *     nvkvm present: display mode = readback (UI console has no GL)
+		 *     nvkvm present: host EGL ready (dma-buf import)
+		 *     Couldn't open libGL.so.1 or libOpenGL.so.0
+		 * and died with SIGSEGV (container exit 139), taking the guest
+		 * with it.  Losing the display is survivable; losing the VM is
+		 * not, and the message had just promised it would not happen.
+		 *
+		 * The frame is dropped instead.  The relay already retains the
+		 * newest one, so a reconnecting broker still paints immediately.
+		 */
+		close(dmabuf_fd);
+		resp->status = 0;
+		return 0;
 	}
 
 	/*

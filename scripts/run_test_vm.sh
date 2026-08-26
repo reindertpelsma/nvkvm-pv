@@ -127,12 +127,11 @@ fi
 # guest root writes scripts/run_test_vm.sh on this share, and the next
 # `run_remote_test.sh restart` runs it on the host as root.
 #
-# Refusing outright was rejected: the writable share is how the guest builds
-# nvkvm-guest.ko, it is the harness's main job, and a hard refusal would only
-# teach people to set the flag without reading it. Read-only by default keeps
-# every non-build use (boot, benchmark, demo, driver bring-up) working with no
-# host-write path at all, and makes the writable case an explicit, named,
-# loudly-announced choice.
+# The normal guest service now copies the module sources into a private guest
+# build directory, so boot, module build, benchmark, demo and driver bring-up
+# all work through a read-only export.  The opt-in remains only for developers
+# who deliberately want to edit or build directly on the mounted host tree;
+# keep that exceptional path explicit, named and loudly announced.
 if [ "${NVKVM_DEV_HARNESS_INSECURE_RW:-0}" = "1" ]; then
     REPO_9P_MODE="read-write  (NVKVM_DEV_HARNESS_INSECURE_RW=1)"
     REPO_9P_RO=""
@@ -160,13 +159,15 @@ else
     REPO_9P_RO=",readonly=on"
     cat >&2 <<'SAFE'
 
-  NOTE: the repo 9p export is READ-ONLY. Building nvkvm-guest.ko inside the
-  guest writes to that share and will fail. To allow it, re-run with
+  NOTE: the repo 9p export is READ-ONLY. The nvkvm-guest service copies module
+  sources into a private guest build directory, so normal boot and validation
+  work without host-tree writes. To edit or build directly on /mnt/nvkvm,
+  re-run with
 
       NVKVM_DEV_HARNESS_INSECURE_RW=1
 
   and read the banner it prints first: a writable export hands guest root a
-  path to host root. Every other use of this harness works read-only.
+  path to host root.
 
 SAFE
 fi

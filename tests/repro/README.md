@@ -11,6 +11,7 @@ the driver's, not nvkvm's.
 | `opencl_correctness.c` | `cc -O2 -o clcorr opencl_correctness.c -lOpenCL` | OpenCL host-shared memory paths: `ALLOC_HOST_PTR`, `USE_HOST_PTR`, repeated map/unmap, `CL_UNORM_INT8` images |
 | `opencl_input_visibility.c` | `cc -O2 -o clvis opencl_input_visibility.c -lOpenCL` | whether the guest CPU and the GPU see the *same* memory, and what makes them diverge |
 | `opencl_map_churn.c` | `cc -O2 -o clchurn opencl_map_churn.c -lOpenCL` | the map/unmap corruption above, parameterised, and it classifies each wrong value as zero / stale-from-earlier-iteration / junk |
+| `uvm_vma_lifetime.c` | `cc -O2 -Wall -Wextra -o uvm-vma uvm_vma_lifetime.c -ldl` | nvkvm managed-fallback fork/split lifetime; keeps inherited VMAs live while churn exceeds both GPA-quarantine limits |
 | `gbm_egl_import.c` | `cc -o gbmtest gbm_egl_import.c $(pkg-config --cflags --libs gbm egl glesv2)` | the GBM bo -> dmabuf -> EGLImage -> texture -> FBO round trip that Xorg's glamor needs; separates the dmabuf import path from the `EGL_NATIVE_PIXMAP_KHR` one |
 
 `opencl_map_churn.c` takes `<iters> <pinned> <clFinish> <log2(N)> <churn>`, e.g.
@@ -32,6 +33,13 @@ two views is wrong rather than just "the answer differs".
 `churn_mode` is the bisect: `0` allocate/release only, `1` also CPU-map and
 write them, `2` also run a kernel, `3` map and write but never release. Only the
 modes that **release** a previously mapped buffer corrupt the next one.
+
+`uvm_vma_lifetime.c` is the exception to the host/guest differential rule: it
+targets nvkvm's finite GPA quarantine and is run in an nvkvm guest.  Its child
+punches a one-page hole in an inherited managed mapping while the parent churns
+80 two-MiB managed allocations, exceeding both 64-extents and 64-MiB.  Both
+processes then verify that every surviving part still contains the original
+pattern.
 
 ## `gbm_egl_import.c` — and the glamor retraction
 

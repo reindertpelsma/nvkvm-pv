@@ -298,7 +298,7 @@ never quietly change what the row measures.
 Run the offline suite any time — it rents nothing:
 
 ```bash
-bash tests/sweep_offline_test.sh      # 71 checks, ~30s, rents nothing
+bash tests/sweep_offline_test.sh      # 73 checks, ~30s, rents nothing
 ```
 
 It sources `sweep.sh` in library mode and drives the **real** functions against

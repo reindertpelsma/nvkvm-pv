@@ -173,3 +173,28 @@ func TestAbiProfileSameSideStaysPut(t *testing.T) {
 		}
 	}
 }
+
+// TestManagedFallbackCommonPrefixFitsEveryMeasuredProfile guards the exact
+// compatibility contract used by nvkvm_uvm_ext_mmap(). The fallback only
+// fills fields through NV_MEMORY_ALLOCATION_PARAMS.size; requiring the newest
+// full struct would reject the measured, shorter pre-545 layouts even though
+// every field used is present.
+func TestManagedFallbackCommonPrefixFitsEveryMeasuredProfile(t *testing.T) {
+	common := uint32(Sizes.NvMemAllocCommon)
+	full := uint32(Sizes.NvMemAlloc)
+	seenShorter := false
+
+	for _, m := range measured {
+		memSize := ProfileForVersion(m.tag)[5]
+		if memSize < common {
+			t.Errorf("%s: measured mem_alloc_size %d ends before used common prefix %d",
+				m.tag, memSize, common)
+		}
+		if memSize < full {
+			seenShorter = true
+		}
+	}
+	if !seenShorter {
+		t.Fatal("matrix no longer exercises a measured pre-545 shorter allocation layout")
+	}
+}

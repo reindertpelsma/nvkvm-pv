@@ -24,23 +24,43 @@ struct VirtIONvgpu;
 /*
  * Relay one already-exported guest scanout dma-buf to the display broker.
  *
- * TAKES OWNERSHIP of `dmabuf_fd` when it returns true (it closes it once the
- * descriptor has been handed over; the broker holds its own copy from
- * SCM_RIGHTS).  Returns false when broker mode is not in use or the broker is
- * gone, in which case the caller still owns the fd and should fall through to
- * the ordinary present path.
+ * TAKES OWNERSHIP of `dmabuf_fd` when it returns true.  The newest descriptor
+ * remains open in QEMU until a later frame replaces it, so a reconnected broker
+ * can be painted without waiting for another guest flip.  This remains true
+ * while the broker socket is down or handshaking: broker mode consumes and
+ * retains the newest frame instead of falling through to the GL display path.
+ * Returns false only when broker mode is not in use or the fd is invalid; the
+ * caller then retains ownership and may use the ordinary present path.
  *
- * Safe to call from a virtio worker thread: the send is serialised by an
- * internal mutex and is non-blocking, so a slow or wedged broker costs a
- * dropped frame rather than a stalled vCPU.
+ * Must be called with the BQL held.  The relay socket, its fd-handler
+ * registration, and all connection state are deliberately main-loop-owned.
+ * A future worker offload must marshal the complete submission back to that
+ * owner rather than calling this function directly.  Sends are nonblocking, so
+ * a slow or wedged broker costs a dropped frame rather than a stalled VM.
  */
+/*
+ * Can the broker's display show buffers of this (fourcc, modifier)?
+ *   -1 not answered yet, 0 no -- read back instead, 1 yes -- zero-copy.
+ *
+ * The question is asked automatically on the first submit of each distinct
+ * pair; this only reads the answer.  Cleared on disconnect, because a
+ * reconnected broker may be a different display.
+ */
+int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier);
+
+bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t width, uint32_t height,
+                                      uint32_t stride, uint32_t fourcc,
+                                      uint64_t modifier, bool shm);
+
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                                 uint32_t width, uint32_t height,
                                 uint32_t stride, uint32_t fourcc,
                                 uint64_t modifier);
 
-/* True when -display nvkvm-broker is in use and the socket is up.  Cheap; no
- * lock.  Only for deciding whether the relay is worth attempting. */
+/* True whenever -display nvkvm-broker is in use, including reconnect windows.
+ * Cheap and immutable after display initialisation; only for choosing the
+ * broker present path. */
 bool nvkvm_display_relay_active(void);
 
 #endif /* NVKVM_DISPLAY_RELAY_H */
