@@ -635,6 +635,15 @@ the Hong Kong rental received HTTP 403 from both NVIDIA CDN URL families for
 `driver-install-failed` rows and a coverage shortfall rather than banking or
 skipping them. Instance 48719818 was verified destroyed; cost was $0.0484.
 
+The retry on tree `0b48bb5` used the same RTX 4070 machine class and the
+verified coordinator cache. Its 580.105.08/profile-580 control and forced
+535.309.01/profile-535 and 610.43.02/profile-610 rows all scored 30 PASS / 0
+FAIL / 0 SKIP. Managed allocation/coherence, CUDA, Vulkan compute and NVIDIA
+EGL pixel verification passed in every row. Warning counts stayed isolated to
+their own VM invocations. The driver-set matrix was 2/2 with zero untested
+units; instance 48751631 was verified destroyed and reconciled absent. Cost was
+$0.1055 and evidence is retained at `/workspace/nvkvm-sweep-ada-0b48bb5/`.
+
 That run exposed two harness reliability gaps now remediated before the Ada
 retry. `setup_guest.sh` previously wrote a cloud-image download directly to its
 final cache path and accepted existence on rerun; it now resumes under a

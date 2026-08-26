@@ -12,9 +12,9 @@ boundaries.
 
 > **Status:** the acquisition, safety, selection and reporting layers are
 > covered by `tests/sweep_offline_test.sh` against a stubbed vast.ai API. The
-> complete in-box path has also passed on Turing and Ampere with multiple forced
-> drivers; an Ada control passed while its forced rows were correctly reported
-> untested after NVIDIA's CDN returned HTTP 403 to that rental. See
+> complete in-box path has also passed on Turing, Ampere and Ada with multiple
+> forced drivers. The Ada retry crossed profiles 535 through 610 on a CDN-blocked
+> rental using the verified coordinator cache relay. See
 > `tests/BOOT_MATRIX.md` and "What is and is not tested" below.
 
 ---

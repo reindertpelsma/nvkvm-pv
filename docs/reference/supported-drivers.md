@@ -102,6 +102,9 @@ kernel launch.
 | RTX 3060 Ti | Ampere GA104 | 8.6 | 580.95.05 | 580 |
 | RTX 3060 Ti | Ampere GA104 | 8.6 | 595.84 | 580 |
 | RTX 3060 | Ampere GA106 | 8.6 | 610.43.02 | 610 |
+| RTX 4070 | Ada AD104 | 8.9 | 535.309.01 | 535 |
+| RTX 4070 | Ada AD104 | 8.9 | 580.105.08 | 580 |
+| RTX 4070 | Ada AD104 | 8.9 | 610.43.02 | 610 |
 
 The 580.95.05 Turing row cleared the expanded 30-check suite, including three
 managed allocations and three verified CPU↔GPU coherence cycles. A current
@@ -111,7 +114,9 @@ Ampere GA106 rerun on tree `2dc9465` did the same at 535.309.01 (profile 535),
 profile matched the header. This spans the oldest profile buildable on the
 kernel-6.8 KVM rentals through the newest V610 channel layout. Drivers 515/525
 remain outside that rental's buildable kernel range, not silently counted as
-coverage. See the 2026-08-26 section of
+coverage. An Ada AD104 follow-up on tree `0b48bb5` independently passed the
+same 30-check suite at 535.309.01/profile 535, the 580.105.08 control/profile
+580, and 610.43.02/profile 610. See the 2026-08-26 section of
 [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md) for exact denials, costs
 and retained evidence.
 

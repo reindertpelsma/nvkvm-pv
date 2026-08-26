@@ -86,6 +86,40 @@ registry reconciled empty. An earlier interrupted controller had banked a
 separate passing 580.105.08 control on instance 48713616; that instance was
 also destroyed and is not counted as a driver-set row.
 
+### Ada endpoint-profile follow-up
+
+Tree `0b48bb5` was tested on an RTX 4070 (Ada AD104), again using the required
+nested-KVM desktop image. The preinstalled control and both forced endpoint
+profiles passed **30 PASS / 0 FAIL / 0 SKIP**:
+
+| observed host driver | selected ABI profile | CUDA reported by guest | verdict |
+|---|---:|---:|---:|
+| 580.105.08 (control) | 580 | 13.0 | 30/30 |
+| 535.309.01 | 535 | 12.2 | 30/30 |
+| 610.43.02 | 610 | 13.3 | 30/30 |
+
+The two driver-set rows were exact versions, not substitutes, and both selected
+the profile predicted by `nvkvm_abi.h`. Every row passed managed allocation and
+the three CPU↔GPU coherence cycles, CUDA copies/kernels/matmul, Vulkan compute,
+NVIDIA EGL rendering and the pixel check. Warning collection was scoped to each
+systemd invocation:
+
+- 580.105.08 control: `0x00730102` (2×).
+- 610.43.02: `0x00730102` (2×), `0x2080019f` (1×),
+  `0x2080220b` (1×).
+- 535.309.01: `0x00730102` (1×), `0x00730138` (4×).
+
+This was also the paid end-to-end check of the optional driver-cache relay. The
+same Hong Kong provider edge had returned HTTP 403 for both NVIDIA installers
+on the preceding attempt. The coordinator copied canonical runfiles without
+executing them, the remote SHA-256 values matched, and each disposable-VM
+installer reported `Verifying archive integrity... OK` before installation.
+
+Evidence: instance 48751631, machine 57608, two forced verdicts, zero untested
+rows, 4,667 seconds and $0.1055 sweep cost. Raw logs and JSON are retained in
+`/workspace/nvkvm-sweep-ada-0b48bb5/`. The instance was destroyed, verified
+absent, and the label-scoped registry reconciled empty.
+
 ## Coverage against the eight-profile table
 
 | profile | covers | booted here | previously booted | status |
