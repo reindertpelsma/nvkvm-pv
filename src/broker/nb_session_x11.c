@@ -136,6 +136,7 @@ struct nb_x11 {
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
     bool ptr_inside;            /* pointer is over the CONTENT window     */
+    unsigned hint_w, hint_h;    /* last size we asked the guest to render */
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
@@ -750,9 +751,40 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             xcb_configure_notify_event_t *c = (void *)ev;
 
             if (c->window == x->win) {
+                unsigned hw, hh;
+
                 x->win_w = c->width;
                 x->win_h = c->height;
-                nb_sink_surface(sink, c->width, c->height, 0 /* no refresh source */);
+                /*
+                 * ALIGN THE HINT DOWN TO A MULTIPLE OF 8, exactly as the
+                 * Wayland backend does and for the same reason: the guest
+                 * builds its mode with drm_cvt_mode(), whose CVT_H_GRANULARITY
+                 * is 8, so an odd width produces a mode whose stride is not the
+                 * one the framebuffer was allocated with.
+                 *
+                 * MEASURED: dragging the window told the guest "host window is
+                 * 2731x1303" and the picture came back skewed and duplicated
+                 * with bands of stripes -- a classic pitch mismatch, and 2731
+                 * is not a multiple of 8.  Down, never up, so the suggestion
+                 * still fits the window we measured.
+                 */
+                hw = (unsigned)c->width & ~7u;
+                hh = (unsigned)c->height;
+                if (hw == 0 || hh == 0) {
+                    break;
+                }
+                /* Idempotent: a configure that did not change the hint is not
+                 * news, and a re-mode the guest does not need is a visible
+                 * flicker at best. */
+                if (hw == x->hint_w && hh == x->hint_h) {
+                    if (x->con_w > 0) {
+                        x11_size_content(x, x->con_w, x->con_h);
+                    }
+                    break;
+                }
+                x->hint_w = hw;
+                x->hint_h = hh;
+                nb_sink_surface(sink, hw, hh, 0 /* no refresh source */);
                 /* Keep the content window centred in its new parent. */
                 if (x->con_w > 0) {
                     x11_size_content(x, x->con_w, x->con_h);
