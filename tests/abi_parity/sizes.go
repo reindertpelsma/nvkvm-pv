@@ -56,6 +56,8 @@ package abi_parity
 // static size_t sz_uvm_reg_gpu(void)  { return sizeof(struct uvm_register_gpu_params); }
 // static size_t off_uvm_reg_gpu_fd(void) { return offsetof(struct uvm_register_gpu_params, rm_ctrl_fd); }
 // static size_t off_uvm_reg_gpu_status(void) { return offsetof(struct uvm_register_gpu_params, rm_status); }
+// static size_t off_uvm_reg_gpu_hclient(void)   { return offsetof(struct uvm_register_gpu_params, h_client); }
+// static size_t off_uvm_reg_gpu_hsmcpart(void)  { return offsetof(struct uvm_register_gpu_params, h_smc_part_ref); }
 // static size_t sz_uvm_unreg_gpu(void){ return sizeof(struct uvm_unregister_gpu_params); }
 // static size_t sz_uvm_reg_gv(void)   { return sizeof(struct uvm_register_gpu_vaspace_params); }
 // static size_t sz_uvm_unreg_gv(void) { return sizeof(struct uvm_unregister_gpu_vaspace_params); }
@@ -166,6 +168,8 @@ var Sizes = struct {
 	UvmRegGpu          uintptr
 	UvmRegGpuFdOff     uintptr
 	UvmRegGpuStatusOff uintptr
+	UvmRegGpuHClientOff     uintptr
+	UvmRegGpuHSmcPartRefOff uintptr
 	UvmUnregGpu        uintptr
 	UvmRegGv           uintptr
 	UvmUnregGv         uintptr
@@ -237,6 +241,8 @@ var Sizes = struct {
 	UvmRegGpu:          uintptr(C.sz_uvm_reg_gpu()),
 	UvmRegGpuFdOff:     uintptr(C.off_uvm_reg_gpu_fd()),
 	UvmRegGpuStatusOff: uintptr(C.off_uvm_reg_gpu_status()),
+	UvmRegGpuHClientOff:     uintptr(C.off_uvm_reg_gpu_hclient()),
+	UvmRegGpuHSmcPartRefOff: uintptr(C.off_uvm_reg_gpu_hsmcpart()),
 	UvmUnregGpu:        uintptr(C.sz_uvm_unreg_gpu()),
 	UvmRegGv:           uintptr(C.sz_uvm_reg_gv()),
 	UvmUnregGv:         uintptr(C.sz_uvm_unreg_gv()),
