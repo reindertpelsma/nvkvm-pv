@@ -83,3 +83,11 @@ tests/unit/transport_ready.inc
 # someone's key landing in it via a stray `git add -A` is hard to walk back.
 data/authorized_keys
 data/root_authorized_keys
+
+# Unit-test binaries.  Four of these reached a commit via `git add -A`; they are
+# build output and a committed one can also mask a source that stopped
+# compiling, which is exactly the hole run_tests.sh now refuses to ignore.
+tests/unit/test_*
+!tests/unit/test_*.c
+!tests/unit/test_*.py
+!tests/unit/test_*.sh
