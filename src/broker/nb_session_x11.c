@@ -1130,6 +1130,15 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
      * enough not to look at _NET_WM_NAME, and gets the same bytes: mildly
      * wrong for a pre-EWMH WM, versus visibly wrong for everyone.
      */
+    /*
+     * Intern HERE, not with the rest of the atoms: those are interned further
+     * down, after this point, so using them here passed atom 0 and the server
+     * answered BadAtom -- "X error 5 (major 18)" in the log, and the property
+     * silently never existed.  A round trip once at startup is cheaper than a
+     * property that is not there.
+     */
+    x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
+    x->a_utf8        = x11_atom(x->c, "UTF8_STRING");
     xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_net_wm_name,
                         x->a_utf8, 8, (uint32_t)strlen(cfg->title),
                         cfg->title);
