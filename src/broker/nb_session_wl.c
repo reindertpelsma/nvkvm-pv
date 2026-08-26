@@ -2816,7 +2816,7 @@ static const struct xdg_toplevel_listener top_listener = {
 
 
 static void cur_make(struct nb_wl *w, int slot, const char *const *art,
-                     int aw, int ah, int hx, int hy);
+                     int aw, int ah, int hx, int hy, int mag);
 
 static void cur_build(struct nb_wl *w)
 {
@@ -2853,11 +2853,11 @@ static void cur_build(struct nb_wl *w)
     if (w->cur_buf[NB_CUR_ARROW]) {
         return;
     }
-    cur_make(w, NB_CUR_ARROW, arrow, 12, 19, 0, 0);
-    cur_make(w, NB_CUR_EW,    ew,   14,  7, 7, 3);
-    cur_make(w, NB_CUR_NS,    ns,    7, 12, 3, 6);
-    cur_make(w, NB_CUR_NWSE,  nwse, 13, 11, 6, 5);
-    cur_make(w, NB_CUR_NESW,  nesw, 11, 11, 5, 5);
+    cur_make(w, NB_CUR_ARROW, arrow, 12, 19, 0, 0, 1);
+    cur_make(w, NB_CUR_EW,    ew,   14,  7, 7, 3, 2);
+    cur_make(w, NB_CUR_NS,    ns,    7, 12, 3, 6, 2);
+    cur_make(w, NB_CUR_NWSE,  nwse, 13, 11, 6, 5, 2);
+    cur_make(w, NB_CUR_NESW,  nesw, 11, 11, 5, 5, 2);
 }
 
 /*
@@ -2866,15 +2866,17 @@ static void cur_build(struct nb_wl *w)
  * five small bitmaps that are only ever seen over this broker's own chrome.
  */
 static void cur_make(struct nb_wl *w, int slot, const char *const *art,
-                     int aw, int ah, int hx, int hy)
+                     int aw, int ah, int hx, int hy, int mag)
 {
     /*
-     * The art is a 7x12-ish bitmap, which next to a normal ~24px theme cursor
-     * reads as a speck -- the bottom-edge one worst, being the smallest.
-     * Nearest-neighbour doubled: still no theme lookup and no new dependency,
-     * but a size someone can see.
+     * `mag` is nearest-neighbour magnification, per cursor on purpose.  The
+     * resize art is a 7x12-ish bitmap that reads as a speck next to a normal
+     * ~24px theme cursor -- the bottom-edge one worst, being the smallest --
+     * so those go 2x.  The plain arrow is already 12x19 and looked oversized
+     * doubled, so it stays 1x.  Either way: no theme lookup, no new
+     * dependency.
      */
-    const int mag = 2;
+    if (mag < 1) { mag = 1; }
     struct wl_shm_pool *pool;
     const int bwd = aw * mag, bht = ah * mag;
     size_t stride = (size_t)bwd * 4, sz = stride * (size_t)bht;
