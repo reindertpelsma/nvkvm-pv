@@ -212,7 +212,9 @@ struct nvkvm_cpu_page {
 struct nvkvm_uvm_gpu_reg {
 	struct list_head list;
 	__u8             gpu_uuid[16];
-	__u32            flags;
+	__u32            rm_ctrl_fd_handle_id;
+	__u32            h_client;
+	__u32            h_smc_part_ref;
 };
 struct nvkvm_uvm_vas_reg {
 	struct list_head list;

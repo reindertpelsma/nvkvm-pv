@@ -1276,6 +1276,10 @@ static int nvkvm_uvm_shadow_prepare(struct nvkvm_fd_ctx *ctx,
 		if (!new)
 			return -ENOMEM;
 		memcpy(new->gpu_uuid, p->gpu_uuid.uuid, sizeof(new->gpu_uuid));
+		new->rm_ctrl_fd_handle_id =
+			(p->rm_ctrl_fd >= 0) ? (__u32)p->rm_ctrl_fd : (__u32)-1;
+		new->h_client = p->h_client;
+		new->h_smc_part_ref = p->h_smc_part_ref;
 		mutex_lock(&st->lock);
 		if (st->shadow_valid) {
 			list_for_each_entry(g, &st->registered_gpus, list) {
@@ -1311,7 +1315,7 @@ static int nvkvm_uvm_shadow_prepare(struct nvkvm_fd_ctx *ctx,
 		/* Sanitization has already replaced a non-negative guest fd with
 		 * the QEMU handle id needed by the dormant snapshot. */
 		new->rm_ctrl_fd_handle_id =
-			((int32_t)p->rm_ctrl_fd >= 0) ? p->rm_ctrl_fd : 0;
+			((int32_t)p->rm_ctrl_fd >= 0) ? p->rm_ctrl_fd : (__u32)-1;
 		new->h_client = p->h_client;
 		new->h_va_space = p->h_va_space;
 		pending->node = new;
@@ -1444,6 +1448,9 @@ static void nvkvm_uvm_record_response(struct nvkvm_fd_ctx *ctx,
 		list_for_each_entry(g, &st->registered_gpus, list) {
 			if (!memcmp(g->gpu_uuid, new->gpu_uuid,
 				    sizeof(g->gpu_uuid))) {
+				g->rm_ctrl_fd_handle_id = new->rm_ctrl_fd_handle_id;
+				g->h_client = new->h_client;
+				g->h_smc_part_ref = new->h_smc_part_ref;
 				found = true;
 				break;
 			}
@@ -1891,9 +1898,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	bool have_uvm_rm_ctrl     = false;
 	/*
 	 * Byte offset of the rm_ctrl_fd the sanitizer swapped for a handle_id.
-	 * 16 for uvm_register_gpu_vaspace_params / uvm_register_channel_params
-	 * (both open with a 16-byte uvm_uuid); UVM_MAP_EXTERNAL_ALLOCATION's is
-	 * version-variant and comes from the ABI profile — see the capture site.
+	 * 24 for UVM_REGISTER_GPU, 16 for UVM_REGISTER_GPU_VASPACE / CHANNEL,
+	 * and a version-profile offset for UVM_MAP_EXTERNAL_ALLOCATION.
 	 */
 	unsigned uvm_rm_ctrl_off  = 16;
 	/* EXPORT_OBJECT_TO_FD (ctrl 0x3d05): frontend fd embedded in the INNER
@@ -1942,7 +1948,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			((struct uvm_mm_initialize_params *)params_buf)->uvm_fd;
 		have_uvm_mm_init = true;
 	} else if (params_buf &&
-		   (cmd == UVM_REGISTER_GPU_VASPACE ||
+		   (cmd == UVM_REGISTER_GPU ||
+		    cmd == UVM_REGISTER_GPU_VASPACE ||
 		    cmd == UVM_REGISTER_CHANNEL ||
 		    cmd == UVM_MAP_EXTERNAL_ALLOCATION)) {
 		/*
@@ -1956,7 +1963,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 		 * userspace.  Index by the same profile offset the sanitizer
 		 * uses so capture and restore cannot disagree.
 		 */
-		if (cmd == UVM_MAP_EXTERNAL_ALLOCATION)
+		if (cmd == UVM_REGISTER_GPU)
+			uvm_rm_ctrl_off =
+				offsetof(struct uvm_register_gpu_params, rm_ctrl_fd);
+		else if (cmd == UVM_MAP_EXTERNAL_ALLOCATION)
 			uvm_rm_ctrl_off = nvkvm_prof()->uvm_map_ext_fd_off;
 		if (param_size >= (size_t)uvm_rm_ctrl_off + sizeof(__u32)) {
 			orig_uvm_rm_ctrl_fd =

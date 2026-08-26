@@ -82,6 +82,35 @@ enum nvkvm_abi_id {
 	NVKVM_ABI_610 = 610,   /* 610+: V610 channel (+hHandleVASpace, 376)       */
 };
 
+/* UVM_REGISTER_GPU_PARAMS is invariant across every published OGKM tag nvkvm
+ * supports.  MEASURED on 2026-08-26, not asserted: tools/abi_derive.sh
+ * --all-published-supported compiled and RAN a sizeof/offsetof probe against
+ * each of the 216 official numeric tags from 515.43.04 through 610.57.04 (the
+ * complete set git ls-remote returns for major 515..610).  All 216 produced one
+ * layout -- size 40, rmCtrlFd 24, hClient 28, hSmcPartRef 32, rmStatus 36 --
+ * with zero clone failures and zero MISSING cells.  There is therefore no
+ * version boundary to put in nvkvm_abi_profile: these are universal wire
+ * constants.  OGKM's first release is 515, so 470 and earlier cannot be probed
+ * at all; that is a documented gap in the evidence, not a measured zero.
+ *
+ * The evidence is COMMITTED, not merely cited.  An earlier revision of this
+ * comment made the same claim while the only artifact was a scratch file
+ * outside the repository -- it would not have survived a clone, and covered 37
+ * tags rather than 216.  The sweep now lives at
+ * tests/abi_parity/ogkm_register_gpu.tsv (one row per tag, with the unedited
+ * 14-field output beside it in ogkm_abi_sweep_20260826.tsv), and
+ * tests/abi_parity/ogkm_fixture_test.go holds the three constants below against
+ * every row.  Re-running the sweep is a reviewable diff to that file.
+ *
+ * Keep the offsets explicit because this ioctl embeds a frontend fd.  Treating
+ * +24 as rmStatus (the old 32-byte model) both suppressed managed fallback GPU
+ * registration and made the dormant REALIZE replay let the driver write eight
+ * bytes beyond a 32-byte stack object.
+ */
+#define NVKVM_UVM_REGISTER_GPU_SIZE       40u
+#define NVKVM_UVM_REGISTER_GPU_FD_OFF     24u
+#define NVKVM_UVM_REGISTER_GPU_STATUS_OFF 36u
+
 struct nvkvm_abi_profile {
 	unsigned id;                 /* enum nvkvm_abi_id                         */
 

@@ -237,6 +237,25 @@ struct nvkvm_stub_uvm_mm_initialize_params {
 	uint32_t rm_status;
 };
 struct nvkvm_stub_uvm_uuid { uint8_t b[16]; };
+struct nvkvm_stub_uvm_register_gpu_params {
+	struct nvkvm_stub_uvm_uuid gpu_uuid;
+	uint8_t  numa_enabled;
+	uint8_t  _pad0[3];
+	int32_t  numa_node_id;
+	int32_t  rm_ctrl_fd;
+	uint32_t h_client;
+	uint32_t h_smc_part_ref;
+	uint32_t rm_status;
+};
+_Static_assert(sizeof(struct nvkvm_stub_uvm_register_gpu_params) ==
+	       NVKVM_UVM_REGISTER_GPU_SIZE,
+	       "UVM_REGISTER_GPU_PARAMS size drifted");
+_Static_assert(offsetof(struct nvkvm_stub_uvm_register_gpu_params, rm_ctrl_fd) ==
+	       NVKVM_UVM_REGISTER_GPU_FD_OFF,
+	       "UVM_REGISTER_GPU_PARAMS rmCtrlFd moved");
+_Static_assert(offsetof(struct nvkvm_stub_uvm_register_gpu_params, rm_status) ==
+	       NVKVM_UVM_REGISTER_GPU_STATUS_OFF,
+	       "UVM_REGISTER_GPU_PARAMS rmStatus moved");
 struct nvkvm_stub_uvm_register_gpu_vaspace_params {
 	struct nvkvm_stub_uvm_uuid gpu_uuid; /* 16 */
 	uint32_t rm_ctrl_fd;                 /* offset 16 */
@@ -266,6 +285,7 @@ struct nvkvm_stub_uvm_register_channel_params {
  * These mirror the values in src/abi/uvm.h.
  */
 #define NVKVM_STUB_UVM_MM_INITIALIZE          75
+#define NVKVM_STUB_UVM_REGISTER_GPU           37
 #define NVKVM_STUB_UVM_REGISTER_GPU_VASPACE   25
 #define NVKVM_STUB_UVM_REGISTER_CHANNEL       27
 #define NVKVM_STUB_UVM_MAP_EXTERNAL_ALLOCATION 33
@@ -1603,6 +1623,12 @@ static void worker_thread(void *arg)
 				    offsetof(struct nvkvm_stub_uvm_mm_initialize_params, uvm_fd);
 				uvm_has_embedded_fd = 1;
 				break;
+			case NVKVM_STUB_UVM_REGISTER_GPU:
+				uvm_embedded_fd_off =
+				    offsetof(struct nvkvm_stub_uvm_register_gpu_params,
+					     rm_ctrl_fd);
+				uvm_has_embedded_fd = 1;
+				break;
 			case NVKVM_STUB_UVM_REGISTER_GPU_VASPACE:
 				uvm_embedded_fd_off =
 				    offsetof(struct nvkvm_stub_uvm_register_gpu_vaspace_params, rm_ctrl_fd);
@@ -2497,9 +2523,14 @@ struct stub_uvm_register_gpu {
 	uint8_t  numa_enabled;
 	uint8_t  _pad0[3];
 	int32_t  numa_node_id;
+	int32_t  rm_ctrl_fd;
+	uint32_t h_client;
+	uint32_t h_smc_part_ref;
 	uint32_t rm_status;
-	uint32_t _pad1;
 };
+_Static_assert(sizeof(struct stub_uvm_register_gpu) ==
+	       NVKVM_UVM_REGISTER_GPU_SIZE,
+	       "REALIZE REGISTER_GPU replay size drifted");
 struct stub_uvm_register_vas {
 	struct stub_uvm_uuid16 uuid;
 	uint32_t rm_ctrl_fd;
@@ -2525,7 +2556,12 @@ struct stub_state_snapshot {
 	uint32_t n_va_spaces;
 	uint32_t n_range_groups;
 	uint32_t _pad0;
-	struct { uint8_t uuid[16]; } gpus[STUB_MAX_REG_GPUS];
+	struct { uint8_t uuid[16];
+		 uint32_t rm_ctrl_fd_handle_id;
+		 uint32_t h_client;
+		 uint32_t h_smc_part_ref;
+		 uint32_t _pad; }
+		gpus[STUB_MAX_REG_GPUS];
 	struct { uint8_t uuid[16];
 		 uint32_t rm_ctrl_fd_handle_id;
 		 uint32_t h_client;
@@ -2534,6 +2570,8 @@ struct stub_state_snapshot {
 		va_spaces[STUB_MAX_VA_SPACES];
 	uint64_t range_group_ids[STUB_MAX_RANGE_GROUPS];
 };
+_Static_assert(sizeof(struct stub_state_snapshot) == 1176,
+	       "REALIZE UVM state snapshot drifted from nvkvm_proto.h");
 
 static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 {
@@ -2608,6 +2646,19 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 		struct stub_uvm_register_gpu rg = {0};
 		__builtin_memcpy(rg.uuid.b, state.gpus[i].uuid, 16);
 		rg.numa_node_id = -1;
+		uint32_t hid = state.gpus[i].rm_ctrl_fd_handle_id;
+		if (hid == (uint32_t)-1) {
+			rg.rm_ctrl_fd = -1;
+		} else {
+			int local_fd = handle_lookup(hid);
+			if (local_fd < 0) {
+				resp.retval = -EBADF;
+				goto cleanup;
+			}
+			rg.rm_ctrl_fd = local_fd;
+		}
+		rg.h_client = state.gpus[i].h_client;
+		rg.h_smc_part_ref = state.gpus[i].h_smc_part_ref;
 		long r = stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU, &rg);
 		if (r < 0 || rg.rm_status != 0) {
 			resp.rm_status = rg.rm_status;
@@ -2622,12 +2673,17 @@ static void handle_realize_uvm_fd(struct isolate_cmd_realize_uvm_fd *cmd)
 	for (uint32_t i = 0; i < state.n_va_spaces; i++) {
 		struct stub_uvm_register_vas rv = {0};
 		__builtin_memcpy(rv.uuid.b, state.va_spaces[i].uuid, 16);
-		int local_fd = handle_lookup(state.va_spaces[i].rm_ctrl_fd_handle_id);
-		if (local_fd < 0) {
-			resp.retval = -EBADF;
-			goto cleanup;
+		uint32_t hid = state.va_spaces[i].rm_ctrl_fd_handle_id;
+		if (hid == (uint32_t)-1) {
+			rv.rm_ctrl_fd = (uint32_t)-1;
+		} else {
+			int local_fd = handle_lookup(hid);
+			if (local_fd < 0) {
+				resp.retval = -EBADF;
+				goto cleanup;
+			}
+			rv.rm_ctrl_fd = (uint32_t)local_fd;
 		}
-		rv.rm_ctrl_fd = (uint32_t)local_fd;
 		rv.h_client   = state.va_spaces[i].h_client;
 		rv.h_va_space = state.va_spaces[i].h_va_space;
 		long r = stub_ioctl(uvm_fd, STUB_UVM_REGISTER_GPU_VASPACE, &rv);

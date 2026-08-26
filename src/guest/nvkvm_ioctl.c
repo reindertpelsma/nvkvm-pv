@@ -305,6 +305,17 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		}
 		return 0;
 	}
+	case UVM_REGISTER_GPU: {
+		struct uvm_register_gpu_params *p = buf;
+
+		if (p->rm_ctrl_fd >= 0) {
+			__s32 hid = guest_fd_to_handle_id(p->rm_ctrl_fd);
+			if (hid < 0)
+				return -EBADF;
+			p->rm_ctrl_fd = hid;
+		}
+		return 0;
+	}
 	case UVM_REGISTER_GPU_VASPACE: {
 		struct uvm_register_gpu_vaspace_params *p = buf;
 		/* CUDA passes -1 to mean "no ctrl fd" for some calls — leave
