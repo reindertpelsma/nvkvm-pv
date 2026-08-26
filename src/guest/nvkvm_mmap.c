@@ -479,6 +479,11 @@ static int nvkvm_mmap_request_uvm_realize(struct nvkvm_fd_ctx *ctx,
 	list_for_each_entry(g, &st->registered_gpus, list) {
 		if (n_gpus >= NVKVM_UVM_MAX_REG_GPUS) break;
 		memcpy(snap->gpus[n_gpus].gpu_uuid, g->gpu_uuid, 16);
+		snap->gpus[n_gpus].rm_ctrl_fd_handle_id =
+			cpu_to_le32(g->rm_ctrl_fd_handle_id);
+		snap->gpus[n_gpus].h_client = cpu_to_le32(g->h_client);
+		snap->gpus[n_gpus].h_smc_part_ref =
+			cpu_to_le32(g->h_smc_part_ref);
 		n_gpus++;
 	}
 	snap->n_gpus = cpu_to_le32(n_gpus);

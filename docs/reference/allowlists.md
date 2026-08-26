@@ -30,19 +30,34 @@ Each entry is `{ cmd, min_size, fd_off[2] }`: the minimum parameter size, and
 the byte offsets of any embedded frontend-fd fields that need
 handle-id→host-fd translation. `0xffff` means "no fd field".
 
-Sizes are the exact `sizeof` from `src/abi/uvm.h` at driver 575.51.03, and the
-comment is explicit that they were *not* copied from gVisor:
+Sizes are the exact `sizeof` from `src/abi/uvm.h`, verified against NVIDIA's
+official OGKM tags rather than copied from a neighbouring nvproxy release:
 
-> `min_size` is the EXACT struct size from our ABI (`src/abi/uvm.h`, driver
-> 575.51.03) — verified by `sizeof`, NOT copied from gVisor's newer layouts
-> (several differ: e.g. `REGISTER_GPU` is 32B here, not gVisor's 40B-with-NUMA;
-> `REGISTER_CHANNEL` 48 not 56; `MIGRATE` 48 not 56).
+> `min_size` is the EXACT struct size from our ABI (`src/abi/uvm.h`), verified
+> against OGKM rather than copied from a neighbouring nvproxy release.
+> `REGISTER_GPU` is 40 bytes at all 216 published OGKM tags, 515.43.04 through
+> 610.57.04; `REGISTER_CHANNEL` remains 48 rather than 56 and `MIGRATE` 48
+> rather than 56.
 >
-> — `src/qemu/nvkvm_isolate_handlers.c:589-598`
+> — `src/qemu/nvkvm_isolate_handlers.c`
+
+Only `REGISTER_GPU` has been swept across the whole tag range. That sweep was
+run on 2026-08-26 with `tools/abi_derive.sh --all-published-supported`, which
+compiles and runs a `sizeof`/`offsetof` probe at each tag `git ls-remote`
+returns for major 515..610. All 216 tags gave one layout — size 40, `rmCtrlFd`
+at 24, `hClient` at 28, `hSmcPartRef` at 32, `rmStatus` at 36 — with no clone
+failure and no unmeasured cell. The output is committed at
+`tests/abi_parity/ogkm_register_gpu.tsv` (raw 14-field sweep beside it in
+`ogkm_abi_sweep_20260826.tsv`) and `tests/abi_parity/ogkm_fixture_test.go`
+checks the shipped constants against every row of it, so the claim is
+re-checkable from a clone rather than resting on a comment. The other UVM
+`min_size` values are still pinned to driver 575.51.03 and verified by `sizeof`
+there; they have not been swept across the range.
 
 Five commands (44, 45, 53, 65, 66) carry `min_size = 0` deliberately: there is no
 driver-verified layout for them and an over-strict guess had already mis-denied
-`REGISTER_GPU` once (`src/qemu/nvkvm_isolate_handlers.c:600-609`).
+`REGISTER_GPU` once. `REGISTER_GPU.rmCtrlFd` is an input fd at offset 24 and is
+translated through the per-VM handle table before forwarding.
 
 Two `min_size` values are version-variant and are overridden from the active ABI
 profile at check time — `UVM_MAP_EXTERNAL_ALLOCATION` (33) and

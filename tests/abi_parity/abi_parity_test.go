@@ -128,7 +128,12 @@ func TestUVMStructSizes(t *testing.T) {
 		{"uvm_initialize_params", Sizes.UvmInit, 16},
 		{"uvm_deinitialize_params", Sizes.UvmDeinit, 8},
 		{"uvm_mm_initialize_params", Sizes.UvmMmInit, 8},
-		{"uvm_register_gpu_params", Sizes.UvmRegGpu, 32},
+		// uvm_register_gpu_params (size + every member offset) is NOT
+		// asserted here.  A literal in this file would only be checked
+		// against src/abi/uvm.h, which the same commit edits -- see the
+		// banner in ogkm_fixture_test.go.  It is checked instead against
+		// the committed sweep of NVIDIA's own headers, in
+		// TestUVMRegisterGPUStructMatchesOGKM.
 		{"uvm_unregister_gpu_params", Sizes.UvmUnregGpu, 24},
 		{"uvm_register_gpu_vaspace_params", Sizes.UvmRegGv, 32},
 		{"uvm_unregister_gpu_vaspace_params", Sizes.UvmUnregGv, 20},
@@ -148,6 +153,20 @@ func TestUVMStructSizes(t *testing.T) {
 		{"uvm_validate_va_range_params", Sizes.UvmValVa, 24},
 		{"uvm_pageable_mem_access_params", Sizes.UvmPageable, 8},
 		{"uvm_alloc_semaphore_pool_params", Sizes.UvmSema, 9248}, // base+len+PerGPUAttributes[UVM_MAX_GPUS]+count+status
+	})
+}
+
+// TestNvkvmUvmStateSnapshotSize pins the size of the UVM state snapshot the
+// guest hands QEMU across a REALIZE replay.
+//
+// This test was called TestUVMRegisterGPUWireConstants until 2026-08-26.  It
+// never read a single REGISTER_GPU value; the name suggested the 40-byte wire
+// claim was under test when nothing here tested it.  The name now says what it
+// asserts, and the REGISTER_GPU wire constants are tested for real, against
+// measured driver headers, in ogkm_fixture_test.go.
+func TestNvkvmUvmStateSnapshotSize(t *testing.T) {
+	checkSizes(t, []sizeCase{
+		{"nvkvm_uvm_state_snapshot", Sizes.NvkvmUvmState, 1176},
 	})
 }
 
@@ -175,20 +194,20 @@ func TestIoctlNumberConstants(t *testing.T) {
 		name string
 		nr   int
 	}{
-		{"NV_ESC_CARD_INFO",          NvEscNums.CardInfo},
-		{"NV_ESC_REGISTER_FD",        NvEscNums.RegisterFd},
-		{"NV_ESC_ALLOC_OS_EVENT",     NvEscNums.AllocOsEvent},
-		{"NV_ESC_FREE_OS_EVENT",      NvEscNums.FreeOsEvent},
-		{"NV_ESC_CHECK_VERSION_STR",  NvEscNums.CheckVersionStr},
-		{"NV_ESC_SYS_PARAMS",         NvEscNums.SysParams},
-		{"NV_ESC_NUMA_INFO",          NvEscNums.NumaInfo},
+		{"NV_ESC_CARD_INFO", NvEscNums.CardInfo},
+		{"NV_ESC_REGISTER_FD", NvEscNums.RegisterFd},
+		{"NV_ESC_ALLOC_OS_EVENT", NvEscNums.AllocOsEvent},
+		{"NV_ESC_FREE_OS_EVENT", NvEscNums.FreeOsEvent},
+		{"NV_ESC_CHECK_VERSION_STR", NvEscNums.CheckVersionStr},
+		{"NV_ESC_SYS_PARAMS", NvEscNums.SysParams},
+		{"NV_ESC_NUMA_INFO", NvEscNums.NumaInfo},
 		{"NV_ESC_WAIT_OPEN_COMPLETE", NvEscNums.WaitOpenComplete},
-		{"NV_ESC_RM_FREE",            NvEscNums.RmFree},
-		{"NV_ESC_RM_CONTROL",         NvEscNums.RmControl},
-		{"NV_ESC_RM_ALLOC",           NvEscNums.RmAlloc},
-		{"NV_ESC_RM_DUP_OBJECT",      NvEscNums.RmDupObject},
-		{"NV_ESC_RM_MAP_MEMORY",      NvEscNums.RmMapMemory},
-		{"NV_ESC_RM_UNMAP_MEMORY",    NvEscNums.RmUnmapMemory},
+		{"NV_ESC_RM_FREE", NvEscNums.RmFree},
+		{"NV_ESC_RM_CONTROL", NvEscNums.RmControl},
+		{"NV_ESC_RM_ALLOC", NvEscNums.RmAlloc},
+		{"NV_ESC_RM_DUP_OBJECT", NvEscNums.RmDupObject},
+		{"NV_ESC_RM_MAP_MEMORY", NvEscNums.RmMapMemory},
+		{"NV_ESC_RM_UNMAP_MEMORY", NvEscNums.RmUnmapMemory},
 	}
 
 	for _, tc := range cases {

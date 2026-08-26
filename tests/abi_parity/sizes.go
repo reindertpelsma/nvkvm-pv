@@ -54,6 +54,10 @@ package abi_parity
 // static size_t sz_uvm_deinit(void)   { return sizeof(struct uvm_deinitialize_params); }
 // static size_t sz_uvm_mm_init(void)  { return sizeof(struct uvm_mm_initialize_params); }
 // static size_t sz_uvm_reg_gpu(void)  { return sizeof(struct uvm_register_gpu_params); }
+// static size_t off_uvm_reg_gpu_fd(void) { return offsetof(struct uvm_register_gpu_params, rm_ctrl_fd); }
+// static size_t off_uvm_reg_gpu_status(void) { return offsetof(struct uvm_register_gpu_params, rm_status); }
+// static size_t off_uvm_reg_gpu_hclient(void)   { return offsetof(struct uvm_register_gpu_params, h_client); }
+// static size_t off_uvm_reg_gpu_hsmcpart(void)  { return offsetof(struct uvm_register_gpu_params, h_smc_part_ref); }
 // static size_t sz_uvm_unreg_gpu(void){ return sizeof(struct uvm_unregister_gpu_params); }
 // static size_t sz_uvm_reg_gv(void)   { return sizeof(struct uvm_register_gpu_vaspace_params); }
 // static size_t sz_uvm_unreg_gv(void) { return sizeof(struct uvm_unregister_gpu_vaspace_params); }
@@ -85,6 +89,7 @@ package abi_parity
 // static size_t sz_nvkvm_resp_ioctl(void) { return sizeof(struct nvkvm_resp_ioctl); }
 // static size_t sz_nvkvm_resp_mmap(void)  { return sizeof(struct nvkvm_resp_mmap); }
 // static size_t sz_nvkvm_shm_ctrl(void)   { return sizeof(struct nvkvm_shm_ctrl); }
+// static size_t sz_nvkvm_uvm_state(void)  { return sizeof(struct nvkvm_uvm_state_snapshot); }
 //
 // // NV_ESC ioctl number accessors (macros can't be used directly as C.NV_ESC_x
 // // when they involve arithmetic, so wrap them in static functions)
@@ -133,11 +138,11 @@ var Sizes = struct {
 	Nvos47 uintptr
 
 	// Per-hClass alloc-param structs
-	Nv0080     uintptr
-	Nv2080     uintptr
-	Nv00deV545 uintptr
-	NvVaspace  uintptr
-	NvMemAlloc uintptr
+	Nv0080           uintptr
+	Nv2080           uintptr
+	Nv00deV545       uintptr
+	NvVaspace        uintptr
+	NvMemAlloc       uintptr
 	NvMemAllocCommon uintptr
 
 	// ioctl wrapper structs
@@ -157,41 +162,46 @@ var Sizes = struct {
 	ExportDma  uintptr
 
 	// UVM structs
-	UvmInit       uintptr
-	UvmDeinit     uintptr
-	UvmMmInit     uintptr
-	UvmRegGpu     uintptr
-	UvmUnregGpu   uintptr
-	UvmRegGv      uintptr
-	UvmUnregGv    uintptr
-	UvmRegCh      uintptr
-	UvmUnregCh    uintptr
-	UvmCreateRg   uintptr
-	UvmDestRg     uintptr
-	UvmSetRg      uintptr
-	UvmFree       uintptr
-	UvmMigrate    uintptr
-	UvmSetPref    uintptr
-	UvmUnsetPref  uintptr
-	UvmSetAb      uintptr
-	UvmUnsetAb    uintptr
-	UvmPeer       uintptr
-	UvmExtRng     uintptr
-	UvmValVa      uintptr
-	UvmPageable   uintptr
-	UvmSema       uintptr
+	UvmInit            uintptr
+	UvmDeinit          uintptr
+	UvmMmInit          uintptr
+	UvmRegGpu          uintptr
+	UvmRegGpuFdOff     uintptr
+	UvmRegGpuStatusOff uintptr
+	UvmRegGpuHClientOff     uintptr
+	UvmRegGpuHSmcPartRefOff uintptr
+	UvmUnregGpu        uintptr
+	UvmRegGv           uintptr
+	UvmUnregGv         uintptr
+	UvmRegCh           uintptr
+	UvmUnregCh         uintptr
+	UvmCreateRg        uintptr
+	UvmDestRg          uintptr
+	UvmSetRg           uintptr
+	UvmFree            uintptr
+	UvmMigrate         uintptr
+	UvmSetPref         uintptr
+	UvmUnsetPref       uintptr
+	UvmSetAb           uintptr
+	UvmUnsetAb         uintptr
+	UvmPeer            uintptr
+	UvmExtRng          uintptr
+	UvmValVa           uintptr
+	UvmPageable        uintptr
+	UvmSema            uintptr
 
 	// Protocol structs
-	NvkvmHdr      uintptr
-	NvkvmReqOpen  uintptr
-	NvkvmReqClose uintptr
-	NvkvmReqIoctl uintptr
-	NvkvmReqMmap  uintptr
+	NvkvmHdr       uintptr
+	NvkvmReqOpen   uintptr
+	NvkvmReqClose  uintptr
+	NvkvmReqIoctl  uintptr
+	NvkvmReqMmap   uintptr
 	NvkvmReqMunmap uintptr
 	NvkvmRespOpen  uintptr
 	NvkvmRespIoctl uintptr
 	NvkvmRespMmap  uintptr
 	NvkvmShmCtrl   uintptr
+	NvkvmUvmState  uintptr
 }{
 	Nvos21: uintptr(C.sz_nvos21()),
 	Nvos64: uintptr(C.sz_nvos64()),
@@ -203,11 +213,11 @@ var Sizes = struct {
 	Nvos46: uintptr(C.sz_nvos46()),
 	Nvos47: uintptr(C.sz_nvos47()),
 
-	Nv0080:     uintptr(C.sz_nv0080()),
-	Nv2080:     uintptr(C.sz_nv2080()),
-	Nv00deV545: uintptr(C.sz_nv00de_v545()),
-	NvVaspace:  uintptr(C.sz_nv_vaspace()),
-	NvMemAlloc: uintptr(C.sz_nv_memalloc()),
+	Nv0080:           uintptr(C.sz_nv0080()),
+	Nv2080:           uintptr(C.sz_nv2080()),
+	Nv00deV545:       uintptr(C.sz_nv00de_v545()),
+	NvVaspace:        uintptr(C.sz_nv_vaspace()),
+	NvMemAlloc:       uintptr(C.sz_nv_memalloc()),
 	NvMemAllocCommon: uintptr(C.sz_nv_memalloc_common()),
 
 	CardInfo:   uintptr(C.sz_card_info()),
@@ -225,29 +235,33 @@ var Sizes = struct {
 	AllocCtx:   uintptr(C.sz_alloc_ctx()),
 	ExportDma:  uintptr(C.sz_export_dma()),
 
-	UvmInit:       uintptr(C.sz_uvm_init()),
-	UvmDeinit:     uintptr(C.sz_uvm_deinit()),
-	UvmMmInit:     uintptr(C.sz_uvm_mm_init()),
-	UvmRegGpu:     uintptr(C.sz_uvm_reg_gpu()),
-	UvmUnregGpu:   uintptr(C.sz_uvm_unreg_gpu()),
-	UvmRegGv:      uintptr(C.sz_uvm_reg_gv()),
-	UvmUnregGv:    uintptr(C.sz_uvm_unreg_gv()),
-	UvmRegCh:      uintptr(C.sz_uvm_reg_ch()),
-	UvmUnregCh:    uintptr(C.sz_uvm_unreg_ch()),
-	UvmCreateRg:   uintptr(C.sz_uvm_create_rg()),
-	UvmDestRg:     uintptr(C.sz_uvm_dest_rg()),
-	UvmSetRg:      uintptr(C.sz_uvm_set_rg()),
-	UvmFree:       uintptr(C.sz_uvm_free()),
-	UvmMigrate:    uintptr(C.sz_uvm_migrate()),
-	UvmSetPref:    uintptr(C.sz_uvm_set_pref()),
-	UvmUnsetPref:  uintptr(C.sz_uvm_unset_pref()),
-	UvmSetAb:      uintptr(C.sz_uvm_set_ab()),
-	UvmUnsetAb:    uintptr(C.sz_uvm_unset_ab()),
-	UvmPeer:       uintptr(C.sz_uvm_peer()),
-	UvmExtRng:     uintptr(C.sz_uvm_ext_rng()),
-	UvmValVa:      uintptr(C.sz_uvm_val_va()),
-	UvmPageable:   uintptr(C.sz_uvm_pageable()),
-	UvmSema:       uintptr(C.sz_uvm_sema()),
+	UvmInit:            uintptr(C.sz_uvm_init()),
+	UvmDeinit:          uintptr(C.sz_uvm_deinit()),
+	UvmMmInit:          uintptr(C.sz_uvm_mm_init()),
+	UvmRegGpu:          uintptr(C.sz_uvm_reg_gpu()),
+	UvmRegGpuFdOff:     uintptr(C.off_uvm_reg_gpu_fd()),
+	UvmRegGpuStatusOff: uintptr(C.off_uvm_reg_gpu_status()),
+	UvmRegGpuHClientOff:     uintptr(C.off_uvm_reg_gpu_hclient()),
+	UvmRegGpuHSmcPartRefOff: uintptr(C.off_uvm_reg_gpu_hsmcpart()),
+	UvmUnregGpu:        uintptr(C.sz_uvm_unreg_gpu()),
+	UvmRegGv:           uintptr(C.sz_uvm_reg_gv()),
+	UvmUnregGv:         uintptr(C.sz_uvm_unreg_gv()),
+	UvmRegCh:           uintptr(C.sz_uvm_reg_ch()),
+	UvmUnregCh:         uintptr(C.sz_uvm_unreg_ch()),
+	UvmCreateRg:        uintptr(C.sz_uvm_create_rg()),
+	UvmDestRg:          uintptr(C.sz_uvm_dest_rg()),
+	UvmSetRg:           uintptr(C.sz_uvm_set_rg()),
+	UvmFree:            uintptr(C.sz_uvm_free()),
+	UvmMigrate:         uintptr(C.sz_uvm_migrate()),
+	UvmSetPref:         uintptr(C.sz_uvm_set_pref()),
+	UvmUnsetPref:       uintptr(C.sz_uvm_unset_pref()),
+	UvmSetAb:           uintptr(C.sz_uvm_set_ab()),
+	UvmUnsetAb:         uintptr(C.sz_uvm_unset_ab()),
+	UvmPeer:            uintptr(C.sz_uvm_peer()),
+	UvmExtRng:          uintptr(C.sz_uvm_ext_rng()),
+	UvmValVa:           uintptr(C.sz_uvm_val_va()),
+	UvmPageable:        uintptr(C.sz_uvm_pageable()),
+	UvmSema:            uintptr(C.sz_uvm_sema()),
 
 	NvkvmHdr:       uintptr(C.sz_nvkvm_hdr()),
 	NvkvmReqOpen:   uintptr(C.sz_nvkvm_req_open()),
@@ -259,25 +273,26 @@ var Sizes = struct {
 	NvkvmRespIoctl: uintptr(C.sz_nvkvm_resp_ioctl()),
 	NvkvmRespMmap:  uintptr(C.sz_nvkvm_resp_mmap()),
 	NvkvmShmCtrl:   uintptr(C.sz_nvkvm_shm_ctrl()),
+	NvkvmUvmState:  uintptr(C.sz_nvkvm_uvm_state()),
 }
 
 // NvEscNums exposes the NV_ESC_* ioctl command numbers as measured by the C
 // compiler from nvgpu.h.
 var NvEscNums = struct {
-	CardInfo        int
-	RegisterFd      int
-	AllocOsEvent    int
-	FreeOsEvent     int
-	CheckVersionStr int
-	SysParams       int
-	NumaInfo        int
+	CardInfo         int
+	RegisterFd       int
+	AllocOsEvent     int
+	FreeOsEvent      int
+	CheckVersionStr  int
+	SysParams        int
+	NumaInfo         int
 	WaitOpenComplete int
-	RmFree          int
-	RmControl       int
-	RmAlloc         int
-	RmDupObject     int
-	RmMapMemory     int
-	RmUnmapMemory   int
+	RmFree           int
+	RmControl        int
+	RmAlloc          int
+	RmDupObject      int
+	RmMapMemory      int
+	RmUnmapMemory    int
 }{
 	CardInfo:         int(C.c_nv_esc_card_info()),
 	RegisterFd:       int(C.c_nv_esc_register_fd()),

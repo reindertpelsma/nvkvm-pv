@@ -67,7 +67,11 @@ struct nvkvm_virtio_config {
 
 /* ── Protocol version ────────────────────────────────────────────────────── */
 
-#define NVKVM_PROTO_VERSION     2
+/* Version 3 expands nvkvm_uvm_state_snapshot.gpus[] with the rmCtrlFd handle
+ * and RM object handles required to replay the real 40-byte
+ * UVM_REGISTER_GPU_PARAMS.  Reject v2 peers rather than parse the following
+ * va_spaces[] and range_group_ids[] at their old offsets. */
+#define NVKVM_PROTO_VERSION     3
 
 /* ── Virtqueue indices ───────────────────────────────────────────────────── */
 
@@ -683,6 +687,10 @@ struct nvkvm_uvm_state_snapshot {
 	__le32 _pad0;
 	struct {
 		__u8   gpu_uuid[16];
+		__le32 rm_ctrl_fd_handle_id;
+		__le32 h_client;
+		__le32 h_smc_part_ref;
+		__le32 _pad;
 	} gpus[NVKVM_UVM_MAX_REG_GPUS];
 	struct {
 		__u8   gpu_uuid[16];

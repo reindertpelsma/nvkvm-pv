@@ -61,6 +61,31 @@ ext_mmap = section(
 assert "lockdep_assert_held(&st->ext_lock);" in ext_mmap
 assert "mutex_lock(&st->ext_lock)" not in ext_mmap
 
+# REGISTER_GPU's embedded rmCtrlFd is translated on every live transport and
+# the corrected 40-byte ABI is shared with the dormant REALIZE replay.  A
+# missing one of these silently drops the fallback's GPU list or forwards a
+# guest fd number into host RM.
+sanitize = section(
+    "src/guest/nvkvm_ioctl.c",
+    "int nvkvm_sanitize_ioctl_params(",
+    "\t/*\n\t * The NR-based switch below",
+)
+assert "case UVM_REGISTER_GPU:" in sanitize
+assert "p->rm_ctrl_fd = hid;" in sanitize
+
+qemu_isolate = (ROOT / "src/qemu/nvkvm_isolate_handlers.c").read_text(
+    encoding="utf-8"
+)
+assert "NVKVM_UVM_REGISTER_GPU_SIZE" in qemu_isolate
+assert "NVKVM_UVM_REGISTER_GPU_FD_OFF" in qemu_isolate
+
+stub = (ROOT / "src/stub/nvkvm_stub.c").read_text(encoding="utf-8")
+assert "case NVKVM_STUB_UVM_REGISTER_GPU:" in stub
+assert "UVM_REGISTER_GPU_PARAMS rmCtrlFd moved" in stub
+proto = (ROOT / "src/common/nvkvm_proto.h").read_text(encoding="utf-8")
+assert "#define NVKVM_PROTO_VERSION     3" in proto
+assert "REALIZE REGISTER_GPU replay size drifted" in stub
+
 kms_init = section(
     "src/guest/nvkvm_kms.c",
     "int nvkvm_kms_init(",

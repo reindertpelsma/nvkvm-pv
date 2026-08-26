@@ -26,6 +26,15 @@ package abi_parity
 // static unsigned profile_id_for_version(const char *vs) {
 //     return nvkvm_abi_for_version(vs)->id;
 // }
+//
+// // The version-INVARIANT UVM_REGISTER_GPU wire constants.  These are the
+// // numbers the QEMU/guest/stub code actually uses on the wire; they are not
+// // part of struct nvkvm_abi_profile precisely because the OGKM sweep found no
+// // version boundary in them.  Exposed here so a test can hold them against the
+// // committed measurement fixture rather than against our own src/abi/uvm.h.
+// static unsigned c_reg_gpu_wire_size(void)   { return NVKVM_UVM_REGISTER_GPU_SIZE; }
+// static unsigned c_reg_gpu_wire_fd_off(void) { return NVKVM_UVM_REGISTER_GPU_FD_OFF; }
+// static unsigned c_reg_gpu_wire_st_off(void) { return NVKVM_UVM_REGISTER_GPU_STATUS_OFF; }
 import "C"
 
 import "unsafe"
@@ -51,4 +60,20 @@ func ProfileIDForVersion(version string) uint32 {
 	cs := C.CString(version)
 	defer C.free(unsafe.Pointer(cs))
 	return uint32(C.profile_id_for_version(cs))
+}
+
+// RegisterGPUWire exposes the NVKVM_UVM_REGISTER_GPU_* constants from
+// src/common/nvkvm_abi.h -- the values QEMU, the guest module and the stub all
+// put on the wire for UVM_REGISTER_GPU.  TestUVMRegisterGPUWireConstants holds
+// these against ogkm_register_gpu.tsv, the committed sweep of NVIDIA's own
+// headers, so the assertion is conformance to the driver rather than agreement
+// with another file in this repo.
+var RegisterGPUWire = struct {
+	Size      uint32
+	FdOff     uint32
+	StatusOff uint32
+}{
+	Size:      uint32(C.c_reg_gpu_wire_size()),
+	FdOff:     uint32(C.c_reg_gpu_wire_fd_off()),
+	StatusOff: uint32(C.c_reg_gpu_wire_st_off()),
 }
