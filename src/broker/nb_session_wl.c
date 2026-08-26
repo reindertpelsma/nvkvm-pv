@@ -341,6 +341,15 @@ struct nb_wl {
     bool                  bg_mapped;
     int                   off_x, off_y;   /* content offset inside the window */
 
+    /*
+     * What bd_layout() last positioned the borders from.  They are children of
+     * the CONTENT surface and offset by the letterbox, so they depend on
+     * off_x/off_y -- which bg_layout() computes from inside wl_viewport_apply(),
+     * on the per-frame path as well as the resize path.  Recording the inputs
+     * lets bd_layout() be called from both and do nothing when nothing moved.
+     */
+    int                   bd_at_ox, bd_at_oy, bd_at_w, bd_at_h;
+    bool                  bd_at_tb, bd_at_fs, bd_at_valid;
     struct wl_surface    *bd_surf[8];
     struct wl_subsurface *bd_sub[8];
     struct wp_viewport   *bd_vp[8];
@@ -1030,6 +1039,15 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
             w->frame_inflight = true;
         }
     }
+    /*
+     * The letterbox offsets the resize borders hang off are computed by
+     * bg_layout() inside the wl_viewport_apply() above, so re-place them here
+     * rather than only on the resize path -- otherwise the FIRST frame, the one
+     * that introduces the letterbox, leaves them where xdg_configure put them.
+     * Guarded on its inputs, so a steady stream of same-size frames pays only
+     * the compare.
+     */
+    bd_layout(w);
     wl_surface_commit(w->surf);
 
     sl->held = true;
@@ -2994,6 +3012,24 @@ static void bd_layout(struct nb_wl *w)
     if (!w->bd_buf) {
         return;
     }
+    /*
+     * Idempotence, so the per-frame caller costs six int compares.  Without
+     * that caller the borders were placed once at xdg_configure -- when off_x
+     * and off_y are still 0 because no frame has arrived to letterbox -- and
+     * nothing moved them until the first resize.  That is why the grab areas
+     * started out displaced and silently corrected themselves after one
+     * maximise.
+     */
+    if (w->bd_at_valid
+        && w->bd_at_ox == w->off_x && w->bd_at_oy == w->off_y
+        && w->bd_at_w  == w->win_w && w->bd_at_h  == w->win_h
+        && w->bd_at_tb == w->tb_mapped && w->bd_at_fs == w->fullscreen) {
+        return;
+    }
+    w->bd_at_ox = w->off_x; w->bd_at_oy = w->off_y;
+    w->bd_at_w  = w->win_w; w->bd_at_h  = w->win_h;
+    w->bd_at_tb = w->tb_mapped; w->bd_at_fs = w->fullscreen;
+    w->bd_at_valid = true;
     /*
      * UNMAP IN FULLSCREEN, like the title bar.  There is nothing to resize a
      * fullscreen window by, and -- the reason that matters here -- fullscreen
