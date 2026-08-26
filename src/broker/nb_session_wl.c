@@ -400,6 +400,15 @@ struct nb_wl {
     int    buf_w, buf_h;
     int    win_w, win_h;
     int    surf_w, surf_h;
+    /* A FOURTH, and it is the only one EV_SURFACE may ever carry: the window's
+     * CONTENT size -- win_* less the decorations we draw.  surf_* cannot serve
+     * because, per the note above, it becomes buf_* whenever no viewport is
+     * scaling: reporting it then tells the guest to render the size it just
+     * rendered, and on a fullscreen window the two disagree, so they trade
+     * places forever.  OBSERVED on a 4K display at scale 1.5: the guest flipped
+     * between 1920x1080 and 3760x2118 about every two seconds, indefinitely.
+     * (2160 - 42 is the 28px title bar at 1.5x, hence the odd number.) */
+    int    cont_w, cont_h;
     uint32_t deco_mode;
     bool   grabbed;
     bool   fullscreen;
@@ -1015,11 +1024,29 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     w->current = w->pending;
     w->pending = -1;
-    if (new_w != w->surf_w || new_h != w->surf_h) {
-        w->surf_w = new_w;
-        w->surf_h = new_h;
-        wl_report_surface(w, new_w, new_h);
-    }
+    /*
+     * RECORD WHAT WE PRESENTED.  DO NOT REPORT IT.
+     *
+     * EV_SURFACE is an INSTRUCTION -- "guest, render this size" -- and it must
+     * only ever carry what the WINDOW can show.  What arrives here is the size
+     * the guest actually sent, which is an OBSERVATION.  Sending it back told
+     * the guest to render the size it had just rendered, and on a fullscreen
+     * window the two disagree, so they traded places forever:
+     *
+     *   configure: the window can show 3760x2118  -> "render 3760x2118"
+     *   commit:    the guest's buffer is 1920x1080 -> "render 1920x1080"
+     *   configure: the window can still show 3760x2118 -> ...
+     *
+     * OBSERVED on a 4K display at scale 1.5: the guest flipped between
+     * 1920x1080 and 3760x2118 about every two seconds, forever.  (2160 - 42 is
+     * the 28px title bar at 1.5x, which is why the number looks arbitrary.)
+     *
+     * This is the same rule the WINDOW handler states one layer up -- a guest
+     * re-mode does not move the user's window -- applied to the buffer layer:
+     * what the guest did is not an instruction to the guest.
+     */
+    w->surf_w = new_w;
+    w->surf_h = new_h;
     return 0;
 }
 
@@ -1602,9 +1629,10 @@ static void frac_scale(void *d, struct wp_fractional_scale_v1 *f,
     nb_log("output scale is %u.%03u — the guest is told PHYSICAL pixels, so a "
            "fullscreen guest buffer can cover the output",
            scale / 120, (scale % 120) * 1000 / 120);
-    /* Re-report the surface at the new scale; the size in logical pixels has
-     * not changed, but what the guest should render has. */
-    wl_report_surface(w, w->surf_w, w->surf_h);
+    /* Re-report at the new scale: the size in logical pixels has not changed,
+     * but what the guest should render has.  cont_*, not surf_* -- see the
+     * field's comment for why reporting surf_* oscillates. */
+    wl_report_surface(w, w->cont_w, w->cont_h);
 }
 static const struct wp_fractional_scale_v1_listener frac_listener = {
     .preferred_scale = frac_scale,
@@ -2667,7 +2695,9 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
         wl_show_idle(w->sess);  /* repaint the placeholder at the new size */
         return;
     }
-    if (wd != w->surf_w || ht != w->surf_h) {
+    if (wd != w->cont_w || ht != w->cont_h) {
+        w->cont_w = wd;
+        w->cont_h = ht;
         w->surf_w = wd;
         w->surf_h = ht;
         if (w->sink) {
