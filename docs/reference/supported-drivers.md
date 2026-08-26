@@ -22,12 +22,19 @@ the "measured from OGKM" column, and `tests/abi_parity` asserts the table
 against those numbers (`go test -count=1 ./tests/abi_parity`).
 
 `UVM_REGISTER_GPU_PARAMS` is a separate universal invariant, not another
-profile row. A compiled sweep of every one of the 216 official numeric OGKM
-tags from 515.43.04 through 610.57.04 measured the same layout at every tag:
-size 40, `rmCtrlFd` at byte 24 and `rmStatus` at byte 36. There are therefore no
-driver-version boundaries for that structure. Reproduce the complete check
-with `tools/abi_derive.sh --all-published-supported`; the ordinary matrix also
-prints those three values for its representative tags.
+profile row. A compiled sweep run on **2026-08-26** over every one of the 216
+official numeric OGKM tags from 515.43.04 through 610.57.04 measured the same
+layout at every tag: size 40, `rmCtrlFd` at byte 24, `hClient` at 28,
+`hSmcPartRef` at 32 and `rmStatus` at byte 36 — 216/216 tags, no clone failure,
+no unmeasured cell. There are therefore no driver-version boundaries for that
+structure. The sweep output is committed at
+`tests/abi_parity/ogkm_register_gpu.tsv` (raw form in
+`ogkm_abi_sweep_20260826.tsv`) and is asserted against the shipped constants by
+`tests/abi_parity/ogkm_fixture_test.go`, so it is checkable from a clone.
+Reproduce it with `tools/abi_derive.sh --all-published-supported`; the ordinary
+matrix also prints those values for its representative tags. Coverage stops at
+515 because that is OGKM's first release — 470 and earlier have no public
+source and cannot be probed at all.
 
 | profile | driver versions | measured from OGKM | booted in this repository |
 |---|---|---|---|

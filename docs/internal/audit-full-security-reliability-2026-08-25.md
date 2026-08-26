@@ -393,12 +393,22 @@ bytes. The overwrite is contained to the sandboxed isolate, but it is still an
 eight-byte stack overwrite and a deterministic reliability failure if that
 path is activated.
 
-This is NVIDIA-driver-specific ABI work. A compiled source sweep checked all
-216 official numeric open-gpu-kernel-modules tags from 515.43.04 through
-610.57.04. Every tag compiled to size 40, `rmCtrlFd` offset 24 and `rmStatus`
-offset 36; there were zero missing probes and zero alternate layouts. Thus the
-supported range contains one interval for this structure and no version gate
-is appropriate. The repaired wire path forwards the full structure, translates
+This is NVIDIA-driver-specific ABI work. A compiled source sweep run on
+**2026-08-26** (`tools/abi_derive.sh --all-published-supported`) checked all 216
+official numeric open-gpu-kernel-modules tags from 515.43.04 through 610.57.04.
+Every tag compiled to size 40, `rmCtrlFd` offset 24, `hClient` offset 28,
+`hSmcPartRef` offset 32 and `rmStatus` offset 36; there were zero missing probes,
+zero clone failures and zero alternate layouts. Thus the supported range
+contains one interval for this structure and no version gate is appropriate.
+
+Note on how this was recorded. The remediation originally shipped this claim
+while the only artifact was a 37-tag scratch file outside the repository, so it
+described a run that had not happened at the stated scope and could not have
+been rechecked from a clone. The 216-tag sweep above is the real one; its output
+is committed at `tests/abi_parity/ogkm_register_gpu.tsv` and
+`tests/abi_parity/ogkm_fixture_test.go` now holds the shipped constants against
+every row of it. The 40-byte conclusion was correct — the evidence for it was
+not yet in the repository. The repaired wire path forwards the full structure, translates
 and round-trips the embedded control fd, preserves the two RM handles needed by
 replay, and statically asserts the size and offsets in the headerless stub.
 
