@@ -149,7 +149,7 @@ ordered(
     "unsigned int hz = refresh_mhz / 1000;",
     "kms->host_hz = hz;",
 )
-assert "if (hz >= NVKVM_KMS_HZ_MIN && hz <= NVKVM_KMS_HZ_MAX)" in set_host, \
+assert "hz >= NVKVM_KMS_HZ_MIN && hz <= NVKVM_KMS_HZ_MAX" in set_host, \
     "an out-of-range refresh from the host is no longer bounded"
 
 # And the event carries it at all.
@@ -161,4 +161,17 @@ virtio = section(
 assert "le32_to_cpu(ui->refresh_mhz)" in virtio, \
     "the ui_info event's refresh is not being read"
 
-print("guest wiring: refresh-rate chain intact")
+# The rate must drive the VBLANK, not only the advertised mode.  A compositor
+# waits on vblank; vblank comes from the hrtimer; the hrtimer uses kms->period.
+# Setting host_hz without setting period is half a feature and looks correct.
+assert "kms->period = ns_to_ktime(NSEC_PER_SEC / hz);" in set_host, \
+    "the host's refresh no longer paces the guest's vblank"
+vblank = section(
+    "src/guest/nvkvm_kms.c",
+    "static enum hrtimer_restart nvkvm_vblank_fn(",
+    "\n/* \u2500\u2500 Connector",
+)
+assert "hrtimer_forward_now(t, kms->period);" in vblank, \
+    "the vblank timer no longer reads the period the host set"
+
+print("guest wiring: refresh-rate chain intact, and it paces the vblank")

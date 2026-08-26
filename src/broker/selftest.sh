@@ -220,6 +220,20 @@ for good in auto none guest 1920x1080; do
     check "--resolution $good is accepted" 'listening on' "$TMP/resg.log"
 done
 
+# --refresh is not cosmetic: the guest paces its virtual vblank to it, so a
+# bad value must be refused at startup rather than becoming a bad frame rate.
+for bad in 0 2000 junk -1; do
+    "$BROKER" --backend test --refresh "$bad" --socket "$TMP/hz.sock" \
+        > "$TMP/hz.log" 2>&1 </dev/null || true
+    check "--refresh $bad is refused at startup" 'refresh must be' "$TMP/hz.log"
+done
+for good in auto none 144 59.94; do
+    ( sleep 0.4 ) | "$BROKER" --backend test --refresh "$good" \
+        --socket "$TMP/hzg.sock" > "$TMP/hzg.log" 2>&1 &
+    sleep 0.8; wait 2>/dev/null
+    check "--refresh $good is accepted" 'listening on' "$TMP/hzg.log"
+done
+
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"
 nocheck "and do not reach attach"                     'TEST attach'     "$CASE_LOG"

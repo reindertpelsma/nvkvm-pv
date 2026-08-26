@@ -2328,6 +2328,11 @@ static void usage(void)
 "                       chosen from a MENU cannot be caught this way\n"
 "  --trace-frames       log one line per commit: frame counter, dma-buf\n"
 "                       inode, cache slot, buffers the compositor still holds\n"
+"  --refresh WHAT       what refresh to tell the guest: auto (default, from\n"
+"                       the compositor's presentation feedback), none (say\n"
+"                       nothing; the guest keeps its kms_hz default), or a\n"
+"                       rate in Hz.  The guest paces its virtual vblank to\n"
+"                       this, so it is not cosmetic.\n"
 "  --resolution WHAT    what size to SUGGEST to the guest.  A suggestion only:\n"
 "                       the guest may ignore it, and whatever frame arrives is\n"
 "                       displayed at whatever size it arrives.\n"
@@ -2601,6 +2606,27 @@ int main(int argc, char **argv)
                 nb_err("--resolution must be auto, none, or WxH within 1..%u",
                        NVKVM_BROKER_MAX_DIM);
                 return 2;
+            }
+        }
+        else if (!strncmp(a, "--refresh=", 10) || !strcmp(a, "--refresh")) {
+            const char *arg;
+            double hz;
+            char *end = NULL;
+
+            if (a[9] == '=') { arg = a + 10; } else { NEEDVAL(); arg = v; }
+            if (!strcmp(arg, "auto")) {
+                nb_hz_mode = NB_HZ_AUTO;
+            } else if (!strcmp(arg, "none")) {
+                nb_hz_mode = NB_HZ_NONE;
+            } else {
+                hz = strtod(arg, &end);
+                if (!end || *end || !(hz >= 1.0 && hz <= 1000.0)) {
+                    nb_err("--refresh must be auto, none, or a rate in Hz "
+                           "between 1 and 1000");
+                    return 2;
+                }
+                nb_hz_mode  = NB_HZ_FIXED;
+                nb_hz_fixed = (unsigned)(hz * 1000.0 + 0.5);
             }
         }
         else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }

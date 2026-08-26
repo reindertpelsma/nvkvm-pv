@@ -179,6 +179,19 @@ const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
  * displayed, at whatever size it arrives; a resolution disagreement must never
  * cost a frame, because a frozen window reads to a user as a crash.
  */
+/*
+ * The refresh we tell the guest, in millihertz.  0 with NB_HZ_AUTO means "not
+ * learned yet"; the broker's only source is presentation feedback, so it knows
+ * nothing until a frame has been presented.
+ *
+ * The override exists because that source can be wrong or absent: an X11
+ * session has none, a compositor may report the output's nominal rate while
+ * something else limits the real one, and a guest is sometimes wanted at a
+ * deliberately lower rate than the panel.
+ */
+int      nb_hz_mode = NB_HZ_AUTO;
+unsigned nb_hz_fixed;          /* millihertz, NB_HZ_FIXED only */
+
 int      nb_res_mode = NB_RES_AUTO;
 unsigned nb_res_w, nb_res_h;   /* NB_RES_FIXED only */
 
