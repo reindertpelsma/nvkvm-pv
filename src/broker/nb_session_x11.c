@@ -98,6 +98,22 @@ struct nb_x11 {
     bool              have_xi;
 #endif
     xcb_atom_t        a_wm_state, a_fs, a_wm_proto, a_wm_delete;
+    /*
+     * CLIPBOARD.  X11 gets the same boundary Wayland does -- the broker is the
+     * only thing that touches either selection, the guest never reaches across
+     * on its own, and a paste happens only when the user presses the paste key
+     * in this window.  Which display server the host happens to run is not a
+     * security parameter.
+     */
+    xcb_atom_t        a_clipboard, a_utf8, a_targets, a_prop, a_incr;
+    xcb_timestamp_t   last_time;      /* a REAL event time; X rejects guesses */
+    bool              focused;
+    char             *src_text;       /* what we serve as CLIPBOARD owner     */
+    size_t            src_len;
+    char             *clip_pending;   /* a guest copy held until focus        */
+    size_t            clip_pending_len;
+    bool              fetch_active;   /* a paste is in flight                 */
+    uint64_t          fetch_generation;
     xcb_visualid_t    visual24;       /* the content window's visual          */
 
     struct nb_formats formats;
@@ -119,6 +135,13 @@ struct nb_x11 {
     int  con_w, con_h;              /* content-window size we last asked for  */
     bool grabbed, fullscreen;
 };
+
+/* Clipboard: defined below the presentation code, used from the event loop. */
+static void x11_clip_flush_pending(struct nb_x11 *x);
+static void x11_clip_serve(struct nb_x11 *x,
+                           const xcb_selection_request_event_t *rq);
+static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
+                             const xcb_selection_notify_event_t *sn);
 
 /* ── small helpers ───────────────────────────────────────────────────────── */
 
@@ -545,10 +568,29 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 break;
             }
             /* The property that stops the grab being a keylogger. */
-            nb_sink_focus(sink,
-                          (ev->response_type & 0x7f) == XCB_FOCUS_IN);
+            x->focused = (ev->response_type & 0x7f) == XCB_FOCUS_IN;
+            nb_sink_focus(sink, x->focused);
+            /* A copy the guest made while we were unfocused is applied HERE,
+             * which is also the first moment the user can see it happen. */
+            x11_clip_flush_pending(x);
             break;
         }
+        case XCB_SELECTION_REQUEST:
+            x11_clip_serve(x, (xcb_selection_request_event_t *)ev);
+            break;
+
+        case XCB_SELECTION_CLEAR:
+            /* Someone else took the clipboard.  Ours is stale; drop it rather
+             * than keep serving the guest's text after the user moved on. */
+            free(x->src_text);
+            x->src_text = NULL;
+            x->src_len = 0;
+            break;
+
+        case XCB_SELECTION_NOTIFY:
+            x11_clip_receive(x, sink, (xcb_selection_notify_event_t *)ev);
+            break;
+
         case XCB_CLIENT_MESSAGE: {
             xcb_client_message_event_t *cm = (void *)ev;
 
@@ -588,6 +630,15 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
         case XCB_KEY_PRESS:
         case XCB_KEY_RELEASE: {
             xcb_key_press_event_t *k = (void *)ev;
+
+            /*
+             * Keep a REAL server timestamp.  Taking and converting a selection
+             * both need one -- ICCCM says use the time of the event that
+             * prompted it, and XCB_CURRENT_TIME is exactly what a strict owner
+             * rejects.  The paste key is a key event, so this is always fresh
+             * by the time it matters.
+             */
+            x->last_time = k->time;
 
             nb_sink_key(sink, x11_kc_to_evdev(k->detail),
                         (ev->response_type & 0x7f) == XCB_KEY_PRESS);
@@ -820,6 +871,10 @@ static void x11_close(struct nb_session *s)
     if (!x) {
         return;
     }
+    free(x->src_text);
+    x->src_text = NULL;
+    free(x->clip_pending);
+    x->clip_pending = NULL;
     if (x->c && !xcb_connection_has_error(x->c)) {
         x11_set_grab(s, false);
         for (i = 0; i < NB_MAX_BUFS; i++) {
@@ -997,6 +1052,11 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     x->a_fs        = x11_atom(x->c, "_NET_WM_STATE_FULLSCREEN");
     x->a_wm_proto  = x11_atom(x->c, "WM_PROTOCOLS");
     x->a_wm_delete = x11_atom(x->c, "WM_DELETE_WINDOW");
+    x->a_clipboard = x11_atom(x->c, "CLIPBOARD");
+    x->a_utf8      = x11_atom(x->c, "UTF8_STRING");
+    x->a_targets   = x11_atom(x->c, "TARGETS");
+    x->a_prop      = x11_atom(x->c, "NVKVM_CLIP");
+    x->a_incr      = x11_atom(x->c, "INCR");
     if (x->a_wm_proto != XCB_ATOM_NONE && x->a_wm_delete != XCB_ATOM_NONE) {
         xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_wm_proto,
                             XCB_ATOM_ATOM, 32, 1, &x->a_wm_delete);
@@ -1013,6 +1073,9 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
 
     s->width = (uint32_t)x->win_w;
     s->height = (uint32_t)x->win_h;
+    /* Both directions, same as Wayland: the boundary the broker draws must not
+     * depend on which display server the host happens to run. */
+    s->clipboard_caps = NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G;
     s->caps = NVKVM_BROKER_CAP_KEYBOARD | NVKVM_BROKER_CAP_ABS_POINTER |
               NVKVM_BROKER_CAP_POINTER_LOCK | NVKVM_BROKER_CAP_TOTAL_GRAB |
               NVKVM_BROKER_CAP_FOCUS_EVENTS | NVKVM_BROKER_CAP_FULLSCREEN |
@@ -1072,6 +1135,199 @@ fail:
     return -ENOTSUP;
 }
 
+/* ── clipboard ───────────────────────────────────────────────────────────── */
+/*
+ * The X11 half of the same policy the Wayland backend implements, using the
+ * two primitives X has had since forever: we OWN the CLIPBOARD selection to
+ * hand the guest's text out, and we CONVERT it to read the host's text in.
+ *
+ * Both are asynchronous and both are driven from the existing event loop, so
+ * unlike Wayland there is no extra fd to poll: the reply arrives as an event
+ * on the connection we already watch.
+ */
+
+/* Guest -> host.  0 = it IS the clipboard now, 1 = held until focus, <0 error. */
+static int x11_set_clipboard(struct nb_session *s, const char *text, size_t len)
+{
+    struct nb_x11 *x = s->priv;
+    char *copy;
+
+    copy = malloc(len + 1);
+    if (!copy) {
+        return -ENOMEM;
+    }
+    memcpy(copy, text, len);
+    copy[len] = '\0';
+
+    /*
+     * NOT FOCUSED: hold it.  Same rule as Wayland, for the same reason -- a
+     * background VM must not replace what you copied somewhere else -- and
+     * dropping it would lose the copy entirely, because the guest believes it
+     * succeeded and never re-sends.
+     */
+    if (!x->focused) {
+        free(x->clip_pending);
+        x->clip_pending = copy;
+        x->clip_pending_len = len;
+        return 1;
+    }
+
+    free(x->src_text);
+    x->src_text = copy;
+    x->src_len = len;
+
+    /*
+     * A REAL timestamp, not XCB_CURRENT_TIME.  ICCCM says an owner must use
+     * the time of the event that prompted it, and some clients police it.
+     */
+    xcb_set_selection_owner(x->c, x->win, x->a_clipboard, x->last_time);
+    xcb_flush(x->c);
+    return 0;
+}
+
+static void x11_clip_flush_pending(struct nb_x11 *x)
+{
+    char *text;
+    size_t len;
+
+    if (!x->clip_pending || !x->focused) {
+        return;
+    }
+    text = x->clip_pending; len = x->clip_pending_len;
+    x->clip_pending = NULL; x->clip_pending_len = 0;
+    if (x->sess && x11_set_clipboard(x->sess, text, len) == 0) {
+        nb_log("the VM's clipboard text is now on yours (it was held while "
+               "the window was not focused)");
+    }
+    free(text);
+}
+
+/* Someone asked us for the selection we own. */
+static void x11_clip_serve(struct nb_x11 *x,
+                           const xcb_selection_request_event_t *rq)
+{
+    xcb_selection_notify_event_t ev;
+    xcb_atom_t prop = rq->property != XCB_ATOM_NONE ? rq->property : rq->target;
+    bool ok = false;
+
+    if (x->src_text && rq->target == x->a_targets) {
+        const xcb_atom_t targets[] = { x->a_targets, x->a_utf8, XCB_ATOM_STRING };
+
+        xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, rq->requestor, prop,
+                            XCB_ATOM_ATOM, 32,
+                            (uint32_t)(sizeof targets / sizeof targets[0]),
+                            targets);
+        ok = true;
+    } else if (x->src_text &&
+               (rq->target == x->a_utf8 || rq->target == XCB_ATOM_STRING)) {
+        xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, rq->requestor, prop,
+                            rq->target, 8, (uint32_t)x->src_len, x->src_text);
+        ok = true;
+    }
+
+    memset(&ev, 0, sizeof ev);
+    ev.response_type = XCB_SELECTION_NOTIFY;
+    ev.time      = rq->time;
+    ev.requestor = rq->requestor;
+    ev.selection = rq->selection;
+    ev.target    = rq->target;
+    ev.property  = ok ? prop : XCB_ATOM_NONE;   /* NONE = refused, per ICCCM */
+    xcb_send_event(x->c, 0, rq->requestor, XCB_EVENT_MASK_NO_EVENT,
+                   (const char *)&ev);
+    xcb_flush(x->c);
+}
+
+/* Host -> guest: ask for the selection.  The answer arrives as an event. */
+static int x11_fetch_clipboard(struct nb_session *s, struct nb_sink *sink,
+                               uint64_t generation)
+{
+    struct nb_x11 *x = s->priv;
+
+    (void)sink;
+    if (x->fetch_active) {
+        return -EBUSY;                  /* one at a time, as on Wayland */
+    }
+    /*
+     * Nobody owns it -- there is nothing to paste.  Reported as ENOENT so the
+     * caller releases the held keystroke rather than waiting for a reply that
+     * will never come.
+     */
+    xcb_get_selection_owner_reply_t *own =
+        xcb_get_selection_owner_reply(x->c,
+            xcb_get_selection_owner(x->c, x->a_clipboard), NULL);
+    bool have_owner = own && own->owner != XCB_WINDOW_NONE;
+    free(own);
+    if (!have_owner) {
+        return -ENOENT;
+    }
+
+    xcb_delete_property(x->c, x->win, x->a_prop);
+    xcb_convert_selection(x->c, x->win, x->a_clipboard, x->a_utf8,
+                          x->a_prop, x->last_time);
+    xcb_flush(x->c);
+    x->fetch_active = true;
+    x->fetch_generation = generation;
+    return 0;
+}
+
+/* The selection we asked for has landed (or been refused). */
+static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
+                             const xcb_selection_notify_event_t *sn)
+{
+    xcb_get_property_reply_t *pr;
+    bool sent = false;
+
+    if (!x->fetch_active) {
+        return;
+    }
+    x->fetch_active = false;
+
+    if (sn->property == XCB_ATOM_NONE) {
+        nb_log("clipboard: the selection owner refused to give us text");
+        nb_sink_clip_finish(sink, x->fetch_generation, false);
+        x->fetch_generation = 0;
+        return;
+    }
+    pr = xcb_get_property_reply(x->c,
+            xcb_get_property(x->c, 1 /* delete */, x->win, x->a_prop,
+                             XCB_GET_PROPERTY_TYPE_ANY, 0,
+                             (NVKVM_BROKER_CLIP_MAX_BYTES + 3) / 4), NULL);
+    if (pr) {
+        int len = xcb_get_property_value_length(pr);
+        const char *val = xcb_get_property_value(pr);
+
+        if (pr->type == x->a_incr) {
+            /*
+             * INCR means the owner wants to stream it in chunks, which it only
+             * does for something far larger than our 7 KiB cap.  Refuse rather
+             * than implement a protocol we would immediately truncate.
+             */
+            nb_log("clipboard: the host selection is too large to paste "
+                   "(offered incrementally; the cap is %u bytes)",
+                   NVKVM_BROKER_CLIP_MAX_BYTES);
+        } else if (len > 0 && (unsigned)len <= NVKVM_BROKER_CLIP_MAX_BYTES) {
+            sent = nb_sink_send_clipboard(sink, x->fetch_generation, val,
+                                          (size_t)len);
+        } else if (len > 0) {
+            nb_log("clipboard: host selection is larger than the %u-byte cap; "
+                   "not pasting it", NVKVM_BROKER_CLIP_MAX_BYTES);
+        }
+        free(pr);
+    }
+    nb_sink_clip_finish(sink, x->fetch_generation, sent);
+    x->fetch_generation = 0;
+}
+
+static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
+{
+    struct nb_x11 *x = s->priv;
+
+    if (x->fetch_active && x->fetch_generation == generation) {
+        x->fetch_active = false;
+        x->fetch_generation = 0;
+    }
+}
+
 static const struct nb_session_ops x11_ops = {
     .name = "x11",
     .open = x11_open,
@@ -1084,6 +1340,9 @@ static const struct nb_session_ops x11_ops = {
     .attach = x11_attach,
     .commit = x11_commit,
     .resize = x11_resize,
+    .set_clipboard = x11_set_clipboard,
+    .fetch_clipboard = x11_fetch_clipboard,
+    .client_detach = x11_client_detach_clip,
 };
 
 struct nb_session *nb_session_x11(const struct nb_config *cfg)
