@@ -1086,6 +1086,48 @@ static void nb_violation(struct nb_sink *s, const char *why)
 }
 
 /*
+ * Resolve a requested (fourcc, modifier) to one the display actually
+ * advertises, or refuse.
+ *
+ * ONE code path, used by ATTACH and by CMD_QUERY_FORMAT, so the answer the VMM
+ * is given can never disagree with what the next frame does.  A query that says
+ * "yes" followed by a rejected ATTACH would be worse than no query at all: the
+ * VMM would settle on zero-copy and every frame would vanish.
+ *
+ * Returns true and writes the fourcc to USE (possibly the opaque twin) to
+ * *use_fourcc; false means no description of this buffer is displayable.
+ */
+static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
+                              uint64_t modifier, uint32_t *use_fourcc)
+{
+    if (ss->ops->format_ok(ss, fourcc, modifier)) {
+        *use_fourcc = fourcc;
+        return true;
+    }
+    /*
+     * Try the OPAQUE TWIN of an alpha format.
+     *
+     * This is not a relaxation of HARDENING 3: the pair we fall back to must
+     * ITSELF be advertised, so the compositor is still only ever handed
+     * something it said it could import.  What changes is which of two
+     * bit-identical descriptions of the same buffer it gets.
+     *
+     * A guest head flips AR24; the compositor advertises the modifier for XR24
+     * only, because alpha goes through its blend path and block-linear is not
+     * always wired up there.  The bytes are the same either way and a scanout
+     * has no meaningful alpha, so describing it as opaque is both correct and
+     * cheaper for the compositor -- it may skip blending altogether.
+     */
+    uint32_t twin = nb_fourcc_opaque_twin(fourcc);
+
+    if (twin && ss->ops->format_ok(ss, twin, modifier)) {
+        *use_fourcc = twin;
+        return true;
+    }
+    return false;
+}
+
+/*
  * HARDENING 1, 2, 3: validate the descriptor against the REAL buffer.
  *
  * A-18 in docs/internal/audit-boundaries-2026-08-20.md is this exact bug found
@@ -1125,59 +1167,38 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                c->width, c->height, NVKVM_BROKER_MAX_DIM);
         return -EINVAL;
     }
-    /* HARDENING 3: not a hardcoded list — what the GPU advertises. */
-    fourcc = c->fourcc;
-    if (!ss->ops->format_ok(ss, fourcc, c->modifier)) {
+    /* HARDENING 3: not a hardcoded list — what the GPU advertises.  Shared
+     * with CMD_QUERY_FORMAT so the promise and the frame cannot disagree. */
+    if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
         /*
-         * Before refusing, try the OPAQUE TWIN of an alpha format.
-         *
-         * This is not a relaxation of HARDENING 3: the pair we fall back to
-         * must ITSELF be advertised, so the compositor is still only ever
-         * handed something it said it could import.  What changes is which of
-         * two bit-identical descriptions of the same buffer we hand it.
-         *
-         * A guest head flips AR24; the compositor advertises the NVIDIA
-         * block-linear modifier for XR24 only, because alpha goes through its
-         * blend path and block-linear is not always wired up there.  The bytes
-         * are the same either way and a scanout has no meaningful alpha, so
-         * describing it as opaque is both correct and cheaper for the
-         * compositor -- it may skip blending altogether.
-         *
-         * If the twin is not advertised either, we still refuse.
+         * Name the VENDOR.  A rejection that lists only the pair reads as
+         * "one entry is missing"; when the vendor differs from everything
+         * the display offers, NO pair can ever match and the answer is a
+         * copy, not a different format.  Saying so here is the difference
+         * between a one-line diagnosis and an evening of bisecting.
          */
-        uint32_t twin = nb_fourcc_opaque_twin(fourcc);
+        nb_err("ATTACH: fourcc %s modifier 0x%016llx (%s) is not "
+               "advertised by this display.  If the compositor runs on a "
+               "different GPU than the guest's, no modifier will ever "
+               "match and a readback/copy path is required — the VMM can "
+               "ask first with CMD_QUERY_FORMAT; run the broker with "
+               "--verbose to see what it does advertise.",
+               nb_fourcc_name(c->fourcc, fcc),
+               (unsigned long long)c->modifier,
+               nb_modifier_vendor(c->modifier));
+        return -EINVAL;
+    }
+    if (fourcc != c->fourcc) {
+        static bool told;
 
-        if (twin && ss->ops->format_ok(ss, twin, c->modifier)) {
-            static bool told;
-
-            if (!told) {
-                told = true;
-                nb_log("ATTACH: %s modifier 0x%016llx is not advertised, but "
-                       "its opaque twin %s is — presenting as %s (same bytes; "
-                       "a scanout has no alpha).  Logged once.",
-                       nb_fourcc_name(fourcc, fcc),
-                       (unsigned long long)c->modifier,
-                       nb_fourcc_name(twin, fcc2),
-                       nb_fourcc_name(twin, fcc2));
-            }
-            fourcc = twin;
-        } else {
-            /*
-             * Name the VENDOR.  A rejection that lists only the pair reads as
-             * "one entry is missing"; when the vendor differs from everything
-             * the display offers, NO pair can ever match and the answer is a
-             * copy, not a different format.  Saying so here is the difference
-             * between a one-line diagnosis and an evening of bisecting.
-             */
-            nb_err("ATTACH: fourcc %s modifier 0x%016llx (%s) is not "
-                   "advertised by this display.  If the compositor runs on a "
-                   "different GPU than the guest's, no modifier will ever "
-                   "match and a readback/copy path is required — run the "
-                   "broker with --verbose to see what it does advertise.",
-                   nb_fourcc_name(fourcc, fcc),
+        if (!told) {
+            told = true;
+            nb_log("ATTACH: %s modifier 0x%016llx is not advertised, but its "
+                   "opaque twin %s is — presenting as %s (same bytes; a "
+                   "scanout has no alpha).  Logged once.",
+                   nb_fourcc_name(c->fourcc, fcc),
                    (unsigned long long)c->modifier,
-                   nb_modifier_vendor(c->modifier));
-            return -EINVAL;
+                   nb_fourcc_name(fourcc, fcc2), nb_fourcc_name(fourcc, fcc2));
         }
     }
     bpp = nb_fourcc_bpp(fourcc);
@@ -1313,6 +1334,50 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             nb_err("ATTACH: the display refused the buffer: %s", strerror(-r));
         }
         return;
+
+    case NVKVM_BROKER_CMD_QUERY_FORMAT: {
+        /*
+         * "Can you display this?"  Answered from the SAME resolver ATTACH
+         * uses, so a yes here is binding.
+         *
+         * The VMM needs this because it cannot see the advertised set and a
+         * rejected ATTACH is not reported back to it -- the frame is dropped
+         * and the reason goes to our stderr.  Without the question, a
+         * cross-vendor host is a black window with an explanation the VMM
+         * never hears.
+         *
+         * No fd, no state, no side effects: a query cannot change what the
+         * next frame does.  reserved1 is checked because this uses the
+         * ordinary command layout, which has one.
+         */
+        uint32_t use = 0;
+        bool ok;
+
+        if (c->reserved1 != 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            nb_violation(s, "QUERY_FORMAT reserved1 is not zero");
+            return;
+        }
+        if (fd >= 0) {
+            close(fd);          /* a query carries no buffer; drop any fd */
+        }
+        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use);
+        {
+            char fcc[8];
+            nb_log("QUERY_FORMAT %s modifier 0x%016llx (%s) -> %s%s",
+                   nb_fourcc_name(c->fourcc, fcc),
+                   (unsigned long long)c->modifier,
+                   nb_modifier_vendor(c->modifier),
+                   ok ? "YES" : "NO",
+                   (ok && use != c->fourcc) ? " (as its opaque twin)" : "");
+        }
+        nb_emit(s, NVKVM_BROKER_EV_FORMAT, ok ? 1 : 0, (int)c->fourcc,
+                (uint32_t)(c->modifier & 0xffffffffu),
+                (uint32_t)(c->modifier >> 32));
+        return;
+    }
 
     case NVKVM_BROKER_CMD_COMMIT:
         if (c->reserved1 != 0) {

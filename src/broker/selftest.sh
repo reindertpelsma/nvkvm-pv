@@ -146,6 +146,21 @@ check   "AR24 falls back to its advertised opaque twin XR24" \
 check   "and the frame is attached, not refused" 'TEST attach' "$CASE_LOG"
 nocheck "with no rejection"                      'not advertised by' "$CASE_LOG"
 
+# CMD_QUERY_FORMAT: the VMM must be able to ASK before it commits to zero-copy,
+# because a rejected ATTACH is not reported back to it.  The answer comes from
+# the same resolver ATTACH uses, so a YES here is binding.
+run_case '' --present 320x240 --query-format
+check   "an advertised pair answers USABLE" \
+        'fourcc=XR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
+check   "an alpha format its twin covers answers USABLE" \
+        'fourcc=AR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
+check   "a foreign-vendor modifier answers NOT USABLE" \
+        'modifier=0x0300000000606014 -> NOT USABLE' "$CASE_OUT"
+check   "the broker logs the query and its verdict" \
+        'QUERY_FORMAT .* -> NO' "$CASE_LOG"
+nocheck "a query is not treated as a protocol violation" \
+        'protocol violation' "$CASE_LOG"
+
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"
 nocheck "and do not reach attach"                     'TEST attach'     "$CASE_LOG"

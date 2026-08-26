@@ -95,6 +95,21 @@ enum {
      * than length-prefixed.
      */
     NVKVM_BROKER_EV_CLIPBOARD = 15,
+
+    /*
+     * Answer to NVKVM_BROKER_CMD_QUERY_FORMAT.  The question is echoed back so
+     * the client needs no outstanding-query state and cannot mismatch a reply
+     * to a request:
+     *     x  = 1 the display can show it, 0 it cannot
+     *     y  = the fourcc that was asked about
+     *     w0 = modifier, low 32 bits
+     *     w1 = modifier, high 32 bits
+     *
+     * x=1 is the same judgement ATTACH would make, taken through the same code
+     * path -- including the opaque-twin substitution -- so an accepted answer
+     * cannot be followed by a rejected frame.
+     */
+    NVKVM_BROKER_EV_FORMAT    = 16,
 };
 
 /* ── Clipboard framing ───────────────────────────────────────────────────── *
@@ -289,6 +304,29 @@ enum {
      * mode up to `full` believing the mode was the problem.
      */
     NVKVM_BROKER_CMD_CAPS = 5,
+
+    /*
+     * "Can you display a buffer of this (fourcc, modifier)?"  Answered with
+     * NVKVM_BROKER_EV_FORMAT.  Uses the ordinary command record: `fourcc` and
+     * `modifier` are the question; every other field is ignored.
+     *
+     * WHY THIS EXISTS.  The guest renders in its GPU's native tiling, and on a
+     * CROSS-VENDOR host -- guest on NVIDIA, compositor scanning out on an
+     * Intel/AMD iGPU -- the compositor cannot import that at any price.
+     * MEASURED on a hybrid laptop: Mutter advertised 28 (format, modifier)
+     * pairs, every one of them Intel, LINEAR or INVALID, while the guest
+     * presented NVIDIA block-linear 0x0300000000606014.  Every ATTACH was
+     * refused and the window stayed black.
+     *
+     * The VMM cannot work that out for itself: the advertised set lives in the
+     * broker, and an ATTACH rejection is not reported back (it drops the frame
+     * and logs).  So it must be able to ASK, once, at mode-set -- and on "no"
+     * fall back to reading the frame back through the guest's own GPU into a
+     * LINEAR buffer that any compositor can take.
+     *
+     * Asked once per mode change, never per frame.
+     */
+    NVKVM_BROKER_CMD_QUERY_FORMAT = 6,
 };
 
 /* NVKVM_BROKER_CMD_CAPS `width` bits. */

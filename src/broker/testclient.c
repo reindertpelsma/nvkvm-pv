@@ -19,6 +19,9 @@
  *
  *   --bad-size H       claim height H for a buffer that is smaller (A-18)
  *   --bad-fourcc       claim a format the display never advertised
+ *   --query-format     ask CMD_QUERY_FORMAT about three pairs and print the
+ *                      answers: one advertised, one only via its opaque twin,
+ *                      one NVIDIA block-linear that no test display can take
  *   --alpha-fourcc     send AR24 where only its opaque twin XR24 is
  *                      advertised: must be ACCEPTED and shown as XR24
  *   --bad-dim          claim dimensions past NVKVM_BROKER_MAX_DIM
@@ -65,6 +68,7 @@ static const char *evname(int t)
     case NVKVM_BROKER_EV_FOCUS:   return "FOCUS";
     case NVKVM_BROKER_EV_POINTER: return "POINTER";
     case NVKVM_BROKER_EV_BYE:     return "BYE";
+    case NVKVM_BROKER_EV_FORMAT:  return "FORMAT";
     default:                      return "?";
     }
 }
@@ -128,7 +132,7 @@ int main(int argc, char **argv)
     int sock, i;
     unsigned pw = 0, ph = 0, ww = 0, wh = 0;
     int bad_size = 0, bad_fourcc = 0, bad_dim = 0, bad_fd = 0, bad_frame = 0;
-    int alpha_fourcc = 0;
+    int alpha_fourcc = 0, query_format = 0;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
     int quiet_after = 0, caps_clipboard = 0;
 
@@ -153,6 +157,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--bad-size") && v){ bad_size = atoi(v); i++; }
         else if (!strcmp(a, "--bad-fourcc"))   { bad_fourcc = 1; }
         else if (!strcmp(a, "--alpha-fourcc")) { alpha_fourcc = 1; }
+        else if (!strcmp(a, "--query-format")) { query_format = 1; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
         else if (!strcmp(a, "--bad-frame"))    { bad_frame = 1; }
@@ -205,6 +210,13 @@ int main(int argc, char **argv)
                (p.flags & NVKVM_BROKER_F_FOCUSED) ? "F" : "-",
                p.x, p.y, p.w0, p.w1);
 
+        if (p.type == NVKVM_BROKER_EV_FORMAT) {
+            uint64_t m = (uint64_t)p.w0 | ((uint64_t)p.w1 << 32);
+            printf("  FORMAT ANSWER: fourcc=%.4s modifier=0x%016llx -> %s\n",
+                   (const char *)&p.y, (unsigned long long)m,
+                   p.x ? "USABLE" : "NOT USABLE (readback required)");
+        }
+
         if (p.type == NVKVM_BROKER_EV_HELLO) {
             printf("  proto v%u caps 0x%x: kbd=%d abs=%d rel=%d lock=%d "
                    "total-grab=%d focus=%d fs=%d dmabuf=%d modifiers=%d "
@@ -232,6 +244,30 @@ int main(int argc, char **argv)
             continue;
         }
         quiet_after = 1;
+
+        if (query_format) {
+            static const struct { uint32_t f; uint64_t m; const char *why; } q[] = {
+                { FOURCC('X','R','2','4'), 0,
+                  "advertised outright" },
+                { FOURCC('A','R','2','4'), 0,
+                  "only its opaque twin XR24 is advertised" },
+                { FOURCC('X','R','2','4'), 0x0300000000606014ull,
+                  "NVIDIA block-linear: no test display can take it" },
+            };
+            for (unsigned qi = 0; qi < 3; qi++) {
+                struct nvkvm_broker_cmd qc = {
+                    .type = NVKVM_BROKER_CMD_QUERY_FORMAT,
+                    .fourcc = q[qi].f, .modifier = q[qi].m,
+                };
+                printf("  -> QUERY_FORMAT %.4s 0x%016llx (%s)\n",
+                       (const char *)&q[qi].f, (unsigned long long)q[qi].m,
+                       q[qi].why);
+                if (send_cmd(sock, &qc, NULL, 0, sizeof qc) != 0) {
+                    perror("send QUERY_FORMAT");
+                    break;
+                }
+            }
+        }
 
         if (caps_clipboard) {
             struct nvkvm_broker_cmd c = {
