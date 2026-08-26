@@ -124,9 +124,36 @@ const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
  * per src/guest/nvkvm_kms.c) are NVIDIA-specific and driver-version-specific,
  * so a hardcoded list would be wrong on the next driver.
  */
+/*
+ * --linear-only: advertise ONLY DRM_FORMAT_MOD_LINEAR.
+ *
+ * Two uses, and the second is why it stays supported rather than being a test
+ * hook.
+ *
+ * TESTING: the cross-vendor path is hard to reach on purpose -- it needs a host
+ * whose compositor scans out on a different GPU than the guest renders on.
+ * Forcing the advertised set down to LINEAR reproduces the CONDITION (the
+ * guest's tiling is not displayable) on any host, so the readback path can be
+ * exercised without a second GPU, a BIOS change or a cable move.
+ *
+ * COMPATIBILITY: a compositor can advertise a modifier it then fails to import.
+ * We have already measured NVIDIA accepting a LINEAR dma-buf into
+ * eglCreateImageKHR and refusing it at bind, so "advertised" and "works" are
+ * demonstrably not the same claim.  When a display lies, narrowing to the one
+ * layout every GPU can read is the escape hatch, at the cost of a readback.
+ *
+ * DRM_FORMAT_MOD_INVALID is dropped too: implicit modifiers mean "whatever the
+ * driver chose", which is exactly the uncertainty this option exists to remove.
+ */
+bool nb_linear_only;
+
 void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier)
 {
     unsigned i;
+
+    if (nb_linear_only && modifier != 0) {
+        return;
+    }
 
     /*
      * DROP WHAT WE COULD NEVER ACCEPT ANYWAY, BEFORE IT COSTS A SLOT.

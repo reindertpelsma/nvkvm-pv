@@ -415,6 +415,9 @@ struct nb_session *nb_session_open(const struct nb_config *cfg);
 /* Bytes per pixel for the single-plane 32-bit formats the nvkvm head can
  * flip, or 0 for anything else.  0 means "reject": a format whose pitch we
  * cannot compute is a format whose bounds we cannot check. */
+/* --linear-only: advertise only DRM_FORMAT_MOD_LINEAR.  See nb_common.c. */
+extern bool nb_linear_only;
+
 uint32_t nb_fourcc_bpp(uint32_t fourcc);
 /* The opaque twin of an alpha format (AR24->XR24), or 0 if there is none.
  * Same byte layout; only the alpha channel's meaning differs. */

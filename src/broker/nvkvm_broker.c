@@ -2128,6 +2128,12 @@ static void usage(void)
 "                       chosen from a MENU cannot be caught this way\n"
 "  --trace-frames       log one line per commit: frame counter, dma-buf\n"
 "                       inode, cache slot, buffers the compositor still holds\n"
+"  --linear-only        advertise ONLY DRM_FORMAT_MOD_LINEAR, so the VMM must\n"
+"                       read frames back into a linear buffer instead of\n"
+"                       handing over the guest's native tiling.  Use it to\n"
+"                       reproduce a cross-vendor host on a single-GPU one, or\n"
+"                       when a compositor advertises a modifier it then fails\n"
+"                       to import.  Costs one GPU transfer per frame.\n"
 "  --verbose\n"
 "\n"
 "The broker owns the window, the compositor connection and the input grab.\n"
@@ -2358,6 +2364,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--allow-group")) { NEEDVAL();
             if (add_group(&cfg, v)) { return 2; } }
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
+        else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }
         else if (!strcmp(a, "--trace-frames")) { nb_trace_frames = 1; }
         else if (!strcmp(a, "--fullscreen")) { cfg.fullscreen = true; }
         else if (!strcmp(a, "--persist"))    { cfg.persist = true; }

@@ -53,7 +53,8 @@ run_case() {
     # to send to before that, and by design it does not buffer for a client
     # that does not exist.
     ( sleep 0.9; printf '%s' "$script"; sleep 1.2 ) | \
-        "$BROKER" --socket "$s" --backend test > "$CASE_LOG" 2>&1 &
+        "$BROKER" --socket "$s" --backend test ${BROKER_EXTRA:-} \
+            > "$CASE_LOG" 2>&1 &
     local bpid=$!
     sleep 0.4
     timeout 3 "$CLIENT" "$s" "$@" > "$CASE_OUT" 2>&1
@@ -160,6 +161,23 @@ check   "the broker logs the query and its verdict" \
         'QUERY_FORMAT .* -> NO' "$CASE_LOG"
 nocheck "a query is not treated as a protocol violation" \
         'protocol violation' "$CASE_LOG"
+
+# --linear-only: the forcing switch.  The test backend advertises XR24 with
+# LINEAR *and* with MOD_INVALID; under the flag only LINEAR survives, so the
+# advertised set shrinks and an implicit-modifier buffer stops being displayable.
+# That is how the cross-vendor condition is reproduced on a single-GPU host.
+BROKER_EXTRA=--linear-only
+run_case '' --present 320x240 --query-format
+check   "--linear-only narrows the advertised set to one pair" \
+        'advertises 1 \(format, modifier\) pair' "$CASE_LOG"
+check   "and LINEAR itself is still USABLE" \
+        'fourcc=XR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
+check   "and a frame still reaches attach" 'TEST attach' "$CASE_LOG"
+
+BROKER_EXTRA=
+run_case '' --present 320x240 --query-format
+check   "without it, both advertised pairs are kept" \
+        'advertises 2 \(format, modifier\) pairs' "$CASE_LOG"
 
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"
