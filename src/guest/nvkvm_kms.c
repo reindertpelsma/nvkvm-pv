@@ -167,7 +167,13 @@ struct nvkvm_kms {
 	struct drm_connector            conn;
 	struct drm_simple_display_pipe  pipe;
 	struct hrtimer                  vblank;   /* software vblank source       */
-	ktime_t                         period;   /* 1/refresh                    */
+	/*
+	 * 1/refresh -- and this, not the mode's advertised vrefresh, is what
+	 * actually paces the guest.  A compositor waits on vblank; vblank comes
+	 * from the hrtimer below; the hrtimer uses this.  Telling the mode list
+	 * one rate while the timer runs at another is half a feature.
+	 */
+	ktime_t                         period;
 
 	/*
 	 * Asynchronous present.
@@ -378,8 +384,30 @@ void nvkvm_kms_set_host_size(unsigned int w, unsigned int h,
 	 * next mode we synthesise should still use the new rate.  Bounded by the
 	 * same min/max the module parameter is checked against.
 	 */
-	if (hz >= NVKVM_KMS_HZ_MIN && hz <= NVKVM_KMS_HZ_MAX)
+	if (hz >= NVKVM_KMS_HZ_MIN && hz <= NVKVM_KMS_HZ_MAX &&
+	    hz != kms->host_hz) {
 		kms->host_hz = hz;
+		/*
+		 * DRIVE THE VBLANK, not just the mode list.
+		 *
+		 * The software vblank is an hrtimer at a FIXED rate -- the
+		 * kms_hz module parameter, default 60 -- with no relationship
+		 * to the host.  On a 144Hz host the guest renders 60 and the
+		 * host shows each frame 2.4 times; and even on a matched 60Hz
+		 * host the two clocks free-run against each other and beat,
+		 * dropping and duplicating frames periodically.  The comment
+		 * on nvkvm_vblank_fn() says this "later slaves to the host
+		 * window's actual vblank"; this is that.
+		 *
+		 * Written without the pending_lock's protection being needed
+		 * for correctness: the timer callback only ever READS period,
+		 * and a torn ktime_t cannot occur on any architecture we build
+		 * for.  The worst case is one frame paced at the old rate.
+		 */
+		kms->period = ns_to_ktime(NSEC_PER_SEC / hz);
+		pr_info("nvkvm: host refresh is %u Hz; pacing the virtual head to match\n",
+			hz);
+	}
 	if (!kms->stopping &&
 	    (w != kms->pending_w || h != kms->pending_h)) {
 		kms->pending_w = w;
@@ -822,6 +850,8 @@ int nvkvm_kms_init(struct drm_device *ddev)
 
 	nvkvm_hrtimer_setup(&kms->vblank, nvkvm_vblank_fn,
 			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	/* Until the host tells us its rate; nvkvm_kms_set_host_size() replaces
+	 * this the moment it does. */
 	kms->period = ns_to_ktime(NSEC_PER_SEC / nvkvm_kms_hz);
 
 	/* Ordered: presents must reach QEMU in flip order. */

@@ -1662,7 +1662,21 @@ static void wl_report_surface(struct nb_wl *w, int lw, int lh)
     }
     w->hint_w = pw;
     w->hint_h = ph;
-    nb_sink_surface(w->sink, pw, ph, w->refresh_mhz);
+    /*
+     * What we LEARNED is w->refresh_mhz; what we SAY is this.  Kept apart so
+     * the log still shows the real host rate even when an operator has pinned
+     * a different one.
+     */
+    {
+        unsigned say = w->refresh_mhz;
+
+        if (nb_hz_mode == NB_HZ_NONE) {
+            say = 0;
+        } else if (nb_hz_mode == NB_HZ_FIXED) {
+            say = nb_hz_fixed;
+        }
+        nb_sink_surface(w->sink, pw, ph, say);
+    }
 }
 
 
@@ -3084,7 +3098,7 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
     if (refresh > 0) {
         unsigned mhz = (unsigned)(1000000000000ULL / refresh);
 
-        if (mhz / 1000 != w->refresh_mhz / 1000) {
+        if (nb_hz_mode == NB_HZ_AUTO && mhz / 1000 != w->refresh_mhz / 1000) {
             unsigned was = w->refresh_mhz;
 
             w->refresh_mhz = mhz;
