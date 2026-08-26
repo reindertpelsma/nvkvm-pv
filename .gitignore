@@ -91,3 +91,11 @@ tests/unit/test_*
 !tests/unit/test_*.c
 !tests/unit/test_*.py
 !tests/unit/test_*.sh
+
+# Kernel build artifacts. These have now reached a commit twice.
+src/guest/.*.cmd
+src/guest/*.o
+src/guest/*.ko
+src/guest/*.mod*
+src/guest/Module.symvers
+src/guest/modules.order
