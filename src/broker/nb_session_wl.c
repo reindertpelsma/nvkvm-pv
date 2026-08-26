@@ -409,6 +409,8 @@ struct nb_wl {
      * between 1920x1080 and 3760x2118 about every two seconds, indefinitely.
      * (2160 - 42 is the 28px title bar at 1.5x, hence the odd number.) */
     int    cont_w, cont_h;
+    /* The last hint actually sent, so an unchanged one is not resent. */
+    unsigned hint_w, hint_h;
     uint32_t deco_mode;
     bool   grabbed;
     bool   fullscreen;
@@ -1611,8 +1613,52 @@ static void wl_report_surface(struct nb_wl *w, int lw, int lh)
      * setter is idempotent, so calling it on every report costs a compare.
      */
     nb_sink_set_fullscreen(w->sink, w->fullscreen);
-    nb_sink_surface(w->sink, (unsigned)((long)lw * s / 120),
-                    (unsigned)((long)lh * s / 120));
+
+    /*
+     * THE ONE PLACE A HINT IS EMITTED, and it is reached only from host events
+     * -- a geometry change or a scale change.  Nothing a guest does gets here.
+     */
+    unsigned pw, ph;
+
+    switch (nb_res_mode) {
+    case NB_RES_GUEST:
+        return;                 /* suggest nothing; the guest picks */
+    case NB_RES_FIXED:
+        pw = nb_res_w;
+        ph = nb_res_h;
+        break;
+    default:
+        pw = (unsigned)((long)lw * s / 120);
+        ph = (unsigned)((long)lh * s / 120);
+        break;
+    }
+
+    /*
+     * ROUND THE WIDTH DOWN TO A MULTIPLE OF 8.
+     *
+     * The guest synthesises the mode with drm_cvt_mode(), which applies
+     * CVT_H_GRANULARITY = 8, so a width that is not a multiple of 8 cannot be
+     * honoured exactly.  Exact is what matters: a compositor promotes a surface
+     * to a hardware plane only when it covers the output, so missing by four
+     * pixels silently costs direct scanout.  Down, never up, so the suggestion
+     * always fits the window we measured.
+     */
+    pw &= ~7u;
+    if (pw == 0 || ph == 0) {
+        return;
+    }
+
+    /*
+     * Idempotent.  A configure that did not change the content size, or a
+     * fixed mode re-reporting the same numbers, is not news -- and a hint the
+     * guest has already acted on is a re-mode it does not need.
+     */
+    if (pw == w->hint_w && ph == w->hint_h) {
+        return;
+    }
+    w->hint_w = pw;
+    w->hint_h = ph;
+    nb_sink_surface(w->sink, pw, ph);
 }
 
 

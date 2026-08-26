@@ -160,6 +160,28 @@ const char *nb_fourcc_name(uint32_t fourcc, char buf[8])
  *   NB_TIER_SHM    refuse dma-buf outright, so only shared memory is left.
  *                  Slowest and universal; the honest floor.
  */
+/*
+ * WHAT RESOLUTION DO WE SUGGEST TO THE GUEST?
+ *
+ * A SUGGESTION, never an instruction.  The broker has no authority over the
+ * guest's mode and does not try to acquire any: it emits EV_SURFACE only in
+ * response to HOST events -- startup and a geometry change -- and never in
+ * response to anything the guest did.  That is what makes a feedback loop
+ * unrepresentable rather than merely fixed: host events cause hints, guest
+ * frames cause only scaling, and there is no edge back.
+ *
+ * (Before this, a guest frame of an unexpected size was reported BACK to the
+ * guest as a new instruction.  On a fullscreen window the two sources disagreed
+ * and traded places about every two seconds, forever.)
+ *
+ * The frame path knows nothing about any of this.  It has a buffer, it has a
+ * window, and it fits one into the other per --scale.  Whatever arrives is
+ * displayed, at whatever size it arrives; a resolution disagreement must never
+ * cost a frame, because a frozen window reads to a user as a crash.
+ */
+int      nb_res_mode = NB_RES_AUTO;
+unsigned nb_res_w, nb_res_h;   /* NB_RES_FIXED only */
+
 int nb_tier = NB_TIER_AUTO;
 
 /* Back-compat: --linear-only is the old spelling of --present-mode=linear. */

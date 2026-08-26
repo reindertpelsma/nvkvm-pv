@@ -205,6 +205,21 @@ run_case '' --present 320x240 --shm --unadvertised-mod
 check   "an F_SHM frame is accepted despite an unadvertised modifier" 'TEST attach' "$CASE_LOG"
 nocheck "and is not rejected for that modifier" 'not advertised by' "$CASE_LOG"
 
+# --resolution names what we SUGGEST to the guest, never what we require.  A
+# bad value must be refused at startup rather than surfacing at frame time.
+for bad in nonsense 0x0 99999x1; do
+    "$BROKER" --backend test --resolution "$bad" --socket "$TMP/r.sock" \
+        > "$TMP/res.log" 2>&1 </dev/null || true
+    check "--resolution $bad is refused at startup" \
+          'resolution must be' "$TMP/res.log"
+done
+for good in auto guest 1920x1080; do
+    ( sleep 0.4 ) | "$BROKER" --backend test --resolution "$good" \
+        --socket "$TMP/rg.sock" > "$TMP/resg.log" 2>&1 &
+    sleep 0.8; wait 2>/dev/null
+    check "--resolution $good is accepted" 'listening on' "$TMP/resg.log"
+done
+
 run_case '' --present 320x240 --bad-dim
 check   "dimensions past the 8192 clamp are rejected" 'is out of range' "$CASE_LOG"
 nocheck "and do not reach attach"                     'TEST attach'     "$CASE_LOG"

@@ -136,7 +136,7 @@ int main(void)
         size_t take = nbytes(&cmds[i]);
 
         if (cmds[i].type != NVKVM_BROKER_CMD_CLIPBOARD ||
-            cmds[i].reserved0 != 0 || cmds[i].reserved1 != 0 ||
+            cmds[i].flags != 0 || cmds[i].reserved1 != 0 ||
             cmds[i].chunk != i || !take ||
             take > NVKVM_BROKER_CLIP_CMD_BYTES ||
             off + take > sizeof(rebuilt)) {

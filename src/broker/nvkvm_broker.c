@@ -2324,6 +2324,16 @@ static void usage(void)
 "                       chosen from a MENU cannot be caught this way\n"
 "  --trace-frames       log one line per commit: frame counter, dma-buf\n"
 "                       inode, cache slot, buffers the compositor still holds\n"
+"  --resolution WHAT    what size to SUGGEST to the guest.  A suggestion only:\n"
+"                       the guest may ignore it, and whatever frame arrives is\n"
+"                       displayed at whatever size it arrives.\n"
+"                         auto   (default) the window's content size, sent at\n"
+"                                startup and whenever the window geometry\n"
+"                                changes -- never in reply to a guest frame\n"
+"                         guest  suggest nothing; the guest picks and the\n"
+"                                broker scales whatever it sends\n"
+"                         WxH    always suggest this size\n"
+"                       Use --scale to choose how a mismatch is fitted.\n"
 "  --present-mode=MODE  which presentation tier to offer.  The tiers are a\n"
 "                       fallback ladder, cheapest first:\n"
 "                         auto    (default) the guest's own modifier if the\n"
@@ -2566,6 +2576,27 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--allow-group")) { NEEDVAL();
             if (add_group(&cfg, v)) { return 2; } }
         else if (!strcmp(a, "--verbose"))    { nb_verbose = 1; }
+        else if (!strncmp(a, "--resolution=", 13) || !strcmp(a, "--resolution")) {
+            unsigned rw, rh;
+
+            const char *arg;
+
+            if (a[12] == '=') { arg = a + 13; } else { NEEDVAL(); arg = v; }
+            if (!strcmp(arg, "auto")) {
+                nb_res_mode = NB_RES_AUTO;
+            } else if (!strcmp(arg, "guest")) {
+                nb_res_mode = NB_RES_GUEST;
+            } else if (sscanf(arg, "%ux%u", &rw, &rh) == 2 && rw && rh &&
+                       rw <= NVKVM_BROKER_MAX_DIM && rh <= NVKVM_BROKER_MAX_DIM) {
+                nb_res_mode = NB_RES_FIXED;
+                nb_res_w = rw;
+                nb_res_h = rh;
+            } else {
+                nb_err("--resolution must be auto, guest, or WxH within 1..%u",
+                       NVKVM_BROKER_MAX_DIM);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--linear-only")) { nb_linear_only = 1; }
         else if (!strncmp(a, "--present-mode=", 15)) {
             const char *mode = a + 15;

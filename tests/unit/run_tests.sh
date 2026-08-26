@@ -137,12 +137,26 @@ ALL_BINARIES="test_uidmap test_objects test_handle test_isolate test_tables test
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }
+build_failed=0
 
 # ── 1. Build everything, and keep going after a failure ────────────────────
 # -k is load-bearing: without it one broken link hides every suite behind it.
 echo "=== building (make -k) ==="
+#
+# A STALE BINARY IS NOT A PASSING SUITE.
+#
+# The existence check below asks whether a binary is there, not whether THIS
+# build produced it -- so a suite whose source stopped compiling still reported
+# built and ran, as long as an object from an earlier build was lying around.
+# OBSERVED: a rename of nvkvm_broker_cmd.reserved0 to .flags broke
+# test_relay_clip.c, and the suite reported 16/16 green from the previous
+# binary.  Only a fresh worktree, with nothing stale to find, showed it.
+#
+# So a build failure is recorded and made fatal at the end, whatever survived.
+build_failed=0
 if ! make -k all; then
-    echo "  (make reported a failure; checking which binaries survived)"
+    echo "  (make reported a failure; every suite below is suspect)"
+    build_failed=1
 fi
 
 echo
@@ -244,6 +258,9 @@ if [ "$rc" -eq 0 ]; then
     # suite was added, which is exactly the kind of stale claim this file exists
     # to prevent.
     n_suites=$(( ${#TALLY_SUITES[@]} + ${#MARKER_SUITES[@]} ))
+if [ "$build_failed" = 1 ]; then
+    fail "the build reported an error; a stale binary must not pass as a suite"
+fi
     echo "UNIT SUITE OK — all ${n_suites} suites built and ran; ${ISOLATE_TOTAL} isolate cases"
     if [ -n "$ISOLATE_KNOWN_FAIL" ]; then
         echo "ran with exactly the ${ISOLATE_KNOWN_FAIL// /, } known failures."
