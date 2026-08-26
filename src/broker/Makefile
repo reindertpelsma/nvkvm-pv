@@ -18,6 +18,7 @@
 # Debian/Ubuntu build deps:
 #   Wayland backend : libwayland-dev wayland-protocols
 #   X11 backend     : libxcb1-dev libxcb-dri3-dev libxcb-present-dev
+#   X11 scaling     : libxcb-render0-dev     (optional; without it, 1:1 only)
 #   X11 rel. motion : libxcb-xinput-dev      (optional; see the report below)
 
 PKG_CONFIG ?= pkg-config
@@ -49,6 +50,13 @@ CFLAGS  += -DNB_HAVE_X11 $(shell $(PKG_CONFIG) --cflags $(X11_PKGS))
 LIBS    += $(shell $(PKG_CONFIG) --libs $(X11_PKGS))
 # Optional: XI2 raw motion, the only source of true relative deltas under a
 # pointer grab (core motion is clamped at the confine boundary).
+# XRender: server-side scaling, so a window that is not the guest's mode still
+# fills.  Optional -- without it the X11 backend letterboxes 1:1 as before.
+ifeq ($(shell $(PKG_CONFIG) --exists xcb-render && echo yes),yes)
+HAVE_XRENDER = 1
+CFLAGS  += -DNB_HAVE_XCB_RENDER $(shell $(PKG_CONFIG) --cflags xcb-render)
+LIBS    += $(shell $(PKG_CONFIG) --libs xcb-render)
+endif
 ifeq ($(shell $(PKG_CONFIG) --exists xcb-xinput && echo yes),yes)
 HAVE_XI  = 1
 CFLAGS  += -DNB_HAVE_XCB_XINPUT $(shell $(PKG_CONFIG) --cflags xcb-xinput)
@@ -116,7 +124,7 @@ report:
 	@echo "nvkvm-display-broker backends:"
 	@echo "  dma-buf test source : $(if $(HAVE_GBM),yes (libgbm),NO - apt install libgbm-dev)"
 	@echo "  wayland : $(if $(HAVE_WL),yes,NO - install libwayland-dev wayland-protocols)"
-	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
+	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
 
 $(BIN): $(OBJS)

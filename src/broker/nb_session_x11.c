@@ -65,6 +65,9 @@ struct nb_session *nb_session_x11(const struct nb_config *cfg)
 #include <xcb/xcbext.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
+#ifdef NB_HAVE_XCB_RENDER
+#include <xcb/render.h>
+#endif
 #ifdef NB_HAVE_XCB_XINPUT
 #include <xcb/xinput.h>
 #endif
@@ -141,6 +144,11 @@ struct nb_x11 {
     xcb_cursor_t blank_cursor;  /* shown while the pointer is the guest's */
     uint64_t  notice_until_ms;  /* title-bar clipboard notice deadline    */
     xcb_gcontext_t idle_gc;     /* for CPU blits: placeholder and dialog  */
+    int       scale_mode;       /* NB_SCALE_*, from the command line      */
+#ifdef NB_HAVE_XCB_RENDER
+    xcb_render_pictformat_t pict_fmt;   /* depth-24 format, 0 = no render */
+    xcb_render_picture_t    dst_pic;    /* the content window as a Picture */
+#endif
     bool      idle_shown;
 };
 
@@ -423,6 +431,82 @@ static void x11_size_content(struct nb_x11 *x, int w, int h)
     xcb_clear_area(x->c, 0, x->win, 0, 0, 0, 0);
 }
 
+/*
+ * WHERE THE GUEST'S FRAME GOES IN THE WINDOW.
+ *
+ * The Wayland backend has wp_viewport and can ask the compositor to scale into
+ * an arbitrary rectangle.  X11's Present cannot scale at all -- it blits 1:1 --
+ * so a window that is not exactly the guest's mode showed bars on BOTH axes and
+ * the guest's picture stayed small until the guest happened to re-mode to match.
+ * That made --scale a no-op on this backend and left the result depending on the
+ * guest, which is precisely what it should not do.
+ *
+ * So compute the destination here, the same way Wayland does, and let
+ * x11_present_scaled() get the pixels there.
+ */
+static void x11_dest_rect(struct nb_x11 *x, int sw, int sh, int *dw, int *dh)
+{
+    if (x->scale_mode == NB_SCALE_STRETCH) {
+        *dw = x->win_w; *dh = x->win_h;
+    } else if (x->scale_mode == NB_SCALE_ASPECT &&
+               sw > 0 && sh > 0 && x->win_w > 0 && x->win_h > 0) {
+        /* Largest rectangle of the source's aspect that fits the window. */
+        long by_w = (long)x->win_w * sh;
+        long by_h = (long)x->win_h * sw;
+
+        if (by_w <= by_h) {         /* width-limited */
+            *dw = x->win_w;
+            *dh = (int)((long)x->win_w * sh / sw);
+        } else {                    /* height-limited */
+            *dh = x->win_h;
+            *dw = (int)((long)x->win_h * sw / sh);
+        }
+    } else {
+        *dw = sw; *dh = sh;         /* NB_SCALE_NONE: 1:1, centred */
+    }
+    if (*dw < 1) { *dw = 1; }
+    if (*dh < 1) { *dh = 1; }
+}
+
+#ifdef NB_HAVE_XCB_RENDER
+/* Scale one buffer into the content window with the X server's own compositor.
+ * Returns false if Render is unusable, so the caller can fall back to Present. */
+static bool x11_render_scaled(struct nb_x11 *x, struct nb_x11_buf *sl,
+                              int dw, int dh)
+{
+    xcb_render_picture_t src;
+    xcb_render_transform_t tr;
+    static const char filter[] = "bilinear";
+
+    if (!x->pict_fmt) {
+        return false;
+    }
+    if (!x->dst_pic) {
+        x->dst_pic = xcb_generate_id(x->c);
+        xcb_render_create_picture(x->c, x->dst_pic, x->content, x->pict_fmt,
+                                  0, NULL);
+    }
+    src = xcb_generate_id(x->c);
+    xcb_render_create_picture(x->c, src, sl->pixmap, x->pict_fmt, 0, NULL);
+
+    /*
+     * The transform maps DESTINATION coordinates back to the SOURCE, so it
+     * carries src/dst, not dst/src.  16.16 fixed point.
+     */
+    memset(&tr, 0, sizeof tr);
+    tr.matrix11 = (xcb_render_fixed_t)(((int64_t)sl->w << 16) / (dw > 0 ? dw : 1));
+    tr.matrix22 = (xcb_render_fixed_t)(((int64_t)sl->h << 16) / (dh > 0 ? dh : 1));
+    tr.matrix33 = 1 << 16;
+    xcb_render_set_picture_transform(x->c, src, tr);
+    xcb_render_set_picture_filter(x->c, src, sizeof filter - 1, filter, 0, NULL);
+    xcb_render_composite(x->c, XCB_RENDER_PICT_OP_SRC, src,
+                         XCB_RENDER_PICTURE_NONE, x->dst_pic,
+                         0, 0, 0, 0, 0, 0, (uint16_t)dw, (uint16_t)dh);
+    xcb_render_free_picture(x->c, src);
+    return true;
+}
+#endif
+
 static int x11_commit(struct nb_session *s, struct nb_sink *sink)
 {
     struct nb_x11 *x = s->priv;
@@ -437,10 +521,31 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         return -ENOENT;
     }
 
-    /* PresentPixmap needs pixmap and window to agree on size, and only we can
-     * change the child, so this always converges in one step. */
-    if (x->con_w != (int)sl->w || x->con_h != (int)sl->h) {
-        x11_size_content(x, (int)sl->w, (int)sl->h);
+    {
+        int dw, dh;
+
+        x11_dest_rect(x, (int)sl->w, (int)sl->h, &dw, &dh);
+        if (x->con_w != dw || x->con_h != dh) {
+            x11_size_content(x, dw, dh);
+        }
+#ifdef NB_HAVE_XCB_RENDER
+        /*
+         * Only when it is actually a different size.  At 1:1 Present is the
+         * better path -- it can reach a hardware plane, which a composite
+         * never can -- so scaling costs nothing when nothing needs scaling.
+         */
+        if ((dw != (int)sl->w || dh != (int)sl->h) &&
+            x11_render_scaled(x, sl, dw, dh)) {
+            xcb_flush(x->c);
+            x->current = x->pending;
+            x->pending = -1;
+            x->idle_shown = false;
+            /* Composite copies, so the buffer is free the moment the server
+             * has read it -- there is no PresentIdleNotify coming for it. */
+            nb_sink_release(sink, sl->id);
+            return 0;
+        }
+#endif
     }
 
     xcb_present_pixmap(x->c, x->content, sl->pixmap, ++x->serial,
@@ -1282,6 +1387,35 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
     x->a_utf8        = x11_atom(x->c, "UTF8_STRING");
     snprintf(x->title, sizeof x->title, "%s", cfg->title);
+    x->scale_mode = cfg->scale_mode;
+#ifdef NB_HAVE_XCB_RENDER
+    {
+        /* One depth-24 format is all the scaler needs; without it we simply
+         * keep the 1:1 Present path and say so. */
+        xcb_render_query_pict_formats_reply_t *pf =
+            xcb_render_query_pict_formats_reply(
+                x->c, xcb_render_query_pict_formats(x->c), NULL);
+
+        if (pf) {
+            xcb_render_pictforminfo_iterator_t it =
+                xcb_render_query_pict_formats_formats_iterator(pf);
+
+            for (; it.rem; xcb_render_pictforminfo_next(&it)) {
+                if (it.data->depth == 24 &&
+                    it.data->type == XCB_RENDER_PICT_TYPE_DIRECT) {
+                    x->pict_fmt = it.data->id;
+                    break;
+                }
+            }
+            free(pf);
+        }
+        nb_log("scaling: %s", x->pict_fmt
+               ? "XRender (the window fills even when the guest's mode differs)"
+               : "NONE - no usable XRender format; frames stay 1:1 and letterboxed");
+    }
+#else
+    nb_log("scaling: NONE - built without xcb-render; frames stay 1:1");
+#endif
     xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_net_wm_name,
                         x->a_utf8, 8, (uint32_t)strlen(cfg->title),
                         cfg->title);
