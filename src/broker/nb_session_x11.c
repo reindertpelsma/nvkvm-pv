@@ -140,10 +140,13 @@ struct nb_x11 {
     char      title[128];       /* the plain window name, without status  */
     xcb_cursor_t blank_cursor;  /* shown while the pointer is the guest's */
     uint64_t  notice_until_ms;  /* title-bar clipboard notice deadline    */
+    xcb_gcontext_t idle_gc;     /* for CPU blits: placeholder and dialog  */
+    bool      idle_shown;
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
 static void x11_clip_flush_pending(struct nb_x11 *x);
+static int  x11_show_idle(struct nb_session *s);
 static void x11_clip_serve(struct nb_x11 *x,
                            const xcb_selection_request_event_t *rq);
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
@@ -450,6 +453,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
 
     x->current = x->pending;
     x->pending = -1;
+    x->idle_shown = false;
     /*
      * DO NOT REPORT THE SIZE WE JUST PRESENTED.
      *
@@ -649,6 +653,13 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
             }
             break;
         }
+        case XCB_EXPOSE:
+            /* Only meaningful while the placeholder is what is on screen; a
+             * live guest repaints itself on the next present. */
+            if (x->idle_shown && x->current < 0) {
+                x11_show_idle(s);
+            }
+            break;
         case XCB_ENTER_NOTIFY:
             /* Deliberately NOT asserting "inside" here: entering the toplevel
              * may mean entering the letterbox.  Motion decides, above. */
@@ -786,8 +797,11 @@ static int x11_dispatch(struct nb_session *s, struct nb_sink *sink)
                 /* Idempotent: a configure that did not change the hint is not
                  * news, and a re-mode the guest does not need is a visible
                  * flicker at best. */
+                if (x->idle_shown && x->current < 0) {
+                    x11_show_idle(s);   /* the placeholder is window-sized */
+                }
                 if (hw == x->hint_w && hh == x->hint_h) {
-                    if (x->con_w > 0) {
+                    if (x->con_w > 0 && x->current >= 0) {
                         x11_size_content(x, x->con_w, x->con_h);
                     }
                     break;
@@ -943,6 +957,63 @@ static void x11_show_cursor(struct nb_x11 *x, bool show)
      * and taking the pointer away there would hide the way out. */
     xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
     xcb_flush(x->c);
+}
+
+/*
+ * Blit a CPU-rendered ARGB buffer to a drawable, in bands.
+ *
+ * PutImage carries the pixels inside the request, and a request has a maximum
+ * length -- a 4K frame is ~33 MB and would simply be refused.  Splitting into
+ * bands that fit is the whole trick; there is no shm here on purpose, because
+ * the placeholder and the dialog are drawn once per event, not per frame.
+ */
+static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
+                     const uint32_t *px, int w, int h)
+{
+    uint32_t maxreq = xcb_get_maximum_request_length(x->c);   /* in 4-byte units */
+    int rows = (int)((maxreq > 4096 ? maxreq - 4096 : 1024) / (uint32_t)(w > 0 ? w : 1));
+    int y;
+
+    if (rows < 1) { rows = 1; }
+    for (y = 0; y < h; y += rows) {
+        int n = h - y < rows ? h - y : rows;
+
+        xcb_put_image(x->c, XCB_IMAGE_FORMAT_Z_PIXMAP, d, gc,
+                      (uint16_t)w, (uint16_t)n, 0, (int16_t)y, 0, 24,
+                      (uint32_t)(w * n * 4), (const uint8_t *)(px + (size_t)y * w));
+    }
+}
+
+/* The "no VM attached" screen.  Same painter the Wayland backend uses. */
+static int x11_show_idle(struct nb_session *s)
+{
+    struct nb_x11 *x = s->priv;
+    int w = x->win_w > 0 ? x->win_w : 1280;
+    int h = x->win_h > 0 ? x->win_h : 800;
+    uint32_t *px;
+
+    if (!x->idle_gc) {
+        x->idle_gc = xcb_generate_id(x->c);
+        xcb_create_gc(x->c, x->idle_gc, x->win, 0, NULL);
+    }
+    px = calloc((size_t)w * h, 4);
+    if (!px) {
+        return -ENOMEM;
+    }
+    nb_placeholder_paint(px, (unsigned)w, (unsigned)h, (unsigned)w,
+                         "NO VM ATTACHED", "WAITING FOR THE VMM TO CONNECT");
+    /* Onto the TOPLEVEL: the content child is the guest's and may still be
+     * holding the last frame at the guest's size, not the window's. */
+    x11_blit(x, x->win, x->idle_gc, px, w, h);
+    /* Shrink the content out of the way so the placeholder is what shows. */
+    x11_size_content(x, 1, 1);
+    xcb_flush(x->c);
+    free(px);
+    x->idle_shown = true;
+    /* Nothing of the guest is on screen, so the host pointer belongs to the
+     * user again. */
+    x11_show_cursor(x, true);
+    return 0;
 }
 
 static int x11_set_grab(struct nb_session *s, bool on)
@@ -1187,7 +1258,7 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
               XCB_EVENT_MASK_BUTTON_PRESS | XCB_EVENT_MASK_BUTTON_RELEASE |
               XCB_EVENT_MASK_POINTER_MOTION | XCB_EVENT_MASK_ENTER_WINDOW |
               XCB_EVENT_MASK_LEAVE_WINDOW | XCB_EVENT_MASK_FOCUS_CHANGE |
-              XCB_EVENT_MASK_STRUCTURE_NOTIFY;
+              XCB_EVENT_MASK_STRUCTURE_NOTIFY | XCB_EVENT_MASK_EXPOSURE;
     xcb_create_window(x->c, XCB_COPY_FROM_PARENT, x->win, x->screen->root,
                       0, 0, (uint16_t)x->win_w, (uint16_t)x->win_h, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, x->screen->root_visual,
@@ -1635,6 +1706,7 @@ static const struct nb_session_ops x11_ops = {
     .attach = x11_attach,
     .commit = x11_commit,
     .resize = x11_resize,
+    .show_idle = x11_show_idle,
     .resync = x11_resync,
     .tick = x11_tick,
     .notify_clipboard = x11_notify_clipboard,
