@@ -598,10 +598,20 @@ own protocol, not NVIDIA ABI.
 | rental safety harness | pass: 73/73 offline cases |
 | ShellCheck 0.10 at blocking severity | pass |
 
-These local results are not a GPU claim. The branch must remain unmerged until
-the recorded hardware sweep exercises CUDA managed memory, Vulkan device
-creation/dispatch and EGL pixel correctness on the intended driver/profile
-matrix.
+### Hardware remediation verification
+
+The first post-fix hardware gate passed on tree `9311bcb`: a Turing GTX 1660
+SUPER produced 30 PASS / 0 FAIL / 0 SKIP on both the preinstalled 580.105.08
+control and forced 580.95.05. In particular, three 4 MiB managed allocations
+reported `MANAGED_MEMORY=1`, and three CPU↔GPU coherence cycles verified all
+1,048,576 elements after a real CUDA kernel. Vulkan NVIDIA device creation and
+compute dispatch, NVIDIA EGL rendering and the pixel check also passed. No
+control was newly allowed; only the known `0x00730102` and `0x20800513` denials
+appeared. Vast instance 48712089 was verified destroyed; the run cost $0.0223.
+
+This proves the RR-09 regression is repaired for the structure's single
+source-derived ABI interval. The branch remains unmerged while the broader
+multi-architecture/profile sweep requested for release confidence continues.
 
 ---
 

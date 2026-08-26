@@ -10,6 +10,32 @@ version pinned), re-run `scripts/make_host_bundle.sh`, re-run
 driver version a vast.ai offer advertises is meaningless — all three boxes
 rented for this run advertised 580.95.05 and all three came up on 575.51.03.
 
+## 2026-08-26 — RR-09 `UVM_REGISTER_GPU` revalidation
+
+Tree `9311bcb` was tested through the unattended sweep on a Vast nested-KVM
+GTX 1660 SUPER (Turing), using the required desktop KVM image. The preinstalled
+open driver 580.105.08 control and the forced 580.95.05 driver both selected ABI
+profile 580 and both passed the expanded suite **30 PASS / 0 FAIL / 0 SKIP**.
+
+The two checks added since the older 28-check matrix are the point of this run:
+
+- `cuda_managed_alloc`: three 4 MiB allocations, each reported
+  `MANAGED_MEMORY=1`.
+- `cuda_managed_coherence`: the host wrote 1,048,576 elements through managed
+  pointers, `vec_add<<<4096,256>>>` ran on them, and the host verified all
+  elements after three CPU↔GPU migration cycles.
+
+The same run also passed the byte-exact 8 MiB CUDA copy, PTX JIT, kernel launch,
+CPU-referenced matmul, Vulkan device selection and compute dispatch, NVIDIA EGL
+renderer, and 64×64 pixel check. The only warning lines were the already-known
+denials `0x00730102` (GET_NUM_HEADS) and `0x20800513`
+(THERMAL_SYSTEM_EXECUTE_V2); the control allowlist was not widened.
+
+Evidence: sweep instance 48712089, machine 54666, requested and observed driver
+580.95.05, 451-second validation, $0.0223 total rental cost. The instance was
+verified absent from the Vast listing after destruction. Raw artifacts remain
+in `/workspace/nvkvm-sweep-rr09-9311bcb/` on the control machine.
+
 ## Coverage against the eight-profile table
 
 | profile | covers | booted here | previously booted | status |

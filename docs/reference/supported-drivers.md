@@ -96,13 +96,16 @@ kernel launch.
 | RTX 4000 Ada | Ada AD104 | 8.9 | 575.51.03 | 570 |
 | GTX 1660 SUPER | Turing TU116 | 7.5 | 575.51.03 | 570 |
 | GTX 1660 SUPER | Turing TU116 | 7.5 | 535.309.01 | 535 |
+| GTX 1660 SUPER | Turing TU116 | 7.5 | 580.95.05 | 580 |
 | RTX 3060 | Ampere GA106 | 8.6 | 545.23.08 | 545 |
 | RTX 3060 | Ampere GA106 | 8.6 | 550.54.14 | 550 |
 | RTX 3060 Ti | Ampere GA104 | 8.6 | 580.95.05 | 580 |
 | RTX 3060 Ti | Ampere GA104 | 8.6 | 595.84 | 580 |
 | RTX 3060 | Ampere GA106 | 8.6 | 610.43.02 | 610 |
 
-The last five rows additionally cleared the PTX JIT path, a matmul checked
+The 580.95.05 Turing row cleared the expanded 30-check suite, including three
+managed allocations and three verified CPU↔GPU coherence cycles. The last five
+Ampere rows additionally cleared the PTX JIT path, a matmul checked
 against a CPU reference, a Vulkan compute dispatch and offscreen EGL, via
 `tests/validate.sh` — see [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md)
 for the per-check values and for the one failure they surfaced: offscreen
