@@ -157,6 +157,23 @@ typedef struct NvkvmRelay {
     uint32_t    last_bw, last_bh, last_stride, last_fourcc;
     uint64_t    last_modifier;
 
+    /*
+     * CAN THE DISPLAY SHOW WHAT THE GUEST RENDERS?
+     *
+     * On a cross-vendor host it cannot, at any price: the guest's tiling is its
+     * GPU's own, and the compositor's GPU has no way to read it.  We cannot see
+     * the broker's advertised set and a rejected ATTACH is not reported back,
+     * so we ASK -- once per (fourcc, modifier), not per frame.
+     *
+     * Connection-generation state: cleared on every disconnect, because a
+     * reconnected broker may be a different display entirely.  Carrying a
+     * verdict across a reconnect is the RR-07 class of bug.
+     */
+    uint32_t    fmt_asked_fourcc;
+    uint64_t    fmt_asked_mod;
+    bool        fmt_asked;      /* a query is outstanding or answered      */
+    int         fmt_verdict;    /* -1 unknown, 0 needs readback, 1 usable  */
+
     /* Partial packet accumulator.  Fixed size: a packet is always exactly
      * NVKVM_BROKER_PKT_SIZE bytes, so nothing here is length-driven. */
     uint8_t     rxbuf[NVKVM_BROKER_PKT_SIZE];
@@ -252,6 +269,7 @@ static int relay_send(NvkvmRelay *r, const struct nvkvm_broker_cmd *cmd, int fd)
 
 static void relay_retry(void *opaque);
 static void relay_readable(void *opaque);
+static void relay_forget_format_verdict(NvkvmRelay *r);
 static void relay_writable(void *opaque);
 static void relay_handshake_timeout(void *opaque);
 static int  relay_start_connect(NvkvmRelay *r, const char *path, Error **errp);
@@ -352,6 +370,39 @@ static void relay_schedule_retry(NvkvmRelay *r)
               qemu_clock_get_ms(QEMU_CLOCK_REALTIME) + r->retry_ms);
 }
 
+/*
+ * Ask the broker whether it can display this (fourcc, modifier).
+ *
+ * Sent once per distinct pair.  While the answer is outstanding the caller
+ * keeps submitting zero-copy: that is the right optimism, because the pair the
+ * guest flips is displayable on every same-vendor host, and being wrong costs
+ * one round trip's worth of dropped frames rather than a wrong permanent mode.
+ */
+static void relay_query_format(NvkvmRelay *r, uint32_t fourcc, uint64_t mod)
+{
+    struct nvkvm_broker_cmd cmd;
+
+    if (r->fmt_asked && r->fmt_asked_fourcc == fourcc &&
+        r->fmt_asked_mod == mod) {
+        return;                         /* already asked about this pair */
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type     = NVKVM_BROKER_CMD_QUERY_FORMAT;
+    cmd.fourcc   = fourcc;
+    cmd.modifier = mod;
+
+    r->fmt_asked_fourcc = fourcc;
+    r->fmt_asked_mod    = mod;
+    r->fmt_asked        = true;
+    r->fmt_verdict      = -1;
+
+    if (relay_send(r, &cmd, -1) != 0) {
+        /* Not fatal and not retried here: the next frame re-asks, because
+         * fmt_asked is only meaningful alongside a verdict. */
+        r->fmt_asked = false;
+    }
+}
+
 static void relay_drop(NvkvmRelay *r, const char *why)
 {
     assert(bql_locked());
@@ -359,6 +410,7 @@ static void relay_drop(NvkvmRelay *r, const char *why)
         return;
     }
     relay_close_connection(r);
+    relay_forget_format_verdict(r);
     error_report("nvkvm-broker: %s; the display and input are gone for now "
                  "(%" PRIu64 " frames relayed, %" PRIu64 " dropped, "
                  "%" PRIu64 " attached without a commit). "
@@ -369,10 +421,26 @@ static void relay_drop(NvkvmRelay *r, const char *why)
     relay_schedule_retry(r);
 }
 
+/*
+ * Connection-generation reset for the format verdict.  A reconnected broker may
+ * be a completely different display -- a different compositor, a different GPU
+ * -- so an answer from the previous connection says nothing about this one.
+ * Carrying it across is the RR-07 class of bug (reconnect inheriting partial
+ * protocol state), and here it would silently pin the wrong present path.
+ */
+static void relay_forget_format_verdict(NvkvmRelay *r)
+{
+    r->fmt_asked        = false;
+    r->fmt_verdict      = -1;
+    r->fmt_asked_fourcc = 0;
+    r->fmt_asked_mod    = 0;
+}
+
 static void relay_attempt_failed(NvkvmRelay *r, const char *why)
 {
     assert(bql_locked());
     relay_close_connection(r);
+    relay_forget_format_verdict(r);
     if (!r->retry_logged) {
         error_report("nvkvm-broker: connection attempt failed: %s", why);
         RELAY_LOG("retrying in the background (up to every %ums); the VM "
@@ -382,6 +450,27 @@ static void relay_attempt_failed(NvkvmRelay *r, const char *why)
     r->retry_ms = r->retry_ms * 2 > RELAY_RETRY_MAX_MS
                       ? RELAY_RETRY_MAX_MS : r->retry_ms * 2;
     relay_schedule_retry(r);
+}
+
+/*
+ * -1 not answered yet, 0 the display cannot show this pair, 1 it can.
+ *
+ * The caller uses 0 to switch to the readback path.  While the answer is
+ * outstanding it should keep going zero-copy: on every same-vendor host the
+ * answer is yes, and being briefly wrong costs a few dropped frames instead of
+ * a permanently wrong mode.
+ */
+int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier)
+{
+    NvkvmRelay *r = nvkvm_relay;
+
+    if (!r || !r->fmt_asked) {
+        return -1;
+    }
+    if (r->fmt_asked_fourcc != fourcc || r->fmt_asked_mod != modifier) {
+        return -1;              /* the verdict is for a different pair */
+    }
+    return r->fmt_verdict;
 }
 
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
@@ -401,6 +490,17 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
      * load-bearing: a future worker offload must marshal the whole operation to
      * the main loop instead of creating a second socket owner. */
     assert(bql_locked());
+
+    /*
+     * Ask -- once per pair -- whether the display can show this at all.  Done
+     * here rather than at mode-set because this is where the actual (fourcc,
+     * modifier) the guest flips first becomes known; a mode-set only tells us
+     * the geometry.  The helper returns immediately once the pair has been
+     * asked about, so this is not per-frame work.
+     */
+    if (r->sock >= 0) {
+        relay_query_format(r, fourcc, modifier);
+    }
 
     /*
      * RETAIN THE NEWEST, DROP THE REST.  This runs whether or not the socket is
@@ -711,6 +811,34 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
          * has them without a protocol change.
          */
         break;
+    case NVKVM_BROKER_EV_FORMAT: {
+        /*
+         * The question is echoed back, so a stale answer for a pair we are no
+         * longer asking about is discarded rather than latched.  That matters
+         * across a mode change: the guest can switch format between our query
+         * and the reply, and adopting the old verdict would pick the wrong
+         * path permanently.
+         */
+        uint64_t mod = (uint64_t)pkt->w0 | ((uint64_t)pkt->w1 << 32);
+
+        if (!r->fmt_asked || (uint32_t)pkt->y != r->fmt_asked_fourcc ||
+            mod != r->fmt_asked_mod) {
+            NVKVM_DBG("nvkvm-broker: stale EV_FORMAT for 0x%x/0x%llx, ignored\n",
+                      (unsigned)pkt->y, (unsigned long long)mod);
+            break;
+        }
+        r->fmt_verdict = pkt->x ? 1 : 0;
+        info_report("nvkvm-broker: the display %s show the guest's buffers "
+                    "(fourcc 0x%08x modifier 0x%016llx)%s",
+                    r->fmt_verdict ? "CAN" : "CANNOT",
+                    (unsigned)r->fmt_asked_fourcc,
+                    (unsigned long long)r->fmt_asked_mod,
+                    r->fmt_verdict ? "" :
+                    " — frames must be read back through the guest's GPU into "
+                    "a LINEAR buffer the display can import");
+        break;
+    }
+
     case NVKVM_BROKER_EV_POINTER:
     case NVKVM_BROKER_EV_HELLO:
         break;

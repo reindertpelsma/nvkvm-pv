@@ -38,6 +38,16 @@ struct VirtIONvgpu;
  * owner rather than calling this function directly.  Sends are nonblocking, so
  * a slow or wedged broker costs a dropped frame rather than a stalled VM.
  */
+/*
+ * Can the broker's display show buffers of this (fourcc, modifier)?
+ *   -1 not answered yet, 0 no -- read back instead, 1 yes -- zero-copy.
+ *
+ * The question is asked automatically on the first submit of each distinct
+ * pair; this only reads the answer.  Cleared on disconnect, because a
+ * reconnected broker may be a different display.
+ */
+int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier);
+
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                                 uint32_t width, uint32_t height,
                                 uint32_t stride, uint32_t fourcc,
