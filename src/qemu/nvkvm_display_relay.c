@@ -823,8 +823,8 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
 
         if (!r->fmt_asked || (uint32_t)p->y != r->fmt_asked_fourcc ||
             mod != r->fmt_asked_mod) {
-            NVKVM_DBG("nvkvm-broker: stale EV_FORMAT for 0x%x/0x%llx, ignored\n",
-                      (unsigned)p->y, (unsigned long long)mod);
+            RELAY_LOG("stale EV_FORMAT for fourcc 0x%x modifier 0x%llx, "
+                      "ignored", (unsigned)p->y, (unsigned long long)mod);
             break;
         }
         r->fmt_verdict = p->x ? 1 : 0;
