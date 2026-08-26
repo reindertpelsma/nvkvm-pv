@@ -433,6 +433,10 @@ int nb_sink_attach(struct nb_sink *s, int fd)
     nb_log("grab: CTRL+ALT+G toggles, CTRL+ALT+F fullscreen. %s",
            ss->grab_caveat[0] ? ss->grab_caveat
                               : "all keyboard input is captured under grab.");
+    /* The client missed every edge that happened before it connected. */
+    if (ss->ops->resync) {
+        ss->ops->resync(ss);
+    }
     return 0;
 }
 

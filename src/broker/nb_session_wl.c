@@ -2273,6 +2273,19 @@ static void wl_notify_clipboard(struct nb_session *s)
  * forever -- which is why a "transient" notice used to sit there until an
  * unrelated event happened to redraw the bar.
  */
+/* Same contract as the X11 backend: a client that attaches after the edges
+ * happened is told the current state rather than left guessing. */
+static void wl_resync(struct nb_session *s)
+{
+    struct nb_wl *w = s->priv;
+
+    if (!w->sink) {
+        return;
+    }
+    nb_sink_focus(w->sink, w->focused);
+    wl_clip_flush_pending(w);
+}
+
 static int wl_tick(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
@@ -3995,6 +4008,7 @@ static const struct nb_session_ops wl_ops = {
     .dismiss_dialog = wl_dismiss_dialog,
     .set_clipboard = wl_set_clipboard,
     .tick = wl_tick,
+    .resync = wl_resync,
     .notify_clipboard = wl_notify_clipboard,
     .fetch_clipboard = wl_fetch_clipboard,
 };

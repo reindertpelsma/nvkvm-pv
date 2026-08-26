@@ -380,6 +380,19 @@ struct nb_session_ops {
      * the later action wins, rather than leaving two modes fighting.
      */
     void (*dismiss_dialog)(struct nb_session *s);
+    /*
+     * Re-assert input state to a client that has just attached.  OPTIONAL.
+     *
+     * Focus and pointer-inside are EDGE-triggered: the backend learns them
+     * from events, and a client that connects afterwards never sees the edge.
+     * MEASURED on X11 under openbox, which focuses a window when it maps: the
+     * broker window took focus before the VM connected, no FocusIn ever
+     * followed, and the guest therefore believed it was unfocused forever --
+     * so no key and no pointer motion reached it, while CTRL+ALT+G still
+     * worked because the hotkey is handled before the focus gate.  Wayland
+     * hid the same bug behind a compositor that re-sends enter on click.
+     */
+    void (*resync)(struct nb_session *s);
     /* Clipboard.  OPTIONAL -- NULL on a backend that has no selection, in
      * which case clipboard is simply unavailable rather than half-working. */
     /*

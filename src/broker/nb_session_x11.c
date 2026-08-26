@@ -106,6 +106,7 @@ struct nb_x11 {
      * security parameter.
      */
     xcb_atom_t        a_clipboard, a_utf8, a_targets, a_prop, a_incr;
+    xcb_atom_t        a_net_wm_name;
     xcb_timestamp_t   last_time;      /* a REAL event time; X rejects guesses */
     bool              focused;
     char             *src_text;       /* what we serve as CLIPBOARD owner     */
@@ -1017,6 +1018,18 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
                       0, 0, (uint16_t)x->win_w, (uint16_t)x->win_h, 0,
                       XCB_WINDOW_CLASS_INPUT_OUTPUT, x->screen->root_visual,
                       mask, vals);
+    /*
+     * _NET_WM_NAME in UTF8_STRING, not WM_NAME in STRING.  WM_NAME's STRING
+     * type is Latin-1 by definition, so the default title's em dash -- three
+     * UTF-8 bytes -- was rendered as its first byte and the rest swallowed:
+     * the window came up called "SteamOS a".  Every window manager since EWMH
+     * prefers _NET_WM_NAME anyway.  WM_NAME is still set, for anything old
+     * enough not to look at _NET_WM_NAME, and gets the same bytes: mildly
+     * wrong for a pre-EWMH WM, versus visibly wrong for everyone.
+     */
+    xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_net_wm_name,
+                        x->a_utf8, 8, (uint32_t)strlen(cfg->title),
+                        cfg->title);
     xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, XCB_ATOM_WM_NAME,
                         XCB_ATOM_STRING, 8, (uint32_t)strlen(cfg->title),
                         cfg->title);
@@ -1057,6 +1070,7 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     x->a_targets   = x11_atom(x->c, "TARGETS");
     x->a_prop      = x11_atom(x->c, "NVKVM_CLIP");
     x->a_incr      = x11_atom(x->c, "INCR");
+    x->a_net_wm_name = x11_atom(x->c, "_NET_WM_NAME");
     if (x->a_wm_proto != XCB_ATOM_NONE && x->a_wm_delete != XCB_ATOM_NONE) {
         xcb_change_property(x->c, XCB_PROP_MODE_REPLACE, x->win, x->a_wm_proto,
                             XCB_ATOM_ATOM, 32, 1, &x->a_wm_delete);
@@ -1318,6 +1332,44 @@ static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
     x->fetch_generation = 0;
 }
 
+/*
+ * Tell a freshly-attached client where focus and the pointer actually are,
+ * by ASKING the server rather than replaying an edge we may never have seen.
+ */
+static void x11_resync(struct nb_session *s)
+{
+    struct nb_x11 *x = s->priv;
+    xcb_get_input_focus_reply_t *f;
+    xcb_query_pointer_reply_t *q;
+
+    if (!x->sink || !x->c || xcb_connection_has_error(x->c)) {
+        return;
+    }
+    f = xcb_get_input_focus_reply(x->c, xcb_get_input_focus(x->c), NULL);
+    if (f) {
+        /* Focus sits on the toplevel, or on a descendant of it when a child
+         * holds it; both mean this window has the keyboard. */
+        x->focused = (f->focus == x->win || f->focus == x->content);
+        free(f);
+        nb_sink_focus(x->sink, x->focused);
+    }
+    q = xcb_query_pointer_reply(x->c, xcb_query_pointer(x->c, x->win), NULL);
+    if (q) {
+        bool inside = q->same_screen && q->child != XCB_WINDOW_NONE
+                      ? true
+                      : (q->win_x >= 0 && q->win_y >= 0 &&
+                         q->win_x < x->win_w && q->win_y < x->win_h);
+
+        nb_sink_pointer(x->sink, inside);
+        if (inside) {
+            nb_sink_abs(x->sink, q->win_x, q->win_y,
+                        (unsigned)x->win_w, (unsigned)x->win_h);
+        }
+        free(q);
+    }
+    x11_clip_flush_pending(x);
+}
+
 static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
 {
     struct nb_x11 *x = s->priv;
@@ -1340,6 +1392,7 @@ static const struct nb_session_ops x11_ops = {
     .attach = x11_attach,
     .commit = x11_commit,
     .resize = x11_resize,
+    .resync = x11_resync,
     .set_clipboard = x11_set_clipboard,
     .fetch_clipboard = x11_fetch_clipboard,
     .client_detach = x11_client_detach_clip,
