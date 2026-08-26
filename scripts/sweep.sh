@@ -72,6 +72,7 @@
 #                                             # lookup + cost estimate. $0.
 #   scripts/sweep.sh --arch ampere --drivers 580.95.05 --go     # L1
 #   scripts/sweep.sh --arch ada --driver-cache /srv/nvidia --go  # relay CDN-blocked installers
+#   scripts/sweep.sh --arch ada --guest-image-cache /srv/images/noble-server-cloudimg-amd64.img --go
 #   scripts/sweep.sh --arch ampere --go                          # L2
 #   scripts/sweep.sh --all-arches --go --max-spend 12            # L3
 #   scripts/sweep.sh --resume sweep-runs/2026-08-23T10-00-00Z --go
@@ -125,6 +126,10 @@ ALL_ARCHES=0
 GPU_FILTER=""
 DRIVERS_REQ=""
 DRIVER_CACHE_DIR="${NVKVM_SWEEP_DRIVER_CACHE:-}"
+GUEST_IMAGE_CACHE="${NVKVM_SWEEP_GUEST_IMAGE_CACHE:-}"
+GUEST_IMAGE_CACHE_SHA256=""
+GUEST_IMAGE_NAME="noble-server-cloudimg-amd64.img"
+GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/$GUEST_IMAGE_NAME"
 PRESET="boundary"
 MIN_DRIVERS=5
 MAX_DPH=0.50
@@ -213,6 +218,7 @@ while [ $# -gt 0 ]; do
         --gpu)          GPU_FILTER="$2"; shift 2 ;;
         --drivers)      DRIVERS_REQ="$2"; shift 2 ;;
         --driver-cache) DRIVER_CACHE_DIR="$2"; shift 2 ;;
+        --guest-image-cache) GUEST_IMAGE_CACHE="$2"; shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
         --max-dph)      MAX_DPH="$2"; shift 2 ;;
@@ -243,12 +249,75 @@ info() { printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 warn() { printf '[%s] !! %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 die()  { printf '\n%s: FATAL: %s\n' "$SELF" "$*" >&2; exit "${2:-3}"; }
 
-if [ -n "$DRIVER_CACHE_DIR" ]; then
-    [ -d "$DRIVER_CACHE_DIR" ] \
-        || die "driver cache is not a directory: $DRIVER_CACHE_DIR" 3
-    DRIVER_CACHE_DIR="$(cd -- "$DRIVER_CACHE_DIR" && pwd -P)" \
-        || die "cannot resolve driver cache: $DRIVER_CACHE_DIR" 3
-fi
+valid_sha256() { [[ "${1:-}" =~ ^[[:xdigit:]]{64}$ ]]; }
+
+# Resolve and authenticate the optional coordinator-local cloud image before
+# any offer can be rented.  The image itself is opaque here: the coordinator
+# only hashes and copies it, and never asks qemu-img (or anything else) to
+# parse/execute its contents.
+#
+# Trust can come from FILE.sha256 (a bare digest, sha256sum-style filename, or
+# setup_guest.sh's digest-plus-source-URL format) or from Ubuntu's SHA256SUMS
+# beside FILE.  If a sidecar exists it is authoritative: a stale/malformed one
+# is an error, not a reason to silently fall through to some other digest.
+validate_guest_image_cache() {
+    local src="$GUEST_IMAGE_CACHE" sidecar manifest hash binding extra actual dir base
+    GUEST_IMAGE_CACHE_SHA256=""
+    [ -n "$src" ] || return 0
+    [ -f "$src" ] && [ -r "$src" ] && [ -s "$src" ] \
+        || { warn "guest image cache is not a readable non-empty file: $src"; return 1; }
+
+    dir="$(cd -- "$(dirname -- "$src")" && pwd -P)" \
+        || { warn "cannot resolve guest image cache: $src"; return 1; }
+    base="$(basename -- "$src")"
+    src="$dir/$base"
+    sidecar="$src.sha256"
+    manifest="$dir/SHA256SUMS"
+    hash=""
+
+    if [ -f "$sidecar" ]; then
+        binding=""; extra=""
+        read -r hash binding extra <"$sidecar" || true
+        if ! valid_sha256 "$hash" || [ -n "$extra" ]; then
+            warn "guest image cache checksum sidecar is malformed: $sidecar"
+            return 1
+        fi
+        if [ -n "$binding" ]; then
+            binding="${binding#\*}"
+            case "$binding" in
+                "$src"|"$base"|"$GUEST_IMAGE_NAME"|"$GUEST_IMAGE_URL") ;;
+                *) warn "guest image cache checksum is bound to '$binding', not $src"; return 1 ;;
+            esac
+        fi
+    elif [ -f "$manifest" ]; then
+        hash="$(awk -v wanted="$GUEST_IMAGE_NAME" '
+            {
+                name = $2
+                sub(/^\*/, "", name)
+                if (name == wanted && length($1) == 64 && $1 !~ /[^[:xdigit:]]/) {
+                    print tolower($1)
+                    exit
+                }
+            }
+        ' "$manifest")"
+        if ! valid_sha256 "$hash"; then
+            warn "no valid SHA-256 for $GUEST_IMAGE_NAME in $manifest"
+            return 1
+        fi
+    else
+        warn "guest image cache needs $sidecar or Ubuntu SHA256SUMS beside it"
+        return 1
+    fi
+
+    actual="$(sha256sum -- "$src" 2>/dev/null | awk '{print $1}')"
+    if ! valid_sha256 "$actual" || [ "${actual,,}" != "${hash,,}" ]; then
+        warn "guest image cache SHA-256 mismatch: $src"
+        return 1
+    fi
+    GUEST_IMAGE_CACHE="$src"
+    GUEST_IMAGE_CACHE_SHA256="${actual,,}"
+    return 0
+}
 
 stop_requested() { [ -f "$STOP_FILE" ]; }
 
@@ -901,6 +970,66 @@ exit 73
     return 0
 }
 
+GUEST_IMAGE_CACHE_DETAIL=""
+
+# Relay the preflight-authenticated Ubuntu image only after SSH and the QEMU
+# build are known-good.  Both the image and setup_guest-compatible sidecar are
+# staged under temporary names.  The reusable image path is changed only after
+# the received bytes hash to the coordinator's trusted digest.
+stage_cached_guest_image() {
+    local src="$GUEST_IMAGE_CACHE" want="$GUEST_IMAGE_CACHE_SHA256"
+    local remote="/opt/nvkvm-guest/$GUEST_IMAGE_NAME" tmp side_tmp got side actual
+    GUEST_IMAGE_CACHE_DETAIL=""
+    [ -n "$src" ] || return 0
+    [ -n "${SCP_HOST:-}" ] && [ -n "${SCP_PORT:-}" ] || {
+        GUEST_IMAGE_CACHE_DETAIL="[HARNESS] cannot relay guest image cache: no SSH endpoint"
+        return 2
+    }
+
+    # Detect replacement or mutation after the initial preflight rather than
+    # copying bytes under a digest that authenticated an earlier file.
+    actual="$(sha256sum -- "$src" 2>/dev/null | awk '{print $1}')"
+    if ! valid_sha256 "$actual" || [ "${actual,,}" != "$want" ]; then
+        GUEST_IMAGE_CACHE_DETAIL="[HARNESS] guest image cache changed after preflight: $src"
+        return 2
+    fi
+
+    got="$(rsh_t 300 "sha256sum '$remote' 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n')"
+    side="$(rsh_t 90 "cat '$remote.sha256' 2>/dev/null" 2>/dev/null | tr -d '\r\n')"
+    if [ "$got" = "$want" ] && [ "$side" = "$want  $GUEST_IMAGE_URL" ]; then
+        info "  guest image cache: already staged and SHA-256 matched"
+        return 0
+    fi
+
+    rsh_t 120 'install -d -m 0755 /opt/nvkvm-guest' >/dev/null 2>&1 || {
+        GUEST_IMAGE_CACHE_DETAIL="[HARNESS] could not create remote guest image directory"
+        return 2
+    }
+    tmp="$remote.relay.$$.part"
+    side_tmp="$remote.sha256.relay.$$.part"
+    timeout 3600 scp $SSH_OPTS -P "$SCP_PORT" -q -- "$src" "root@$SCP_HOST:$tmp" || {
+        rsh_t 90 "rm -f '$tmp' '$side_tmp'" >/dev/null 2>&1
+        GUEST_IMAGE_CACHE_DETAIL="[HARNESS] scp failed while relaying guest image cache"
+        return 2
+    }
+    got="$(rsh_t 600 "sha256sum '$tmp' 2>/dev/null | awk '{print \$1}'" 2>/dev/null | tr -d '\r\n')"
+    if [ "$got" != "$want" ]; then
+        rsh_t 90 "rm -f '$tmp' '$side_tmp'" >/dev/null 2>&1
+        GUEST_IMAGE_CACHE_DETAIL="[HARNESS] SHA-256 mismatch after relaying guest image cache"
+        return 2
+    fi
+
+    # setup_guest.sh binds cached checksums to their source URL.  Install that
+    # exact format so it verifies the relayed bytes and skips the stalled route.
+    if ! rsh_t 120 "printf '%s  %s\\n' '$want' '$GUEST_IMAGE_URL' > '$side_tmp' && chmod 0644 '$tmp' '$side_tmp' && mv -f '$tmp' '$remote' && mv -f '$side_tmp' '$remote.sha256'" >/dev/null 2>&1; then
+        rsh_t 90 "rm -f '$tmp' '$side_tmp'" >/dev/null 2>&1
+        GUEST_IMAGE_CACHE_DETAIL="[HARNESS] could not atomically install relayed guest image cache"
+        return 2
+    fi
+    info "  guest image cache: relayed $GUEST_IMAGE_NAME (SHA-256 $want)"
+    return 0
+}
+
 provision_box() {
     local step cmd tmo rc errs tail
     PROVISION_FAIL_DETAIL=""; PROVISION_FAILED_STEP=""
@@ -962,6 +1091,14 @@ TAIL:
 $tail"
             PROVISION_FAILED_STEP="$step"
             return 1
+        fi
+        if [ "$step" = "build" ] && [ -n "$GUEST_IMAGE_CACHE" ]; then
+            info "  guest image cache relay ..."
+            if ! stage_cached_guest_image; then
+                PROVISION_FAIL_DETAIL="$GUEST_IMAGE_CACHE_DETAIL"
+                PROVISION_FAILED_STEP="guest-image-cache"
+                return 1
+            fi
         fi
     done
     return 0
@@ -1847,6 +1984,18 @@ if [ "$RECONCILE" = 1 ]; then
     exit 0
 fi
 
+# Optional input caches are irrelevant to emergency cleanup.  Validate them
+# only after --reconcile has had a chance to destroy billing instances; a stale
+# local path must never prevent leak recovery.
+if [ -n "$DRIVER_CACHE_DIR" ]; then
+    [ -d "$DRIVER_CACHE_DIR" ] \
+        || die "driver cache is not a directory: $DRIVER_CACHE_DIR" 3
+    DRIVER_CACHE_DIR="$(cd -- "$DRIVER_CACHE_DIR" && pwd -P)" \
+        || die "cannot resolve driver cache: $DRIVER_CACHE_DIR" 3
+fi
+validate_guest_image_cache \
+    || die "refusing untrusted or corrupt guest image cache: $GUEST_IMAGE_CACHE" 3
+
 load_matrix || die "could not read the architecture map out of scripts/sweep_matrix.py"
 build_abiq || warn "expected ABI profiles unavailable -- rows will read '?' and no mismatch can be detected"
 
@@ -1883,6 +2032,7 @@ say "  image         : $KVM_IMAGE"
 say "  architectures : $ARCHES"
 say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_REQ)}"
 say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
+say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
 say "  caps          : \$$MAX_DPH/hr per box, \$$MAX_SPEND total, ${BUDGET_HOURS}h auto-destroy"
 say ""

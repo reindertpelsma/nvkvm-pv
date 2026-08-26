@@ -39,6 +39,11 @@ scripts/sweep.sh --all-arches --max-spend 12 --go
 # Optional: relay official installers from a coordinator-local cache when a
 # rental's NVIDIA CDN edge returns 403. Files use NVIDIA's canonical names.
 scripts/sweep.sh --arch ada --driver-cache /srv/nvidia-drivers --go
+
+# Optional: relay the Noble cloud image when the rental's Ubuntu route stalls.
+# Keep either FILE.sha256 or Ubuntu's SHA256SUMS beside the image.
+scripts/sweep.sh --arch ada \
+  --guest-image-cache /srv/cloud-images/noble-server-cloudimg-amd64.img --go
 ```
 
 Stop a running sweep gracefully:
@@ -183,6 +188,23 @@ its remote SHA-256 matches, and the disposable KVM box still runs the
 installer's own `--check` before use. Missing entries fall back to the CDN;
 corrupt entries are rejected and recorded as harness evidence.
 
+The Ubuntu cloud-image route can likewise stall on a rental even when it is
+healthy from the coordinator. `--guest-image-cache FILE` (or
+`NVKVM_SWEEP_GUEST_IMAGE_CACHE`) relays a coordinator-local copy after the
+remote QEMU build and before `setup_guest.sh`. Preflight requires a non-empty
+image whose SHA-256 matches either `FILE.sha256` or a sibling Ubuntu
+`SHA256SUMS`. A `.sha256` file may contain a bare digest, normal `sha256sum`
+output bound to the local filename, or the digest-plus-default-URL format used
+by `setup_guest.sh`.
+
+The coordinator treats the image as opaque bytes: it only hashes and copies
+it. The remote transfer is hashed again before a temporary file is atomically
+renamed to `/opt/nvkvm-guest/noble-server-cloudimg-amd64.img`; a matching
+`.sha256` sidecar is installed with the default Ubuntu URL. Consequently
+`setup_guest.sh` verifies the relayed file and skips its own download. A
+missing option preserves the direct-download behavior, while a missing,
+malformed, or mismatched trusted checksum fails before any instance is rented.
+
 The expected profile in that table is **not** hardcoded anywhere. `sweep.sh`
 compiles `src/common/nvkvm_abi.h` and calls `nvkvm_abi_id_for_version()`, so the
 expectation is by construction whatever the shipped selector says. The
@@ -312,7 +334,7 @@ never quietly change what the row measures.
 Run the offline suite any time — it rents nothing:
 
 ```bash
-bash tests/sweep_offline_test.sh      # 80 checks, ~90s, rents nothing
+bash tests/sweep_offline_test.sh      # 95 checks, ~90s, rents nothing
 ```
 
 It sources `sweep.sh` in library mode and drives the **real** functions against
