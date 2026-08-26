@@ -1781,6 +1781,30 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 			resp->status = 0;
 			return 0;
 		}
+		/*
+		 * BROKER MODE IS TERMINAL.  Do NOT fall through to the QEMU
+		 * console below.
+		 *
+		 * That path imports the buffer with EGL and reads it back, and
+		 * a broker-mode VMM is built to need no EGL, no GL and no
+		 * /dev/dri/renderD* -- the container ships none of them.
+		 * OBSERVED on the physical box: the broker was restarted, the
+		 * relay reported "the display and input are gone for now ...
+		 * The VM keeps running", the next frame fell through here, and
+		 * QEMU printed
+		 *     nvkvm present: display mode = readback (UI console has no GL)
+		 *     nvkvm present: host EGL ready (dma-buf import)
+		 *     Couldn't open libGL.so.1 or libOpenGL.so.0
+		 * and died with SIGSEGV (container exit 139), taking the guest
+		 * with it.  Losing the display is survivable; losing the VM is
+		 * not, and the message had just promised it would not happen.
+		 *
+		 * The frame is dropped instead.  The relay already retains the
+		 * newest one, so a reconnecting broker still paints immediately.
+		 */
+		close(dmabuf_fd);
+		resp->status = 0;
+		return 0;
 	}
 
 	/*
