@@ -3793,23 +3793,43 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
         nb_err("this compositor advertises no wl_seat: there will be NO "
                "keyboard, NO pointer and NO grab. Display only.");
     }
-    if (!w->dmabuf) {
-        nb_err("this compositor does not implement zwp_linux_dmabuf_v1, so it "
-               "cannot take the guest's buffer without a copy.  There is no "
-               "fallback here on purpose: a copy path would need a GL context "
-               "in the privileged process, which is what this design removes.");
-        goto fail;
-    }
-    if (w->dmabuf_ver < 2) {
-        nb_err("zwp_linux_dmabuf_v1 version %u has no create_immed; version 2 "
-               "or later is required (universally available since 2016)",
-               w->dmabuf_ver);
-        goto fail;
-    }
-    if (w->formats.n == 0) {
-        nb_err("the compositor advertised no dma-buf formats at all — nothing "
-               "could be validated against, so every frame would be rejected");
-        goto fail;
+    /*
+     * THE SHM TIER NEEDS NONE OF THIS, and demanding it broke the tier
+     * outright.  --present-mode shm refuses dma-buf on purpose so that shared
+     * memory is the only thing left; the format list is then empty BY DESIGN.
+     * These three checks read that deliberate state as a broken compositor and
+     * killed the broker on startup -- MEASURED: "the compositor advertised no
+     * dma-buf formats at all", on a compositor advertising plenty.
+     *
+     * What shm actually requires is wl_shm, which is a core global no
+     * compositor may omit -- that being the whole reason it is the last rung.
+     */
+    if (nb_tier == NB_TIER_SHM) {
+        if (!w->shm) {
+            nb_err("--present-mode shm needs wl_shm, and this compositor "
+                   "offers none.  wl_shm is core Wayland; a compositor without "
+                   "it has no tier left to fall back to.");
+            goto fail;
+        }
+    } else {
+        if (!w->dmabuf) {
+            nb_err("this compositor does not implement zwp_linux_dmabuf_v1, so "
+                   "it cannot take the guest's buffer without a copy.  Retry "
+                   "with --present-mode shm, which needs no dma-buf at all.");
+            goto fail;
+        }
+        if (w->dmabuf_ver < 2) {
+            nb_err("zwp_linux_dmabuf_v1 version %u has no create_immed; version "
+                   "2 or later is required (universally available since 2016)",
+                   w->dmabuf_ver);
+            goto fail;
+        }
+        if (w->formats.n == 0) {
+            nb_err("the compositor advertised no dma-buf formats at all — "
+                   "nothing could be validated against, so every frame would "
+                   "be rejected");
+            goto fail;
+        }
     }
 
     /* The window. */
