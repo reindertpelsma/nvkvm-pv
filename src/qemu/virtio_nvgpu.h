@@ -447,7 +447,7 @@ void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
 /* The host window changed size: forward it to the guest's KMS head over
  * VQ_EVT.  Advisory and latest-wins -- see nvkvm_virtio_push_ui_info(). */
 void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
-			       uint32_t height);
+			       uint32_t height, uint32_t refresh_mhz);
 
 /*
  * DEAD-1, 2026-08-24: the nvkvm_dispatch.c and nvkvm_frontend.c declarations

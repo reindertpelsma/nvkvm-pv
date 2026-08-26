@@ -48,6 +48,10 @@
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
 struct nb_test {
+    /* Settable so the harness can exercise the refresh hint without a
+     * compositor; 0 means 'unknown', which is what a backend with no
+     * presentation feedback reports. */
+    unsigned refresh_mhz;
     bool     grabbed;
     bool     fullscreen;
     char     line[256];
@@ -143,7 +147,7 @@ static int test_dispatch(struct nb_session *s, struct nb_sink *sink)
     ssize_t n;
 
     if (t->resize_w) {
-        nb_sink_surface(sink, t->resize_w, t->resize_h);
+        nb_sink_surface(sink, t->resize_w, t->resize_h, t->refresh_mhz);
         t->resize_w = t->resize_h = 0;
     }
     while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
@@ -202,7 +206,7 @@ static int test_commit(struct nb_session *s, struct nb_sink *sink)
     }
     nb_log("TEST commit: id=%llu %ux%u", (unsigned long long)t->pending_id,
            t->pending_w, t->pending_h);
-    nb_sink_surface(sink, t->pending_w, t->pending_h);
+    nb_sink_surface(sink, t->pending_w, t->pending_h, t->refresh_mhz);
     /* A real backend answers with these; produce them so a client's pacing
      * and recycling paths are exercised end to end. */
     nb_sink_release(sink, t->pending_id);

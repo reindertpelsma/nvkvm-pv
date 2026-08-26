@@ -800,6 +800,7 @@ struct nvkvm_ui_info_push {
 	VirtIONvgpu *nv;
 	uint32_t     width;
 	uint32_t     height;
+	uint32_t     refresh_mhz;   /* 0 = unknown; the guest keeps its default */
 };
 
 static void nvkvm_ui_info_push_bh(void *opaque)
@@ -811,7 +812,7 @@ static void nvkvm_ui_info_push_bh(void *opaque)
 		struct nvkvm_evt_ui_info msg = {
 			.width    = cpu_to_le32(p->width),
 			.height   = cpu_to_le32(p->height),
-			.reserved = 0,
+			.refresh_mhz = cpu_to_le32(p->refresh_mhz),
 			.type     = cpu_to_le32(NVKVM_EVT_TYPE_UI_INFO),
 		};
 		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
@@ -826,7 +827,7 @@ static void nvkvm_ui_info_push_bh(void *opaque)
 }
 
 void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
-			       uint32_t height)
+			       uint32_t height, uint32_t refresh_mhz)
 {
 	struct nvkvm_ui_info_push *p;
 
@@ -835,8 +836,9 @@ void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
 	}
 	p = g_malloc(sizeof(*p));
 	p->nv     = nv;
-	p->width  = width;
-	p->height = height;
+	p->width       = width;
+	p->height      = height;
+	p->refresh_mhz = refresh_mhz;
 	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_ui_info_push_bh, p);
 }
 

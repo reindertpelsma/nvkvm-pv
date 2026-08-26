@@ -411,6 +411,10 @@ struct nb_wl {
     int    cont_w, cont_h;
     /* The last hint actually sent, so an unchanged one is not resent. */
     unsigned hint_w, hint_h;
+    /* The host output's refresh in MILLIHERTZ, learned from presentation
+     * feedback.  0 until the first frame has been presented -- there is no
+     * other source: the broker does not bind wl_output. */
+    unsigned refresh_mhz;
     uint32_t deco_mode;
     bool   grabbed;
     bool   fullscreen;
@@ -1658,7 +1662,7 @@ static void wl_report_surface(struct nb_wl *w, int lw, int lh)
     }
     w->hint_w = pw;
     w->hint_h = ph;
-    nb_sink_surface(w->sink, pw, ph);
+    nb_sink_surface(w->sink, pw, ph, w->refresh_mhz);
 }
 
 
@@ -3062,6 +3066,38 @@ static void pres_presented(void *d, struct wp_presentation_feedback *f,
 
     (void)tv_sec_hi; (void)tv_sec_lo; (void)tv_nsec; (void)sh; (void)sl;
     wp_presentation_feedback_destroy(f);
+
+    /*
+     * THE HOST'S REFRESH, which the guest otherwise cannot know.
+     *
+     * Its virtual head is pinned by the kms_hz module parameter (default 60)
+     * while the host may be running at 144, so the guest renders at a rate
+     * nothing asked for and neither side is aware.  `refresh` here is the
+     * output's nominal frame interval in NANOSECONDS; QemuUIInfo.refresh_rate
+     * and our EV_SURFACE both use MILLIHERTZ, so 16666666ns -> 60000.
+     *
+     * Compared at whole-Hz granularity before re-hinting: the value is nominal
+     * rather than measured and should be stable, but a hint per frame would be
+     * a re-mode per frame, and that is the shape of bug this file has already
+     * had twice.
+     */
+    if (refresh > 0) {
+        unsigned mhz = (unsigned)(1000000000000ULL / refresh);
+
+        if (mhz / 1000 != w->refresh_mhz / 1000) {
+            unsigned was = w->refresh_mhz;
+
+            w->refresh_mhz = mhz;
+            nb_log("host output refresh is %u.%03u Hz — telling the guest, so "
+                   "it need not stay at its built-in default",
+                   mhz / 1000, mhz % 1000);
+            if (was && w->sink) {
+                /* Not the first learn: geometry is settled, so re-hint now. */
+                w->hint_w = 0;          /* force the idempotence check open */
+                wl_report_surface(w, w->cont_w, w->cont_h);
+            }
+        }
+    }
     if (zc != w->last_scanout) {
         w->last_scanout = zc;
         /*

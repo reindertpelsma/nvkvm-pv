@@ -849,6 +849,16 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
 
             info.width  = (uint32_t)p->x;
             info.height = (uint32_t)p->y;
+            /*
+             * w0 is the host output's refresh in millihertz, which is also
+             * QemuUIInfo's unit, so it passes straight through.  0 means the
+             * broker does not know -- an X11 session, or a Wayland one before
+             * its first presentation feedback -- and then the field is left
+             * alone rather than zeroed, so the guest keeps whatever it had.
+             */
+            if (p->w0 > 0) {
+                info.refresh_rate = p->w0;
+            }
             dpy_set_ui_info(con, &info, true);
         }
         break;
