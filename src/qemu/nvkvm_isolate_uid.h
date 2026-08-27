@@ -36,6 +36,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -382,6 +383,24 @@ static inline int nvkvm_iso_have_caps(bool *setuid_ok, bool *setgid_ok,
 	return 0;
 }
 
+/*
+ * Is one arbitrary capability in our EFFECTIVE set?  1 = yes, 0 = no,
+ * -1 = capget failed.  Used for CAP_SETPCAP, which no rung *requires* but
+ * whose absence silently weakens the uid rungs -- see nvkvm_iso_auto_select().
+ */
+static inline int nvkvm_iso_cap_effective(int cap)
+{
+	struct __user_cap_header_struct hdr = {
+		.version = _LINUX_CAPABILITY_VERSION_3, .pid = 0
+	};
+	struct __user_cap_data_struct data[2];
+
+	memset(data, 0, sizeof(data));
+	if (syscall(SYS_capget, &hdr, data) != 0)
+		return -1;
+	return (data[cap >> 5].effective & (1u << (cap & 31))) != 0;
+}
+
 static inline int nvkvm_iso_have_setid_caps(bool *setuid_ok, bool *setgid_ok)
 {
 	return nvkvm_iso_have_caps(setuid_ok, setgid_ok, NULL);
@@ -409,6 +428,98 @@ static inline int nvkvm_iso_node_world_rw(const char *path, unsigned *mode_out)
 	return ((st.st_mode & S_IROTH) && (st.st_mode & S_IWOTH)) ? 1 : 0;
 }
 
+/* ── Parent-side userns mapping (SHARED with the real spawn) ─────────────
+ *
+ * These two functions came out of nvkvm_isolate.c so that
+ * nvkvm_iso_probe_namespaces() below and nvkvm_isolate_create()'s real spawn
+ * path call THE SAME code, for the same reason the rest of this header is
+ * header-only: a probe that attempts a different thing than the spawn performs
+ * is a probe that lies.  It did lie -- see the probe's own comment.
+ *
+ * Nothing else changed in the move; nvkvm_isolate.c calls
+ * nvkvm_map_child_userns() with exactly the arguments it always did.
+ */
+/* Parent-side: write one /proc/<pid>/<which> map file for the child's userns. */
+static inline int nvkvm_write_child_map(pid_t pid, const char *which, const char *val)
+{
+	char path[64];
+	snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, which);
+	int fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0)
+		return -1;
+	size_t len = strlen(val);
+	ssize_t n = write(fd, val, len);
+	close(fd);
+	return (n == (ssize_t)len) ? 0 : -1;
+}
+
+/*
+ * Parent-side: set up the rootless uid/gid mapping for a child that was
+ * clone()'d with CLONE_NEWUSER.  ns-root 0 -> our euid/egid (single-line map,
+ * permitted even for an unprivileged parent).  Returns 0 / -1.
+ *
+ * COMBINED namespace+uid mode needs a SECOND line.  The child becomes ns-root
+ * (uid 0) so it can mount/pivot_root, and only then drops to its per-isolate
+ * uid — but setresuid() to an id that is not mapped into the user namespace
+ * fails with EINVAL, so the target uid must appear in the map.  We map it
+ * identity (host uid N -> ns uid N) so the host-visible uid really is the
+ * separated one; a namespaced-but-unmapped uid would give a process that looks
+ * separated from the inside and is uid `nobody` on the host, which is the
+ * opposite of what this mode is for.
+ *
+ * Writing a multi-line map requires CAP_SETUID/CAP_SETGID in the PARENT user
+ * namespace.  UID mode already demands both (checked up front in
+ * nvkvm_iso_cfg_validate), so this adds no new requirement.  `setgroups: deny`
+ * is still written — it is always permitted and is strictly stronger than the
+ * setgroups(0, NULL) the child would otherwise do.
+ */
+static inline int nvkvm_map_child_userns(pid_t pid, uid_t extra_uid, gid_t extra_gid)
+{
+	char map[128];
+	/*
+	 * setgroups policy.
+	 *
+	 * Plain namespace mode writes "deny", unchanged: it is what stops an
+	 * unprivileged process in a user namespace from dropping a supplementary
+	 * group to get past a negative group permission.
+	 *
+	 * Combined namespace+uid mode must NOT write it, and the reason is
+	 * measured rather than theoretical.  With "deny", setgroups(2) is
+	 * permanently EPERM inside the namespace, so the child cannot run
+	 * setgroups(0, NULL) and keeps QEMU's inherited supplementary group 0 —
+	 * observed on a real isolate as `Uid: 500004 ... Groups: 0`, i.e. a uid
+	 * separated isolate still carrying the host root group.  That defeats
+	 * half the point of adding uid separation on top.
+	 *
+	 * Leaving the policy at its default ("allow") lets the child clear the
+	 * group list outright, which is strictly stronger than being unable to
+	 * change it.  The exposure "deny" exists to prevent does not apply: the
+	 * child is blocked on the sync pipe until we release it, its very first
+	 * act is setgroups(0, NULL), and after the uid drop it holds no
+	 * CAP_SETGID — nor is setgroups in the stub's seccomp allowlist — so it
+	 * can never add a group back.
+	 */
+	if (!extra_uid && nvkvm_write_child_map(pid, "setgroups", "deny") < 0)
+		return -1;
+	if (extra_uid)
+		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
+			 (unsigned)geteuid(), (unsigned)extra_uid,
+			 (unsigned)extra_uid);
+	else
+		snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)geteuid());
+	if (nvkvm_write_child_map(pid, "uid_map", map) < 0)
+		return -1;
+	if (extra_gid)
+		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
+			 (unsigned)getegid(), (unsigned)extra_gid,
+			 (unsigned)extra_gid);
+	else
+		snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)getegid());
+	if (nvkvm_write_child_map(pid, "gid_map", map) < 0)
+		return -1;
+	return 0;
+}
+
 /* ── Ladder probes (used by mode `auto`) ─────────────────────────────────
  *
  * Every probe ATTEMPTS the thing rather than inferring it from configuration,
@@ -421,22 +532,140 @@ static inline int nvkvm_iso_node_world_rw(const char *path, unsigned *mode_out)
  */
 
 /*
- * Can we create the namespace set the sandbox needs?  Does a real
- * clone(2) with the production flags and immediately reaps the child.
- * Returns 0 if yes; -1 with *err_out set to the errno if not.
+ * Which privileged step of the real spawn failed.  The real spawn does three
+ * of them and the probe must attempt all three, in the same order, or it can
+ * report a rung that then cannot run.
  */
-static inline int nvkvm_iso_probe_namespaces(int *err_out)
+/* Feature macro: the probe reports WHICH step failed.  An enum constant is
+ * invisible to #ifdef, and tests/security/ns_probe_test.c needs to build
+ * against both this header and the pre-fix one to demonstrate the regression. */
+#define NVKVM_ISO_NS_STEP_AWARE 1
+
+enum nvkvm_iso_ns_step {
+	NVKVM_ISO_NS_OK    = 0,
+	NVKVM_ISO_NS_CLONE,   /* clone(CLONE_NEWUSER|...) itself was refused   */
+	NVKVM_ISO_NS_MAP,     /* parent could not write the child's uid/gid map */
+	NVKVM_ISO_NS_MOUNT,   /* child could not USE the namespace it got      */
+};
+
+/*
+ * Turn a probe failure into the sentence an operator can act on.  Same
+ * treatment the clone-failure path in nvkvm_isolate.c already gets: name the
+ * likely cause and the knob, because "EPERM writing uid_map" is otherwise a
+ * mystery even to someone who knows namespaces.
+ */
+static inline void nvkvm_iso_ns_step_explain(enum nvkvm_iso_ns_step step,
+					     int err, char *out, size_t outsz)
+{
+	switch (step) {
+	case NVKVM_ISO_NS_CLONE:
+		snprintf(out, outsz,
+			 "clone(CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET|"
+			 "CLONE_NEWIPC|CLONE_NEWUTS|CLONE_NEWNS) failed: %s. "
+			 "Typical under the default Docker seccomp/AppArmor "
+			 "profile, which blocks CLONE_NEWUSER regardless of "
+			 "kernel.unprivileged_userns_clone and "
+			 "user.max_user_namespaces.", strerror(err));
+		return;
+	case NVKVM_ISO_NS_MAP:
+		snprintf(out, outsz,
+			 "the namespace was created but its uid/gid map could "
+			 "not be written: %s. The map is `0 <euid> 1`, so when "
+			 "QEMU runs as uid 0 it maps UID 0 of the PARENT "
+			 "namespace, and since Linux 5.12 that requires "
+			 "CAP_SETFCAP in the parent namespace (user_namespaces(7), "
+			 "\"writing to uid_map and gid_map\"); no other "
+			 "capability substitutes for it, CAP_SYS_ADMIN "
+			 "included. Either add CAP_SETFCAP "
+			 "(--cap-add=SETFCAP) or run QEMU as a non-root uid, "
+			 "for which the rule does not apply.", strerror(err));
+		return;
+	case NVKVM_ISO_NS_MOUNT:
+		snprintf(out, outsz,
+			 "the namespace was created and mapped but could not be "
+			 "used: mount(MS_REC|MS_PRIVATE) on / failed: %s. "
+			 "Typical on Ubuntu 23.10+ with the default "
+			 "kernel.apparmor_restrict_unprivileged_userns=1, which "
+			 "lets an unprivileged process create the user namespace "
+			 "and then refuses the mount operations inside it.",
+			 strerror(err));
+		return;
+	case NVKVM_ISO_NS_OK:
+	default:
+		snprintf(out, outsz, "no failure");
+		return;
+	}
+}
+
+/*
+ * Can we create AND USE the namespace set the sandbox needs?  Performs a real
+ * clone(2) with the production flags and then every other privileged step the
+ * real spawn performs, in the same order, using the same code:
+ *
+ *   1. clone(CLONE_NEWUSER|NEWPID|NEWNET|NEWIPC|NEWUTS|NEWNS)
+ *   2. parent writes setgroups/uid_map/gid_map  <- nvkvm_map_child_userns()
+ *   3. child does mount(NULL, "/", NULL, MS_REC|MS_PRIVATE, NULL)
+ *
+ * Returns 0 if all three succeed; -1 with *err_out set and *step_out naming
+ * the step that failed.  Both out-params are optional.
+ *
+ * STEP 2 IS WHY THIS FUNCTION LOOKS EXPENSIVE FOR A PROBE, and it is not
+ * optional.  An earlier version stopped after step 3 without ever attempting
+ * step 2, which made it fail OPEN on a real configuration: with CAP_SYS_ADMIN
+ * and without CAP_SETFCAP the clone succeeds, the mount succeeds, the probe
+ * says "namespace available", `auto` pins the strongest rung -- and then every
+ * isolate dies in nvkvm_map_child_userns() with EPERM, so the guest gets no
+ * GPU at all.  Measured; tests/security/ns_probe_test.c is the regression test.
+ *
+ * The sync pipe is the same handshake the real spawn uses (pipe2(O_CLOEXEC),
+ * child blocks on a 1-byte read, EOF means the parent's map write failed and
+ * the child must not proceed).  Reusing the shape matters: the child MUST be
+ * alive while the parent writes its map, and it must do the mount AFTER the
+ * map lands, because that is the order and the credential state the real
+ * isolate runs in.
+ */
+static inline int nvkvm_iso_probe_namespaces(int *err_out,
+					     enum nvkvm_iso_ns_step *step_out)
 {
 	unsigned long flags = CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET |
 			      CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWNS |
 			      (unsigned long)SIGCHLD;
-	pid_t pid = (pid_t)syscall(SYS_clone, flags, (void *)0, (void *)0,
-				   (void *)0, 0UL);
+	int syncpipe[2] = { -1, -1 };
+	int err = 0, status = 0, map_rc;
+	enum nvkvm_iso_ns_step step = NVKVM_ISO_NS_OK;
+	pid_t pid;
+
+	/* pipe2 via syscall(): this header is included by translation units that
+	 * do not define _GNU_SOURCE, so the libc wrapper may not be declared. */
+#ifdef SYS_pipe2
+	if (syscall(SYS_pipe2, syncpipe, O_CLOEXEC) != 0)
+#else
+	if (pipe(syncpipe) != 0)
+#endif
+	{
+		/* Not a statement about namespaces, but we cannot run the probe
+		 * without it.  Report as the first step so the caller degrades
+		 * rather than trusting an answer we never obtained. */
+		err = errno;
+		step = NVKVM_ISO_NS_CLONE;
+		goto out;
+	}
+
+	pid = (pid_t)syscall(SYS_clone, flags, (void *)0, (void *)0,
+			     (void *)0, 0UL);
 	if (pid == 0) {
+		char go;
+		close(syncpipe[1]);
+		/* Same fail-closed handshake as the real child: a short read
+		 * means the parent could not map us, and we must not report
+		 * success by exiting 0. */
+		if (read(syncpipe[0], &go, 1) != 1)
+			_exit(126);
+		close(syncpipe[0]);
 		/*
 		 * USE the namespace, do not merely enter it.  A successful
 		 * clone(CLONE_NEWUSER|...) does NOT mean the namespace is
-		 * usable: on Ubuntu 24.04 and later, with the default
+		 * usable: on Ubuntu 23.10 and later, with the default
 		 * kernel.apparmor_restrict_unprivileged_userns=1, an
 		 * unprivileged process creates the user namespace fine and is
 		 * then refused the mount operations inside it.  A probe that
@@ -447,31 +676,65 @@ static inline int nvkvm_iso_probe_namespaces(int *err_out)
 		 * with QEMU running as a non-root user, which is exactly how
 		 * libvirt runs it.
 		 *
-		 * So attempt the first privileged thing the real spawn does.
-		 * Cheap, and it is the operation that actually gets refused.
+		 * This is the first privileged thing the real child does after
+		 * the map lands, and it is the operation that gets refused.
 		 */
 		if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
 			_exit(errno & 0x7f ? errno & 0x7f : 1);
 		_exit(0);
 	}
 	if (pid < 0) {
-		if (err_out) *err_out = errno;
-		return -1;
+		err = errno;
+		step = NVKVM_ISO_NS_CLONE;
+		close(syncpipe[0]);
+		close(syncpipe[1]);
+		goto out;
 	}
+
+	close(syncpipe[0]);
+	/*
+	 * extra_uid/extra_gid are 0 because `auto` only ever selects
+	 * NVKVM_ISO_LAYER_NS|NVKVM_ISO_LAYER_SECCOMP -- no UID layer -- and
+	 * that is the rung this probe decides.  Combined `namespace+uid` writes
+	 * the two-line map instead, which additionally needs CAP_SETUID and
+	 * CAP_SETGID in the parent; it is never auto-selected and is validated
+	 * up front by nvkvm_iso_cfg_validate(), which demands both.
+	 */
+	errno = 0;
+	map_rc = nvkvm_map_child_userns(pid, 0, 0);
+	if (map_rc != 0)
+		err = errno ? errno : EPERM;
+	else if (write(syncpipe[1], "x", 1) != 1) {
+		err = errno ? errno : EIO;
+		map_rc = -1;
+	}
+	/* On failure this close is the EOF that makes the child _exit(126). */
+	close(syncpipe[1]);
+
 	/* Reap.  If QEMU's own SIGCHLD handling got there first waitpid fails
-	 * with ECHILD, which tells us nothing about the probe — the clone
-	 * already succeeded, and that is the whole answer. */
-	int status = 0;
+	 * with ECHILD, which tells us nothing about the probe -- the steps we
+	 * care about have already reported themselves. */
 	while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
 		;
+
+	if (map_rc != 0) {
+		step = NVKVM_ISO_NS_MAP;
+		goto out;
+	}
 	if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
 		/* The namespace exists but cannot be used.  Treat exactly as
-		 * "namespace unavailable" so auto falls to the next rung. */
-		if (err_out) *err_out = WEXITSTATUS(status);
-		return -1;
+		 * "namespace unavailable" so auto falls to the next rung.
+		 * 126 cannot appear here: it means the child saw EOF on the
+		 * sync pipe, which only happens when map_rc != 0 above. */
+		err = WEXITSTATUS(status);
+		step = NVKVM_ISO_NS_MOUNT;
+		goto out;
 	}
-	if (err_out) *err_out = 0;
-	return 0;
+
+out:
+	if (err_out)  *err_out  = (step == NVKVM_ISO_NS_OK) ? 0 : err;
+	if (step_out) *step_out = step;
+	return (step == NVKVM_ISO_NS_OK) ? 0 : -1;
 }
 
 /*
@@ -507,6 +770,24 @@ static inline int nvkvm_iso_probe_uid(char *why, size_t whysz)
  * seccomp(SECCOMP_SET_MODE_FILTER, ...) faults BEFORE installing anything, so
  * EFAULT is the "supported" answer and nothing is applied to this process.
  * ENOSYS means no seccomp syscall; EINVAL means CONFIG_SECCOMP_FILTER is off.
+ *
+ * EACCES IS ALSO A "SUPPORTED" ANSWER, and this is the one non-obvious case.
+ * The kernel refuses SECCOMP_SET_MODE_FILTER with EACCES when the caller has
+ * neither no_new_privs nor CAP_SYS_ADMIN.  That is a statement about *this*
+ * process, not about the host: the filter is installed by the STUB, which sets
+ * PR_SET_NO_NEW_PRIVS in main() before it spawns its workers and only then
+ * calls seccomp() with TSYNC.  QEMU deliberately does not set no_new_privs on
+ * itself just to run a probe -- it is irreversible and would apply to every
+ * later execve QEMU does.  So treating EACCES as unsupported would make `auto`
+ * refuse to start on a host where the stub's filter would install perfectly.
+ *
+ * MEASURED (kernel 7.0.0-29, 2026-08-27): this kernel checks the filter
+ * pointer first, so the probe returns EFAULT in every combination tested --
+ * root with full caps, root with CapEff=0, uid 65534, with and without
+ * no_new_privs.  EACCES was never observed, so this arm is defensive against a
+ * kernel that orders the two checks the other way, not a fix for an observed
+ * failure.  It is the fail-CLOSED direction (the old code would have refused
+ * to start), which is why it was not the bug the namespace probe had.
  */
 static inline int nvkvm_iso_probe_seccomp(int *err_out)
 {
@@ -514,12 +795,39 @@ static inline int nvkvm_iso_probe_seccomp(int *err_out)
 	long r = syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, (void *)0);
 	if (r == 0)                     /* should be impossible; be conservative */
 		return 0;
-	if (errno == EFAULT) {
+	if (errno == EFAULT || errno == EACCES) {
 		if (err_out) *err_out = 0;
 		return 0;
 	}
 	if (err_out) *err_out = errno;
 	return -1;
+}
+
+/*
+ * Append to a report buffer, clamped.
+ *
+ * snprintf() returns the length it WOULD have written, so the idiom
+ * `n += snprintf(buf + n, sz - n, ...)` walks n past the end of the buffer as
+ * soon as anything truncates -- after which `buf + n` is out of bounds and
+ * `sz - n` underflows to a huge size_t.  auto_select() used that idiom and the
+ * step-aware explanations below are long enough to reach it, so clamp once
+ * here rather than reasoning aboutevery call site.
+ */
+static inline size_t nvkvm_iso_report_append(char *buf, size_t sz, size_t n,
+					     const char *fmt, ...)
+{
+	va_list ap;
+	int w;
+
+	if (n >= sz)
+		return sz ? sz - 1 : 0;
+	va_start(ap, fmt);
+	w = vsnprintf(buf + n, sz - n, fmt, ap);
+	va_end(ap);
+	if (w < 0)
+		return n;
+	n += (size_t)w;
+	return n >= sz ? sz - 1 : n;
 }
 
 /*
@@ -540,24 +848,27 @@ static inline int nvkvm_iso_auto_select(unsigned *mode_out, char *report,
 					size_t errsz)
 {
 	char why[192];
+	char nswhy[512];
+	enum nvkvm_iso_ns_step nsstep = NVKVM_ISO_NS_OK;
 	int e = 0;
 	size_t n = 0;
 
-	if (nvkvm_iso_probe_namespaces(&e) == 0) {
+	if (nvkvm_iso_probe_namespaces(&e, &nsstep) == 0) {
 		*mode_out = NVKVM_ISO_LAYER_NS | NVKVM_ISO_LAYER_SECCOMP;
 		snprintf(report, reportsz,
 			 "isolate mode auto -> namespace (strongest rung; "
-			 "clone(CLONE_NEWUSER|...) succeeded)");
+			 "clone(CLONE_NEWUSER|...), the uid/gid map write and "
+			 "the in-namespace mount all succeeded)");
 		return 0;
 	}
-	n += snprintf(report + n, reportsz - n,
-		      "isolate mode auto: 'namespace' UNAVAILABLE — "
-		      "clone(CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET|"
-		      "CLONE_NEWIPC|CLONE_NEWUTS|CLONE_NEWNS) failed: %s. "
-		      "Typical under the default Docker seccomp/AppArmor "
-		      "profile, which blocks CLONE_NEWUSER regardless of "
-		      "kernel.unprivileged_userns_clone and "
-		      "user.max_user_namespaces.\n", strerror(e));
+	/* Name the step that actually failed.  The old text blamed the clone
+	 * unconditionally, which was wrong the moment the probe grew a second
+	 * failure mode -- and the map-write mode is the one nobody can debug
+	 * from a bare EPERM. */
+	nvkvm_iso_ns_step_explain(nsstep, e, nswhy, sizeof(nswhy));
+	n = nvkvm_iso_report_append(report, reportsz, n,
+				    "isolate mode auto: 'namespace' UNAVAILABLE — %s\n",
+				    nswhy);
 
 	why[0] = '\0';
 	if (nvkvm_iso_probe_uid(why, sizeof(why)) == 0) {
@@ -565,7 +876,7 @@ static inline int nvkvm_iso_auto_select(unsigned *mode_out, char *report,
 		nvkvm_iso_have_caps(&su, &sg, &cc);
 		*mode_out = NVKVM_ISO_LAYER_UID | NVKVM_ISO_LAYER_SECCOMP |
 			    (cc ? NVKVM_ISO_LAYER_CHROOT : 0u);
-		snprintf(report + n, reportsz - n,
+		n = nvkvm_iso_report_append(report, reportsz, n,
 			 "isolate mode auto -> %s. %s"
 			 "This is a MATERIALLY WEAKER boundary than namespace "
 			 "mode: no pid, mount, net, ipc or uts isolation. See "
@@ -575,14 +886,46 @@ static inline int nvkvm_iso_auto_select(unsigned *mode_out, char *report,
 			      "confinement is included. "
 			    : "CAP_SYS_CHROOT is ABSENT, so the isolate can "
 			      "read the whole host filesystem. ");
+		/*
+		 * CAP_SETPCAP is not required by this rung and must not gate it
+		 * -- rejecting it here would push a host that grants
+		 * SETUID/SETGID and not SETPCAP all the way down to the
+		 * `seccomp` rung, which does not separate isolates from each
+		 * other at all.  But its absence is not free either:
+		 * nvkvm_drop_caps_pre()'s PR_CAPBSET_DROP loop needs it and
+		 * ignores its return value, so without it the isolate silently
+		 * keeps a FULL capability bounding set.  Measured: with
+		 * CAP_SETPCAP out of the bounding set every PR_CAPBSET_DROP
+		 * returns EPERM and CapBnd stays at 000001fffffffeff.
+		 *
+		 * That is inert in practice -- after the uid drop the isolate
+		 * holds no permitted caps, no_new_privs is set, and execve is
+		 * not in the stub's seccomp allowlist, so there is no path to
+		 * regain anything -- but "inert in practice" is not something
+		 * an operator should have to rediscover from /proc.  Say it.
+		 */
+		if (nvkvm_iso_cap_effective(CAP_SETPCAP) == 0) {
+			n = nvkvm_iso_report_append(report, reportsz, n,
+				 " CAP_SETPCAP is ABSENT, so the isolate's "
+				 "capability BOUNDING set cannot be dropped and "
+				 "stays full (CapBnd unchanged in "
+				 "/proc/<isolate>/status). Its effective and "
+				 "permitted sets are still zeroed and "
+				 "no_new_privs is still set, so this is a "
+				 "weakened defence in depth rather than a live "
+				 "capability -- add --cap-add=SETPCAP to close "
+				 "it.");
+		}
+		(void)n;
 		return 0;
 	}
-	n += snprintf(report + n, reportsz - n,
-		      "isolate mode auto: 'uid' UNAVAILABLE — %s.\n", why);
+	n = nvkvm_iso_report_append(report, reportsz, n,
+				    "isolate mode auto: 'uid' UNAVAILABLE — %s.\n",
+				    why);
 
 	if (nvkvm_iso_probe_seccomp(&e) == 0) {
 		*mode_out = NVKVM_ISO_LAYER_SECCOMP;
-		snprintf(report + n, reportsz - n,
+		n = nvkvm_iso_report_append(report, reportsz, n,
 			 "isolate mode auto -> seccomp (LOWEST rung auto will "
 			 "ever select; it never selects 'none'). The isolate "
 			 "gets the 20-syscall allowlist and nothing else: it "
@@ -592,13 +935,12 @@ static inline int nvkvm_iso_auto_select(unsigned *mode_out, char *report,
 		return 0;
 	}
 	snprintf(err, errsz,
-		 "isolate mode auto: every rung failed. namespace: clone "
-		 "refused; uid: %s; seccomp: SECCOMP_SET_MODE_FILTER "
-		 "unavailable (%s). auto will not select 'none', so there is "
-		 "nothing left to fall back to — refusing to start. Set "
-		 "NVKVM_ISOLATE_MODE=none plus %s=%s if you genuinely want no "
-		 "confinement at all.",
-		 why, strerror(e), NVKVM_ISO_UNSAFE_ACK_ENV,
+		 "isolate mode auto: every rung failed. namespace: %s uid: %s; "
+		 "seccomp: SECCOMP_SET_MODE_FILTER unavailable (%s). auto will "
+		 "not select 'none', so there is nothing left to fall back to — "
+		 "refusing to start. Set NVKVM_ISOLATE_MODE=none plus %s=%s if "
+		 "you genuinely want no confinement at all.",
+		 nswhy, why, strerror(e), NVKVM_ISO_UNSAFE_ACK_ENV,
 		 NVKVM_ISO_UNSAFE_ACK_VALUE);
 	return -1;
 }

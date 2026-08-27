@@ -123,86 +123,23 @@ static void nvkvm_drop_caps_post(void)
 	prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
 }
 
-/* Parent-side: write one /proc/<pid>/<which> map file for the child's userns. */
-static int nvkvm_write_child_map(pid_t pid, const char *which, const char *val)
-{
-	char path[64];
-	snprintf(path, sizeof(path), "/proc/%d/%s", (int)pid, which);
-	int fd = open(path, O_WRONLY | O_CLOEXEC);
-	if (fd < 0)
-		return -1;
-	size_t len = strlen(val);
-	ssize_t n = write(fd, val, len);
-	close(fd);
-	return (n == (ssize_t)len) ? 0 : -1;
-}
-
 /*
- * Parent-side: set up the rootless uid/gid mapping for a child that was
- * clone()'d with CLONE_NEWUSER.  ns-root 0 -> our euid/egid (single-line map,
- * permitted even for an unprivileged parent).  Returns 0 / -1.
+ * The parent-side userns map writers -- nvkvm_write_child_map() and
+ * nvkvm_map_child_userns() -- used to live here.  They now live in
+ * nvkvm_isolate_uid.h, next to nvkvm_iso_probe_namespaces(), and this file
+ * still calls nvkvm_map_child_userns() below exactly as before.
  *
- * COMBINED namespace+uid mode needs a SECOND line.  The child becomes ns-root
- * (uid 0) so it can mount/pivot_root, and only then drops to its per-isolate
- * uid — but setresuid() to an id that is not mapped into the user namespace
- * fails with EINVAL, so the target uid must appear in the map.  We map it
- * identity (host uid N -> ns uid N) so the host-visible uid really is the
- * separated one; a namespaced-but-unmapped uid would give a process that looks
- * separated from the inside and is uid `nobody` on the host, which is the
- * opposite of what this mode is for.
- *
- * Writing a multi-line map requires CAP_SETUID/CAP_SETGID in the PARENT user
- * namespace.  UID mode already demands both (checked up front in
- * nvkvm_iso_cfg_validate), so this adds no new requirement.  `setgroups: deny`
- * is still written — it is always permitted and is strictly stronger than the
- * setgroups(0, NULL) the child would otherwise do.
+ * WHY THEY MOVED.  The probe used to clone with the production flags and stop
+ * there; the real spawn does one more privileged step -- this map write -- and
+ * that step needs CAP_SETFCAP whenever it maps parent-UID 0 (the Linux 5.12
+ * rule in user_namespaces(7)).  So on a host holding CAP_SYS_ADMIN but not
+ * CAP_SETFCAP the probe reported `namespace` AVAILABLE and every isolate then
+ * died here, fail-closed, with the GPU silently unavailable to the guest.
+ * Sharing one function means the probe cannot attempt a DIFFERENT map than the
+ * spawn writes: a change to the map content is automatically a change to what
+ * the probe exercises.  tests/security/ns_probe_test.c is the regression test.
  */
-static int nvkvm_map_child_userns(pid_t pid, uid_t extra_uid, gid_t extra_gid)
-{
-	char map[128];
-	/*
-	 * setgroups policy.
-	 *
-	 * Plain namespace mode writes "deny", unchanged: it is what stops an
-	 * unprivileged process in a user namespace from dropping a supplementary
-	 * group to get past a negative group permission.
-	 *
-	 * Combined namespace+uid mode must NOT write it, and the reason is
-	 * measured rather than theoretical.  With "deny", setgroups(2) is
-	 * permanently EPERM inside the namespace, so the child cannot run
-	 * setgroups(0, NULL) and keeps QEMU's inherited supplementary group 0 —
-	 * observed on a real isolate as `Uid: 500004 ... Groups: 0`, i.e. a uid
-	 * separated isolate still carrying the host root group.  That defeats
-	 * half the point of adding uid separation on top.
-	 *
-	 * Leaving the policy at its default ("allow") lets the child clear the
-	 * group list outright, which is strictly stronger than being unable to
-	 * change it.  The exposure "deny" exists to prevent does not apply: the
-	 * child is blocked on the sync pipe until we release it, its very first
-	 * act is setgroups(0, NULL), and after the uid drop it holds no
-	 * CAP_SETGID — nor is setgroups in the stub's seccomp allowlist — so it
-	 * can never add a group back.
-	 */
-	if (!extra_uid && nvkvm_write_child_map(pid, "setgroups", "deny") < 0)
-		return -1;
-	if (extra_uid)
-		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
-			 (unsigned)geteuid(), (unsigned)extra_uid,
-			 (unsigned)extra_uid);
-	else
-		snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)geteuid());
-	if (nvkvm_write_child_map(pid, "uid_map", map) < 0)
-		return -1;
-	if (extra_gid)
-		snprintf(map, sizeof(map), "0 %u 1\n%u %u 1\n",
-			 (unsigned)getegid(), (unsigned)extra_gid,
-			 (unsigned)extra_gid);
-	else
-		snprintf(map, sizeof(map), "0 %u 1\n", (unsigned)getegid());
-	if (nvkvm_write_child_map(pid, "gid_map", map) < 0)
-		return -1;
-	return 0;
-}
+
 
 /*
  * Spawn the isolate child.  In namespace mode, clone() it directly into fresh

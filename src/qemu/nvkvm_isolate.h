@@ -282,7 +282,12 @@ struct nvkvm_isolate_table {
 	 * text explaining why isolation is unavailable or unsafe.  A security
 	 * message that stops mid-sentence is worse than a compiler warning. */
 	char                     cfg_error[512];  /* non-empty => config unusable */
-	char                     cfg_report[1024];/* what `auto` probed and chose */
+	char                     cfg_report[2048];/* what `auto` probed and chose;
+					   2048 not 1024: the step-aware probe
+					   explanations (CAP_SETFCAP / AppArmor
+					   userns / CAP_SETPCAP) are the reason
+					   the report exists and must not be
+					   the part that gets truncated. */
 	/*
 	 * Owning VirtIONvgpu (opaque here to avoid a header cycle).  Set on the
 	 * first isolate create; used by ring setup/teardown to place the ring
