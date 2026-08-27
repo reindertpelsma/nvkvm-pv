@@ -482,9 +482,41 @@ files under `.github/` had prose references to "QEMU 9.2"; updated.
 `git rebase`d onto `v11.1.1`. That is the recipe now written into
 `patches/README.md`.
 
-**Build.** `NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force`, i.e. the repo's own
-path, from a fresh clone, with GTK **and** SDL enabled so that `0005`–`0009` are
-actually compiled.
+**Build.** `NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force` — the repo's own
+path, from a fresh clone of `v11.1.1`, with GTK **and** SDL enabled so that
+`0005`–`0009` are actually compiled rather than merely applied. Clean: zero
+`FAILED` targets across all 3156.
+
+All twelve patches applied to the fresh tree in order, and the new step-2b tag
+guard reported `tree is at v11.1.1, as the patches expect`. Re-running
+`--force` over the already-patched tree now works (`reset 14 upstream file(s)
+to v11.1.1`, then twelve `applied:` lines) — that is the idempotency bug fixed
+in this branch.
+
+What the resulting binary proves, beyond "it linked":
+
+```
+$ qemu-system-x86_64 --version
+QEMU emulator version 11.1.1 (v11.1.1-dirty)
+
+$ qemu-system-x86_64 -device help | grep -i nvgpu
+name "virtio-nvgpu-pci", bus PCI
+name "virtio-nvgpu-pci-non-transitional", bus PCI
+name "virtio-nvgpu-pci-transitional", bus PCI
+name "virtio-nvgpu-device", bus virtio-bus
+name "nvkvm-gpu", bus PCI, desc "nvkvm emulated NVIDIA GPU PCI identity ..."
+
+$ qemu-system-x86_64 -display help | grep -iE 'nvkvm|^gtk|^sdl'
+gtk
+sdl
+nvkvm-broker
+```
+
+`nvkvm-broker` appearing in `-display help` is the end-to-end check on patch
+`0011`: the QAPI schema change survived 11.1's stricter QAPI codegen (including
+the new ≤70-character doc-line rule) and produced a real display backend.
+`gtk` and `sdl` being present is what makes `0005`–`0009` compiled code rather
+than untested patch text.
 
 **Unit tests.** `bash tests/unit/run_tests.sh` — all 16 suites built and ran,
 no failures, and the `test_isolate` known-failing set came back with none
