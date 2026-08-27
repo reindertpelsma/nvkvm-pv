@@ -573,4 +573,36 @@ held key and the grab).
 Note the selftest needs `make -C src/broker` first; it exits 2 with
 `build first: make` otherwise, which is easy to mistake for a failure.
 
-**Hardware.** See below.
+**Hardware.**
+
+> ### Scope of the hardware result — read this before quoting it
+>
+> The rented box runs **NVIDIA driver 580.105.08, open kernel module**
+> (`NVRM version: NVIDIA UNIX Open Kernel Module for x86_64 580.105.08`), on a
+> **GeForce RTX 4070 Ti** (Ada), in a real VM (`systemd-detect-virt` = `kvm`,
+> `/dev/kvm` present, 17 vCPU / 24 GB).
+>
+> **The physical PC this ships against runs 595.84.** So a pass here covers
+> **one driver branch and one module flavour**, and neither is the shipping
+> one.
+>
+> That distinction is not cosmetic for nvkvm. The device *forwards ioctls to
+> the host driver*, so a large part of the surface under test is the host
+> driver's ABI, not QEMU's — which is exactly why `docs/internal/`
+> already carries `nvkms-allowlist-abi-drift.md`. A result on 580-open does
+> not generalise to 595-proprietary for free.
+>
+> Write it as "passes on 580.105.08 / open module, RTX 4070 Ti", never as
+> "passes on hardware". **The physical-PC run on 595.84 is still required and
+> is the owner's to schedule; this is the first of two, not a substitute.**
+>
+> ### Attribution rule for any failure here
+>
+> A failure on this branch is only a *bump regression* if it does **not**
+> reproduce on 9.2.0 **on this same box, same driver, same guest image**. That
+> control is cheap — `main` still pins 9.2.0 — and
+> `scripts/` + `onbox_control_92.sh` build it to a separate prefix
+> (`/opt/qemu-nvkvm-92`) and run the identical checks. Run the control before
+> calling anything a regression; a failure that reproduces on 9.2.0 is a
+> driver-branch or box property and belongs in `known-limitations.md`, not in
+> this bump's ledger.
