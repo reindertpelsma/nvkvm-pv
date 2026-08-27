@@ -466,6 +466,7 @@ typedef struct NvkvmPresent {
      * compositor upload -- see nvkvm_udmabuf.h for the measurements.
      */
     bool      relay_readback;      /* stage into udmabuf and submit to relay */
+    uint64_t  relay_gen;           /* broker connection this decision belongs to */
     struct nvkvm_udmabuf stage_buf[NVKVM_STAGE_MAX];
 
     uint8_t  *stage[NVKVM_STAGE_MAX];
@@ -1542,11 +1543,50 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
     g_free(p);
 }
 
+/*
+ * A RECONNECTED BROKER IS A DIFFERENT DISPLAY, so a present decision made for
+ * the previous one is void.  relay_readback and mode are latched deliberately
+ * -- they must not be re-probed per frame -- but the latch was never scoped to
+ * a connection, so it outlived the broker it was made for.
+ *
+ * MEASURED, and it goes both ways.  Restart only the broker container and the
+ * VMM keeps offering the dma-buf the OLD broker accepted; the new one rejects
+ * every frame ("is not advertised by this display") until the VMM itself is
+ * restarted.  The mirror case is silent: a VMM that fell back to readback for a
+ * display which could not import stays on that slower path forever after
+ * reconnecting to one that can.
+ *
+ * The relay already does exactly this for its own format verdict and names it
+ * the RR-07 class of bug: a reconnect inheriting partial protocol state.
+ */
+static void present_sync_relay_generation(struct VirtIONvgpu *nv)
+{
+    NvkvmPresent *p = nv ? nv->present_ctx : NULL;
+    uint64_t gen;
+
+    if (!p) {
+        return;
+    }
+    gen = nvkvm_display_relay_generation();
+    if (gen == p->relay_gen) {
+        return;
+    }
+    p->relay_gen = gen;
+    if (p->relay_readback || p->mode != -1) {
+        p->relay_readback = false;
+        p->mode = -1;                 /* re-probed on the next frame */
+        fprintf(stderr, "nvkvm present: the broker reconnected -- forgetting "
+                        "the present path chosen for the previous one and "
+                        "re-probing\n");
+    }
+}
+
 bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                           uint32_t owner_isolate_id, uint32_t buf_key,
                           uint32_t width, uint32_t height, uint32_t stride,
                           uint32_t fourcc, uint64_t modifier)
 {
+    present_sync_relay_generation(nv);
     NvkvmPresent *p = nv->present_ctx;
     if (!p || !p->con) {
         return false;        /* no console → caller keeps the fd */
@@ -1596,6 +1636,7 @@ bool nvkvm_present_submit_readback(struct VirtIONvgpu *nv, int dmabuf_fd,
                                    uint32_t stride, uint32_t fourcc,
                                    uint64_t modifier)
 {
+    present_sync_relay_generation(nv);
     NvkvmPresent *p = nv->present_ctx;
 
     if (!p) {

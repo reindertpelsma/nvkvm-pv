@@ -63,4 +63,7 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
  * broker present path. */
 bool nvkvm_display_relay_active(void);
 
+/* Bumped on every reconnect; see the definition. */
+uint64_t nvkvm_display_relay_generation(void);
+
 #endif /* NVKVM_DISPLAY_RELAY_H */

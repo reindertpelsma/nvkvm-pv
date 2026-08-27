@@ -1669,6 +1669,20 @@ static void register_nvkvm_broker(void)
 
 type_init(register_nvkvm_broker);
 
+/*
+ * Connection generation.  Bumped every time a RECONNECT completes, so a caller
+ * that cached anything about the previous broker can notice the display it was
+ * talking to is gone.  The relay already forgets its own format verdict on
+ * disconnect (relay_forget_format_verdict); this lets the present path do the
+ * same for the decision it latched.
+ */
+uint64_t nvkvm_display_relay_generation(void)
+{
+    NvkvmRelay *r = nvkvm_relay;
+
+    return r ? r->n_reconnects : 0;
+}
+
 #else /* !CONFIG_LINUX */
 
 #include "nvkvm_display_relay.h"
@@ -1676,6 +1690,11 @@ type_init(register_nvkvm_broker);
 bool nvkvm_display_relay_active(void)
 {
     return false;
+}
+
+uint64_t nvkvm_display_relay_generation(void)
+{
+    return 0;
 }
 
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
