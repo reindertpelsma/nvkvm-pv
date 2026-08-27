@@ -321,6 +321,7 @@ out:
 
 #include <pthread.h>
 #include <string.h>
+#include <strings.h>
 #include "qemu/thread.h"
 
 #define NVKVM_PRESENT_CACHE 8
@@ -1045,7 +1046,18 @@ static bool nvkvm_disp_stats(void)
 {
     if (!nvkvm_st_checked) {
         nvkvm_st_checked = true;
-        nvkvm_st_on = getenv("NVKVM_PRESENT_TIMING") != NULL;
+        /*
+         * VALUE-AWARE, NOT PRESENCE-AWARE.  This used to be `!= NULL`, which
+         * meant NVKVM_PRESENT_TIMING=0 switched the stats ON -- the one value
+         * a person sets when they want them off.  Off by default, and every
+         * spelling of "no" is honoured, because this prints a line per second
+         * for the life of the VM and lands in the container log.
+         */
+        const char *t = getenv("NVKVM_PRESENT_TIMING");
+
+        nvkvm_st_on = t && *t
+                      && strcmp(t, "0") != 0 && strcasecmp(t, "off") != 0
+                      && strcasecmp(t, "no") != 0 && strcasecmp(t, "false") != 0;
     }
     return nvkvm_st_on;
 }

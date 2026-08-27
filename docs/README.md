@@ -35,6 +35,7 @@ someone changing that code.
 | [ABI profiles](reference/abi-profiles.md) | the version-keyed table, how it is measured, how it reaches all three components |
 | [Allowlists](reference/allowlists.md) | all nine gates in the order an ioctl meets them — six static default-deny tables plus three code checks |
 | [Virtio protocol](reference/virtio-protocol.md) | virtqueues, shared memory, request types, GPA windows |
+| [Display broker protocol](reference/broker-protocol.md) | the 40-byte command and 24-byte packet, backpressure, and the rule it enforces |
 
 ## Internal
 
@@ -50,6 +51,7 @@ page should link here rather than recite them.
 | [The forwarding model](internal/forwarding-model.md) | sanitiser, aux slot, handle translation, per-command special cases |
 | [The isolate model](internal/isolate-model.md) | why one process per guest process, what the sandbox is, what the trust boundary is |
 | [Cross-isolate sharing](internal/cross-isolate-sharing.md) | dma-buf and CUDA-VMM handle brokering between isolates — the NCCL shared-memory path |
+| [Display broker design](internal/broker-design.md) | why the broker exists, its threat model, and the hardware verification log |
 | [Known limitations](internal/known-limitations.md) | open bugs, intrinsic limits, retracted findings, and numbers that should not be quoted |
 | [The Mint guest desktop](internal/mint-guest-desktop.md) | the DDX investigation end to end, including what `fake-bars` measured before it was removed from the tree |
 | [Narrow-MAXPHYADDR GPA windows](internal/gpa-window-narrow-maxphyaddr.md) | why the window base is computed rather than constant, and what happens when it does not fit |
