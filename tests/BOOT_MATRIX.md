@@ -10,6 +10,48 @@ version pinned), re-run `scripts/make_host_bundle.sh`, re-run
 driver version a vast.ai offer advertises is meaningless — all three boxes
 rented for this run advertised 580.95.05 and all three came up on 575.51.03.
 
+## 2026-08-27 — merge verification of `audit-remediation-tested` (tree `bbe7010`)
+
+The merge of `fix/audit-remediation-20260825` into current `main` was swept on
+two architectures before being proposed for merge. Both boxes ran the tarball
+of tree `bbe7010`, and every result row below carries that stamp.
+
+| GPU | arch | host driver | ABI expected | ABI selected | validate.sh |
+|---|---|---|---:|---:|---:|
+| RTX 4090 | Ada AD102 | 575.51.03 (control) | 570 | 570 | 30P/0F/0S |
+| RTX 4090 | Ada AD102 | 595.84 | 580 | 580 | 30P/0F/0S |
+| RTX 4090 | Ada AD102 | 610.43.02 | 610 | 610 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 575.51.03 (control) | 570 | 570 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 535.309.01 | 535 | 535 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 595.84 | 580 | 580 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 610.43.02 | 610 | 610 | 30P/0F/0S |
+
+The selected ABI profile matched `nvkvm_abi.h`'s prediction on every row, which
+is the property this branch is about: it touches the guest module, the stub and
+the ABI headers, so a wrong profile would show up here first.
+
+**The denial set did not grow.** Measured against the table in
+[Control commands denied by the allowlist](#control-commands-denied-by-the-allowlist):
+
+- 595.84 and 610.43.02, on BOTH architectures: exactly `0x00730102` (2x),
+  `0x2080220b` (1x), `0x2080019f` (1x) — the three already-recorded harmless RM
+  control denials, and nothing else. The nvkms `cmdType=60` denial did not
+  reappear (it is allowed since the 2026-08-17 fix).
+- 535.309.01: `0x00730138` (4x) and `0x00730102` (1x). Both are already recorded
+  against 545.23.08 in the same table; no denial code outside the recorded union
+  appeared.
+- Both 575.51.03 controls: `0x00730102` only.
+
+Cost $0.2867 total ($0.2141 Ada, $0.0726 Ampere). Ada instance 48933590 (machine
+28080) and Ampere instance 48933692 (machine 140965) were destroyed and verified
+absent from the listing. The first Ampere rental, instance 48933447 on machine
+18856, never provisioned KVM (`created` with the log frozen at "Domain not
+found"), was destroyed after 208s / $0.005 and the machine was added to
+`scripts/sweep-known-bad-machines.txt`; the sweep recycled onto the RTX 3080.
+That untested unit is why the Ampere run exits 2 — no requested driver was left
+without a verdict. Raw artifacts are retained at
+`/workspace/nvkvm-sweep-audrem-bbe7010/`.
+
 ## 2026-08-26 — RR-09 `UVM_REGISTER_GPU` revalidation
 
 Tree `9311bcb` was tested through the unattended sweep on a Vast nested-KVM
