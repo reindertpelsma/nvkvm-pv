@@ -323,6 +323,25 @@ files under `.github/` had prose references to "QEMU 9.2"; updated.
 path, from a fresh clone, with GTK **and** SDL enabled so that `0005`–`0009` are
 actually compiled.
 
-**Unit tests.** See the branch's test record below.
+**Unit tests.** `bash tests/unit/run_tests.sh` — all 16 suites built and ran,
+no failures, and the `test_isolate` known-failing set came back with none
+failing:
+
+```
+test_relay_wiring 22/22   test_objects 20/20   test_tables 17/17
+test_kvm_slot 12/12       test_stub_ptr_sanitize 17/17
+test_transport_ready 6/6  test_r1_type_dev 33/33  test_handle 11/11
+test_drm_devinfo 67/67    test_relay_clip 35/35   test_relay_state 17/17
+test_stub_window 27/27    test_ctrl_gate / test_open_scm / test_uidmap: ok
+test_isolate: 9 cases run (expected 9), failing now: <none>
+```
+
+**Broker selftest.** `bash src/broker/selftest.sh` — **76 checks run, all
+passed**, including the whole ATTACH validator and the input policy state
+machine (grab on/off, key suppression under grab, focus-loss releasing both the
+held key and the grab).
+
+Note the selftest needs `make -C src/broker` first; it exits 2 with
+`build first: make` otherwise, which is easy to mistake for a failure.
 
 **Hardware.** See below.
