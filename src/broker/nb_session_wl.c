@@ -195,6 +195,9 @@ struct nb_wl {
     } proven[NB_PROVEN_SLOTS];
     uint32_t probe_fourcc;   /* the pair the outstanding probe is about */
     uint64_t probe_mod;
+    /* ...and there is at most ONE, because the two fields above are how its
+     * answer is attributed.  See wl_attach(). */
+    bool     probe_inflight;
     /* A probe that failed and the client has not been told about yet. */
     bool     probe_bad_pending;
     uint32_t probe_bad_fourcc;
@@ -569,6 +572,7 @@ static void probe_created(void *data, struct zwp_linux_buffer_params_v1 *params,
     struct nb_wl *w = data;
     int i = wl_pair_slot(w, w->probe_fourcc, w->probe_mod, false);
 
+    w->probe_inflight = false;
     if (i >= 0) {
         w->proven[i].state   = 1;
         w->proven[i].probing = false;
@@ -586,6 +590,7 @@ static void probe_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
     struct nb_wl *w = data;
     int i = wl_pair_slot(w, w->probe_fourcc, w->probe_mod, false);
 
+    w->probe_inflight = false;
     if (i >= 0) {
         w->proven[i].state   = -1;
         w->proven[i].probing = false;
@@ -720,13 +725,38 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
     {
         int ps = wl_pair_slot(w, d->fourcc, d->modifier, true);
 
-        if (ps >= 0 && w->proven[ps].state == -1) {
+        /*
+         * NO SLOT LEFT IS A REJECTION, NOT A DARE.  AUDIT 2026-08-27 S-6:
+         * falling through from here reached create_immed with a pair nothing
+         * had vouched for -- and create_immed reports a refusal as a WAYLAND
+         * PROTOCOL ERROR, which kills the connection and exits the broker.
+         * That is the exact outcome the proven[] table was added to avoid, so
+         * running out of table entries must not re-open it.  The display
+         * advertises dozens of pairs and the client picks which four to spend,
+         * so this is client-reachable in four commands.
+         */
+        if (ps < 0) {
+            return -EINVAL;
+        }
+        if (w->proven[ps].state == -1) {
             return -EINVAL;         /* known-refused: reject, do not retry */
         }
-        if (ps >= 0 && w->proven[ps].probing) {
+        if (w->proven[ps].probing) {
             return 0;               /* a probe is in flight; nothing to show */
         }
-        if (ps >= 0 && w->proven[ps].state == 0) {
+        /*
+         * ONE PROBE AT A TIME.  probe_fourcc/probe_mod are a single slot --
+         * "the pair the outstanding probe is about", singular -- and the
+         * `created`/`failed` events carry no identity of their own, so two
+         * probes in flight means both answers are filed against whichever pair
+         * was started last.  The other pair's slot then stays `probing`
+         * forever: it never displays, and it never frees its entry either,
+         * which is how a client reaches the ps < 0 case above.
+         */
+        if (w->probe_inflight) {
+            return 0;
+        }
+        if (w->proven[ps].state == 0) {
             /* First buffer of this pair: probe it asynchronously, so a refusal
              * arrives as an event rather than as a fatal protocol error. */
             struct zwp_linux_buffer_params_v1 *pp =
@@ -742,6 +772,7 @@ static int wl_attach(struct nb_session *s, const struct nb_buf_desc *d)
             w->probe_fourcc      = d->fourcc;
             w->probe_mod         = d->modifier;
             w->proven[ps].probing = true;
+            w->probe_inflight     = true;
             zwp_linux_buffer_params_v1_create(pp, (int32_t)d->width,
                                               (int32_t)d->height, d->fourcc,
                                               0 /* flags */);
@@ -4067,8 +4098,15 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
      * It costs the compositor an upload per frame, which is why it is the LAST
      * tier and not the first.  The VMM only reaches for it when the dma-buf
      * tiers have been refused.
+     *
+     * accept_SHM, not accept_MEMFD.  AUDIT 2026-08-27 S-1: this line used to
+     * set accept_memfd, which is the validator's "a memfd may stand in for a
+     * dma-buf ANYWHERE" switch -- so making the shm tier work here also
+     * deleted the dma-buf proof (design §3 rule 4) from every ordinary frame,
+     * and a memfd sent WITHOUT F_SHM went to
+     * zwp_linux_buffer_params_v1_add() as though it were one.
      */
-    s->accept_memfd = true;
+    s->accept_shm = true;
     return 0;
 
 fail:

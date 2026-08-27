@@ -295,6 +295,7 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
                    NB_DRM_FORMAT_MOD_INVALID);
 
     s->accept_memfd = true;
+    s->accept_shm   = true;
     s->clipboard_caps = NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G;
     s->caps = NVKVM_BROKER_CAP_KEYBOARD | NVKVM_BROKER_CAP_ABS_POINTER |
               NVKVM_BROKER_CAP_REL_POINTER | NVKVM_BROKER_CAP_POINTER_LOCK |

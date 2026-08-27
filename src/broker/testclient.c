@@ -112,11 +112,20 @@ static int send_cmd(int sock, const struct nvkvm_broker_cmd *c,
  * why only --backend test accepts it: on any real backend this is REJECTED,
  * and proving that is one of the selftest's checks.
  */
+/*
+ * --bad-unsealed: hand over a memfd the client can still shrink.  The broker
+ * must refuse it on the F_SHM path, because everything downstream (the
+ * broker's own mmap on X11, the compositor's wl_shm_pool on Wayland) reads it
+ * after the size was measured.
+ */
+static int tc_unsealed;
+
 static int make_buffer(unsigned w, unsigned h, unsigned *stride_out)
 {
     unsigned stride = w * 4;
     size_t size = (size_t)stride * h;
-    int fd = memfd_create("nvkvm-broker-testbuf", MFD_CLOEXEC);
+    int fd = memfd_create("nvkvm-broker-testbuf",
+                          MFD_CLOEXEC | MFD_ALLOW_SEALING);
 
     if (fd < 0) {
         perror("memfd_create");
@@ -124,6 +133,20 @@ static int make_buffer(unsigned w, unsigned h, unsigned *stride_out)
     }
     if (ftruncate(fd, (off_t)size) < 0) {
         perror("ftruncate");
+        close(fd);
+        return -1;
+    }
+    /*
+     * SEAL IT AGAINST SHRINKING, because the broker now requires that of an
+     * F_SHM buffer and an honest client already has it: the same memfd is
+     * sealed one process out, in src/qemu/nvkvm_udmabuf.c, because udmabuf
+     * demands it for the same reason -- a reader that has measured the size
+     * must not have the backing store taken away underneath it (SIGBUS).
+     * Sealing here is not a test convenience; it is this tool modelling what a
+     * correct VMM does.
+     */
+    if (!tc_unsealed && fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK) < 0) {
+        perror("F_ADD_SEALS(F_SEAL_SHRINK)");
         close(fd);
         return -1;
     }
@@ -178,7 +201,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <socket> [--present WxH] [--window WxH]\n"
                         "       [--bad-size H|--bad-fourcc|--alpha-fourcc|--bad-dim|"
                         "--bad-fd|--bad-frame|--bad-two-fds|--bad-reserved|"
-                        "--bad-commit-fd|--caps-clipboard]\n", argv[0]);
+                        "--bad-commit-fd|--caps-clipboard|--shm|--bad-unsealed]\n",
+                        argv[0]);
         return 2;
     }
     for (i = 2; i < argc; i++) {
@@ -193,6 +217,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--query-format")) { query_format = 1; }
         else if (!strcmp(a, "--unadvertised-mod")) { unadv_mod = 1; }
         else if (!strcmp(a, "--shm")) { shm_mode = 1; }
+        else if (!strcmp(a, "--bad-unsealed")) { shm_mode = 1; tc_unsealed = 1; }
         else if (!strcmp(a, "--hold") && v) { hold_s = atoi(v); i++; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
@@ -384,7 +409,8 @@ int main(int argc, char **argv)
             }
             if (shm_mode) {
                 c.flags = NVKVM_BROKER_CMD_F_SHM;
-                printf("  -> ATTACH declaring F_SHM (shared memory)\n");
+                printf("  -> ATTACH declaring F_SHM (shared memory)%s\n",
+                       tc_unsealed ? " on an UNSEALED memfd" : "");
             }
             if (unadv_mod) {
                 /* NVIDIA block-linear: never advertised by the test backend.
