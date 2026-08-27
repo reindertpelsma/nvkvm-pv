@@ -764,17 +764,21 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
 
     switch (p->type) {
     case NVKVM_BROKER_EV_KEY: {
-        /* Linux evdev keycode -> QKeyCode, the same table ui/input-linux.c
-         * uses, so the broker's backend-independent wire format costs one
-         * array lookup here. */
+        /*
+         * The broker's wire format is a Linux evdev keycode, and since QEMU
+         * 11.1 that is also what a QemuInputEvent carries natively -- the
+         * QKeyCode-based sender (qemu_input_event_send_key_qcode) is gone and
+         * qemu_input_event_send_key_linux() takes the evdev code directly.  So
+         * the conversion this used to do is no longer needed on the way IN;
+         * the map lookup is kept purely as the validity filter it always
+         * doubled as, so a key QEMU has no mapping for is still dropped rather
+         * than forwarded as a code the guest cannot interpret.
+         */
         unsigned code = (unsigned)p->x;
 
-        if (code < qemu_input_map_linux_to_qcode_len) {
-            QKeyCode q = qemu_input_map_linux_to_qcode[code];
-
-            if (q != Q_KEY_CODE_UNMAPPED) {
-                qemu_input_event_send_key_qcode(con, q, p->y != 0);
-            }
+        if (code < qemu_input_map_linux_to_qcode_len &&
+            qemu_input_map_linux_to_qcode[code] != Q_KEY_CODE_UNMAPPED) {
+            qemu_input_event_send_key_linux(con, code, p->y != 0);
         }
         break;
     }
@@ -847,8 +851,12 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
          * coalescing is what turns that into one mode switch when the drag
          * settles rather than a hundred during it.
          */
-        if (con && p->x > 0 && p->y > 0 && dpy_ui_info_supported(con)) {
-            QemuUIInfo info = *dpy_get_ui_info(con);
+        /* 11.1: dpy_ui_info_supported/dpy_get_ui_info/dpy_set_ui_info were
+         * renamed qemu_console_ui_info_supported/_get_ui_info/_set_ui_info,
+         * and _get_ui_info now returns a CONST pointer -- the copy below was
+         * already a copy, so that costs nothing. */
+        if (con && p->x > 0 && p->y > 0 && qemu_console_ui_info_supported(con)) {
+            QemuUIInfo info = *qemu_console_get_ui_info(con);
 
             info.width  = (uint32_t)p->x;
             info.height = (uint32_t)p->y;
@@ -862,7 +870,7 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
             if (p->w0 > 0) {
                 info.refresh_rate = p->w0;
             }
-            dpy_set_ui_info(con, &info, true);
+            qemu_console_set_ui_info(con, &info, true);
         }
         break;
     case NVKVM_BROKER_EV_FRAME:

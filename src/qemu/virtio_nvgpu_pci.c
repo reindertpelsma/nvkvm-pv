@@ -137,7 +137,7 @@ static void virtio_nvgpu_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 	nvkvm_present_console_set_device(&dev->vdev, DEVICE(vpci_dev));
 }
 
-static void virtio_nvgpu_pci_class_init(ObjectClass *klass, void *data)
+static void virtio_nvgpu_pci_class_init(ObjectClass *klass, const void *data)
 {
 	DeviceClass     *dc       = DEVICE_CLASS(klass);
 	VirtioPCIClass  *k        = VIRTIO_PCI_CLASS(klass);

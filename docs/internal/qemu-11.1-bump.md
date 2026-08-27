@@ -217,6 +217,85 @@ grep -rhoE '#include "[a-z0-9_/-]+\.h"' src/qemu src/common src/abi |
 (`qapi/qapi-commands-ui.h` shows up as missing and is a false positive — QAPI
 headers are generated into the build directory, not the source tree.)
 
+### The device sources needed a real API port, not just header paths
+
+This was the largest single cost of the bump and it is **not** in `patches/` at
+all — it is `src/qemu/`, the ~12,900 lines copied into `hw/misc/`. Because they
+are copied rather than patched, `git apply` cannot warn about any of it; the
+compiler is the only check, and it runs at step 8.
+
+Everything below is mechanical — renames and one-for-one signature changes,
+with no behavioural decision except where noted — but there were eleven of them:
+
+**QOM / qdev**
+
+* `class_init(ObjectClass *, void *data)` → `(ObjectClass *, const void *data)`
+  (3 call sites). `TypeInfo.class_data` is `const void *` now.
+* `DEFINE_PROP_END_OF_LIST()` was **removed** (upstream `5fcabe628b`).
+  `device_class_set_props()` is now a macro that takes `ARRAY_SIZE(props)` and
+  build-asserts that the *last* entry's `name` is non-NULL — so the old
+  terminator is a compile error rather than a harmless extra. Property arrays
+  also became `static const Property [];`.
+
+**Poisoned identifier**
+
+* `TARGET_PHYS_ADDR_SPACE_BITS` is now in `include/exec/poison.h`.
+  `nvkvm_mmap_host.c` guarded its use with `#ifdef`, and had a comment
+  explaining that the branch was already always false in `system_ss` — but
+  `#pragma GCC poison` rejects the *mention* of the identifier, `#ifdef`
+  included. The dead branch was deleted; behaviour is unchanged.
+
+**Console / display entry points, renamed into a `qemu_console_*` namespace**
+
+| 9.2 | 11.1.1 |
+|---|---|
+| `console_has_gl` | `qemu_console_has_gl` |
+| `dpy_gfx_update` | `qemu_console_update` |
+| `dpy_gl_ctx_create` / `_destroy` / `_make_current` | `qemu_console_gl_ctx_create` / `_destroy` / `_make_current` |
+| `dpy_gl_scanout_dmabuf` / `dpy_gl_release_dmabuf` / `dpy_gl_update` | `qemu_console_gl_scanout_dmabuf` / `_gl_release_dmabuf` / `_gl_update` |
+| `dpy_ui_info_supported` / `dpy_get_ui_info` / `dpy_set_ui_info` | `qemu_console_ui_info_supported` / `qemu_console_get_ui_info` / `qemu_console_set_ui_info` |
+| `graphic_console_init` | `qemu_graphic_console_create` |
+| `graphic_console_close` | `qemu_graphic_console_close` |
+| `graphic_hw_update` | `qemu_console_hw_update` |
+
+`qemu_console_get_ui_info()` also returns a `const QemuUIInfo *` now; the relay
+already copied it, so that cost nothing.
+
+**Two that are more than a rename**
+
+* `GraphicHwOps.gfx_update` changed from `void (*)(void *)` to
+  `bool (*)(void *)`: **true means the update completed synchronously**, false
+  means "deferred, I will call `qemu_console_hw_update_done()`".
+  `nvkvm_present_gfx_update()` publishes inline and finishes before it returns,
+  so it returns `true` on every path. Returning `false` without ever calling
+  `_update_done()` would hang whatever waits on the update — this is the one
+  change here where getting it wrong is silent rather than a compile error.
+* `qemu_input_event_send_key_qcode()` is **gone**. QEMU 11.1 carries Linux
+  evdev codes in `QemuInputEvent` natively, and the sender is
+  `qemu_input_event_send_key_linux(con, lnx, down)`. The broker's wire format
+  was *already* an evdev code, so the relay's evdev→QKeyCode conversion is now
+  unnecessary on the way in; the `qemu_input_map_linux_to_qcode` lookup is kept
+  purely as the validity filter it always also was, so a key QEMU has no
+  mapping for is still dropped rather than forwarded blind.
+* `qemu_dmabuf_new()` became multi-plane: `offset`, `stride` and the fd are
+  arrays with an explicit `num_planes`. Both nvkvm call sites scan out a
+  single-plane buffer, so both pass one-element arrays and `num_planes = 1`.
+
+**How to find these fast next time.** Do not discover them one 20-minute build
+at a time. Compile *only* the nvkvm objects, with `ninja -k 0` so it does not
+stop at the first failure, and read the whole list at once:
+
+```bash
+ninja -C <qemu>/build -k 0 $(for f in virtio_nvgpu virtio_nvgpu_pci nvkvm_objects \
+    nvkvm_mmap_host nvkvm_handle nvkvm_isolate nvkvm_isolate_handlers \
+    nvkvm_tables nvkvm_present_egl nvkvm_display_relay nvkvm_udmabuf; do \
+    echo libsystem.a.p/hw_misc_$f.c.o; done)
+```
+
+Then `grep -oE "implicit declaration of function ‘[a-z_]+’"` gives the entire
+rename list in one pass, and each old name's replacement is usually findable by
+grepping the new `include/ui/console.h` for the same suffix.
+
 * `scripts/build_qemu.sh` —
   * `QEMU_VERSION="9.2.0"` → `"11.1.1"`;
   * comments saying "QEMU 9.2", "ten patch files" (there are twelve), and the

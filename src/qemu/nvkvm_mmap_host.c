@@ -322,17 +322,19 @@ bool nvkvm_gpa_layout_compute(struct nvkvm_gpa_layout *out,
 	 * TARGET_PHYS_ADDR_SPACE_BITS is the right constant but it is
 	 * *target-specific* (target/i386/cpu-param.h) and these sources are
 	 * compiled into system_ss, which is built once for all targets — so it
-	 * is not visible here.  Use it when it is, and otherwise fall back to
-	 * x86-64's value (52), which is also the architectural ceiling for
-	 * MAXPHYADDR.
+	 * is not visible here.  Fall back to x86-64's value (52), which is also
+	 * the architectural ceiling for MAXPHYADDR, and which nvkvm is limited
+	 * to anyway (the build refuses any host that is not x86-64).
+	 *
+	 * This used to be `#ifdef TARGET_PHYS_ADDR_SPACE_BITS ... #else 52`.
+	 * The #ifdef was ALREADY always false here for the reason above, so
+	 * nothing changes behaviourally -- but QEMU 11.1 adds the symbol to
+	 * include/exec/poison.h, and `#pragma GCC poison` rejects the mere
+	 * MENTION of the identifier, `#ifdef` included.  It was a compile error
+	 * from 10.x on, not a silent fallback.
 	 */
-#ifdef TARGET_PHYS_ADDR_SPACE_BITS
-	if (bits > TARGET_PHYS_ADDR_SPACE_BITS)
-		bits = TARGET_PHYS_ADDR_SPACE_BITS;
-#else
 	if (bits > 52)
 		bits = 52;
-#endif
 
 	limit   = (bits >= 64) ? UINT64_MAX : (1ULL << bits);
 	ram_top = nvkvm_guest_ram_top();
