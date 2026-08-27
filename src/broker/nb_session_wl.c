@@ -208,6 +208,7 @@ struct nb_wl {
     int                   idle_w, idle_h;
     bool                  idle_wanted;   /* show it as soon as configured */
     bool                  client_attached; /* a VMM is connected, frames or not */
+    uint64_t              last_frame_ms;   /* when we last paced the VMM        */
     bool                  idle_shown;
 
     struct zwp_keyboard_shortcuts_inhibit_manager_v1 *inhibit_mgr;
@@ -799,6 +800,7 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t t)
     wl_callback_destroy(cb);
     w->frame_inflight = false;
     if (w->sink) {
+        w->last_frame_ms = nb_now_ms_wl();
         nb_sink_frame(w->sink);
     }
 }
@@ -2310,10 +2312,36 @@ static void wl_resync(struct nb_session *s)
     }
 }
 
+/* How long to wait before pacing the VMM unprompted. */
+#define NB_WL_PACE_MS 100
+
 static int wl_tick(struct nb_session *s)
 {
     struct nb_wl *w = s->priv;
     uint64_t now;
+
+    /*
+     * THE SAME PACING WATCHDOG THE X11 BACKEND CARRIES, for the same reason:
+     * here FRAME comes from a wl_surface frame callback, and that callback is
+     * armed inside wl_commit().  No commit, no callback, no FRAME, no commit --
+     * a closed loop that cannot restart itself once a token is lost, and a
+     * guest rebooting from inside is enough to lose one (the VMM's socket is
+     * per-QEMU, so it never re-handshakes and is never re-primed).
+     *
+     * A compositor's vblank fires whether or not anything was drawn; match it.
+     * Slow on purpose -- in the steady state the frame callbacks pace at the
+     * compositor's own rate and this must not add frames on top of them.
+     */
+    if (w->sink) {
+        now = nb_now_ms_wl();
+        if (now - w->last_frame_ms >= NB_WL_PACE_MS) {
+            w->last_frame_ms = now;
+            nb_sink_frame(w->sink);
+        }
+        if (!w->clip_notice_until) {
+            return NB_WL_PACE_MS;
+        }
+    }
 
     if (!w->clip_notice_until) {
         return -1;

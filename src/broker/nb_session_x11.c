@@ -2259,11 +2259,12 @@ static int x11_tick(struct nb_session *s)
     uint64_t now;
 
     /*
-     * SHM PACING WATCHDOG.  Pacing in this tier is commit-driven: the broker
-     * sends FRAME after it has put a frame on screen.  That is a closed loop
-     * with no way to restart itself -- the VMM will not commit until it is
-     * paced, and it is only paced by a commit -- so ANY lost token wedges the
-     * display permanently.
+     * PACING WATCHDOG, EVERY TIER.  Pacing is commit-driven whichever path is
+     * in use: the shm tier sends FRAME after its PutImage, and the dma-buf tier
+     * gets it from Present's CompleteNotify -- which only fires because we
+     * called PresentPixmap.  Either way it is a closed loop with no way to
+     * restart itself: the VMM will not commit until it is paced, and it is only
+     * paced by a commit, so ANY lost token wedges the display permanently.
      *
      * MEASURED: the guest was rebooted from inside (`systemctl reboot`).  The
      * VMM never reconnected (its socket is per-QEMU, not per-boot), so nothing
@@ -2277,7 +2278,7 @@ static int x11_tick(struct nb_session *s)
      * the steady state the commit path is doing the pacing at the guest's own
      * rate, and this must not add frames on top of it.
      */
-    if (nb_tier == NB_TIER_SHM && x->sink) {
+    if (x->sink) {
         now = x11_now_ms();
         if (now - x->last_frame_ms >= NB_SHM_PACE_MS) {
             x->last_frame_ms = now;
