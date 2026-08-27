@@ -13,9 +13,10 @@ They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
 A reader deciding whether to trust this can read twelve diffs; a maintainer
 bumping the QEMU version resolves conflicts with ordinary tools instead of
-rewriting editing logic; and "is it already applied?" is answered by
-`git apply --reverse --check` rather than by grepping the tree for a comment
-string, which used to mean that rewording a comment made a patch apply twice.
+rewriting editing logic; and "is this tree already patched?" is answered by
+restoring the files the series touches to the tag and re-applying, rather than
+by grepping the tree for a comment string, which used to mean that rewording a
+comment made a patch apply twice.
 
 | patch | file | what it does |
 |---|---|---|
@@ -38,7 +39,7 @@ that is the whole justification for the change.
 
 ## Which of these should stop existing
 
-Seven of the ten carry `ui/` changes, and `ui/` is the surface we would most
+Seven of the twelve carry `ui/` changes, and `ui/` is the surface we would most
 like to shed — it is generic front-end code, shared with every other QEMU user,
 and the part a reviewer has least reason to trust us with.
 
@@ -136,8 +137,17 @@ git apply --check /path/to/nvkvm/patches/*.patch   # all-or-nothing dry run
 git apply         /path/to/nvkvm/patches/*.patch
 ```
 
-`scripts/build_qemu.sh` does exactly this, plus the same `--reverse --check`
-already-applied test for each patch so a re-run is a no-op.
+Note the series is **ordered and self-dependent** — `0012` appends to the
+`hw/misc/meson.build` list that `0001` creates — so a patch must be checked
+against the tree *with its predecessors applied*, not against a pristine one.
+
+`scripts/build_qemu.sh` does the same thing, and makes a re-run a no-op by
+restoring the files the series touches to the pinned tag before applying rather
+than asking each patch whether it is already applied. That per-patch
+`git apply --reverse --check` test used to be how it decided, and it is unsound
+exactly because of the self-dependency above: once `0012` is in, `0001` no
+longer reverses cleanly, so the script declared its own output tree unusable
+and `--force` failed. Fixed at the 11.1.1 bump.
 
 `0005`–`0007` only touch files that are compiled when QEMU is configured
 `--enable-gtk`, and `0008`–`0009` only files compiled when it is configured
