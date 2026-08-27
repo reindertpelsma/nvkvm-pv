@@ -19,3 +19,4 @@
 42636	# 8x RTX 3060 -- instance 48297558, 2026-08-20
 44906	# single RTX 4090, Denmark -- 2026-08-23; proved this is not a multi-GPU-only defect
 11908	# 2026-08-23
+24044	# single RTX 4070S, Quebec -- instance 48910285, 2026-08-27; sshd never listened, instance log frozen at 'Domain not found: no domain with matching name' past 35 min
