@@ -794,15 +794,35 @@ the bare-metal host too, on the ffmpeg build used
 
 ## Security
 
-### This is not a hardened multi-tenant boundary
+### Not multi-tenant ready — and designed to become so, which is a distinction worth making
+
+**Two separate claims, do not conflate them: nvkvm is not multi-tenant ready
+today, and nvkvm is architected toward multi-tenancy as a goal.** Both are
+true at once, and the gap between them is exactly what a reader skimming the
+source can miss.
+
+The second claim is why the code can read like the first one is already
+satisfied. The pieces below are not incidental hardening bolted onto a
+single-tenant design — they are the specific shape a multi-tenant threat
+model requires: per-process isolates so one guest process's corruption stays
+inside its own GPU context, default-deny allowlists on the surfaces that
+cross the guest/host boundary, and checks that are explicitly scoped to
+cross-VM and host-process boundaries rather than intra-VM ones. Seeing that
+architecture and concluding "the isolation is done" is the mistake this
+section exists to head off. The architecture is real; its completion and its
+independent verification are not.
 
 `nvkvm` has had two internal security audits — their findings are visible all
 over the source as `audit`-tagged comments, and the fixes are real (default-deny
 allowlists on five surfaces, a seccomp-confined rootless isolate, integer-
 overflow hardening in dispatch, GPA/KVM-slot reclamation). It has had no
-external audit.
+external audit. The whole project is experimental, and this section should be
+read in that light rather than as a punch list that, once cleared, makes the
+boundary trustworthy — items can and do get fixed one at a time while the
+boundary as a whole is still unaudited.
 
-Specific things a reader should weigh:
+Specific gaps a reader should weigh — each one is a concrete way "designed for
+multi-tenancy" is not the same as "safe for multi-tenancy today":
 
 - **UVM ioctls execute in QEMU's own privileged process**, not in an isolate.
   This is forced by the driver: UVM binds its file's `nvfp` to the calling task's
@@ -846,6 +866,11 @@ Do not put untrusted tenants behind this.
 ## Functional gaps worth knowing
 
 ### Managed memory (`cuMemAllocManaged`) works, but it is NOT unified memory — the fallback, 2026-08-24
+
+This fallback is a known gap, not the intended end state: real migration is
+planned as Tier 2, "the R region" — designed, not yet built. See
+[the UVM roadmap](uvm-roadmap.md) for what it would fix and why it is not a
+quick follow-up.
 
 **What you get.** `cuMemAllocManaged` succeeds, the pointer is coherent between
 the guest CPU and the GPU, and kernels read and write it correctly. What backs it

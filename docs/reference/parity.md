@@ -147,16 +147,76 @@ worse than the host (host 115.7 → 47.9 tok/s without SHM; guest → 10.0), whi
 is why removing it moves the end-to-end ratio so much further than it moves
 collective bandwidth (0.83 → 1.52 GB/s, roughly double).
 
-Two caveats, both load-bearing:
-
-- That is **one** datapoint, not a re-measured matrix. TP=1/2/4 scaling on the
-  fixed stack has not been measured.
-- In that run the **generated-text hashes differed between host and guest**,
-  where the earlier `NCCL_SHM_DISABLE=1` comparison had been byte-identical.
-  That is plausibly reduction-order nondeterminism in tensor-parallel
-  collectives, which is common and not specific to nvkvm — but it has not been
-  shown either way, so **output parity on this path is not claimed**.
+One caveat, load-bearing: in that run the **generated-text hashes differed
+between host and guest**, where the earlier `NCCL_SHM_DISABLE=1` comparison had
+been byte-identical. That is plausibly reduction-order nondeterminism in
+tensor-parallel collectives, which is common and not specific to nvkvm — but it
+has not been shown either way, so **output parity on this path is not
+claimed**. (Confirmed by the TP=1/2/4 run below: the *host* fails to reproduce
+its own output at TP=4 across separate processes, in both eager and CUDA-graph
+mode, on the same binary. TP=1 is rock solid on both sides, so a host/guest
+difference at TP>1 tracks the collective, not a guest defect. One residue stays
+guest-only: at TP=1 with CUDA graphs — no collective at all — the host was
+20/20 identical and the guest flipped once in 20. Cause unknown.)
 
 Single-GPU serving is unaffected by any of this. Mechanism and the fd-brokering
 fix: [cross-isolate sharing](../internal/cross-isolate-sharing.md); the raw runs
 are in [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md).
+
+### TP=1/2/4 scaling, and the one cell that does not fit
+
+That "not been measured" gap above is now closed, on a **different box**: 4x
+RTX 4090 (PCIe-only, no NVLink), driver 575.51.03, host pinned to
+`taskset -c 0-31` so vCPU count is not silently part of the answer, vLLM 0.10.2,
+Qwen2.5-7B-Instruct bf16, batch 8, 128 in / 128 out, same read-only image
+mounted on both sides. Full method and raw output:
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md#4x-rtx-4090-tensor-parallel-scaling-on-the-shm-fixed-stack-and-what-tp-costs).
+
+| TP | mode | host tok/s | guest tok/s | guest/host |
+|---|---|---|---|---|
+| 1 | eager | 449.4 | 437.5 | **0.97x** |
+| 1 | CUDA graphs | 466.4 | 459.7 | **0.99x** |
+| 2 | eager | 389.7 | 355.0 | **0.91x** |
+| 2 | CUDA graphs | 489.5 | 519.3 | **1.06x** |
+| 4 | eager | 411.8 | 367.3 | **0.89x** |
+| 4 | CUDA graphs | 716.9 | 369.8 | **0.52x** |
+
+Eager scaling is flat and orderly (0.97 → 0.91 → 0.89). **All of the damage is
+in one cell** — TP=4 with CUDA graphs — and it is not part of a trend: TP=2
+with graphs is *faster* in the guest than on the host. That cell is bimodal
+where the host's is not — 40 guest samples across 13 separate engine
+instantiations, interleaved host/guest so GPU-clock drift cancels: guest median
+369.8 (range 308.9–659.6), host median 716.9 (range 494.2–775.1). The guest's
+best observed run (795.3 tok/s) **beats the host's best** (775.1), so this is a
+mode the guest sometimes falls into and stays in for the life of the process,
+not a throughput ceiling.
+
+**The cause is not established.** What has been ruled out, each with its own
+measurement (detail in `tests/BOOT_MATRIX.md`):
+
+- **Forwarder serialisation under N-way concurrent load** — `rtt_contend`
+  (rdtscp-timed launch+sync, 1/2/4 concurrent isolates) is flat: guest p50
+  7.6 / 6.3–7.0 / 7.0–8.0 us against host 5.2 / 5.2–5.5 / 5.2–5.6 us. Four
+  isolates cost a guest round trip nothing over one.
+- **A different NCCL collective algorithm** — `NCCL_DEBUG=INFO` shows identical
+  `SHM/direct/direct` on every channel on both sides, and vLLM disables its
+  custom all-reduce on both sides for the same reason.
+- **NCCL channel count** — host and guest do pick differently (4 vs 2
+  channels), but forcing the guest to match (4 or 8) makes it *worse*
+  (306–343 tok/s), and pinning it to 2 does not remove the bimodality.
+- **CUDA graphs failing to capture** — the guest captures all 67 piecewise
+  graphs, 0.99 GiB, same as the host.
+
+What the guest does carry, and has not been shown to cause the slow mode: a
+long per-call tail. Launch+sync p99 is 38–54 us against the host's 6.6–8.6 us,
+and an empty `cuCtxSynchronize` has a p999 of 56–89 us against 0.4–0.8 us on
+the host. Whether that tail *triggers* the slow mode is assumed, not shown —
+the specific measurement that would settle it is a per-run correlation between
+early-decode tail samples and which mode that run lands in, which has not been
+done.
+
+Re-measured with `NCCL_SHM_DISABLE=1` forced on both sides (the workaround the
+6x A4000 table above was taken under), TP=4 eager does not lose at all —
+guest 129.0 tok/s vs host 63.9, **2.02x** — which says the earlier 0.21x-class
+figures were a property of that workaround on that topology, not a property of
+forwarding.

@@ -28,6 +28,7 @@ someone changing that code.
 | [Correctness and known issues](reference/correctness.md) | what is known to be wrong, how far it is traced, and how to reproduce it |
 | [Tested platforms, full matrix](reference/tested-platforms.md) | every box, driver and footnote — the README carries a condensed view |
 | [Reading the parity numbers](reference/parity.md) | what the host/guest ratios do and do not establish, and which are bare metal on both sides |
+| [Quoting numbers publicly](reference/quoting-numbers.md) | a short checklist: which numbers are safe to quote, which are not, and the scope each one needs |
 | [Supported drivers and GPUs](reference/supported-drivers.md) | which profile rows have actually been booted, which have only been measured, and the host-CPU address-bit requirement |
 | [Guest kernels](reference/guest-kernels.md) | which guest kernels the module builds on, which have been *run*, and why the range is narrow |
 | [Guest userspace libraries](reference/guest-userspace-libraries.md) | every library the guest needs, what breaks without it, and the version-matching traps |
