@@ -1101,6 +1101,22 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      */
     w->surf_w = new_w;
     w->surf_h = new_h;
+    /*
+     * FLUSH, or the frame sits in libwayland's outgoing buffer.
+     *
+     * wl_surface_commit() only QUEUES the request; nothing reaches the
+     * compositor until the connection is flushed.  Every other request this
+     * backend issues is followed by a flush, and the present path -- the one
+     * that runs most often -- was the one that was not.
+     *
+     * A busy guest hid it completely: the next frame's flush pushed the
+     * previous one out microseconds later, so the lag was invisible.  It only
+     * showed on an IDLE desktop, where a single event produces exactly one
+     * frame and nothing follows to flush it.  REPORTED as: type a character in
+     * Konsole and nothing appears, then move the mouse and it appears -- the
+     * mouse motion was doing the flush the commit should have done.
+     */
+    wl_display_flush(w->dpy);
     return 0;
 }
 
