@@ -466,6 +466,52 @@ static void nvkvm_evt_prime(struct nvkvm_state *state)
 	virtqueue_kick(state->vq_evt);
 }
 
+/*
+ * A forwarded ioctl that blocks for seconds is indistinguishable, to the guest
+ * application, from a hung GPU -- and Chromium-based UIs (CEF, Electron,
+ * Coherent UI, the Steam overlay) answer that by DELIBERATELY killing their own
+ * GPU process, which surfaces as an application SIGSEGV pointing nowhere near
+ * here.  Measured on the physical PC 2026-08-27: Planetary Annihilation's
+ * CoherentUI_Host died inside
+ * GpuWatchdogThread::DeliberatelyTerminateToRecoverFromHang, and nothing in
+ * this driver could say whether a forwarded ioctl had blocked at all.
+ *
+ * So record it.  Two ktime_get() calls per forwarded ioctl cost tens of
+ * nanoseconds against a round trip measured in microseconds at best.
+ */
+#define NVKVM_SLOW_WAIT_NS   (100ULL * 1000 * 1000)    /* 100 ms: hurts frame pacing */
+#define NVKVM_STALL_WAIT_NS  (1000ULL * 1000 * 1000)   /* 1 s: GPU-watchdog territory */
+
+static void nvkvm_note_wait_duration(struct nvkvm_state *state,
+				     ktime_t started,
+				     const struct nvkvm_inflight *inf)
+{
+	u64 ns = (u64)ktime_to_ns(ktime_sub(ktime_get(), started));
+	s64 prev;
+
+	if (ns < NVKVM_SLOW_WAIT_NS)
+		return;
+
+	atomic64_inc(&state->slow_waits);
+
+	/* Keep the maximum.  Racy by construction -- a concurrent larger writer
+	 * may win -- which is acceptable for a diagnostic counter. */
+	prev = atomic64_read(&state->max_wait_ns);
+	if ((s64)ns > prev)
+		atomic64_set(&state->max_wait_ns, (s64)ns);
+
+	if (ns >= NVKVM_STALL_WAIT_NS)
+		pr_warn_ratelimited(
+			"nvkvm: forwarded ioctl BLOCKED %llu ms (pid=%d isolate=%u txn=0x%x) -- long enough for a GPU watchdog to fire\n",
+			ns / 1000000, task_pid_nr(current), inf->isolate_id,
+			inf->txn_id);
+	else
+		pr_info_ratelimited(
+			"nvkvm: forwarded ioctl slow: %llu ms (pid=%d isolate=%u txn=0x%x)\n",
+			ns / 1000000, task_pid_nr(current), inf->isolate_id,
+			inf->txn_id);
+}
+
 static void nvkvm_evt_callback(struct virtqueue *vq)
 {
 	struct nvkvm_state *state = vq->vdev->priv;
@@ -529,6 +575,7 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 		    void *req_buf, size_t req_len,
 		    struct nvkvm_inflight *inf)
 {
+	ktime_t wait_started;
 	struct scatterlist out_sg, in_sg;
 	struct scatterlist *sgs[2] = { &out_sg, &in_sg };
 	int ret;
@@ -627,6 +674,7 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 	 * syscall that has already made unrepeatable progress.  The signal is
 	 * not lost: it stays pending and is delivered as soon as we return.
 	 */
+	wait_started = ktime_get();
 	if (inf->isolate_id) {
 		if (wait_for_completion_interruptible(&inf->done) == -ERESTARTSYS) {
 			long long interrupted =
@@ -647,6 +695,7 @@ int nvkvm_send_sync(struct nvkvm_state *state,
 	} else {
 		wait_for_completion(&inf->done);
 	}
+	nvkvm_note_wait_duration(state, wait_started, inf);
 	inflight_dequeue(state, inf);
 
 	kfree(inf->resp_buf);
@@ -860,6 +909,8 @@ int nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state)
 	INIT_LIST_HEAD(&state->inflight_list);
 	atomic_set(&state->next_txn_id, 0);
 	atomic64_set(&state->interrupted_waits, 0);
+	atomic64_set(&state->max_wait_ns, 0);
+	atomic64_set(&state->slow_waits, 0);
 	bitmap_zero(state->txn_inflight_bm, NVKVM_MAX_INFLIGHT);
 	spin_lock_init(&state->slot_lock);
 	bitmap_zero(state->slot_bitmap, NVKVM_SHM_NSLOTS);

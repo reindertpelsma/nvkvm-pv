@@ -433,6 +433,15 @@ struct nvkvm_state {
 	spinlock_t              vq_tx_lock;
 	atomic_t                next_txn_id;        /* monotonic seed */
 	atomic64_t              interrupted_waits;  /* signal-interrupted ioctl waits */
+	/*
+	 * How long forwarded ioctls actually block.  Without this the most
+	 * common failure report -- "the game crashed" -- is unattributable:
+	 * a Chromium GPU watchdog kills its own process when a GPU operation
+	 * misses a ~10s check-in, and nothing here could say whether a
+	 * forwarded ioctl was the thing that blocked.
+	 */
+	atomic64_t              max_wait_ns;        /* longest forwarded wait seen */
+	atomic64_t              slow_waits;         /* waits over NVKVM_SLOW_WAIT_NS */
 	unsigned long           txn_inflight_bm[NVKVM_MAX_INFLIGHT / BITS_PER_LONG];
 
 	/* Slot allocator for shared memory */
