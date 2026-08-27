@@ -606,3 +606,43 @@ Note the selftest needs `make -C src/broker` first; it exits 2 with
 > calling anything a regression; a failure that reproduces on 9.2.0 is a
 > driver-branch or box property and belongs in `known-limitations.md`, not in
 > this bump's ledger.
+>
+> **The control was NOT run**, because nothing failed. It stays staged for the
+> next person.
+
+### Result — PASS on driver 580.105.08 / open kernel module, RTX 4070 Ti
+
+vast.ai instance 48914024, machine 47025. Real VM: `systemd-detect-virt` =
+`kvm`, `/dev/kvm` present, 17 vCPU / 24 GB. Guest: Ubuntu 24.04 noble cloud
+image, kernel 6.8.0-138-generic. Built from this branch by the repo's own
+`scripts/build_qemu.sh --install-deps --force` with `NVKVM_QEMU_UI=1`.
+
+| # | Check | Measured evidence |
+|---|---|---|
+| — | QEMU builds | **0 failed targets / 3127**; `QEMU emulator version 11.1.1` |
+| a | nvkvm device enumerates | guest `lspci`: `00:04.0 Unclassified device [00ff]: Red Hat, Inc. Device [1af4:1072]`, and guest dmesg `nvkvm: probe called for virtio device id=0x32`. `0x1072 = 0x1040+50` and `0x32 = 50` — **patch 0002's ID, confirmed from both ends** |
+| — | host driver negotiated | `nvkvm: host driver 580.105.08 → ABI profile 580`; isolate `mode auto -> namespace (strongest rung)`; `GPA width: host MAXPHYADDR 46 bits, guest 46 -> 46` |
+| b | DRM node appears | `/dev/dri/card0`, `/dev/dri/renderD128`, plus `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-modeset`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`. Guest dmesg: `registered nvidia-drm render node under 0000:00:07.0 (primary minor 0)`, `virtual KMS head ready (1920x1080, up to 3840x2160, 1 connector/crtc)` |
+| c | `nvidia-smi` in the guest | `NVIDIA-SMI 580.105.08  Driver Version: 580.105.08  CUDA Version: 13.0`, `NVIDIA GeForce RTX 4070 Ti`, `00000000:00:07.0`, `306MiB / 12282MiB` |
+| d | real CUDA workload | `driver version: 13000` / `cuInit OK` / `device count: 1` → `PASS: cuInit OK with 1 device(s)`, and **`PASS: 1024-element vec_add ran on GPU through nvkvm forwarder`** |
+| e1 | **patch 0004** — screendump by device id | `screendump {'device':'nvkvm0'}` → `{"return": {}}`, **QEMU survived** (this is the abort the patch exists to fix), captured `P6 640 480` while the boot VGA captured `P6 720 400` |
+| e2 | **patches 0011+0012** — broker relay | broker: `accepted uid 0 gid 0 pid 38355` (SO_PEERCRED), `client attached: window 1920x1080, capabilities 0x3ff`; QEMU: `broker mode active: this QEMU holds no display-server connection and imports nothing` |
+
+**What e1 does and does not prove.** It proves the 0004 fix: the by-device-id
+lookup no longer walks into a text console and aborts, and it resolved to a
+*different* console than the default (640×480 vs the VGA's 720×400, so the
+device argument selected something). It does **not** prove guest GPU pixels
+reached the capture — both PPMs contain only two distinct byte values, i.e.
+they are blank. That is expected here (the guest ran headless with no
+compositor, and during that phase no guest module was loaded), but it means
+"screendump produces the guest's rendered desktop" is **untested** and must not
+be claimed from this run.
+
+**Also not covered by this run:** `tests/validate.sh`'s full 30-check ladder
+(Vulkan, EGL, GL) — the guest bring-up was driven by hand after
+`nvkvm-guest.service` failed to build the module (see `known-limitations.md`,
+unrelated to this bump), and the run was scoped to the checks above rather than
+re-plumbing the harness mid-test.
+
+Raw logs, the broker transcript and both PPMs were pulled off the box before it
+was destroyed.
