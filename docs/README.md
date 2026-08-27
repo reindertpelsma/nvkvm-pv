@@ -53,6 +53,7 @@ page should link here rather than recite them.
 | [The isolate model](internal/isolate-model.md) | why one process per guest process, what the sandbox is, what the trust boundary is |
 | [Cross-isolate sharing](internal/cross-isolate-sharing.md) | dma-buf and CUDA-VMM handle brokering between isolates — the NCCL shared-memory path |
 | [Display broker design](internal/broker-design.md) | why the broker exists, its threat model, and the hardware verification log |
+| [Present backpressure](internal/present-backpressure.md) | why the guest lapped its scanout ring, why deeper buffering was rejected, and what happens in every case where the host never releases a buffer |
 | [Known limitations](internal/known-limitations.md) | open bugs, intrinsic limits, retracted findings, and numbers that should not be quoted |
 | [The Mint guest desktop](internal/mint-guest-desktop.md) | the DDX investigation end to end, including what `fake-bars` measured before it was removed from the tree |
 | [Narrow-MAXPHYADDR GPA windows](internal/gpa-window-narrow-maxphyaddr.md) | why the window base is computed rather than constant, and what happens when it does not fit |
