@@ -205,6 +205,15 @@ run_case '' --present 320x240 --shm --unadvertised-mod
 check   "an F_SHM frame is accepted despite an unadvertised modifier" 'TEST attach' "$CASE_LOG"
 nocheck "and is not rejected for that modifier" 'not advertised by' "$CASE_LOG"
 
+# An F_SHM buffer the client can still shrink is refused: the size the
+# validator measures with lseek must stay true for as long as somebody reads
+# it, and without F_SEAL_SHRINK it does not.  A rejection, not a disconnect --
+# the same policy every other bad frame gets.
+run_case '' --bad-unsealed --present 320x240
+check   "an UNSEALED shm memfd is rejected" 'must be a memfd sealed' "$CASE_LOG"
+nocheck "and the unsealed frame is not presented" 'TEST attach' "$CASE_LOG"
+check   "and the client is NOT disconnected for it" 'client detached' "$CASE_LOG"
+
 # --resolution names what we SUGGEST to the guest, never what we require.  A
 # bad value must be refused at startup rather than surfacing at frame time.
 for bad in nonsense 0x0 99999x1; do

@@ -1963,9 +1963,12 @@ formats_done:
      *
      * Only in the shm tier: on the dma-buf tiers a memfd really is a bug, and
      * accepting one there would silently drop the import path's guarantees.
+     * accept_SHM says "this backend can present an F_SHM buffer"; the separate
+     * accept_memfd -- which this backend never sets -- says "a memfd may stand
+     * in for a dma-buf on the ordinary path", which is a test-only relaxation.
      */
     if (nb_tier == NB_TIER_SHM) {
-        s->accept_memfd = true;
+        s->accept_shm = true;
     }
     return 0;
 

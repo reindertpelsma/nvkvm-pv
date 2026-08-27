@@ -149,7 +149,9 @@ struct nb_config {
  * What reaches a backend's attach().  Every field here has already been
  * checked by nb_cmd_attach() in nvkvm_broker.c against the REAL fd:
  *
- *   - `fd` is a dma-buf (fstatfs f_type == DMA_BUF_MAGIC), not merely an fd;
+ *   - `fd` is a dma-buf (fstatfs f_type == DMA_BUF_MAGIC), not merely an fd —
+ *     or, when `is_shm` is set, a memfd (TMPFS_MAGIC) carrying F_SEAL_SHRINK,
+ *     which is the only other fd type any backend may ever be handed;
  *   - width/height are non-zero and <= NVKVM_BROKER_MAX_DIM;
  *   - fourcc is one the backend's format_ok() said the GPU advertises,
  *     paired with this exact modifier;
@@ -203,6 +205,15 @@ struct nb_sink {
      * trying to burn the broker's CPU, not one trying to display. */
     uint64_t rate_ms;           /* start of the current 1s window          */
     unsigned rate_count;
+    /*
+     * Rejection-log throttle (audit 2026-08-27 S-4).  A rejected frame is
+     * deliberately NOT a disconnect, so the reject path is the one thing a
+     * hostile client can drive forever — and every line through nb_err() is a
+     * blocking, fflush()ed write.  Log a few per second and count the rest.
+     */
+    uint64_t rej_log_ms;
+    unsigned rej_log_count;
+    unsigned rej_log_hidden;
 
     /*
      * CLIPBOARD, guest -> host.  Reassembled here rather than in a backend so
@@ -453,8 +464,22 @@ struct nb_session {
      * able to exercise the accept side of the validator without a GPU.  It is
      * the only backend that sets this, it is never reachable from
      * --backend auto, and it prints a banner saying it drives nothing.
+     *
+     * IT MEANS EXACTLY ONE THING: a memfd may stand in for a dma-buf on the
+     * ORDINARY import path.  It is NOT the shm tier's gate — see accept_shm.
+     * Audit 2026-08-27 S-1: the real backends set this to make the shm tier
+     * work, which silently deleted the "the fd is proved to be a dma-buf"
+     * rule (design §3 rule 4) for every ordinary frame as well.  One flag
+     * cannot answer two questions.
      */
     bool     accept_memfd;
+    /*
+     * This backend can PRESENT a memfd declared with NVKVM_BROKER_CMD_F_SHM.
+     * Distinct from accept_memfd because the shm tier authenticates the fd
+     * itself (TMPFS_MAGIC + F_SEAL_SHRINK) rather than relaxing the dma-buf
+     * proof for everything else.
+     */
+    bool     accept_shm;
     /* One line, printed at startup and again at connect, naming exactly what
      * this stack cannot capture.  Empty string means "everything". */
     char     grab_caveat[256];

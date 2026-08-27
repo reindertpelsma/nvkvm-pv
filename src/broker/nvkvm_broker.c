@@ -154,6 +154,9 @@ static void nb_client_state_reset(struct nb_sink *s)
     s->window_established = false;
     s->rate_ms = 0;
     s->rate_count = 0;
+    s->rej_log_ms = 0;
+    s->rej_log_count = 0;
+    s->rej_log_hidden = 0;
     memset(s->clip_in, 0, sizeof(s->clip_in));
     s->clip_in_len = 0;
     s->clip_in_chunks = 0;
@@ -518,6 +521,27 @@ static void nb_set_grab(struct nb_sink *s, bool on)
      */
     nb_release_all(s);
     s->grabbed = on;
+    /*
+     * AUDIT 2026-08-27 S-5.  nb_release_all() EMITS, and an emit into a ring
+     * the client has stopped draining calls nb_sink_detach() from underneath
+     * us.  That detach carries the rule "never leave the host's keyboard
+     * grabbed because the VMM died" -- but it read s->grabbed before the line
+     * above set it, so of all the transitions it protects, the one it missed
+     * was the grab being taken.  The display-side grab was already held by
+     * then, so the broker came out of here holding the user's keyboard with no
+     * client to send it to.  A hostile client can arrange the moment: nothing
+     * stops it filling the ring on demand (QUERY_FORMAT answers are not
+     * coalesced) and then never reading.
+     *
+     * Re-check after the emit rather than reordering the assignment, so the
+     * key-ups above still go out with the flags they were generated under.
+     */
+    if (on && s->client_fd < 0) {
+        s->sess->ops->set_grab(s->sess, false);
+        s->grabbed = false;
+        nb_log("grab dropped: the client went away while it was being taken");
+        return;
+    }
     nb_emit(s, NVKVM_BROKER_EV_GRAB, on, 0, 0, 0);
     nb_log("grab %s", on ? "ON" : "off");
 }
@@ -1084,6 +1108,46 @@ void nb_sink_bye(struct nb_sink *s, int reason)
 #define NB_FOURCC_XR24 0x34325258u
 #define NB_FOURCC_AR24 0x34325241u
 
+/*
+ * AUDIT 2026-08-27 S-4.  A rejected frame is deliberately NOT a disconnect
+ * (design §3: "a guest flipping nonsense must not be able to kill the display
+ * of a VMM that is behaving"), which makes the rejection path the one thing a
+ * hostile client can drive forever.  Every nb_err() is a vfprintf followed by
+ * an fflush -- a blocking write on the thread that also services the display
+ * server and the keyboard.  At the B-1b command ceiling that is ~20,000
+ * fflush()ed lines a second, megabytes a second into the session's journal,
+ * and on a log pipe that stops draining it is B-1's consequence reached
+ * through a different door: the main loop stalls and the grab cannot be
+ * released.
+ *
+ * So the reject path gets its own budget, and says how many it swallowed --
+ * a silent throttle would hide the very flood it is there to bound.
+ */
+#define NB_REJECT_LOG_PER_SEC 10u
+
+static bool nb_reject_log(struct nb_sink *s)
+{
+    uint64_t now = nb_now_ms();
+
+    if (now - s->rej_log_ms >= 1000u) {
+        unsigned hidden = s->rej_log_hidden;
+
+        s->rej_log_ms     = now;
+        s->rej_log_count  = 0;
+        s->rej_log_hidden = 0;
+        if (hidden) {
+            nb_err("... and %u more frames rejected in that second, not "
+                   "logged (the client is being refused faster than this can "
+                   "be written down)", hidden);
+        }
+    }
+    if (++s->rej_log_count > NB_REJECT_LOG_PER_SEC) {
+        s->rej_log_hidden++;
+        return false;
+    }
+    return true;
+}
+
 static bool nb_fd_is_dmabuf(int fd, bool allow_memfd)
 {
     struct statfs sfs;
@@ -1177,35 +1241,79 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     uint64_t need;
     char fcc[8], fcc2[8];
 
-    if (!nb_fd_is_dmabuf(fd, ss->accept_memfd)) {
-        nb_err("ATTACH: the fd is not a dma-buf");
-        return -EINVAL;
-    }
     /*
      * The VMM DECLARES shared memory; it is not inferred from the fd.  A memfd
      * is a legitimate carrier for other things (the test client sends one every
      * frame), so sniffing st.f_type would misread honest clients as asking for
      * a tier they never requested.
      *
-     * The declaration is then ENFORCED: a client that claims shm must really
-     * hand over a memfd, or the broker would map something else into a wl_shm
-     * pool on the strength of an assertion from an untrusted VMM.
+     * The declaration is then ENFORCED, and it decides WHICH identity the fd
+     * has to prove.  AUDIT 2026-08-27 S-1: this used to be the other way round
+     * -- one nb_fd_is_dmabuf(accept_memfd) gate for both tiers -- and because
+     * the real backends had to set accept_memfd to make the shm tier work at
+     * all, "the fd is proved to be a dma-buf" (design §3 rule 4) silently
+     * stopped holding for ORDINARY frames too.  A memfd then reached
+     * zwp_linux_buffer_params_v1_add() as if it were a dma-buf.  Two questions,
+     * two gates, and neither one answers the other.
      */
     d->is_shm = (c->flags & NVKVM_BROKER_CMD_F_SHM) != 0;
     if (d->is_shm) {
         struct statfs sfs;
+        int seals;
 
-        if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC) {
-            nb_err("ATTACH: F_SHM was set but the fd is not a memfd");
+        if (!ss->accept_shm) {
+            if (nb_reject_log(s)) {
+                nb_err("ATTACH: F_SHM was set but backend '%s' does not present "
+                       "shared memory in this mode", ss->ops->name);
+            }
             return -EINVAL;
         }
+        if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC) {
+            if (nb_reject_log(s)) {
+                nb_err("ATTACH: F_SHM was set but the fd is not a memfd");
+            }
+            return -EINVAL;
+        }
+        /*
+         * F_SEAL_SHRINK, OR THE SIZE WE MEASURE IS A SIZE THAT CAN CHANGE.
+         *
+         * AUDIT 2026-08-27 S-2.  The extent below comes from lseek(SEEK_END)
+         * at this instant; the fd stays the client's and it can ftruncate()
+         * the backing store smaller a microsecond later.  What then touches a
+         * page past the new end is not the client: it is the BROKER
+         * (nb_session_x11.c mmaps and PutImages it) or the user's COMPOSITOR
+         * (nb_session_wl.c hands it over as a wl_shm_pool), and a MAP_SHARED
+         * tmpfs page past EOF is SIGBUS.  Neither has a handler.  The seal is
+         * what makes the measurement mean something for longer than a line of
+         * code; it is exactly why udmabuf demands it of the same memfd one
+         * process out (src/qemu/nvkvm_udmabuf.c), so an honest VMM already
+         * carries it.  F_GET_SEALS also fails outright on a plain tmpfs file,
+         * which is how an fd to /dev/shm/... -- also TMPFS_MAGIC, and not a
+         * memfd at all -- is refused here rather than mapped.
+         */
+        seals = fcntl(fd, F_GET_SEALS);
+        if (seals < 0 || !(seals & F_SEAL_SHRINK)) {
+            if (nb_reject_log(s)) {
+                nb_err("ATTACH: an F_SHM buffer must be a memfd sealed with "
+                       "F_SEAL_SHRINK; without it the size measured here can be "
+                       "taken away under the reader (SIGBUS)");
+            }
+            return -EINVAL;
+        }
+    } else if (!nb_fd_is_dmabuf(fd, ss->accept_memfd)) {
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: the fd is not a dma-buf");
+        }
+        return -EINVAL;
     }
     /* HARDENING 2: same bound as NVKVM_PRESENT_MAX_DIM in the VMM, restated
      * here because the VMM is the attacker in this model. */
     if (c->width == 0 || c->height == 0 ||
         c->width > NVKVM_BROKER_MAX_DIM || c->height > NVKVM_BROKER_MAX_DIM) {
-        nb_err("ATTACH: %ux%u is out of range (1..%u)",
-               c->width, c->height, NVKVM_BROKER_MAX_DIM);
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: %ux%u is out of range (1..%u)",
+                   c->width, c->height, NVKVM_BROKER_MAX_DIM);
+        }
         return -EINVAL;
     }
     /* HARDENING 3: not a hardcoded list — what the GPU advertises.  Shared
@@ -1235,12 +1343,17 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
      */
     if (d->is_shm) {
         if (fourcc != NB_FOURCC_XR24 && fourcc != NB_FOURCC_AR24) {
-            nb_err("ATTACH: fourcc %s cannot be presented as shared memory; "
-                   "only XR24 and AR24 are mapped to wl_shm formats",
-                   nb_fourcc_name(fourcc, fcc));
+            if (nb_reject_log(s)) {
+                nb_err("ATTACH: fourcc %s cannot be presented as shared memory; "
+                       "only XR24 and AR24 are mapped to wl_shm formats",
+                       nb_fourcc_name(fourcc, fcc));
+            }
             return -EINVAL;
         }
     } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
+        if (!nb_reject_log(s)) {
+            return -EINVAL;
+        }
         /*
          * Name the VENDOR.  A rejection that lists only the pair reads as
          * "one entry is missing"; when the vendor differs from everything
@@ -1274,22 +1387,28 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     }
     bpp = nb_fourcc_bpp(fourcc);
     if (bpp == 0) {
-        nb_err("ATTACH: fourcc %s has no known bytes-per-pixel, so its extent "
-               "cannot be bounded", nb_fourcc_name(fourcc, fcc));
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: fourcc %s has no known bytes-per-pixel, so its extent "
+                   "cannot be bounded", nb_fourcc_name(fourcc, fcc));
+        }
         return -EINVAL;
     }
     /* A row must hold the pixels it claims to. */
     if ((uint64_t)c->stride < (uint64_t)c->width * bpp) {
-        nb_err("ATTACH: stride %u < width %u * bpp %u",
-               c->stride, c->width, bpp);
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: stride %u < width %u * bpp %u",
+                   c->stride, c->width, bpp);
+        }
         return -EINVAL;
     }
     /* HARDENING 1: measure the fd, do not believe the sender.  The in-tree
      * pattern is nvkvm_isolate_handlers.c:1332. */
     size = lseek(fd, 0, SEEK_END);
     if (size <= 0) {
-        nb_err("ATTACH: lseek(SEEK_END) on the dma-buf gave %lld — refusing a "
-               "buffer whose extent cannot be measured", (long long)size);
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: lseek(SEEK_END) on the dma-buf gave %lld — refusing a "
+                   "buffer whose extent cannot be measured", (long long)size);
+        }
         return -EINVAL;
     }
     /*
@@ -1298,11 +1417,33 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
      * That is what makes this test overflow-safe without a separate check.
      */
     need = (uint64_t)c->stride * c->height + (uint64_t)c->offset;
+    /*
+     * AND IT MUST FIT THE PROTOCOLS WE HAND IT TO.  AUDIT 2026-08-27 S-3:
+     * wl_shm_create_pool takes an int32_t, and nothing else bounded `need`
+     * from above -- lseek on a sparse 4 GiB memfd costs the client nothing, so
+     * a stride of 0x40000 over 8192 rows made the pool size land on
+     * INT32_MIN.  A negative size is a wl_shm protocol error, which is fatal
+     * to the connection, so the client picks the moment the broker dies.
+     * Bounding it HERE (rather than at the cast) keeps "reject, never clamp"
+     * in the one place both backends inherit it from, and bounds stride and
+     * offset with it: each is <= need when height >= 1.
+     */
+    if (need > (uint64_t)INT32_MAX) {
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: %ux%u stride=%u offset=%u spans %llu bytes; the "
+                   "largest buffer any display protocol here can be handed is "
+                   "%d — REJECTED", c->width, c->height, c->stride, c->offset,
+                   (unsigned long long)need, INT32_MAX);
+        }
+        return -EINVAL;
+    }
     if (need > (uint64_t)size) {
-        nb_err("ATTACH: %ux%u stride=%u offset=%u needs %llu bytes but the "
-               "dma-buf is %lld — REJECTED (the compositor would read out of "
-               "bounds)", c->width, c->height, c->stride, c->offset,
-               (unsigned long long)need, (long long)size);
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: %ux%u stride=%u offset=%u needs %llu bytes but the "
+                   "dma-buf is %lld — REJECTED (the compositor would read out of "
+                   "bounds)", c->width, c->height, c->stride, c->offset,
+                   (unsigned long long)need, (long long)size);
+        }
         return -EINVAL;
     }
     if (fstat(fd, &st) < 0) {
@@ -1402,7 +1543,10 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                              * is bounded at one in flight by construction */
         if (r != 0) {
             s->n_reject++;
-            nb_err("ATTACH: the display refused the buffer: %s", strerror(-r));
+            if (nb_reject_log(s)) {
+                nb_err("ATTACH: the display refused the buffer: %s",
+                       strerror(-r));
+            }
         }
         return;
 
@@ -1435,7 +1579,9 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             close(fd);          /* a query carries no buffer; drop any fd */
         }
         ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use);
-        {
+        /* Asked once per mode change by an honest client -- and once per
+         * command by a hostile one, so it shares the reject budget. */
+        if (nb_reject_log(s)) {
             char fcc[8];
             nb_log("QUERY_FORMAT %s modifier 0x%016llx (%s) -> %s%s",
                    nb_fourcc_name(c->fourcc, fcc),
@@ -1674,7 +1820,10 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             c->width > NVKVM_BROKER_MAX_DIM ||
             c->height > NVKVM_BROKER_MAX_DIM) {
             s->n_reject++;
-            nb_err("WINDOW: %ux%u out of range — ignored", c->width, c->height);
+            if (nb_reject_log(s)) {
+                nb_err("WINDOW: %ux%u out of range — ignored",
+                       c->width, c->height);
+            }
             return;
         }
         /*
