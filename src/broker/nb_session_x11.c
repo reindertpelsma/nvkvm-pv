@@ -155,6 +155,7 @@ struct nb_x11 {
 #endif
     bool      idle_shown;
     bool      client_attached;  /* a VMM is connected, frames or not      */
+    uint64_t  last_frame_ms;    /* shm tier: when we last paced the VMM   */
     xcb_window_t dlg;           /* close-confirmation child, 0 = never made */
     bool      dlg_mapped;
     int       dlg_hot;          /* hovered row, -1 = none                 */
@@ -163,6 +164,11 @@ struct nb_x11 {
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
 static void x11_clip_flush_pending(struct nb_x11 *x);
+static uint64_t x11_now_ms(void);
+
+/* How long the shm tier waits before pacing the VMM unprompted. */
+#define NB_SHM_PACE_MS 100
+
 static int  x11_show_idle(struct nb_session *s);
 static void x11_dlg_show(struct nb_x11 *x);
 static void x11_dlg_hide(struct nb_x11 *x);
@@ -650,6 +656,7 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
          * for the same reason -- its frame callbacks keep firing.
          */
         nb_sink_frame(sink);
+        x->last_frame_ms = x11_now_ms();
         return 0;
     }
 
@@ -2250,6 +2257,36 @@ static int x11_tick(struct nb_session *s)
 {
     struct nb_x11 *x = s->priv;
     uint64_t now;
+
+    /*
+     * SHM PACING WATCHDOG.  Pacing in this tier is commit-driven: the broker
+     * sends FRAME after it has put a frame on screen.  That is a closed loop
+     * with no way to restart itself -- the VMM will not commit until it is
+     * paced, and it is only paced by a commit -- so ANY lost token wedges the
+     * display permanently.
+     *
+     * MEASURED: the guest was rebooted from inside (`systemctl reboot`).  The
+     * VMM never reconnected (its socket is per-QEMU, not per-boot), so nothing
+     * re-primed it the way the handshake's one free FRAME does; the desktop
+     * came back up with kwin holding /dev/dri/card0 and rendering, and not one
+     * frame reached the broker again.
+     *
+     * A real display does not work this way: vblank fires whether or not
+     * anything was drawn.  So if nothing has been paced for a while, pace
+     * anyway.  Deliberately a slow watchdog (100 ms), not a 60 Hz clock: in
+     * the steady state the commit path is doing the pacing at the guest's own
+     * rate, and this must not add frames on top of it.
+     */
+    if (nb_tier == NB_TIER_SHM && x->sink) {
+        now = x11_now_ms();
+        if (now - x->last_frame_ms >= NB_SHM_PACE_MS) {
+            x->last_frame_ms = now;
+            nb_sink_frame(x->sink);
+        }
+        if (!x->notice_until_ms) {
+            return NB_SHM_PACE_MS;
+        }
+    }
 
     if (!x->notice_until_ms) {
         return -1;
