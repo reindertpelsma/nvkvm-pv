@@ -27,7 +27,7 @@
 #include "ui/dmabuf.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
-#include "hw/qdev-core.h"
+#include "hw/core/qdev.h"
 #include "nvkvm_log.h"
 #include "nvkvm_udmabuf.h"
 
@@ -261,9 +261,18 @@ int nvkvm_present_capture(int dmabuf_fd, uint32_t width, uint32_t height,
                        EGL_NO_CONTEXT);
         return e;
     }
-    QemuDmaBuf *buf = qemu_dmabuf_new(width, height, stride, 0, 0,
-                                      width, height, fourcc, modifier,
-                                      dup_fd, false, false);
+    /*
+     * QEMU 11.1 made QemuDmaBuf multi-plane: offset, stride and the fd are now
+     * ARRAYS with an explicit plane count, where 9.2 took three scalars and no
+     * count.  nvkvm scans out a single-plane buffer -- one fd, one stride,
+     * offset 0 -- so this is that same buffer expressed in the new shape.
+     */
+    const uint32_t db_offset[1] = { 0 };
+    const uint32_t db_stride[1] = { stride };
+    const int32_t  db_fd[1]     = { dup_fd };
+    QemuDmaBuf *buf = qemu_dmabuf_new(width, height, db_offset, db_stride,
+                                      0, 0, width, height, fourcc, modifier,
+                                      db_fd, 1, false, false);
     if (!buf) {
         close(dup_fd);
         eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
@@ -338,7 +347,7 @@ typedef struct NvkvmPresent {
     uint64_t modifier;
     bool     dirty;          /* a new frame is waiting since last present */
 
-    QEMUBH  *bh;             /* scheduled from worker → graphic_hw_update */
+    QEMUBH  *bh;             /* scheduled from worker → qemu_console_hw_update */
 
     /* GL zero-copy path: the dma-buf currently handed to the UI.  Kept alive
      * (and its fd open) until a newer frame replaces it, like virtio-gpu's
@@ -494,7 +503,7 @@ typedef struct NvkvmPresent {
  * blank window, which is why the old code simply defaulted to readback and
  * made the operator opt in to zero-copy by hand.
  *
- * dpy_gl_ctx_create() gives us a context on the UI's own display, so
+ * qemu_console_gl_ctx_create() gives us a context on the UI's own display, so
  * glGetString() through it reports the window's renderer.  Safe to bind and
  * drop: both ui/gtk-egl.c and ui/sdl2-gl.c re-bind their context at the top of
  * every draw, so leaving no context current cannot strand them.  Runs once,
@@ -506,22 +515,22 @@ static bool nvkvm_probe_ui_renderer(NvkvmPresent *p)
     QEMUGLContext ctx;
 
     p->ui_renderer[0] = '\0';
-    if (!console_has_gl(p->con)) {
+    if (!qemu_console_has_gl(p->con)) {
         return false;
     }
-    ctx = dpy_gl_ctx_create(p->con, &params);
+    ctx = qemu_console_gl_ctx_create(p->con, &params);
     if (!ctx) {
         return false;
     }
-    if (dpy_gl_ctx_make_current(p->con, ctx) != 0) {
-        dpy_gl_ctx_destroy(p->con, ctx);
+    if (qemu_console_gl_ctx_make_current(p->con, ctx) != 0) {
+        qemu_console_gl_ctx_destroy(p->con, ctx);
         return false;
     }
     const char *vendor   = (const char *)glGetString(GL_VENDOR);
     const char *renderer = (const char *)glGetString(GL_RENDERER);
     snprintf(p->ui_renderer, sizeof(p->ui_renderer), "%s / %s",
              vendor ? vendor : "?", renderer ? renderer : "?");
-    dpy_gl_ctx_destroy(p->con, ctx);
+    qemu_console_gl_ctx_destroy(p->con, ctx);
     return true;
 }
 
@@ -560,7 +569,7 @@ static int nvkvm_present_decide_mode(NvkvmPresent *p, uint64_t mod)
     }
 
     const char *forced = getenv("NVKVM_PRESENT_MODE");
-    bool has_gl  = console_has_gl(p->con);
+    bool has_gl  = qemu_console_has_gl(p->con);
     bool probed  = nvkvm_probe_ui_renderer(p);
     bool nvidia  = probed && (strcasestr(p->ui_renderer, "NVIDIA") != NULL);
     bool linear  = (mod == NVKVM_MOD_LINEAR);
@@ -614,22 +623,28 @@ static int nvkvm_present_decide_mode(NvkvmPresent *p, uint64_t mod)
 static bool nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
                              uint32_t stride, uint32_t fourcc, uint64_t mod)
 {
-    /* qemu_dmabuf_new takes ownership of fd (freed by qemu_dmabuf_close). */
-    QemuDmaBuf *buf = qemu_dmabuf_new(w, h, stride, 0, 0, w, h, fourcc, mod,
-                                      fd, false, false);
+    /* qemu_dmabuf_new takes ownership of fd (freed by qemu_dmabuf_close).
+     * 11.1: offset/stride/fd are arrays with an explicit plane count now; the
+     * nvkvm scanout buffer is single-plane, so num_planes is 1. */
+    const uint32_t db_offset[1] = { 0 };
+    const uint32_t db_stride[1] = { stride };
+    const int32_t  db_fd[1]     = { fd };
+    QemuDmaBuf *buf = qemu_dmabuf_new(w, h, db_offset, db_stride, 0, 0,
+                                      w, h, fourcc, mod, db_fd, 1,
+                                      false, false);
     if (!buf) {
         close(fd);
         return false;   /* frame never reached the display */
     }
     qemu_console_resize(p->con, w, h);
-    dpy_gl_scanout_dmabuf(p->con, buf);
-    dpy_gl_update(p->con, 0, 0, w, h);
+    qemu_console_gl_scanout_dmabuf(p->con, buf);
+    qemu_console_gl_update(p->con, 0, 0, w, h);
 
     /* Retire the previously scanned-out buffer only now that the new one is
      * live (its fd was in use until this point). */
     if (p->cur_buf) {
         /*
-         * Tell the UI backend to drop what dpy_gl_scanout_dmabuf() made it
+         * Tell the UI backend to drop what qemu_console_gl_scanout_dmabuf() made it
          * create.  That call has the backend glGenTextures() into the
          * QemuDmaBuf; qemu_dmabuf_free() is a bare g_free and does not touch
          * the texture, so without this the texture and its EGLImage are
@@ -642,7 +657,7 @@ static bool nvkvm_present_gl(NvkvmPresent *p, int fd, uint32_t w, uint32_t h,
          * QEMU's own attributed VRAM flat.  It is still an unbounded per-flip
          * leak of driver-side objects, and it is one call to stop it.
          */
-        dpy_gl_release_dmabuf(p->con, p->cur_buf);
+        qemu_console_gl_release_dmabuf(p->con, p->cur_buf);
         qemu_dmabuf_close(p->cur_buf);
         qemu_dmabuf_free(p->cur_buf);
     }
@@ -1304,11 +1319,20 @@ static void nvkvm_present_publish(NvkvmPresent *p)
             }
         }
     }
-    dpy_gfx_update(p->con, 0, 0, (int)w, (int)h);
+    qemu_console_update(p->con, 0, 0, (int)w, (int)h);
 }
 
-/* GraphicHwOps.gfx_update — main loop, BQL held. */
-static void nvkvm_present_gfx_update(void *opaque)
+/*
+ * GraphicHwOps.gfx_update — main loop, BQL held.
+ *
+ * QEMU 11.1 changed this callback's return type from void to bool: true means
+ * "the update completed synchronously", false means "deferred, I will call
+ * qemu_console_hw_update_done() when it is ready".  Everything below finishes
+ * before it returns -- nvkvm_present_publish() does the work inline -- so this
+ * is synchronous and returns true.  Returning false without ever calling
+ * _update_done() would hang whatever is waiting on the update.
+ */
+static bool nvkvm_present_gfx_update(void *opaque)
 {
     NvkvmPresent *p = opaque;
 
@@ -1321,7 +1345,7 @@ static void nvkvm_present_gfx_update(void *opaque)
     pthread_mutex_unlock(&p->lock);
 
     if (!pending) {
-        return;
+        return true;
     }
 
     if (nvkvm_present_decide_mode(p, mod) == 1) {
@@ -1333,7 +1357,7 @@ static void nvkvm_present_gfx_update(void *opaque)
         pthread_mutex_lock(&p->lock);
         if (!p->dirty || p->fd < 0) {
             pthread_mutex_unlock(&p->lock);
-            return;
+            return true;
         }
         int      fd     = p->fd;
         uint32_t w      = p->w, h = p->h, stride = p->stride;
@@ -1360,6 +1384,7 @@ static void nvkvm_present_gfx_update(void *opaque)
             qemu_sem_post(&p->wake);
         }
     }
+    return true;   /* synchronous: publish already happened above */
 }
 
 static void nvkvm_present_invalidate(void *opaque)
@@ -1477,7 +1502,7 @@ static void nvkvm_present_bh(void *opaque)
         return;
     }
 
-    graphic_hw_update(p->con);
+    qemu_console_hw_update(p->con);
 }
 
 int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
@@ -1488,7 +1513,7 @@ int nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
     p->mode = -1;
     p->dev  = dev;
     p->nv   = nv;
-    p->con  = graphic_console_init(dev, 0, &nvkvm_present_hwops, p);
+    p->con  = qemu_graphic_console_create(dev, 0, &nvkvm_present_hwops, p);
     p->bh   = qemu_bh_new(nvkvm_present_bh, p);
     qemu_sem_init(&p->wake, 0);   /* #125: present thread starts on first use */
     nv->present_ctx = p;
@@ -1530,7 +1555,7 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
         qemu_bh_delete(p->bh);
     }
     if (p->con) {
-        graphic_console_close(p->con);
+        qemu_graphic_console_close(p->con);
     }
     if (p->cur_buf) {
         qemu_dmabuf_close(p->cur_buf);

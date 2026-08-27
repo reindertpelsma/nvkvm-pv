@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Sun, 24 Aug 2026 12:00:00 +0200
-Subject: [PATCH] qapi/ui: add the nvkvm-broker display type
+Date: Thu, 27 Aug 2026 17:10:20 +0200
+Subject: [PATCH 11/12] qapi/ui: add the nvkvm-broker display type
 
 nvkvm's other display options all end in a host window QEMU owns:
 -display gtk or -display sdl make QEMU a client of the user's X11 or
@@ -32,11 +32,14 @@ file in hw/misc/ (nvkvm_display_relay.c), copied in like the rest of the
 device.  Gated on CONFIG_LINUX because SCM_RIGHTS fd relay and dma-buf
 are Linux interfaces.
 ---
+ qapi/ui.json | 31 +++++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
 diff --git a/qapi/ui.json b/qapi/ui.json
-index 460a26b..88089a6 100644
+index b2c42a7f57..5557e7235b 100644
 --- a/qapi/ui.json
 +++ b/qapi/ui.json
-@@ -1470,6 +1470,22 @@
+@@ -1482,6 +1482,22 @@
  { 'struct'  : 'DisplaySDL',
    'data'    : { '*grab-mod'   : 'HotKeyMod' } }
  
@@ -45,12 +48,12 @@ index 460a26b..88089a6 100644
 +#
 +# Display setup for the nvkvm privileged display broker.
 +#
-+# @socket: path of the broker's unix socket.  QEMU connects to it and is
-+#     validated by SO_PEERCRED before the broker sends anything.  QEMU
-+#     then relays the guest's scanout dma-buf fd over SCM_RIGHTS and
-+#     receives input events on the same socket.
++# @socket: path of the broker's unix socket.  QEMU connects to it
++#     and is validated by SO_PEERCRED before the broker sends
++#     anything.  QEMU then relays the guest's scanout dma-buf fd
++#     over SCM_RIGHTS and receives input events on the same socket.
 +#
-+# Since: 9.2
++# Since: 11.1
 +##
 +{ 'struct'  : 'DisplayNvkvmBroker',
 +  'data'    : { 'socket' : 'str' },
@@ -59,22 +62,22 @@ index 460a26b..88089a6 100644
  ##
  # @DisplayType:
  #
-@@ -1505,6 +1521,14 @@
+@@ -1517,6 +1533,14 @@
  #
  # @dbus: Start a D-Bus service for the display.  (Since 7.0)
  #
-+# @nvkvm-broker: Hand the display to the nvkvm display broker over a
-+#     unix socket.  QEMU relays the guest's scanout dma-buf fd to the
-+#     broker with SCM_RIGHTS and receives keyboard and pointer events
-+#     back; the broker owns the window, the compositor connection and
-+#     the input grab.  QEMU therefore needs no window-system connection
-+#     at all -- no GTK, no SDL, no EGL, and no X11 or Wayland socket
-+#     inside QEMU's sandbox.  (Since 9.2)
++# @nvkvm-broker: Hand the display to the nvkvm display broker over
++#     a unix socket.  QEMU relays the guest's scanout dma-buf fd to
++#     the broker with SCM_RIGHTS and receives keyboard and pointer
++#     events back; the broker owns the window, the compositor
++#     connection and the input grab.  QEMU therefore needs no
++#     window-system connection at all -- no GTK, no SDL, no EGL, and
++#     no X11 or Wayland socket inside QEMU's sandbox.  (Since 11.1)
 +#
  # Since: 2.12
  ##
  { 'enum'    : 'DisplayType',
-@@ -1517,7 +1541,8 @@
+@@ -1529,7 +1553,8 @@
      { 'name': 'curses', 'if': 'CONFIG_CURSES' },
      { 'name': 'cocoa', 'if': 'CONFIG_COCOA' },
      { 'name': 'spice-app', 'if': 'CONFIG_SPICE' },
@@ -84,7 +87,7 @@ index 460a26b..88089a6 100644
    ]
  }
  
-@@ -1555,7 +1580,9 @@
+@@ -1567,7 +1592,9 @@
        'egl-headless': { 'type': 'DisplayEGLHeadless',
                          'if': 'CONFIG_OPENGL' },
        'dbus': { 'type': 'DisplayDBus', 'if': 'CONFIG_DBUS_DISPLAY' },

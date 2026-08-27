@@ -32,18 +32,18 @@
 
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci.h"          /* nvkvm-gpu PCI identity device */
 #include "hw/pci/pci_device.h"
-#include "hw/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
+#include "hw/core/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
 #include "qemu/main-loop.h"
 #include "block/thread-pool.h"
-#include "block/aio.h"
-#include "exec/memory.h"
-#include "exec/address-spaces.h"
+#include "qemu/aio.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -1635,7 +1635,7 @@ static void nvkvm_gpu_realize(PCIDevice *pdev, Error **errp)
 	 * registered on this device is a region the guest can map. */
 }
 
-static void nvkvm_gpu_class_init(ObjectClass *klass, void *data)
+static void nvkvm_gpu_class_init(ObjectClass *klass, const void *data)
 {
 	DeviceClass    *dc = DEVICE_CLASS(klass);
 	PCIDeviceClass *k  = PCI_DEVICE_CLASS(klass);
@@ -1670,14 +1670,17 @@ static const TypeInfo virtio_nvgpu_info = {
 	.class_init    = NULL,     /* filled below */
 };
 
-static Property virtio_nvgpu_properties[] = {
+/* const, and NOT NULL-terminated: upstream 5fcabe628b removed
+ * DEFINE_PROP_END_OF_LIST() and device_class_set_props() now derives the count
+ * with ARRAY_SIZE and build-asserts that the LAST entry's name is non-NULL, so
+ * a trailing terminator is a compile error rather than a no-op. */
+static const Property virtio_nvgpu_properties[] = {
 	/* graphics=on|off (default on): expose+forward the DRM render node and
 	 * NVKMS modeset device. off → compute-only VM, smaller attack surface. */
 	DEFINE_PROP_BOOL("graphics", VirtIONvgpu, graphics, true),
-	DEFINE_PROP_END_OF_LIST(),
 };
 
-static void virtio_nvgpu_class_init(ObjectClass *klass, void *data)
+static void virtio_nvgpu_class_init(ObjectClass *klass, const void *data)
 {
 	DeviceClass *dc = DEVICE_CLASS(klass);
 	VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);

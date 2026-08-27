@@ -1587,3 +1587,102 @@ Two machines, two APIs, one boundary.  Whatever this is, it is a property of
 the second forwarding hop and not of a card, a driver build, or a guest image
 -- which is the useful half of the finding, because it means a fix can be
 developed anywhere rather than only on rented multi-GPU hardware.
+
+### `nvkvm-guest.service` reported success without building or loading the module — OPEN, first-boot, observed 2026-08-27
+
+**This has nothing to do with the QEMU 11.1 bump.** It was found while using a
+rented box to test that bump, on a guest image built by
+`scripts/setup_guest.sh` at its documented defaults, and it is filed here
+because it is a defect in the shipped first-boot path, not in anything the bump
+touched.
+
+**The shape of it is the part that matters: the unit reported success and did
+nothing.** `systemctl show -p Result --value nvkvm-guest` returned `success`
+while the module was not built, not loaded, and no device nodes existed. That
+is the same failure class as an isolate probe that fails while returning OK —
+silent success is worse than a failure, because nothing downstream retries and
+nothing complains. A first-time user gets a guest with no GPU and a green
+service.
+
+Observed on:
+
+```
+host    vast.ai KVM instance, RTX 4070 Ti (AD104), driver 580.105.08
+        NVIDIA UNIX Open Kernel Module, systemd-detect-virt = kvm
+guest   Ubuntu 24.04 noble cloud image, kernel 6.8.0-138-generic
+QEMU    11.1.1 + nvkvm (branch qemu-bump) -- but see the note above
+```
+
+What was seen, in order:
+
+```
+$ systemctl is-active nvkvm-guest
+activating                       # ~50 s after guest sshd came up
+$ systemctl is-active nvkvm-guest
+inactive                         # some minutes later
+$ systemctl show -p Result --value nvkvm-guest
+success
+$ systemctl status nvkvm-guest --no-pager
+   Loaded: loaded (/etc/systemd/system/nvkvm-guest.service; disabled; preset: enabled)
+   Active: inactive (dead)
+$ lsmod | grep -i nvkvm          # nothing
+$ ls /dev/nvidia* /dev/dri/*     # No such file or directory
+$ journalctl -u nvkvm-guest      # -- No entries --
+$ find / -name 'nvkvm*.ko'       # nothing
+```
+
+Everything the unit needs was present at the time it should have run —
+`cloud-init status` was `done`, `/lib/modules/6.8.0-138-generic/build` existed,
+`gcc` and `make` were on PATH, and the 9p export was mounted
+(`nvkvm_src on /mnt/nvkvm type 9p`).
+
+**A hand build of the same sources on the same guest worked.** Copying
+`src/guest`, `src/common` and `src/abi` into one directory and building there
+produced and loaded the module, and the whole stack then came up correctly:
+
+```
+nvkvm: probe called for virtio device id=0x32
+nvkvm: host NVIDIA driver 580.105.08, slot_size=65536
+nvkvm: virtual KMS head ready (1920x1080, up to 3840x2160, 1 connector/crtc)
+nvkvm: registered nvidia-drm render node under 0000:00:07.0 (primary minor 0)
+nvkvm: NVIDIA GPU passthrough guest module loaded
+# /dev/dri/card0, /dev/dri/renderD128, /dev/nvidia0, /dev/nvidiactl,
+# /dev/nvidia-modeset, /dev/nvidia-uvm, /dev/nvidia-uvm-tools all appeared
+```
+
+So the sources build and the module works on this kernel. Whatever the unit did
+or did not do, it is not that the code is broken.
+
+#### Leads, in the order they are worth checking
+
+1. **Did the ExecStarts run at all?** `Result=success` together with an empty
+   journal for the unit is the odd pair. A `Type=oneshot` whose first
+   `ExecStart` fails should leave `Result=exit-code`, not `success`. Establish
+   first whether the commands executed and the failure was swallowed, or
+   whether they never executed.
+
+2. **Ordering against the kernel headers.** The unit builds against
+   `KDIR=/lib/modules/$(uname -r)/build`. `setup_guest.sh`'s cloud-init
+   installs the headers package, and the unit has no dependency expressing
+   "after the headers exist". If it fires on a boot where that path is not yet
+   populated, `make` fails immediately. The headers were present when checked
+   *later*, which is consistent with this and does not prove it.
+
+3. **The work directory is deleted on the way out.**
+   `trap "rm -rf -- \"$work\"" EXIT` in the first `ExecStart` removes the build
+   tree unconditionally, so a failed build leaves no log, no `.o` files and no
+   `.ko` to inspect — which is why there was nothing on disk to post-mortem.
+   Whatever else is wrong, this should keep the tree on failure.
+
+**A lead that was considered and is argued against by the unit text:** the
+hand build initially failed because only `src/guest` was copied, and its
+sources include `../../src/common/nvkvm_proto.h` — a missing-sibling
+dependency. That was an error in the by-hand reproduction, not evidence about
+the service: the unit's own `ExecStart` already does
+`cp -a /mnt/nvkvm/src/guest /mnt/nvkvm/src/common /mnt/nvkvm/src/abi "$work/src/"`
+and builds with `-C "$work/src/guest"`, which is exactly the layout that works.
+Recorded so the next person does not spend time re-deriving it.
+
+**Not diagnosed, and deliberately not fixed here** — the run this was found on
+was a QEMU version-bump test, and changing the guest bring-up path mid-test
+would have destroyed the thing being measured.

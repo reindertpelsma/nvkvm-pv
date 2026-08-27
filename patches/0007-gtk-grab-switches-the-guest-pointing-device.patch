@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Fri, 21 Aug 2026 19:44:27 +0200
-Subject: [PATCH 2/2] ui/gtk: make the pointer grab switch the guest's pointing
- device
+Date: Thu, 27 Aug 2026 17:10:20 +0200
+Subject: [PATCH 07/12] ui/gtk: make the pointer grab switch the guest's
+ pointing device
 
 *** THIS PATCH IS NOT KNOWN TO WORK.  The mechanism it automates was
 *** tried by hand on real hardware -- `mouse_set <relative index>` from
@@ -146,7 +146,7 @@ call, with the mode choice expressed once instead of per backend.
  1 file changed, 135 insertions(+)
 
 diff --git a/ui/gtk.c b/ui/gtk.c
-index 23ca23f..fb3cd43 100644
+index 0300dc5c9f..60808d9eb0 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
 @@ -35,6 +35,7 @@
@@ -157,7 +157,7 @@ index 23ca23f..fb3cd43 100644
  #include "qemu/cutils.h"
  #include "qemu/error-report.h"
  #include "qemu/main-loop.h"
-@@ -1621,6 +1622,134 @@ static void gd_ungrab_keyboard(GtkDisplayState *s)
+@@ -1755,6 +1756,134 @@ static void gd_ungrab_keyboard(GtkDisplayState *s)
      trace_gd_ungrab(vc->label, "kbd");
  }
  
@@ -292,7 +292,7 @@ index 23ca23f..fb3cd43 100644
  static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
  {
      GdkDisplay *display = gtk_widget_get_display(vc->gfx.drawing_area);
-@@ -1637,6 +1766,9 @@ static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
+@@ -1771,6 +1900,9 @@ static void gd_grab_pointer(VirtualConsole *vc, const char *reason)
      gdk_device_get_position(gd_get_pointer(display),
                              NULL, &vc->s->grab_x_root, &vc->s->grab_y_root);
      vc->s->ptr_owner = vc;
@@ -302,7 +302,7 @@ index 23ca23f..fb3cd43 100644
      gd_update_caption(vc->s);
      trace_gd_grab(vc->label, "ptr", reason);
  }
-@@ -1656,6 +1788,9 @@ static void gd_ungrab_pointer(GtkDisplayState *s)
+@@ -1790,6 +1922,9 @@ static void gd_ungrab_pointer(GtkDisplayState *s)
      gdk_device_warp(gd_get_pointer(display),
                      gtk_widget_get_screen(vc->gfx.drawing_area),
                      vc->s->grab_x_root, vc->s->grab_y_root);

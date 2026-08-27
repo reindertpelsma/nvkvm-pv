@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Thu, 21 Aug 2026 12:00:00 +0200
-Subject: [PATCH] ui/sdl2: show the guest's GPU head
+Date: Thu, 27 Aug 2026 17:16:58 +0200
+Subject: [PATCH 08/12] ui/sdl2: show the guest's GPU head
 
 *** RUN ON REAL HARDWARE, ONCE.  What was measured and what was not is
 *** under "WHAT THE HARDWARE SAID" below; read that before trusting any
@@ -223,18 +223,72 @@ is nvkvm policy ("the interesting console is the one that is not the boot VGA")
 hardcoded into a generic front end, with an nvkvm-branded symbol and log line,
 and would have to become the same dpy_console_request_focus()-shaped mechanism
 patches/0005 wants before either could go upstream.
+
+--- 9.2 -> 11.1 REBASE NOTE (2026-08-27) ---------------------------------
+
+Point 1 above -- "SDL's dcl_gl_ops has no dpy_gl_scanout_dmabuf" -- IS NO
+LONGER TRUE UPSTREAM.  QEMU commit
+
+    52053b7e0a0e285ce3448b830053b05fb0a9b1a8
+    ("ui/sdl2: Implement dpy dmabuf functions",
+     Pierre-Eric Pelloux-Prayer, first released in v10.1.0)
+
+added sdl2_gl_scanout_dmabuf(), sdl2_gl_release_dmabuf() and
+sdl2_gl_has_dmabuf(), the scon->has_dmabuf field, the dcl_gl_ops entries
+for all three, and the `qemu_egl_display = eglGetCurrentDisplay()` read in
+sdl2_window_create().  So did point 3 ("nothing ever set qemu_egl_display
+for an SDL window").
+
+This patch is therefore no longer "SDL has no dma-buf scanout path"; it is
+now a DELTA ON TOP of upstream's.  What was dropped as redundant:
+
+  * the dcl_gl_ops table entries -- dcl_gl_ops is now byte-identical to
+    upstream's, including .dpy_gl_update = sdl2_gl_scanout_flush;
+  * the three function prototypes in include/ui/sdl2.h;
+  * the `bool has_dmabuf` field in struct sdl2_console;
+  * the bare eglGetCurrentDisplay() read.
+
+What is kept, and why upstream's version is not sufficient on its own:
+
+  * sdl2_gl_ensure_window() -- point 2 above.  Upstream's
+    sdl2_gl_scanout_dmabuf() still does SDL_GL_MakeCurrent() on a possibly
+    NULL scon->real_window and never creates one, so a console whose only
+    content is a GL scanout still gets no window.  Unfixed at v11.1.1.
+  * the per-console scon->edpy and sdl2_gl_bind_window_egl().  Upstream
+    writes the window's EGLDisplay into the GLOBAL qemu_egl_display, which
+    hw/misc/nvkvm_present_egl.c already owns and pairs with its own
+    render-node context every readback frame.  We now fill the global only
+    when it is still EGL_NO_DISPLAY (preserving upstream's behaviour for a
+    stock run, and keeping qemu_egl_has_dmabuf() correct in
+    sdl2_gl_console_init()) and borrow it around the import instead.
+  * the real geometry.  Upstream hardcodes y0_top=false and x/y=0,0 and
+    ignores backing_width/backing_height; we pass what the QemuDmaBuf
+    actually carries.
+  * a release_dmabuf that makes the context current before
+    glDeleteTextures and clears guest_fb.dmabuf.  Upstream's is a bare
+    egl_dmabuf_release_texture().
+  * the !scon->real_window guard in sdl2_gl_scanout_flush() -- upstream
+    still calls SDL_GetWindowSize(NULL, ...) there.
+  * nvkvm_sdl2_maybe_raise(), which was always nvkvm policy, not a gap.
+
+Upstream's `if (qemu_dmabuf_get_allow_fences(dmabuf)) guest_fb.dmabuf =
+dmabuf;` was folded into our scanout_dmabuf so this stays a strict superset.
+
+The parts of this patch that were "plain upstream gaps worth sending to
+qemu-devel" have shrunk accordingly: what is left to send is
+sdl2_gl_ensure_window() and the NULL-window guard in scanout_flush.
 ---
- include/ui/sdl2.h |  51 +++++++++++++++
+ include/ui/sdl2.h |  44 +++++++++++
  ui/sdl2-2d.c      |   3 +
- ui/sdl2-gl.c      | 192 ++++++++++++++++++++++++++++++++++++++++++++++++++++++
- ui/sdl2.c         |  15 +++++
- 4 files changed, 261 insertions(+)
+ ui/sdl2-gl.c      | 185 ++++++++++++++++++++++++++++++++++++++++++----
+ ui/sdl2.c         |  28 ++++++-
+ 4 files changed, 246 insertions(+), 14 deletions(-)
 
 diff --git a/include/ui/sdl2.h b/include/ui/sdl2.h
-index dbe6e3d..cce22b1 100644
+index 9daf5ecffa..792f0bf41a 100644
 --- a/include/ui/sdl2.h
 +++ b/include/ui/sdl2.h
-@@ -51,9 +51,50 @@ struct sdl2_console {
+@@ -52,9 +52,46 @@ struct sdl2_console {
      egl_fb win_fb;
      bool y0_top;
      bool scanout_mode;
@@ -246,10 +300,6 @@ index dbe6e3d..cce22b1 100644
 +     * backend, e.g. GLX on X11.
 +     */
 +    EGLDisplay edpy;
-+    /* Can that display import a dma-buf?  Reported to ui/console.c through
-+     * .dpy_has_dmabuf, so a console that requires dma-buf is not handed a
-+     * window that cannot show it. */
-+    bool has_dmabuf;
  #endif
  };
  
@@ -285,23 +335,20 @@ index dbe6e3d..cce22b1 100644
  void sdl2_window_create(struct sdl2_console *scon);
  void sdl2_window_destroy(struct sdl2_console *scon);
  void sdl2_window_resize(struct sdl2_console *scon);
-@@ -97,4 +138,14 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
- void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
-                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+@@ -104,4 +141,11 @@ void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
+ bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl);
+ void sdl2_gl_console_init(struct sdl2_console *scon);
  
 +#ifdef CONFIG_OPENGL
-+/* nvkvm: dma-buf scanout for SDL -- see patches/0008 for why it was missing. */
++/* nvkvm: read this window's own EGLDisplay out of its GL context.  Upstream
++ * (52053b7e0a) sets the GLOBAL qemu_egl_display from the same call site; we
++ * additionally keep it per console -- see sdl2-gl.c for why. */
 +void sdl2_gl_bind_window_egl(struct sdl2_console *scon);
-+void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
-+                            QemuDmaBuf *dmabuf);
-+void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
-+                            QemuDmaBuf *dmabuf);
-+bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl);
 +#endif
 +
  #endif /* SDL2_H */
 diff --git a/ui/sdl2-2d.c b/ui/sdl2-2d.c
-index 7305238..ff97a59 100644
+index 68a3aff715..c623113393 100644
 --- a/ui/sdl2-2d.c
 +++ b/ui/sdl2-2d.c
 @@ -122,6 +122,9 @@ void sdl2_2d_switch(DisplayChangeListener *dcl,
@@ -315,10 +362,10 @@ index 7305238..ff97a59 100644
  
  void sdl2_2d_refresh(DisplayChangeListener *dcl)
 diff --git a/ui/sdl2-gl.c b/ui/sdl2-gl.c
-index e01d9ab..87697d8 100644
+index 1547ad2f6f..e30851b1c1 100644
 --- a/ui/sdl2-gl.c
 +++ b/ui/sdl2-gl.c
-@@ -46,6 +46,86 @@ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
+@@ -48,6 +48,86 @@ static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
      }
  }
  
@@ -405,7 +452,7 @@ index e01d9ab..87697d8 100644
  static void sdl2_gl_render_surface(struct sdl2_console *scon)
  {
      int ww, wh;
-@@ -106,6 +186,9 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
+@@ -107,6 +187,9 @@ void sdl2_gl_switch(DisplayChangeListener *dcl,
      }
  
      surface_gl_create_texture(scon->gls, scon->surface);
@@ -415,7 +462,7 @@ index e01d9ab..87697d8 100644
  }
  
  void sdl2_gl_refresh(DisplayChangeListener *dcl)
-@@ -211,6 +294,11 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+@@ -217,6 +300,11 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
      struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
  
      assert(scon->opengl);
@@ -427,14 +474,32 @@ index e01d9ab..87697d8 100644
      scon->x = x;
      scon->y = y;
      scon->w = w;
-@@ -222,6 +310,105 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
+@@ -228,6 +316,8 @@ void sdl2_gl_scanout_texture(DisplayChangeListener *dcl,
      sdl2_set_scanout_mode(scon, true);
      egl_fb_setup_for_tex(&scon->guest_fb, backing_width, backing_height,
                           backing_id, false);
 +
 +    nvkvm_sdl2_maybe_raise(scon);
-+}
-+
+ }
+ 
+ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+@@ -243,6 +333,11 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+     if (!scon->guest_fb.framebuffer) {
+         return;
+     }
++    if (!scon->real_window) {
++        /* nvkvm: SDL_GetWindowSize() on a NULL window leaves ww/wh
++         * uninitialised and the blit below would use them. */
++        return;
++    }
+ 
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+ 
+@@ -253,49 +348,113 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
+     SDL_GL_SwapWindow(scon->real_window);
+ }
+ 
+-#ifdef CONFIG_GBM
 +/*
 + * nvkvm: import a dma-buf scanout and present it.
 + *
@@ -449,23 +514,24 @@ index e01d9ab..87697d8 100644
 + * This is gd_egl_scanout_dmabuf() with the GTK parts removed: import, then
 + * hand the resulting texture to the texture path that already worked.
 + */
-+void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
-+                            QemuDmaBuf *dmabuf)
-+{
+ void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+                             QemuDmaBuf *dmabuf)
+ {
 +#ifdef CONFIG_GBM
-+    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+-    const int *fds;
 +    uint32_t x, y, width, height, backing_width, backing_height, texture;
 +    EGLDisplay saved_dpy;
 +    bool y0_top;
-+
-+    assert(scon->opengl);
+ 
+     assert(scon->opengl);
 +
 +    if (!sdl2_gl_ensure_window(scon) || scon->edpy == EGL_NO_DISPLAY) {
 +        return;
 +    }
 +    /* The import binds a texture into whatever context is current. */
-+    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
-+
+     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+ 
 +    /*
 +     * Borrow the global for the length of the import and put it back.  See
 +     * sdl2_gl_bind_window_egl() for why it is borrowed rather than owned: the
@@ -475,14 +541,24 @@ index e01d9ab..87697d8 100644
 +     */
 +    saved_dpy = qemu_egl_display;
 +    qemu_egl_display = scon->edpy;
-+    egl_dmabuf_import_texture(dmabuf);
+     egl_dmabuf_import_texture(dmabuf);
+-    if (!qemu_dmabuf_get_texture(dmabuf)) {
+-        fds = qemu_dmabuf_get_fds(dmabuf, NULL);
+-        error_report("%s: failed fd=%d", __func__, fds ? fds[0] : -1);
 +    qemu_egl_display = saved_dpy;
 +
 +    texture = qemu_dmabuf_get_texture(dmabuf);
 +    if (!texture) {
-+        return;
-+    }
-+
+         return;
+     }
+ 
+-    sdl2_gl_scanout_texture(dcl, qemu_dmabuf_get_texture(dmabuf), false,
+-                            qemu_dmabuf_get_width(dmabuf),
+-                            qemu_dmabuf_get_height(dmabuf),
+-                            0, 0,
+-                            qemu_dmabuf_get_width(dmabuf),
+-                            qemu_dmabuf_get_height(dmabuf),
+-                            NULL);
 +    x = qemu_dmabuf_get_x(dmabuf);
 +    y = qemu_dmabuf_get_y(dmabuf);
 +    width = qemu_dmabuf_get_width(dmabuf);
@@ -490,12 +566,23 @@ index e01d9ab..87697d8 100644
 +    backing_width = qemu_dmabuf_get_backing_width(dmabuf);
 +    backing_height = qemu_dmabuf_get_backing_height(dmabuf);
 +    y0_top = qemu_dmabuf_get_y0_top(dmabuf);
-+
+ 
 +    sdl2_gl_scanout_texture(dcl, texture, y0_top, backing_width, backing_height,
 +                            x, y, width, height, NULL);
-+#endif
-+}
 +
++    /*
++     * nvkvm/11.1: upstream's own sdl2_gl_scanout_dmabuf() (52053b7e0a) parks
++     * the dma-buf on guest_fb when it allows fences.  Nothing in ui/sdl2*
++     * reads it back yet -- only the GTK backend does -- but keep the
++     * assignment so this stays a strict superset of upstream's behaviour, and
++     * so sdl2_gl_release_dmabuf()'s clear below has something to clear.
++     */
+     if (qemu_dmabuf_get_allow_fences(dmabuf)) {
+         scon->guest_fb.dmabuf = dmabuf;
+     }
++#endif
+ }
+ 
 +/*
 + * nvkvm: drop what the import above created.  Without this the texture and its
 + * EGLImage are abandoned on every flip -- the same leak, and the same fix, as
@@ -503,9 +590,9 @@ index e01d9ab..87697d8 100644
 + * hw/display/virtio-gpu-udmabuf.c) releases the previous buffer once the new
 + * one is live.
 + */
-+void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
-+                            QemuDmaBuf *dmabuf)
-+{
+ void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
+                             QemuDmaBuf *dmabuf)
+ {
 +#ifdef CONFIG_GBM
 +    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
 +
@@ -513,55 +600,63 @@ index e01d9ab..87697d8 100644
 +        /* glDeleteTextures needs the context the texture was created in. */
 +        SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 +    }
-+    egl_dmabuf_release_texture(dmabuf);
+     egl_dmabuf_release_texture(dmabuf);
 +    if (scon->guest_fb.dmabuf == dmabuf) {
 +        scon->guest_fb.dmabuf = NULL;
 +    }
 +#endif
-+}
-+
+ }
+ 
 +/*
 + * nvkvm: report dma-buf support honestly.  Without this, console.c infers it
 + * from the mere presence of dpy_gl_scanout_dmabuf, so a GLX window (no EGL
 + * display, no import) would claim support and then draw nothing.
 + */
-+bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl)
-+{
-+    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
-+
-+    return scon->has_dmabuf;
+ bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl)
+ {
+     struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+ 
+     return scon->has_dmabuf;
  }
+-#endif
  
- void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
-@@ -237,6 +424,11 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
-     if (!scon->guest_fb.framebuffer) {
-         return;
-     }
-+    if (!scon->real_window) {
-+        /* nvkvm: SDL_GetWindowSize() on a NULL window leaves ww/wh
-+         * uninitialised and the blit below would use them. */
-+        return;
-+    }
- 
-     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
- 
+ void sdl2_gl_console_init(struct sdl2_console *scon)
+ {
 diff --git a/ui/sdl2.c b/ui/sdl2.c
-index bd4f5a9..6b207e5 100644
+index 1c97d23a47..1703d3f699 100644
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
-@@ -116,6 +116,11 @@ void sdl2_window_create(struct sdl2_console *scon)
- 
-         scon->winctx = SDL_GL_CreateContext(scon->real_window);
+@@ -124,7 +124,28 @@ void sdl2_window_create(struct sdl2_console *scon)
          SDL_GL_SetSwapInterval(0);
-+#ifdef CONFIG_OPENGL
-+        /* nvkvm: the context is current right now -- read the EGL display out
-+         * of it, which is what makes dma-buf import possible at all here. */
+ 
+ #ifdef CONFIG_OPENGL
+-        qemu_egl_display = eglGetCurrentDisplay();
++        /*
++         * nvkvm: the context is current right now -- read the EGL display out
++         * of it, which is what makes dma-buf import possible at all here.
++         *
++         * 9.2 -> 11.1: upstream (52053b7e0a "ui/sdl2: Implement dpy dmabuf
++         * functions") added the plain `qemu_egl_display = eglGetCurrentDisplay()`
++         * below, which is the same read but stored in the GLOBAL.  We cannot
++         * let it clobber unconditionally: hw/misc/nvkvm_present_egl.c pairs
++         * qemu_egl_display with its OWN render-node context on every readback
++         * frame, and a context does not belong to another display, so
++         * overwriting the global there breaks nvkvm's default present mode
++         * silently.  Fill the global only when nothing owns it yet -- which is
++         * exactly the stock-QEMU case upstream added it for, and is what makes
++         * qemu_egl_has_dmabuf() answer correctly in sdl2_gl_console_init() --
++         * and keep this window's own display on the console for the import
++         * path (sdl2_gl_bind_window_egl(), borrowed back in
++         * sdl2_gl_scanout_dmabuf()).
++         */
++        if (qemu_egl_display == EGL_NO_DISPLAY) {
++            qemu_egl_display = eglGetCurrentDisplay();
++        }
 +        sdl2_gl_bind_window_egl(scon);
-+#endif
+ #endif
      } else {
          /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
-         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
-@@ -797,6 +802,11 @@ static void sdl_cleanup(void)
+@@ -812,6 +833,11 @@ static void sdl_cleanup(void)
      SDL_QuitSubSystem(SDL_INIT_VIDEO);
  }
  
@@ -573,15 +668,3 @@ index bd4f5a9..6b207e5 100644
  static const DisplayChangeListenerOps dcl_2d_ops = {
      .dpy_name             = "sdl2-2d",
      .dpy_gfx_update       = sdl2_2d_update,
-@@ -819,6 +829,11 @@ static const DisplayChangeListenerOps dcl_gl_ops = {
- 
-     .dpy_gl_scanout_disable  = sdl2_gl_scanout_disable,
-     .dpy_gl_scanout_texture  = sdl2_gl_scanout_texture,
-+    /* nvkvm: without these three, dpy_gl_scanout_dmabuf() in ui/console.c
-+     * skips this listener and a dma-buf present never reaches the window. */
-+    .dpy_gl_scanout_dmabuf   = sdl2_gl_scanout_dmabuf,
-+    .dpy_gl_release_dmabuf   = sdl2_gl_release_dmabuf,
-+    .dpy_has_dmabuf          = sdl2_gl_has_dmabuf,
-     .dpy_gl_update           = sdl2_gl_scanout_flush,
- };
- 

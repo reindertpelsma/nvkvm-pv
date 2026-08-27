@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# build_qemu.sh — clone QEMU 9.2, patch virtio-nvgpu into it, and build a
+# build_qemu.sh — clone QEMU 11.1, patch virtio-nvgpu into it, and build a
 #                 minimal KVM-only QEMU binary at /opt/qemu-nvkvm.
 #
 # This script is a CONVENIENCE, not the mechanism.  Everything it does to
-# upstream QEMU is ten patch files in patches/, applied with `git apply`;
+# upstream QEMU is twelve patch files in patches/, applied with `git apply`;
 # everything it adds is a file copy.  docs/howto/build.md walks the identical
 # sequence by hand, and you can follow it instead of running this — that is the
 # point of keeping the delta as patches rather than as sed expressions.
@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-QEMU_VERSION="9.2.0"
+QEMU_VERSION="11.1.1"
 REPO_ROOT="$(realpath "$(dirname "$0")/..")"
 
 # Where the QEMU tree is cloned and the binary installed.  /opt when we can
@@ -238,7 +238,7 @@ else
     echo "  NVKVM_STUB_PATH=$REPO_ROOT/src/stub/nvkvm_stub if you ever need it."
 fi
 
-# ── 2. Clone QEMU 9.2 stable ──────────────────────────────────────────────
+# ── 2. Clone QEMU 11.1 stable ─────────────────────────────────────────────
 if [ ! -d "$QEMU_SRC" ]; then
     echo "[2/9] Cloning QEMU $QEMU_VERSION..."
     git clone --depth=1 --branch "v${QEMU_VERSION}" \
@@ -247,11 +247,46 @@ else
     echo "[2/9] QEMU source already present at $QEMU_SRC — skipping clone."
 fi
 
+# ── 2b. Guard: is that tree the version the patches are written against? ──
+#
+# Added with the 9.2.0 -> 11.1.1 bump, because the failure it catches is the
+# single most likely way to hit this upgrade badly.  The clone above is skipped
+# whenever $QEMU_SRC merely EXISTS, so a box that built the old QEMU keeps its
+# 9.2.0 tree, every one of the twelve patches then fails to apply, and the
+# error you get blames the patches.  Checking the tag turns that into one line
+# naming the real problem and the one-command fix.
+#
+# Only the tag is checked, not the working tree: patches are applied with
+# `git apply` and never committed, so HEAD stays on the tag for the whole
+# build and a re-run is still a no-op.  If the tag cannot be determined (a
+# hand-made tree, a mirror without tags) this warns and continues rather than
+# refusing -- the patch-apply step below is the real gate.
+_qemu_tag="$(git -C "$QEMU_SRC" describe --tags --exact-match HEAD 2>/dev/null || true)"
+if [ -z "$_qemu_tag" ]; then
+    echo "  WARNING: cannot determine the tag of $QEMU_SRC."
+    echo "  Expected v$QEMU_VERSION. Continuing; step 3 will fail if it is wrong."
+elif [ "$_qemu_tag" != "v$QEMU_VERSION" ]; then
+    cat >&2 <<EOF
+
+ERROR: $QEMU_SRC is QEMU $_qemu_tag, but the patches in patches/ are written
+       against v$QEMU_VERSION and nothing else.
+
+This is almost certainly a tree left over from an earlier nvkvm build (the
+clone above is skipped whenever the directory exists).  Remove it and re-run:
+
+    rm -rf $QEMU_SRC && $0 --force
+
+EOF
+    exit 1
+else
+    echo "  tree is at v$QEMU_VERSION, as the patches expect."
+fi
+
 # ── 3. Apply the QEMU patch series ────────────────────────────────────────
 #
-# Everything nvkvm changes in *upstream* QEMU lives in patches/ as ten
+# Everything nvkvm changes in *upstream* QEMU lives in patches/ as twelve
 # ordinary patch files.  "What does this do to my QEMU?" is therefore answered
-# by reading ten diffs, not by reading this script and mentally executing the
+# by reading twelve diffs, not by reading this script and mentally executing the
 # edits it generates.  Each patch carries a header saying why it exists;
 # patches/README.md is the index, and docs/howto/build.md walks the same steps
 # by hand.
@@ -263,10 +298,13 @@ fi
 #   * a QEMU version bump meant rewriting the editing logic rather than
 #     resolving conflicts with ordinary tools.
 #
-# Idempotency is decided by `git apply --reverse --check` -- "does this patch
-# un-apply cleanly?", i.e. is it already in the tree.  The old script grepped
-# the tree for a comment string taken from the patch body, so rewording a
-# comment silently made the patch apply a second time.
+# Idempotency is decided by RESETTING the upstream files the series touches
+# back to the tag and re-applying (see the note at the loop below).  It used to
+# be decided by `git apply --reverse --check` per patch, which is unsound as
+# soon as two patches touch one region -- 0001 and 0012 both edit the same
+# meson.build block -- and before that by grepping the tree for a comment
+# string taken from the patch body, so rewording a comment silently made the
+# patch apply a second time.
 #
 # The whole pending set is --check'ed as ONE unit before anything is written.
 # git apply is all-or-nothing per invocation, so that is what guarantees a
@@ -292,21 +330,52 @@ cd "$QEMU_SRC"
 # introduce -- 0010 edits code that 0009 adds to ui/sdl2.c.  Validating every
 # patch against the tree as it stands BEFORE applying any of them therefore
 # fails for the first genuinely dependent patch in the series, with a message
-# blaming the tree.  That is what happened: 0010 applies perfectly to a v9.2.0
-# tree with 0001-0009 on it, and could never apply to a pristine one.
+# blaming the tree.  That is what happened: 0012 applies perfectly to a v11.1.1
+# tree with 0001-0011 on it -- it appends to the meson.build file list that 0001
+# creates -- and could never apply to a pristine one.
 #
 # Atomicity is kept by rolling back on failure instead of by batching: each
 # patch is checked against the CURRENT tree, applied immediately, and recorded,
 # so a failure can reverse exactly what this run did and leave the tree as it
 # was found.
 #
+#
+# ...and RESET the files the series touches before applying, rather than
+# asking each patch "are you already applied?".
+#
+# Bump fix 2026-08-27.  The per-patch `git apply --reverse --check` test is not
+# sound once two patches touch the same region: 0012 appends two lines INSIDE
+# the meson.build block that 0001 adds, so on an already-patched tree 0001 no
+# longer reverses cleanly -- the text it would remove is not the text it added.
+# The script then declared the tree neither-applied-nor-appliable and refused,
+# which meant `--force` (the documented way to rebuild after editing
+# src/qemu/) failed on every tree it had itself produced.  It was not a version
+# problem; it arrived with 0012 and would have bitten 9.2.0 identically.
+#
+# Resetting is sound where the reverse-check is not, and it is the same claim
+# patches/README.md already makes: the QEMU tree is the tag plus this series
+# and NOTHING else, so restoring the tag's copy of exactly the files the series
+# names and re-applying is a no-op by construction.  Only tracked upstream
+# files are touched -- the nvkvm sources copied into hw/misc/ are untracked and
+# survive, as does the build directory.
+#
+NVKVM_TOUCHED=$(sed -n 's|^diff --git a/\(.*\) b/.*|\1|p' "${NVKVM_PATCHES[@]}" | sort -u)
+if [ -n "$NVKVM_TOUCHED" ]; then
+    # shellcheck disable=SC2086
+    if ! git checkout -- $NVKVM_TOUCHED 2>/dev/null; then
+        echo "ERROR: could not restore $QEMU_SRC to a pristine v$QEMU_VERSION." >&2
+        echo "  Files: $(echo $NVKVM_TOUCHED | tr '\n' ' ')" >&2
+        echo "  To start clean:  rm -rf $QEMU_SRC && $0 --force" >&2
+        exit 1
+    fi
+    echo "  reset $(echo "$NVKVM_TOUCHED" | wc -l) upstream file(s) to v$QEMU_VERSION"
+fi
+
 NVKVM_APPLIED=()
 NVKVM_NEW=0
 for _p in "${NVKVM_PATCHES[@]}"; do
     _name="$(basename "$_p")"
-    if git apply --reverse --check "$_p" 2>/dev/null; then
-        echo "  already applied: $_name"
-    elif git apply --check "$_p" 2>/dev/null; then
+    if git apply --check "$_p" 2>/dev/null; then
         git apply "$_p"
         NVKVM_APPLIED+=( "$_p" )
         NVKVM_NEW=$((NVKVM_NEW + 1))
@@ -320,14 +389,14 @@ for _p in "${NVKVM_PATCHES[@]}"; do
         fi
         cat >&2 <<EOF
 
-ERROR: $_name neither applies to nor is already applied to
+ERROR: $_name does not apply to
        $QEMU_SRC
 
-This almost always means one of:
+The files this series touches were just reset to v$QEMU_VERSION, so the tree
+is pristine upstream plus the patches before this one.  That means:
   * the QEMU tree is not $QEMU_VERSION (the patches are written against the
-    v$QEMU_VERSION tag and nothing else);
-  * the tree was hand-edited, or half-patched by an older build script;
-  * the patch was edited and no longer matches upstream context.
+    v$QEMU_VERSION tag and nothing else) -- step 2b checks this;
+  * or the patch was edited and no longer matches upstream context.
 
 Note the series is applied in order and later patches may depend on earlier
 ones, so this is reported against the tree WITH its predecessors applied.
@@ -340,8 +409,9 @@ EOF
     fi
 done
 
-if [ "$NVKVM_NEW" -eq 0 ]; then
-    echo "  all ${#NVKVM_PATCHES[@]} patches already applied — nothing to do."
+if [ "$NVKVM_NEW" -ne "${#NVKVM_PATCHES[@]}" ]; then
+    echo "ERROR: applied $NVKVM_NEW of ${#NVKVM_PATCHES[@]} patches." >&2
+    exit 1
 fi
 
 # ── 4. Copy nvkvm QEMU source files into hw/misc/ ─────────────────────────
@@ -434,7 +504,7 @@ cd "$QEMU_SRC"
     --prefix="$QEMU_PREFIX"
 
 # ── 8. Build ──────────────────────────────────────────────────────────────
-# Rebuild fix 2026-07-04: QEMU 9.2's ./configure creates the build tree in
+# Rebuild fix 2026-07-04: QEMU's ./configure creates the build tree in
 # ./build (out-of-tree); build.ninja is NOT in $QEMU_SRC.  Run ninja against it.
 echo "[8/9] Building QEMU with ninja -j$(nproc)..."
 BUILD_DIR="$QEMU_SRC/build"

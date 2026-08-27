@@ -33,7 +33,7 @@ application, and we will tell you so. Checking first saves us both a day.
 ## Working on the code
 
 ```bash
-bash scripts/build_qemu.sh --install-deps   # isolate stub, then QEMU 9.2
+bash scripts/build_qemu.sh --install-deps   # isolate stub, then QEMU 11.1
 bash tests/unit/run_tests.sh                # the unit gate -- see the note below
 ```
 

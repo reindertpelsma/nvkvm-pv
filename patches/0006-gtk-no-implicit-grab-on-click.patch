@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Fri, 21 Aug 2026 19:43:19 +0200
-Subject: [PATCH 1/2] ui/gtk: do not grab the pointer on a click
+Date: Thu, 27 Aug 2026 17:10:19 +0200
+Subject: [PATCH 06/12] ui/gtk: do not grab the pointer on a click
 
 A plain left click in the guest window took the host's pointer and
 keyboard, hid the cursor, and did not reach the guest.  The window was
@@ -53,10 +53,10 @@ change than nvkvm needs.
  1 file changed, 7 insertions(+), 13 deletions(-)
 
 diff --git a/ui/gtk.c b/ui/gtk.c
-index daa3dd6..23ca23f 100644
+index 697e441acb..0300dc5c9f 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -988,21 +988,15 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
+@@ -1085,21 +1085,15 @@ static gboolean gd_button_event(GtkWidget *widget, GdkEventButton *button,
                                  void *opaque)
  {
      VirtualConsole *vc = opaque;

@@ -42,7 +42,7 @@ int  nvkvm_present_console_init(struct DeviceState *dev, struct VirtIONvgpu *nv)
 void nvkvm_present_console_fini(struct VirtIONvgpu *nv);
 /* Re-point the scanout console's "device" link at `dev`.
  *
- * graphic_console_init() binds the console to the device that registered it —
+ * qemu_graphic_console_create() binds the console to the device that registered it —
  * for us the inner virtio device, which carries no user-visible id.  But
  * `-device virtio-nvgpu-pci-...,id=X` puts X on the PCI PROXY, and QEMU's
  * screendump resolves X to the proxy and then asks which console is bound to
