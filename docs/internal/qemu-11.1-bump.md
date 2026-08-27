@@ -35,14 +35,16 @@ Three are fixed by the bump. **Two are not**, and that matters more than the thr
 |---|---|
 | `CVE-2026-48914` | **Fixed by the bump.** virtio-blk missing `VIRTIO_BLK_T_SCSI_CMD` size check → heap OOB write. Fixed upstream `aeea0c2804`, released in **11.0.2**. Relevant: we use virtio-blk. |
 | `CVE-2026-63319` | **Fixed by the bump, but we are not exposed.** usbredir infinite loop / divide-by-zero via `max_packet_size=0`. Fixed `a002485bfe`, released in **11.0.3**. We attach no `usb-redir` chardev. (MITRE's central record was still unsynced at time of checking; Ubuntu's CNA page and the upstream commit confirm it is genuine.) |
-| `CVE-2024-8612` | **NOT fixed. Still open upstream at 11.1.1.** virtio-scsi/blk/crypto: an oversized `virtqueue_push()` can write uninitialised bounce-buffer bytes back to the guest (info leak, CVSS 3.8). Debian marks it *vulnerable* in every suite including sid `1:11.1.0+ds-2`, `no-dsa (Minor issue)`. Red Hat: no fixed version. |
-| `CVE-2023-1386` | **NOT fixed. Still open upstream at 11.1.1.** 9pfs passthrough does not drop SUID/SGID when a guest-local user writes an executable → privilege escalation. Debian: *vulnerable* through sid, status "postponed… revisit when fixed upstream". **This is the one from the original justification that mounts into every nvkvm-steamos guest, and the bump does not close it.** |
+| `CVE-2024-8612` | **NOT fixed upstream — but NOT reachable in our deployed config.** virtio-scsi/blk/crypto: an oversized `virtqueue_push()` leaks uninitialised bounce-buffer bytes to the guest (CVSS 3.8). Still vulnerable in sid `1:11.1.0+ds-2`, and the pattern is still in the pinned tree. The deployed guest attaches none of the three devices (its disk is `-device nvme`): see [Residual risk](#residual-risk--fixed--mitigated--exposed) §3b. |
+| `CVE-2023-1386` | **NOT fixed. Still open upstream at 11.1.1.** 9pfs `passthrough` does not drop SUID/SGID when a guest writes an executable → host privilege escalation. Debian: *vulnerable* through sid. Whether we are exposed depends on `security_model`, and today **we are**: see [Residual risk](#residual-risk--fixed--mitigated--exposed) §3a. |
 | `CVE-2026-0665` | **Fixed long before 11.1, and we are not exposed.** Off-by-one in `xen_physdev_map_pirq` — the *Xen-on-KVM guest-compat hypercall shim*, not core KVM acceleration. Not the same thing as "we use KVM". |
 
 **Do not describe this bump as closing `CVE-2023-1386` or `CVE-2024-8612`.** It
-does not. They are residual risk, unchanged. In particular the 9p SUID/SGID
-behaviour must not be relied on as part of the nvkvm-steamos sandbox boundary —
-see `SECURITY.md`.
+does not. Both are residual risk, and the section below splits them into what is
+mitigated by configuration and what is genuinely exposed — a configuration
+mitigation is not a fix, and the one that mitigates 9pfs is **not on `main`
+yet**. The 9p SUID/SGID behaviour must not be relied on as part of the
+nvkvm-steamos sandbox boundary; see `SECURITY.md`.
 
 ### What the bump does close, in subsystems we actually build
 
@@ -94,6 +96,167 @@ Also out of scope because the device is not built or not attached: USB
 vars device (10 IDs), virtio-snd, PCIe SR-IOV, e1000, LSI53C895A, block/vmdk and
 block/dmg, hyperv syndbg, virtio-crypto asym, and `libvhost-user`
 (`CVE-2026-6425` — vhost-user backend processes only).
+
+## Residual risk: fixed / mitigated / exposed
+
+The bump was justified partly by CVEs it does **not** fix. This section separates
+the three cases so nobody reads a configuration mitigation as a code fix.
+
+Evidence below is from the pinned tree (`v11.1.1`) and from
+`/workspace/nvkvm-steamos`, checked on 2026-08-27.
+
+### Category 1 — fixed by the bump
+
+Everything in the "What the bump does close" tables above: the four 9pfs
+resource-exhaustion / `O_TRUNC` bugs, the two core `hw/virtio/virtio.c` bugs,
+the three virtio-gpu blob/2D bugs, plus `CVE-2026-48914` (virtio-blk) and
+`CVE-2026-63319` (usbredir, not attached here). These are code fixes present in
+`v11.1.1` and absent from `9.2.0`. Nothing in this category depends on how we
+configure QEMU.
+
+### Category 2 — NOT fixed upstream, but mitigated by configuration
+
+**`CVE-2023-1386` — 9pfs does not drop SUID/SGID.**
+
+Still unfixed upstream at `v11.1.1`, and the bump does not touch it. It is only
+exploitable if a guest-created setuid file becomes a **real setuid file on the
+host**, and that depends entirely on the export's `security_model`.
+
+QEMU's local backend branches on the security model at every point where a mode
+reaches the host. In the pinned tree:
+
+| path | `mapped-xattr` (`V9FS_SM_MAPPED`) | `passthrough` / `none` |
+|---|---|---|
+| create a file | `hw/9pfs/9p-local.c:851` — `openat_file(dirfd, name, flags, fs_ctx->fmode)` | `hw/9pfs/9p-local.c:867` — `openat_file(dirfd, name, flags, credp->fc_mode)` |
+| mknod | `hw/9pfs/9p-local.c:688` — `qemu_mknodat(..., fs_ctx->fmode \| S_IFREG, 0)` | `hw/9pfs/9p-local.c:703` — `qemu_mknodat(..., credp->fc_mode, credp->fc_rdev)` |
+| chmod | `hw/9pfs/9p-local.c:654` — `local_set_xattrat()` | `hw/9pfs/9p-local.c:659` — `fchmodat_nofollow(dirfd, name, credp->fc_mode)` |
+
+Under `passthrough`, the guest's mode reaches the host file, and
+`local_set_cred_passthrough()` finishes the job at **`hw/9pfs/9p-local.c:458`**:
+
+```c
+return fchmodat_nofollow(dirfd, name, credp->fc_mode & 07777);
+```
+
+`07777` **includes `S_ISUID` (04000) and `S_ISGID` (02000)** — that is the CVE.
+
+Under `mapped-xattr` the guest's mode is stored as data, in the
+`user.virtfs.mode` xattr (`hw/9pfs/9p-local.c:426-431`), and the host file is
+created with the export's own `fmode`. That `fmode` **cannot express setuid at
+all**, because it is masked when the option is parsed —
+**`hw/9pfs/9p-local.c:1597-1598`**:
+
+```c
+fse->fmode =
+    qemu_opt_get_number(opts, "fmode", SM_LOCAL_MODE_BITS) & 0777;
+```
+
+`& 0777` strips the setuid/setgid bits, and the default `SM_LOCAL_MODE_BITS` is
+`0600` (`fsdev/file-op-9p.h:32`). So on a `mapped-xattr` export a guest cannot
+produce a setuid host file even if the operator deliberately tried to configure
+one. The option string maps to that flag at `hw/9pfs/9p-local.c:1550-1552`
+(`"mapped"` and `"mapped-xattr"` both set `V9FS_SM_MAPPED`); `"passthrough"` is
+`hw/9pfs/9p-local.c:1548-1549`.
+
+**So the mitigation is real and is enforced by QEMU itself — but see Category 3,
+because it is not on the deployed branch yet.**
+
+### Category 3 — NOT fixed and NOT mitigated
+
+**3a. `CVE-2023-1386` on `main`, i.e. on what actually deploys today.**
+
+The `passthrough` → `mapped-xattr` change is **commit `b26ae01` on branch
+`audit-followups` only. It is not merged to `main`.** Verified:
+
+```
+$ git -C /workspace/nvkvm-steamos merge-base --is-ancestor b26ae01 main ; echo $?
+1                                    # NOT an ancestor of main
+$ git -C /workspace/nvkvm-steamos branch -a --contains b26ae01
+* audit-followups
+  remotes/origin/audit-followups
+$ git -C /workspace/nvkvm-steamos show main:scripts/steamos-container-entrypoint.sh | sed -n 435p
+    -virtfs "local,path=$DATA_DIR,mount_tag=data,security_model=passthrough" \
+```
+
+`main` and `origin/main` are both at `464f494`.
+
+The exposed export is, by name:
+
+> **`scripts/steamos-container-entrypoint.sh:435` on `main` — `mount_tag=data`,
+> `security_model=passthrough`, writable**, `path=$DATA_DIR` (`:15`,
+> `DATA_DIR="${NVKVM_STEAMOS_DATA_DIR:-/data}"`), backed by the compose volume
+> `${NVKVM_STEAMOS_DATA:-steamos-data}:/data` (`docker-compose.yml:205`) — a
+> named Docker volume by default, but a **real host directory** whenever the
+> operator sets `NVKVM_STEAMOS_DATA=/absolute/host/path`. QEMU runs as uid 0 in
+> that container.
+
+A guest can drop a root-owned setuid binary into that directory and leave a host
+privilege-escalation vector for whoever later runs it.
+
+On branch `audit-followups` (`scripts/steamos-container-entrypoint.sh:443`) this
+becomes Category 2. **Until `b26ae01` is merged, CVE-2023-1386 is Category 3 for
+the deployed configuration.**
+
+The other three deployed exports are *not* exposed, and it is worth writing down
+why so nobody "fixes" them unnecessarily: they are `security_model=none` but
+also `readonly=on`, and they export either the baked-in `/opt/nvkvm` or an
+nvkvm-pv source checkout — there is no guest-writable path through them:
+
+* `scripts/steamos-container-entrypoint.sh:434` — `mount_tag=nvkvm`, `/opt/nvkvm`, `readonly=on`
+* `boot/run_steamos_nvkvm.sh:53` — `mount_tag=nvkvm`, `$SHARE`, `readonly=on`
+* `install_steamos_vm.sh:253` — `mount_tag=nvkvm`, `$SHARE`, `readonly=on`
+
+**3b. `CVE-2024-8612` — virtio bounce-buffer info leak. Not fixed; not reachable
+in the deployed config; reachable in the dev harness.**
+
+Not fixed upstream. Debian tracks `qemu` as *vulnerable* in every suite
+including sid `1:11.1.0+ds-2`, and the pattern is still in the pinned tree:
+
+* `hw/scsi/virtio-scsi.c:118` — `virtqueue_push(vq, &req->elem, req->qsgl.size + req->resp_iov.size);`
+* `hw/block/virtio-blk.c:67` — `virtqueue_push(req->vq, &req->elem, req->in_len);`
+
+Red Hat's page cites commit `637b0aa1395`, and that commit **is already in
+`v9.2.0`** (`git tag --contains` → `v9.2.0`), so it is not something the bump
+delivers; Debian's note is explicit that the existing commit addresses a symptom
+and not the root cause.
+
+The affected devices are **virtio-scsi, virtio-blk and virtio-crypto**. The
+deployed nvkvm-steamos guest attaches **none** of them — its disk is emulated
+NVMe:
+
+```
+scripts/steamos-container-entrypoint.sh:427-428
+    -drive "file=$QCOW,format=qcow2,if=none,id=nvm0" \
+    -device nvme,drive=nvm0,serial=nvkvmsteamos \
+```
+
+and `grep -rE 'virtio-scsi|virtio-crypto'` over the deployed scripts returns
+nothing. So for the shipped configuration this CVE is **not reachable**.
+
+The configuration that *would* be exposed is any guest given a virtio-blk or
+virtio-scsi disk — and nvkvm-pv's own dev harness is exactly that:
+`scripts/run_test_vm.sh` boots with `-drive file="$IMG",format=qcow2,if=virtio`,
+which is virtio-blk. That harness is documented as trusted-guest-only and is not
+a deployment, so this is a note, not a finding — but if the deployed guest ever
+moves from `-device nvme` to virtio-blk, this CVE moves to Category 3a
+alongside 9pfs.
+
+### What to guard
+
+1. **`b26ae01` must reach `main`.** Until it does, the writable `data` export
+   ships as `passthrough` and CVE-2023-1386 is live.
+2. **Guard against a revert to `passthrough`.** The mitigation is one word in
+   one line, it lives in a shell script with no test asserting it, and the
+   failure is completely silent — nothing observable changes in the guest when
+   it flips back. A `grep -q 'mount_tag=data,security_model=mapped-xattr'`
+   assertion in CI, or in the entrypoint itself, is the cheap way to keep it.
+   `security_model=none` is equally unsafe for a *writable* export; the check
+   should be an allowlist of `mapped-xattr`, not a denylist of `passthrough`.
+3. **Do not let 9p passthrough be described as part of the sandbox boundary.**
+   `SECURITY.md` should say that a `passthrough` export is a host-privilege
+   path, independent of this CVE.
+4. **If the guest disk ever becomes virtio-blk/virtio-scsi**, re-check
+   CVE-2024-8612 before shipping.
 
 ## Per-patch outcome
 
