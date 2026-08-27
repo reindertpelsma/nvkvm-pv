@@ -449,6 +449,13 @@ void nvkvm_virtio_push_evt(VirtIONvgpu *nv, uint32_t isolate_id,
 void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
 			       uint32_t height, uint32_t refresh_mhz);
 
+/* The host display finished reading the guest scanout bo (isolate_id,
+ * stub_handle); tell the guest over VQ_EVT so its virtual head can stop
+ * pretending a software vblank means the buffer is free.  ADVISORY -- see
+ * struct nvkvm_evt_release.  Main-loop/BQL callers only. */
+void nvkvm_virtio_push_buf_release(VirtIONvgpu *nv, uint32_t isolate_id,
+				   uint32_t stub_handle);
+
 /*
  * DEAD-1, 2026-08-24: the nvkvm_dispatch.c and nvkvm_frontend.c declarations
  * were here — nvkvm_dispatch_ioctl(), nvkvm_ioctl_expected_param_size() and the

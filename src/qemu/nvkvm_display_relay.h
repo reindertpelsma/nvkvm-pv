@@ -58,6 +58,18 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
                                 uint32_t stride, uint32_t fourcc,
                                 uint64_t modifier);
 
+/*
+ * Name the guest bo behind the next zero-copy submit, so the broker's
+ * EV_RELEASE -- which identifies a buffer by its host dma-buf inode -- can be
+ * translated back into something the guest recognises and forwarded to it over
+ * VQ_EVT.  Call immediately before nvkvm_display_relay_submit() and ONLY on the
+ * zero-copy path; the readback tier presents a VMM-owned buffer the guest has
+ * no stake in.  BQL held, like every other entry point here.
+ */
+void nvkvm_display_relay_note_present(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t isolate_id,
+                                      uint32_t stub_handle);
+
 /* True whenever -display nvkvm-broker is in use, including reconnect windows.
  * Cheap and immutable after display initialisation; only for choosing the
  * broker present path. */

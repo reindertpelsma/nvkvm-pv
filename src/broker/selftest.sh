@@ -127,6 +127,33 @@ check   "COMMIT presents it"               'TEST commit: .*320x240'  "$CASE_LOG"
 check   "the client is told the buffer was released" 'RELEASE'       "$CASE_OUT"
 nocheck "no rejection on the happy path"   'REJECTED|not advertised' "$CASE_LOG"
 
+# ── BACKPRESSURE'S ONE WIRE REQUIREMENT ──────────────────────────────────────
+# The VMM cannot forward a release to the guest unless the release NAMES the
+# buffer.  The guest knows its scanout bos by (isolate, GEM handle) and has no
+# idea what a host dma-buf inode is, so the VMM keeps an inode -> (isolate, GEM)
+# table populated at ATTACH time and looks the release up in it.  That works
+# only if EV_RELEASE.w0/w1 carry the same id the ATTACH was given, and if the id
+# is not zero -- a zero id translates to nothing and the guest waits out its
+# deadline for a release that can never be matched.
+#
+# Checked here rather than assumed because it is a property of the broker, and
+# the consumer of it (src/qemu/nvkvm_display_relay.c) lives in another process
+# and another repository half.  See src/guest/nvkvm_kms.c for what the guest
+# does with it.
+ATTACH_ID="$(sed -n 's/.*TEST attach: id=\([0-9]\+\) .*/\1/p' "$CASE_LOG" | head -1)"
+if [ -n "$ATTACH_ID" ] && [ "$ATTACH_ID" != 0 ]; then
+    ok "the buffer the broker imported has a non-zero id"
+else
+    bad "the buffer the broker imported has a non-zero id"
+fi
+REL_LO=$(( ATTACH_ID & 0xffffffff ))
+REL_HI=$(( (ATTACH_ID >> 32) & 0xffffffff ))
+check   "RELEASE names the buffer that was attached, not some other one" \
+        "RELEASE .*w0=$REL_LO w1=$REL_HI" "$CASE_OUT"
+nocheck "RELEASE never names buffer 0 (which would translate to nothing)" \
+        'RELEASE .*w0=0 w1=0' "$CASE_OUT"
+
+
 # A-18: geometry that does not fit the buffer.  REJECT, never clamp.
 run_case '' --present 320x240 --bad-size 4000
 check   "a buffer smaller than its claimed geometry is REJECTED" \

@@ -77,6 +77,9 @@ tests/unit/r1_stub_type_dev.inc
 sweep-runs/
 # ...and the guest device-presence guard, extracted from src/guest/nvkvm_virtio.c
 tests/unit/transport_ready.inc
+# ...and the release path's inode -> (isolate, GEM) table, extracted from
+# src/qemu/nvkvm_display_relay.c between the NVKVM_RELAY_BUFMAP markers.
+tests/unit/relay_bufmap.inc
 
 # Operator-supplied SSH keys for the SteamOS guest (steamos_boot.sh gates sshd on
 # the presence of these). Public keys are not secrets, but this repo is PUBLIC and

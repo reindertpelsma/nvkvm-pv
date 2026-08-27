@@ -523,6 +523,15 @@ void nvkvm_kms_fini(struct drm_device *ddev);
 void nvkvm_kms_set_host_size(unsigned int w, unsigned int h,
 			     unsigned int refresh_mhz);
 
+/*
+ * The host display has finished reading the guest scanout bo (isolate_id,
+ * stub_handle).  Called from the VQ_EVT virtqueue callback (softirq), so it
+ * must not sleep.  ADVISORY: the head arms its backpressure on the first one of
+ * these it sees and disarms itself when they stop, so a host that never sends
+ * them costs nothing.  See NVKVM_KMS_PRESENT_WAIT_DEFAULT in nvkvm_kms.c.
+ */
+void nvkvm_kms_buffer_released(__u32 isolate_id, __u32 stub_handle);
+
 /* nvkvm_virtio.c — transport layer */
 int  nvkvm_virtio_init(struct virtio_device *vdev, struct nvkvm_state *state);
 void nvkvm_virtio_fini(struct nvkvm_state *state);

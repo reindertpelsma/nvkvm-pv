@@ -496,6 +496,23 @@ static void nvkvm_evt_callback(struct virtqueue *vq)
 #endif
 				break;
 			}
+			case NVKVM_EVT_TYPE_RELEASE: {
+				const struct nvkvm_evt_release *rel =
+					(const struct nvkvm_evt_release *)evt;
+
+#ifdef NVKVM_GRAPHICS
+				nvkvm_kms_buffer_released(
+					le32_to_cpu(rel->isolate_id),
+					le32_to_cpu(rel->stub_handle));
+#else
+				/* Compute-only: no head, nothing scans out.
+				 * Consumed and recycled anyway so a mismatched
+				 * host cannot wedge VQ_EVT behind a buffer
+				 * nobody handled. */
+				(void)rel;
+#endif
+				break;
+			}
 			case NVKVM_EVT_TYPE_POLL:
 			default:
 				nvkvm_evt_deliver(le32_to_cpu(evt->isolate_id),

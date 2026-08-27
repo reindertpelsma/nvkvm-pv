@@ -37,7 +37,7 @@ CTRL_GATE_SRCS = test_ctrl_gate.c
 
 .PHONY: all clean run check
 
-all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_uidmap
+all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap
 
 test_objects: $(OBJECTS_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
@@ -166,6 +166,15 @@ test_relay_state: test_relay_state.c relay_state_helpers.inc
 # self-contained clipboard transaction builder.  This pins the real chunking
 # and resumable EAGAIN cursor; losing the markers makes the test fail to compile
 # rather than silently testing a copy.
+# The release path's inode -> (isolate, GEM) translation.  Same extraction trick
+# and same reason: the relay cannot be linked whole outside QEMU, and a copy of
+# this table in the test would be a copy that could drift from the one that runs.
+relay_bufmap.inc: ../../src/qemu/nvkvm_display_relay.c
+	awk '/NVKVM_RELAY_BUFMAP_BEGIN/,/NVKVM_RELAY_BUFMAP_END/' $< > $@
+
+test_relay_bufmap: test_relay_bufmap.c relay_bufmap.inc
+	$(CC) $(CFLAGS) -I. -o $@ test_relay_bufmap.c
+
 relay_clip_batch.inc: ../../src/qemu/nvkvm_display_relay.c
 	awk '/NVKVM_RELAY_CLIP_BATCH_BEGIN/,/NVKVM_RELAY_CLIP_BATCH_END/' $< > $@
 
@@ -234,9 +243,10 @@ check:
 	@bash run_tests.sh
 
 clean:
-	rm -f test_uidmap test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_relay_state test_relay_clip test_relay_wiring \
+	rm -f test_uidmap test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap \
 	      stub_sanitize.inc kvm_slot_pool.inc stub_window.inc win_alloc.inc \
 	      drm_param_structs.inc r1_type_dev.inc r1_stub_type_dev.inc \
 	      relay_state_helpers.inc relay_clip_batch.inc relay_fd_ownership.inc \
-	      relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc
+	      relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc \
+	      relay_bufmap.inc
 	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc test_relay_state relay_state_helpers.inc test_relay_clip relay_clip_batch.inc test_relay_wiring relay_fd_ownership.inc relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc

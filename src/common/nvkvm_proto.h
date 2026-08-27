@@ -550,12 +550,48 @@ struct nvkvm_resp_unpoll_on_isolate {
  */
 #define NVKVM_EVT_TYPE_POLL     0u
 #define NVKVM_EVT_TYPE_UI_INFO  1u
+#define NVKVM_EVT_TYPE_RELEASE  2u
 
 struct nvkvm_evt_poll {
 	__le32 isolate_id;
 	__le32 handle_id;
 	__le32 events;
 	__le32 type;            /* NVKVM_EVT_TYPE_POLL (0); was `reserved` */
+};
+
+/*
+ * THE HOST DISPLAY HAS FINISHED READING A SCANOUT BUFFER.
+ *
+ * The guest's present path is guest-driven: it flips, QEMU exports the bo, and
+ * the broker hands it to the host compositor.  That compositor is a SECOND
+ * consumer of the buffer, with a lifetime the guest cannot see -- and it is the
+ * one the guest was previously blind to.  Without this event the guest
+ * completes its page flip off a software vblank timer alone, so a host that
+ * stalls for a few frames sees the guest cycle its whole scanout ring and start
+ * rendering into a buffer the compositor is still reading.  The broker DETECTS
+ * that (nb_session_wl.c, "REUSE-IN-FLIGHT") and cannot fix it; only the guest
+ * can, and only if it is told.
+ *
+ * `stub_handle` is the same GEM handle the guest sent in nvkvm_req_present, and
+ * `isolate_id` the isolate that owns it -- the pair the guest already keys its
+ * own scanout bos by, so nothing new has to be invented on either side.  The
+ * VMM maps the broker's buffer id (a host dma-buf inode, which the guest has no
+ * name for) back to this pair before sending.
+ *
+ * ADVISORY, and the guest must treat it as such.  It is a HINT that a specific
+ * buffer is free again, never a promise that one will arrive: no broker
+ * attached, a readback tier where the compositor never sees the guest's bo at
+ * all, an older VMM, a compositor that exited -- in every one of those the
+ * event simply never comes, and a guest that waits for it stops.  See
+ * nvkvm_kms.c: the guest arms this mechanism only after the first such event
+ * has actually arrived, and disarms itself back to pure timer pacing when they
+ * stop.
+ */
+struct nvkvm_evt_release {
+	__le32 isolate_id;
+	__le32 stub_handle;
+	__le32 reserved;        /* must be 0 */
+	__le32 type;            /* NVKVM_EVT_TYPE_RELEASE (2) */
 };
 
 /*
