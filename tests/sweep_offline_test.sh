@@ -296,6 +296,12 @@ set_instances '[]'
 LEAK_SUSPECTED=0
 reconcile >/dev/null 2>&1
 check "nothing alive -> reconcile passes" "$LEAK_SUSPECTED" "0"
+NVKVM_SWEEP_LIB=0 \
+NVKVM_SWEEP_GUEST_IMAGE_CACHE="$TMP/missing-guest-image" \
+NVKVM_SWEEP_DRIVER_CACHE="$TMP/missing-driver-cache" \
+VAST_API_KEY=offline-test \
+  "$REPO/scripts/sweep.sh" --reconcile >/dev/null 2>&1; rc=$?
+check "stale optional caches cannot block emergency reconcile" "$rc" "0"
 
 echo
 echo "=== 13. resumability: answers are kept, harness failures are retried ==="
@@ -402,6 +408,9 @@ while IFS= read -r line; do
 done <<<"$(printf 'a\nb\nc\nd\ne\nf\n')"
 check "all 6 driver rows are visited, not just the first" "$iterations" "6"
 SSH=""
+# The cache-relay test below deliberately replaces rsh_t with a local fake
+# after this assertion; this call must exercise the original definition.
+# shellcheck disable=SC2218
 rsh_t 5 'rm -rf /definitely/not/local' >/dev/null 2>&1; rc=$?
 check "an empty ssh target REFUSES to run the command locally" "$rc" "97"
 rm -f "$TMP/bin/ssh"
@@ -414,6 +423,140 @@ check "proprietary NVRM banner" \
 check "open NVRM banner" \
   "$(printf '%s\n' 'NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  580.105.08  Release Build' | parse_nvrm_driver_version)" \
   "580.105.08"
+
+echo
+echo "=== 21. warning attribution is scoped to one systemd invocation ==="
+check "a valid invocation selects the invocation journal field" \
+  "$(invocation_journal_query 0123456789abcdef0123456789abcdef)" \
+  "journalctl _SYSTEMD_INVOCATION_ID=0123456789abcdef0123456789abcdef"
+if invocation_journal_query '0123; touch /tmp/not-a-journal-id' >/dev/null 2>&1; then
+    bad "an invalid/injectable invocation id was accepted"
+else
+    ok "invalid/injectable invocation ids are rejected"
+fi
+warnings_block="$(sed -n '/^[[:space:]]*VR_WARNINGS="\$(/,/^[[:space:]]*)"/p' "$REPO/scripts/sweep.sh")"
+if printf '%s\n' "$warnings_block" | grep -Fq '$vm_journal --no-pager'; then
+    ok "VR_WARNINGS uses the invocation-scoped journal selector"
+else
+    bad "VR_WARNINGS does not use the invocation-scoped journal selector"
+fi
+
+echo
+echo "=== 22. coordinator driver-cache relay is atomic and digest-checked ==="
+DRIVER_CACHE_DIR="$TMP/driver cache"
+FAKE_REMOTE_CACHE="$TMP/remote-driver-cache"
+FAKE_REMOTE_GUEST="$TMP/remote-guest"
+mkdir -p "$DRIVER_CACHE_DIR" "$FAKE_REMOTE_CACHE" "$FAKE_REMOTE_GUEST"
+printf 'verified installer bytes\n' >"$DRIVER_CACHE_DIR/NVIDIA-Linux-x86_64-610.43.02.run"
+export FAKE_REMOTE_CACHE FAKE_REMOTE_GUEST
+cat >"$TMP/bin/scp" <<'SCPSTUB'
+#!/usr/bin/env bash
+src=""; dst=""
+for arg in "$@"; do src="$dst"; dst="$arg"; done
+dst="${dst#*:}"
+dst="${dst/#\/root\/nvkvm-driver-cache/$FAKE_REMOTE_CACHE}"
+dst="${dst/#\/opt\/nvkvm-guest/$FAKE_REMOTE_GUEST}"
+mkdir -p "$(dirname "$dst")"
+if [ "${FAKE_SCP_CORRUPT:-0}" = 1 ]; then
+    printf 'corrupt in transit\n' >"$dst"
+else
+    cp -- "$src" "$dst"
+fi
+SCPSTUB
+chmod +x "$TMP/bin/scp"
+SCP_HOST=example.invalid; SCP_PORT=22; SSH_OPTS=""
+rsh_t() {
+    shift
+    local cmd="$*"
+    cmd="${cmd//\/root\/nvkvm-driver-cache/$FAKE_REMOTE_CACHE}"
+    cmd="${cmd//\/opt\/nvkvm-guest/$FAKE_REMOTE_GUEST}"
+    bash -c "$cmd" </dev/null
+}
+stage_cached_driver 610.43.02 >/dev/null 2>&1; rc=$?
+check "a cached installer is relayed successfully" "$rc" "0"
+check "the promoted bytes equal the coordinator cache" \
+  "$(sha256sum "$DRIVER_CACHE_DIR/NVIDIA-Linux-x86_64-610.43.02.run" "$FAKE_REMOTE_CACHE/NVIDIA-Linux-x86_64-610.43.02.run" | awk '{print $1}' | uniq | wc -l)" "1"
+rm -f "$FAKE_REMOTE_CACHE/NVIDIA-Linux-x86_64-610.43.02.run"
+FAKE_SCP_CORRUPT=1 stage_cached_driver 610.43.02 >/dev/null 2>&1; rc=$?
+check "a transfer digest mismatch is rejected" "$rc" "2"
+if [ -e "$FAKE_REMOTE_CACHE/NVIDIA-Linux-x86_64-610.43.02.run" ]; then
+    bad "a corrupt transfer was promoted to the remote cache"
+else
+    ok "a corrupt transfer is removed before promotion"
+fi
+
+echo
+echo "=== 23. coordinator guest-image relay requires trust and has no corrupt side effects ==="
+GUEST_LOCAL="$TMP/coordinator image/$GUEST_IMAGE_NAME"
+mkdir -p "$(dirname "$GUEST_LOCAL")"
+printf 'authenticated Noble cloud image bytes\n' >"$GUEST_LOCAL"
+guest_hash="$(sha256sum "$GUEST_LOCAL" | awk '{print $1}')"
+printf '%s  %s\n' "$guest_hash" "$GUEST_IMAGE_URL" >"$GUEST_LOCAL.sha256"
+GUEST_IMAGE_CACHE="$GUEST_LOCAL"
+if validate_guest_image_cache >/dev/null 2>&1; then
+    ok "a setup_guest-compatible trusted sidecar passes preflight"
+else
+    bad "a valid guest image and trusted sidecar failed preflight"
+fi
+check "preflight retains the trusted digest" "$GUEST_IMAGE_CACHE_SHA256" "$guest_hash"
+
+stage_cached_guest_image >/dev/null 2>&1; rc=$?
+check "the authenticated guest image is relayed successfully" "$rc" "0"
+assert_guest="$FAKE_REMOTE_GUEST/$GUEST_IMAGE_NAME"
+check "remote guest bytes match the coordinator cache" \
+  "$(sha256sum "$assert_guest" | awk '{print $1}')" "$guest_hash"
+check "remote sidecar is bound to setup_guest's default URL" \
+  "$(<"$assert_guest.sha256")" "$guest_hash  $GUEST_IMAGE_URL"
+
+# Authenticate a different source, then corrupt only its transfer.  Existing
+# known-good remote bytes and sidecar must remain byte-for-byte unchanged.
+printf 'new authenticated image bytes\n' >"$GUEST_LOCAL"
+new_guest_hash="$(sha256sum "$GUEST_LOCAL" | awk '{print $1}')"
+printf '%s  %s\n' "$new_guest_hash" "$GUEST_IMAGE_URL" >"$GUEST_LOCAL.sha256"
+validate_guest_image_cache >/dev/null 2>&1
+before_image="$(sha256sum "$assert_guest" | awk '{print $1}')"
+before_side="$(sha256sum "$assert_guest.sha256" | awk '{print $1}')"
+FAKE_SCP_CORRUPT=1 stage_cached_guest_image >/dev/null 2>&1; rc=$?
+check "a corrupt guest-image transfer is rejected" "$rc" "2"
+check "corruption leaves the prior remote image untouched" \
+  "$(sha256sum "$assert_guest" | awk '{print $1}')" "$before_image"
+check "corruption leaves the prior remote sidecar untouched" \
+  "$(sha256sum "$assert_guest.sha256" | awk '{print $1}')" "$before_side"
+check "corrupt transfer staging files are removed" \
+  "$(find "$FAKE_REMOTE_GUEST" -name '*.relay.*.part' -print | wc -l)" "0"
+
+# A source can change after successful preflight but before it is copied.  The
+# staging function must notice independently and preserve the remote cache.
+printf 'tamper after sidecar creation\n' >>"$GUEST_LOCAL"
+before_image="$(sha256sum "$assert_guest" | awk '{print $1}')"
+stage_cached_guest_image >/dev/null 2>&1; rc=$?
+check "a coordinator image changed after preflight is rejected before relay" "$rc" "2"
+check "post-preflight mutation leaves the prior remote image untouched" \
+  "$(sha256sum "$assert_guest" | awk '{print $1}')" "$before_image"
+if validate_guest_image_cache >/dev/null 2>&1; then
+    bad "a coordinator image that mismatches its trusted sidecar passed preflight"
+else
+    ok "a coordinator image that mismatches its trusted sidecar is rejected"
+fi
+
+# Ubuntu's signed-distribution manifest layout is accepted as the alternative
+# trust source, without needing to inspect the image as qcow2 on coordinator.
+rm -f "$GUEST_LOCAL.sha256"
+manifest_hash="$(sha256sum "$GUEST_LOCAL" | awk '{print $1}')"
+printf '%s *%s\n' "$manifest_hash" "$GUEST_IMAGE_NAME" >"$(dirname "$GUEST_LOCAL")/SHA256SUMS"
+if validate_guest_image_cache >/dev/null 2>&1; then
+    ok "a sibling Ubuntu SHA256SUMS authenticates the cache"
+else
+    bad "a valid sibling Ubuntu SHA256SUMS was rejected"
+fi
+
+rm -f "$(dirname "$GUEST_LOCAL")/SHA256SUMS"
+if validate_guest_image_cache >/dev/null 2>&1; then
+    bad "a guest cache without a trusted digest source passed preflight"
+else
+    ok "a guest cache without a trusted digest source is rejected"
+fi
+rm -f "$TMP/bin/scp"
 
 echo
 echo "======================================================================"

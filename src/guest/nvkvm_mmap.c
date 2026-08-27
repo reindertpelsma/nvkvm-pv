@@ -397,6 +397,10 @@ int nvkvm_mmap_request(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 		 * and local intent are committed under this same lock. */
 		mutex_lock(&ctx->uvm_state->ext_lock);
 		intent = nvkvm_uvm_mmap_intent(ctx, vma->vm_start, vma_len);
+		pr_debug("nvkvm: UVM mmap gva=0x%lx len=0x%lx classification=%s\n",
+			 vma->vm_start, vma_len,
+			 intent < 0 ? "invalid-shadow" :
+			 intent ? "forwarded-intent" : "managed-fallback");
 		if (intent < 0)
 			ret = intent;
 		else if (!intent)

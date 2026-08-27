@@ -67,4 +67,49 @@ assert SWEEP.install_driver("ssh-target", "580.95.05", "ada", "/tmp/log") == (
     True, "already installed: 580.95.05 (no download; preinstalled or prior step)",
     "580.95.05")
 
+# A coordinator-relayed installer is checked on the disposable VM and wins
+# before any CDN request.  The coordinator must never execute the runfile.
+fetch_calls = []
+
+
+def cache_sh(cmd, timeout=120, check=False):
+    fetch_calls.append(cmd)
+    remote = shlex.split(cmd)[1]
+    if remote.startswith("test -s /root/nvkvm-driver-cache/"):
+        return "", 0
+    if remote.startswith("install -m 0700 /root/nvkvm-driver-cache/"):
+        return "", 0
+    if remote.startswith("/root/drv.run --check"):
+        return "", 0
+    raise AssertionError(f"unexpected command after cache hit: {remote}")
+
+
+SWEEP.sh = cache_sh
+tried = []
+assert SWEEP._fetch_installer("ssh-target", ["610.43.02"], tried) == (
+    True, "610.43.02")
+assert any("verified intact" in line for line in tried)
+assert not any("curl " in command for command in fetch_calls)
+
+# A corrupt relay is rejected and the normal CDN fallback remains available.
+def corrupt_cache_sh(cmd, timeout=120, check=False):
+    remote = shlex.split(cmd)[1]
+    if remote.startswith("test -s /root/nvkvm-driver-cache/"):
+        return "", 0
+    if remote.startswith("install -m 0700 /root/nvkvm-driver-cache/"):
+        return "", 0
+    if remote.startswith("/root/drv.run --check"):
+        return "", 1
+    if remote.startswith("curl "):
+        return "HTTP=403 CURLRC=0", 0
+    raise AssertionError(f"unexpected command: {remote}")
+
+
+SWEEP.sh = corrupt_cache_sh
+tried = []
+assert SWEEP._fetch_installer("ssh-target", ["535.309.01"], tried) == (
+    False, None)
+assert any("local relay" in line and "CORRUPT" in line for line in tried)
+assert any("HTTP=403" in line for line in tried)
+
 print("sweep-matrix offline GPU quiesce tests: PASS")

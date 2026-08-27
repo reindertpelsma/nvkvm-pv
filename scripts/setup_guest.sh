@@ -4,11 +4,13 @@
 # Host: Ubuntu 22.04, kernel 6.8.0-59-generic, NVIDIA RTX 3060.
 # Guest: Ubuntu 24.04 (Noble) cloud image, 20 GB qcow2.
 #
-# Idempotent: already-downloaded / already-converted artefacts are reused.
+# Idempotent: already-downloaded / already-converted artefacts are reused after
+# the source image has been validated.  An interrupted download remains under
+# a .part name and is never exposed as the reusable cache entry.
 
 set -euo pipefail
 
-GUEST_DIR="/opt/nvkvm-guest"
+GUEST_DIR="${NVKVM_GUEST_DIR:-/opt/nvkvm-guest}"
 
 # Source image (Noble Numbat / 24.04).  The filename uses the Ubuntu codename
 # "noble" but the user-facing label is 24.04.
@@ -16,10 +18,186 @@ GUEST_DIR="/opt/nvkvm-guest"
 # cloud-init and can build an out-of-tree module works in principle; only the
 # Ubuntu 24.04 image below is tested, and a distro whose kernel headers package
 # is named differently will need the runcmd below adjusted.
-CLOUD_IMG_URL="${NVKVM_GUEST_IMAGE_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
+DEFAULT_CLOUD_IMG_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+DEFAULT_CLOUD_IMG_SHA256_URL="https://cloud-images.ubuntu.com/noble/current/SHA256SUMS"
+CLOUD_IMG_URL="${NVKVM_GUEST_IMAGE_URL:-$DEFAULT_CLOUD_IMG_URL}"
+CLOUD_IMG_SHA256="${NVKVM_GUEST_IMAGE_SHA256:-}"
+CLOUD_IMG_SHA256_URL="${NVKVM_GUEST_IMAGE_SHA256_URL:-}"
+if [ "$CLOUD_IMG_URL" = "$DEFAULT_CLOUD_IMG_URL" ] \
+   && [ -z "$CLOUD_IMG_SHA256" ] && [ -z "$CLOUD_IMG_SHA256_URL" ]; then
+    CLOUD_IMG_SHA256_URL="$DEFAULT_CLOUD_IMG_SHA256_URL"
+fi
 CLOUD_IMG_RAW="$GUEST_DIR/noble-server-cloudimg-amd64.img"
 QCOW2_IMG="$GUEST_DIR/ubuntu-24.04.qcow2"
 SEED_ISO="$GUEST_DIR/seed.iso"
+
+valid_sha256_text() {
+    [[ "$1" =~ ^[[:xdigit:]]{64}$ ]]
+}
+
+checksum_from_manifest() {
+    local manifest_url="$1"
+    local image_name="$2"
+    local manifest hash
+
+    if ! manifest="$(wget -qO- "$manifest_url")"; then
+        echo "[2/6] ERROR: could not fetch checksum manifest: $manifest_url" >&2
+        return 1
+    fi
+    hash="$(printf '%s\n' "$manifest" | awk -v wanted="$image_name" '
+        {
+            name = $2
+            sub(/^\*/, "", name)
+            if (name == wanted && length($1) == 64 && $1 !~ /[^[:xdigit:]]/) {
+                print tolower($1)
+                exit
+            }
+        }
+    ')"
+    if ! valid_sha256_text "$hash"; then
+        echo "[2/6] ERROR: no valid SHA-256 for $image_name in $manifest_url" >&2
+        return 1
+    fi
+    printf '%s\n' "$hash"
+}
+
+guest_image_is_valid() {
+    local image="$1"
+    local expected_sha256="$2"
+    local actual
+
+    [ -s "$image" ] || return 1
+    if [ -n "$expected_sha256" ]; then
+        actual="$(sha256sum -- "$image")" || return 1
+        actual="${actual%% *}"
+        [ "${actual,,}" = "${expected_sha256,,}" ]
+        return
+    fi
+
+    # A custom URL has no authoritative checksum unless the caller supplies
+    # one.  It is operator-trusted input, but it still must not get the old
+    # existence-only cache treatment: reject truncated or invalid qcow2 data.
+    qemu-img check -q -f qcow2 "$image" >/dev/null 2>&1
+}
+
+write_checksum_sidecar() {
+    local sidecar="$1"
+    local checksum="$2"
+    local image_url="$3"
+    local staged
+
+    staged="$(mktemp "${sidecar}.part.XXXXXX")"
+    # Bind the digest to its source.  The cache filename is intentionally
+    # stable, so a hash-only sidecar could make a later custom URL silently
+    # reuse an image downloaded from the previous URL (or vice versa).
+    if ! printf '%s  %s\n' "$checksum" "$image_url" >"$staged"; then
+        rm -f -- "$staged"
+        return 1
+    fi
+    mv -f -- "$staged" "$sidecar"
+}
+
+download_cloud_image() {
+    local image_url="$1"
+    local final="$2"
+    local explicit_sha256="${3:-}"
+    local checksum_url="${4:-}"
+    local image_name expected_sha256 cached_sha256 cached_url cached_extra
+    local part="${final}.part"
+    local sidecar="${final}.sha256"
+
+    image_name="${image_url%%\?*}"
+    image_name="${image_name##*/}"
+
+    if [ -n "$explicit_sha256" ]; then
+        if ! valid_sha256_text "$explicit_sha256"; then
+            echo "[2/6] ERROR: NVKVM_GUEST_IMAGE_SHA256 must be exactly 64 hexadecimal characters" >&2
+            return 1
+        fi
+        expected_sha256="${explicit_sha256,,}"
+    elif [ -f "$sidecar" ]; then
+        cached_sha256=""
+        cached_url=""
+        cached_extra=""
+        read -r cached_sha256 cached_url cached_extra <"$sidecar" || true
+        if valid_sha256_text "$cached_sha256" \
+           && [ "$cached_url" = "$image_url" ] && [ -z "$cached_extra" ]; then
+            expected_sha256="${cached_sha256,,}"
+        else
+            echo "[2/6] Ignoring stale or malformed cached checksum: $sidecar" >&2
+            expected_sha256=""
+        fi
+    else
+        expected_sha256=""
+    fi
+
+    if [ -z "$expected_sha256" ] && [ -n "$checksum_url" ]; then
+        expected_sha256="$(checksum_from_manifest "$checksum_url" "$image_name")" || return 1
+    fi
+
+    if [ -z "$expected_sha256" ]; then
+        echo "[2/6] Custom image has no SHA-256; validating qcow2 integrity only." >&2
+        echo "[2/6] Set NVKVM_GUEST_IMAGE_SHA256 for cryptographic verification." >&2
+    fi
+
+    if guest_image_is_valid "$final" "$expected_sha256"; then
+        echo "[2/6] Cloud image cache verified — skipping download."
+        if [ -n "$expected_sha256" ]; then
+            write_checksum_sidecar "$sidecar" "$expected_sha256" "$image_url"
+        else
+            rm -f -- "$sidecar"
+        fi
+        return 0
+    fi
+
+    if [ -e "$final" ]; then
+        echo "[2/6] Existing cloud image is incomplete or invalid; recovering it as a resumable download." >&2
+        if [ -e "$part" ]; then
+            rm -f -- "$final"
+        else
+            mv -- "$final" "$part"
+        fi
+    fi
+
+    echo "[2/6] Downloading Ubuntu 24.04 cloud image (resumable staging file)..."
+    if ! wget -q --show-progress --continue --output-document="$part" "$image_url"; then
+        echo "[2/6] ERROR: image download interrupted; resumable data retained at $part" >&2
+        return 1
+    fi
+
+    # A stale same-sized file (or a server that changed underneath a resumed
+    # transfer) can make wget report success without producing the requested
+    # object.  Retry once from byte zero before declaring the source bad.
+    if ! guest_image_is_valid "$part" "$expected_sha256"; then
+        echo "[2/6] Resumed image failed validation; retrying once from byte zero." >&2
+        rm -f -- "$part"
+        if ! wget -q --show-progress --output-document="$part" "$image_url"; then
+            echo "[2/6] ERROR: clean image download failed; partial data retained at $part" >&2
+            return 1
+        fi
+        if ! guest_image_is_valid "$part" "$expected_sha256"; then
+            echo "[2/6] ERROR: downloaded cloud image failed validation" >&2
+            return 1
+        fi
+    fi
+
+    # final and part share a directory, so rename is atomic.  qemu-img can
+    # therefore observe either the previous verified image or the new one,
+    # never bytes from an in-progress wget.
+    mv -f -- "$part" "$final"
+    if [ -n "$expected_sha256" ]; then
+        write_checksum_sidecar "$sidecar" "$expected_sha256" "$image_url"
+    else
+        rm -f -- "$sidecar"
+    fi
+    echo "[2/6] Cloud image downloaded and verified."
+}
+
+# Offline regression tests source the real cache implementation without
+# installing packages or creating anything below /opt.
+if [ "${NVKVM_SETUP_GUEST_LIB:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 echo "=== nvkvm guest setup ==="
 echo "Guest directory : $GUEST_DIR"
@@ -30,12 +208,12 @@ echo ""
 # Skipped when the tools are already there, so this works in a container
 # image that ships them and on a host with no network.
 if command -v wget >/dev/null && command -v qemu-img >/dev/null \
-   && command -v genisoimage >/dev/null; then
+   && command -v genisoimage >/dev/null && command -v sha256sum >/dev/null; then
     echo "[prereq] Required host tools already present — skipping apt."
 else
     echo "[prereq] Installing required host tools..."
     apt-get update -q
-    apt-get install -y wget qemu-utils genisoimage
+    apt-get install -y wget qemu-utils genisoimage coreutils
 fi
 
 # ── 1. Create guest directory ─────────────────────────────────────────────
@@ -43,12 +221,9 @@ echo "[1/6] Creating $GUEST_DIR..."
 mkdir -p "$GUEST_DIR"
 
 # ── 2. Download Ubuntu 24.04 cloud image ──────────────────────────────────
-if [ ! -f "$CLOUD_IMG_RAW" ]; then
-    echo "[2/6] Downloading Ubuntu 24.04 cloud image..."
-    wget -q --show-progress -O "$CLOUD_IMG_RAW" "$CLOUD_IMG_URL"
-else
-    echo "[2/6] Cloud image already present — skipping download."
-fi
+download_cloud_image \
+    "$CLOUD_IMG_URL" "$CLOUD_IMG_RAW" \
+    "$CLOUD_IMG_SHA256" "$CLOUD_IMG_SHA256_URL"
 
 # ── 3. Convert to qcow2 and resize ───────────────────────────────────────
 # GUEST_DISK_GROW: extra GB to add to the cloud image.  20G is fine for the

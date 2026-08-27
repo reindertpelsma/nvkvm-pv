@@ -14,27 +14,36 @@ is done by cloud-init on first boot. Idempotent.
 
 It fetches the Ubuntu 24.04 (Noble) cloud image, converts it to qcow2 and grows
 it by 20 GB, writes cloud-init `user-data`/`meta-data`, and generates a seed ISO
-(`scripts/setup_guest.sh:36-129`). Artefacts land in `/opt/nvkvm-guest/`.
+(`scripts/setup_guest.sh:219-450`). Artefacts land in `/opt/nvkvm-guest/`.
 
-The cloud-init `runcmd` is the entire first-boot bring-up
-(`scripts/setup_guest.sh:104-110`):
+The download is resumable, but a `.part` file is renamed into the cache only
+after validation. The default Ubuntu image is checked against the published
+`SHA256SUMS`; the verified digest is retained beside it so an already prepared
+host does not depend on the rolling `current/` manifest staying unchanged.
+For a custom `NVKVM_GUEST_IMAGE_URL`, set `NVKVM_GUEST_IMAGE_SHA256` (preferred)
+or `NVKVM_GUEST_IMAGE_SHA256_URL` (a sha256sum-format manifest). Without either,
+the URL is operator-trusted and `qemu-img check` still rejects a truncated or
+invalid qcow2 cache on every run. `NVKVM_GUEST_DIR` relocates the artefacts from
+the default `/opt/nvkvm-guest/`.
+
+The cloud-init `runcmd` performs the first-boot mounts and enables the persistent
+guest service (`scripts/setup_guest.sh:349-431`):
 
 ```
 mkdir -p /mnt/nvkvm
 mount -t 9p -o trans=virtio,version=9p2000.L nvkvm_src /mnt/nvkvm
 grep -q nvkvm_src /etc/fstab || echo 'nvkvm_src /mnt/nvkvm 9p trans=virtio,version=9p2000.L,nofail 0 0' >> /etc/fstab
-cd /mnt/nvkvm/src/guest && make KDIR=/lib/modules/$(uname -r)/build
-insmod /mnt/nvkvm/src/guest/nvkvm-guest.ko
+systemctl enable --now nvkvm-guest.service
 ```
 
 The `fstab` line matters: `runcmd` runs **once per instance**, so without it any
 later boot of the same image comes up with `/mnt/nvkvm` empty — no module
-source, no staging script, no test suite (`scripts/setup_guest.sh:96-103`).
+source, no staging script, no test suite (`scripts/setup_guest.sh:360-377`).
 
-The `make` line needs `/mnt/nvkvm` to be **writable**, which it is not unless
-the VM was launched with `NVKVM_DEV_HARNESS_INSECURE_RW=1` — see
-[Launch](#3-launch). On a read-only export this step fails and the module never
-loads, which looks like a broken guest rather than a missing flag.
+The service copies the module sources to a private temporary directory before
+building, then loads the module and stages an available NVIDIA userspace bundle
+(`scripts/setup_guest.sh:277-316`). The repository export therefore remains
+read-only; `NVKVM_DEV_HARNESS_INSECURE_RW=1` is unnecessary for normal setup.
 
 Packages installed: `build-essential git python3 linux-headers-virtual`.
 Login is `ubuntu` / `ubuntu` with passwordless sudo.
@@ -44,7 +53,7 @@ before: `ssh_pwauth: true` must be **top-level** (nested under the `users:`
 entry it is ignored and sshd keeps `PasswordAuthentication no`), and the
 password must come from `chpasswd:` rather than a `users:` hash, because
 cloud-init will not reset the password of a user that already exists in the
-image (`scripts/setup_guest.sh:67-78`).
+image (`scripts/setup_guest.sh:262-273`).
 
 `setup_guest.sh` does **not** stage the NVIDIA userspace. That is a separate
 manual step — see [step 4](#4-stage-the-nvidia-userspace).

@@ -11,11 +11,11 @@ forced through at least five driver versions chosen to cross the ABI profile
 boundaries.
 
 > **Status:** the acquisition, safety, selection and reporting layers are
-> covered by `tests/sweep_offline_test.sh` against a stubbed vast.ai API, and
-> the multi-architecture planning layer has been run against live vast.ai data
-> in dry-run mode. **The in-box layers — build, driver install, guest boot,
-> validate — have not yet been run end to end by this script on real hardware.**
-> See "What is and is not tested" at the bottom before trusting a green run.
+> covered by `tests/sweep_offline_test.sh` against a stubbed vast.ai API. The
+> complete in-box path has also passed on Turing, Ampere and Ada with multiple
+> forced drivers. The Ada retry crossed profiles 535 through 610 on a CDN-blocked
+> rental using the verified coordinator cache relay. See
+> `tests/BOOT_MATRIX.md` and "What is and is not tested" below.
 
 ---
 
@@ -35,6 +35,15 @@ scripts/sweep.sh --arch ampere --max-spend 3 --go
 
 # 4. Layer 3: every architecture.
 scripts/sweep.sh --all-arches --max-spend 12 --go
+
+# Optional: relay official installers from a coordinator-local cache when a
+# rental's NVIDIA CDN edge returns 403. Files use NVIDIA's canonical names.
+scripts/sweep.sh --arch ada --driver-cache /srv/nvidia-drivers --go
+
+# Optional: relay the Noble cloud image when the rental's Ubuntu route stalls.
+# Keep either FILE.sha256 or Ubuntu's SHA256SUMS beside the image.
+scripts/sweep.sh --arch ada \
+  --guest-image-cache /srv/cloud-images/noble-server-cloudimg-amd64.img --go
 ```
 
 Stop a running sweep gracefully:
@@ -169,6 +178,33 @@ NVIDIA on 2026-08-23 (HTTP 200 at one of the two paths `sweep_matrix.py`
 tries). Re-check with a `curl -I` before blaming a box if an install starts
 404ing — NVIDIA does unpublish versions, which is why the alternates exist.
 
+Some CDN edges reject rented IPs with HTTP 403 even while the same object is
+reachable from the coordinator. `--driver-cache DIR` (or
+`NVKVM_SWEEP_DRIVER_CACHE`) handles that without weakening a verdict. Put files
+in `DIR` under their canonical names, for example
+`NVIDIA-Linux-x86_64-610.43.02.run`. The coordinator hashes and transfers the
+bytes but never executes them. The transfer is atomically promoted only after
+its remote SHA-256 matches, and the disposable KVM box still runs the
+installer's own `--check` before use. Missing entries fall back to the CDN;
+corrupt entries are rejected and recorded as harness evidence.
+
+The Ubuntu cloud-image route can likewise stall on a rental even when it is
+healthy from the coordinator. `--guest-image-cache FILE` (or
+`NVKVM_SWEEP_GUEST_IMAGE_CACHE`) relays a coordinator-local copy after the
+remote QEMU build and before `setup_guest.sh`. Preflight requires a non-empty
+image whose SHA-256 matches either `FILE.sha256` or a sibling Ubuntu
+`SHA256SUMS`. A `.sha256` file may contain a bare digest, normal `sha256sum`
+output bound to the local filename, or the digest-plus-default-URL format used
+by `setup_guest.sh`.
+
+The coordinator treats the image as opaque bytes: it only hashes and copies
+it. The remote transfer is hashed again before a temporary file is atomically
+renamed to `/opt/nvkvm-guest/noble-server-cloudimg-amd64.img`; a matching
+`.sha256` sidecar is installed with the default Ubuntu URL. Consequently
+`setup_guest.sh` verifies the relayed file and skips its own download. A
+missing option preserves the direct-download behavior, while a missing,
+malformed, or mismatched trusted checksum fails before any instance is rented.
+
 The expected profile in that table is **not** hardcoded anywhere. `sweep.sh`
 compiles `src/common/nvkvm_abi.h` and calls `nvkvm_abi_id_for_version()`, so the
 expectation is by construction whatever the shipped selector says. The
@@ -298,7 +334,7 @@ never quietly change what the row measures.
 Run the offline suite any time — it rents nothing:
 
 ```bash
-bash tests/sweep_offline_test.sh      # 73 checks, ~30s, rents nothing
+bash tests/sweep_offline_test.sh      # 95 checks, ~90s, rents nothing
 ```
 
 It sources `sweep.sh` in library mode and drives the **real** functions against
@@ -307,16 +343,17 @@ including `success: false`, offer selection with the price cap and known-bad
 filter, the dead-box-vs-slow-box discriminator, destroy verification against a
 CLI that exits 0 without doing anything, protected-instance refusal, stray
 reaping by label, leak reconciliation, resume semantics, spend-cap enforcement,
-and the auto-destroy timer end to end.
+the invocation-scoped warning selector, driver-cache relay integrity, and the
+auto-destroy timer end to end.
 
 **Covered offline:** everything above the ssh boundary.
 
-**Not yet covered:** everything on the far side of ssh — shipping the tree,
-`build_qemu.sh`, `setup_guest.sh`, `make_host_bundle.sh`, the driver install
-itself, guest boot, `stage_guest_libs.sh` and `validate.sh`. Those steps are
-ported from `sweep_matrix.py`, which has run them on real boxes, but
-`sweep.sh` has not driven them end to end on hardware. Treat the first real
-`--go` run as a bring-up, watch it, and expect to fix something.
+**Covered on hardware:** tree shipping, QEMU and guest setup, host-driver
+replacement, host bundle creation, guest boot/module load, userspace staging,
+and all of `validate.sh` have run end to end on Turing and Ampere. The 2026-08-26
+RR-09 matrix in `tests/BOOT_MATRIX.md` is the evidence. Each new architecture
+and driver interval still needs its own verdict; a control pass or a transport
+failure is deliberately not extrapolated into coverage.
 
 `tests/validate.sh` is deliberately not modified by any of this; the sweep runs
 whatever that suite becomes and reports its verdict and exit code faithfully.
