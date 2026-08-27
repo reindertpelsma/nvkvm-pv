@@ -479,6 +479,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	__u64 gpa_base = 0;
 	__u32 mmap_token = 0;
 	bool have_range = false, have_mmap = false;
+	const char *stage = "allocate bookkeeping";
 	int ret;
 
 	if (!st)
@@ -493,6 +494,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	cp     = kzalloc(sizeof(*cp), GFP_KERNEL);
 	mp     = kzalloc(mp_size, GFP_KERNEL);
 	if (!region || !ap || !mm || !cp || !mp) { ret = -ENOMEM; goto out; }
+	stage = "validate ABI profile";
 	/* mem_alloc_size is measured per profile: 515--535 legitimately use a
 	 * shorter allocation struct than V545.  The fallback writes only the
 	 * owner/type/attr/size common prefix, so require the compiler-derived end
@@ -504,6 +506,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	}
 
 	mutex_lock(&st->lock);
+	stage = "validate UVM shadow";
 	if (!st->shadow_valid) {
 		mutex_unlock(&st->lock);
 		ret = -EIO;
@@ -511,6 +514,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	}
 	mutex_unlock(&st->lock);
 
+	stage = "build RM object tree";
 	ret = ext_tree_build(st);
 	if (ret)
 		goto out_locked;
@@ -539,6 +543,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * carries one returns NV_ERR_STATE_IN_USE (0x63).  Measured both ways:
 	 * tools/uvm_sysmem_probe.c "ctl->ctl x2" fails and "ctl->ctl2" works.
 	 */
+	stage = "open per-mapping control handle";
 	region->ext_map_ctl = nvkvm_fd_ctx_open_dev(NVKVM_DEV_CTL, O_RDWR);
 	if (IS_ERR(region->ext_map_ctl)) {
 		ret = PTR_ERR(region->ext_map_ctl);
@@ -553,6 +558,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	ap->attr  = NVOS32_ATTR_LOCATION_PCI; /* system memory */
 	ap->size  = (__u64)vma_len;
 	h = RM_HANDLE_LET_RM_CHOOSE;
+	stage = "allocate RM system memory";
 	ret = rm_alloc(tctl, st->ext_h_client, st->ext_h_device, &h,
 		       NV01_MEMORY_SYSTEM, ap, ap_size, &nvstatus);
 	if (ret || nvstatus) {
@@ -580,6 +586,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	mm->length   = (__u64)vma_len;
 	mm->flags    = 0;
 	mm->fd       = (__s32)region->ext_map_ctl->handle_id;
+	stage = "arm RM CPU mapping";
 	ret = (int)nvkvm_virtio_ioctl_on_isolate_nomm(
 			tctl.isolate_id, tctl.handle_id, tctl.session_id,
 			FE_CMD(NV_ESC_RM_MAP_MEMORY,
@@ -601,6 +608,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * (nv-mmap.c, nvidia_mmap_sysmem), i.e. ordinary write-back RAM — which
 	 * is what lets it sit under a KVM memslot at all.
 	 */
+	stage = "map RM pages in isolate";
 	ret = nvkvm_virtio_mmap_on_isolate(tuvm.isolate_id,
 					   region->ext_map_ctl->handle_id,
 					   gva, 0, (__u64)vma_len,
@@ -615,6 +623,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	region->gpa_base   = (unsigned long)gpa_base;
 	have_mmap = true;
 
+	stage = "validate returned GPA";
 	if (!nvkvm_gpa_in_mmap_window((unsigned long)gpa_base, vma_len)) {
 		pr_warn("nvkvm: uvm fallback: GPA 0x%llx outside window\n", gpa_base);
 		ret = -EIO;
@@ -623,6 +632,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 
 	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	stage = "map GPA into guest VMA";
 	ret = remap_pfn_range(vma, vma->vm_start,
 			      (unsigned long)(gpa_base >> PAGE_SHIFT),
 			      vma_len, vma->vm_page_prot);
@@ -640,6 +650,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	 * records the range in the ownership table. */
 	cp->base   = gva;
 	cp->length = (__u64)vma_len;
+	stage = "create UVM external range";
 	ret = uvm_call(tuvm, UVM_CREATE_EXTERNAL_RANGE, cp, sizeof(*cp), &nvstatus,
 		       offsetof(struct uvm_create_external_range_params, rm_status));
 	if (ret || nvstatus) {
@@ -651,6 +662,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	}
 	have_range = true;
 
+	stage = "collect registered GPUs";
 	n_gpus = ext_collect_uuids(st, mp, mp_size);
 	if (!n_gpus) {
 		pr_warn_ratelimited("nvkvm: uvm fallback: no GPU registered on this UVM fd\n");
@@ -664,6 +676,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 	put_u32(mp, fd_off,     region->ext_map_ctl->handle_id);
 	put_u32(mp, fd_off + 4, st->ext_h_client);
 	put_u32(mp, fd_off + 8, region->ext_h_memory);
+	stage = "map UVM external allocation";
 	ret = uvm_call(tuvm, UVM_MAP_EXTERNAL_ALLOCATION, mp, mp_size, &nvstatus,
 		       fd_off + 12 /* rmStatus */);
 	if (ret || nvstatus) {
@@ -674,6 +687,7 @@ int nvkvm_uvm_ext_mmap(struct nvkvm_fd_ctx *ctx, struct vm_area_struct *vma)
 		goto out_locked;
 	}
 
+	stage = "publish guest VMA";
 	spin_lock(&ctx->mmap_lock);
 	list_add_tail(&region->list, &ctx->mmap_regions);
 	spin_unlock(&ctx->mmap_lock);
@@ -689,6 +703,13 @@ out_locked:
 	if (ret && region)
 		ext_unwind(region, have_range, have_mmap);
 out:
+	if (ret)
+		pr_warn_ratelimited(
+			"nvkvm: uvm fallback failed: stage=%s ret=%d gva=0x%llx len=0x%lx\n",
+			stage, ret, (unsigned long long)gva, vma_len);
+	else
+		pr_debug("nvkvm: uvm fallback mapped gva=0x%llx len=0x%lx\n",
+			 (unsigned long long)gva, vma_len);
 	kfree(region); kfree(ap); kfree(mm); kfree(cp); kfree(mp);
 	return ret;
 }

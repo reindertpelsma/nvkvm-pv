@@ -600,18 +600,73 @@ own protocol, not NVIDIA ABI.
 | core unit suite | pass: all 15 suites; relay wiring 22/22, relay state 17/17, relay clipboard 35/35; 9 isolate cases with no known failures |
 | QEMU syntax | pass with default GCC 15 and GCC 14 |
 | guest source ordering gate | pass |
-| guest module, local kernel 7.0, `NVKVM_GRAPHICS=1` | pass |
-| guest module, local kernel 7.0, `NVKVM_GRAPHICS=0` | pass; directly closes the linked CI failure mode |
+| guest module, installed kernels 7.0.0-29 and 7.0.0-30, `NVKVM_GRAPHICS=1` | pass |
+| guest module, installed kernels 7.0.0-29 and 7.0.0-30, `NVKVM_GRAPHICS=0` | pass; directly closes the linked CI failure mode |
 | ABI parity | pass; includes the pre-545 common-prefix regression and universal REGISTER_GPU size/fd/status offsets |
 | VMA lifetime reproducer | warning-clean compilation; execution requires nvkvm GPU hardware |
-| broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 43/43, adopted socket, clipboard and lifecycle suites |
-| rental safety harness | pass: 71/71 offline cases |
+| broker normal + ASAN/UBSAN | pass: UTF-8 20/20, selftest 46/46, adopted socket, clipboard and lifecycle suites |
+| rental safety harness | pass: 80/80 offline cases, including invocation-scoped warnings and atomic driver-cache relay |
+| guest cloud-image cache | pass: 15/15 interruption, resume, digest, atomic-promotion and custom-image cases |
 | ShellCheck 0.10 at blocking severity | pass |
 
-These local results are not a GPU claim. The branch must remain unmerged until
-the recorded hardware sweep exercises CUDA managed memory, Vulkan device
-creation/dispatch and EGL pixel correctness on the intended driver/profile
-matrix.
+### Hardware remediation verification
+
+The first post-fix hardware gate passed on tree `9311bcb`: a Turing GTX 1660
+SUPER produced 30 PASS / 0 FAIL / 0 SKIP on both the preinstalled 580.105.08
+control and forced 580.95.05. In particular, three 4 MiB managed allocations
+reported `MANAGED_MEMORY=1`, and three CPU↔GPU coherence cycles verified all
+1,048,576 elements after a real CUDA kernel. Vulkan NVIDIA device creation and
+compute dispatch, NVIDIA EGL rendering and the pixel check also passed. No
+control was newly allowed; only the known `0x00730102` and `0x20800513` denials
+appeared. Vast instance 48712089 was verified destroyed; the run cost $0.0223.
+
+This proves the RR-09 regression is repaired for the structure's single
+source-derived ABI interval. A second gate on tree `2dc9465` then covered an
+Ampere RTX 3060 across forced drivers 535.309.01/profile 535,
+570.124.06/profile 570 and 610.43.02/profile 610, plus the preinstalled
+580.105.08/profile-580 control. Every row selected the expected profile and
+scored 30 PASS / 0 FAIL / 0 SKIP, including the managed allocation/coherence,
+Vulkan compute and EGL pixel checks. The driver-set coverage was 3/3 with
+nothing untested. Vast instance 48715042 was verified destroyed and the
+label-scoped registry reconciled empty; cost was $0.0575. The passing runs kept
+the observed control denials, including `0x00730138` on 535 and `0x2080019f`
+on 610, so this test did not widen the allowlist. Reconciliation also found and
+fixed a sweep-reporting defect: warning capture used the reused transient unit
+name and accumulated prior drivers' warnings. It now filters the journal by
+the current systemd invocation id and rejects invalid/missing ids rather than
+silently misattributing a control to another driver.
+
+An Ada RTX 4070 follow-up on tree `ddf2b5a` produced a clean 30 PASS / 0 FAIL /
+0 SKIP control on 580.105.08/profile 580. Its two `0x00730102` denials were
+scoped only to that boot, providing the first real-hardware check of the
+invocation-id reporting fix. The two forced rows did **not** produce verdicts:
+the Hong Kong rental received HTTP 403 from both NVIDIA CDN URL families for
+610.43.02 and 535.309.01. The harness correctly recorded two
+`driver-install-failed` rows and a coverage shortfall rather than banking or
+skipping them. Instance 48719818 was verified destroyed; cost was $0.0484.
+
+The retry on tree `0b48bb5` used the same RTX 4070 machine class and the
+verified coordinator cache. Its 580.105.08/profile-580 control and forced
+535.309.01/profile-535 and 610.43.02/profile-610 rows all scored 30 PASS / 0
+FAIL / 0 SKIP. Managed allocation/coherence, CUDA, Vulkan compute and NVIDIA
+EGL pixel verification passed in every row. Warning counts stayed isolated to
+their own VM invocations. The driver-set matrix was 2/2 with zero untested
+units; instance 48751631 was verified destroyed and reconciled absent. Cost was
+$0.1055 and evidence is retained at `/workspace/nvkvm-sweep-ada-0b48bb5/`.
+
+That run exposed two harness reliability gaps now remediated before the Ada
+retry. `setup_guest.sh` previously wrote a cloud-image download directly to its
+final cache path and accepted existence on rerun; it now resumes under a
+`.part` name, verifies Ubuntu's published SHA-256 (or an explicit custom-image
+digest), and promotes atomically. The sweep can also relay canonical NVIDIA
+runfiles from an optional coordinator-local cache. The trusted coordinator
+only hashes and copies the file; transfer equality is proven remotely and the
+disposable KVM box still runs the archive's own `--check`. No driver installer
+is executed on the coordinator, and no transport failure is converted into a
+test verdict.
+
+The branch remains unmerged while the broader multi-architecture/profile sweep
+requested for release confidence continues.
 
 ---
 

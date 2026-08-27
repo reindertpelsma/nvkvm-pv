@@ -1,5 +1,33 @@
 # Tested platforms — the full matrix
 
+## Current 30-check managed-memory suite
+
+These are the first rows rebuilt after the suite gained real
+`cuMemAllocManaged` allocation and CPU↔GPU coherence checks. Each row passed
+all 30 checks with zero failures and zero skips, including three 4 MiB managed
+allocations, three verified migration/coherence cycles, CUDA kernels and
+matmul, Vulkan compute, and EGL pixel verification.
+
+| GPU | architecture | host driver | ABI profile | tree | `validate.sh` |
+|---|---|---|---:|---|---:|
+| GTX 1660 SUPER | Turing TU116 | 580.105.08 (control) | 580 | `9311bcb` | 30/30 |
+| GTX 1660 SUPER | Turing TU116 | 580.95.05 | 580 | `9311bcb` | 30/30 |
+| RTX 3060 | Ampere GA106 | 580.105.08 (control) | 580 | `2dc9465` | 30/30 |
+| RTX 3060 | Ampere GA106 | 535.309.01 | 535 | `2dc9465` | 30/30 |
+| RTX 3060 | Ampere GA106 | 570.124.06 | 570 | `2dc9465` | 30/30 |
+| RTX 3060 | Ampere GA106 | 610.43.02 | 610 | `2dc9465` | 30/30 |
+| RTX 4070 | Ada AD104 | 580.105.08 (control) | 580 | `0b48bb5` | 30/30 |
+| RTX 4070 | Ada AD104 | 535.309.01 | 535 | `0b48bb5` | 30/30 |
+| RTX 4070 | Ada AD104 | 610.43.02 | 610 | `0b48bb5` | 30/30 |
+
+The Turing evidence is retained at
+`/workspace/nvkvm-sweep-rr09-9311bcb/`; the Ampere evidence is retained at
+`/workspace/nvkvm-sweep-ampere-2dc9465/`; the Ada evidence is retained at
+`/workspace/nvkvm-sweep-ada-0b48bb5/`. All paid instances were destroyed and
+verified absent. The numeric control denials retained on the passing rows are
+recorded in [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md); none was
+allowed merely to make this matrix green.
+
 > ## ⚠ HISTORICAL. This matrix is being rebuilt (2026-08-23).
 >
 > **Every row below is real, and every row is narrower than it reads.** Two

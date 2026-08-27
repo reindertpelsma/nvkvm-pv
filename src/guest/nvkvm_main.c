@@ -1815,6 +1815,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		if (nvkvm_uvm_ext_covers(ctx, p->requested_base, p->length)) {
 			long sr = 0;
+			pr_debug("nvkvm: uvm fallback answered DISABLE_READ_DUPLICATION for 0x%llx+0x%llx\n",
+				 (unsigned long long)p->requested_base,
+				 (unsigned long long)p->length);
 			p->rm_status = 0;              /* NV_OK */
 			if (uparams &&
 			    copy_to_user(uparams, params_buf, param_size))
@@ -1863,6 +1866,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 		if (nvkvm_uvm_ext_covers(ctx, p->base, p->length)) {
 			long sr = 0;
+			pr_debug("nvkvm: uvm fallback answered SET_RANGE_GROUP for 0x%llx+0x%llx\n",
+				 (unsigned long long)p->base,
+				 (unsigned long long)p->length);
 			p->rm_status = 0;              /* NV_OK */
 			if (uparams &&
 			    copy_to_user(uparams, params_buf, param_size))
@@ -2931,6 +2937,8 @@ forwarded:;
 					  &uvm_pending);
 		mutex_unlock(&ctx->uvm_state->ext_lock);
 	}
+	if (ctx->dev_id == NVKVM_DEV_UVM)
+		pr_debug("nvkvm: forwarded UVM ioctl cmd=%u ret=%ld\n", cmd, ret);
 
 	/*
 	 * Restore the user-space pointer fields the sanitizer (and stub) blanked.

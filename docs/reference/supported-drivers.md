@@ -103,13 +103,31 @@ kernel launch.
 | RTX 4000 Ada | Ada AD104 | 8.9 | 575.51.03 | 570 |
 | GTX 1660 SUPER | Turing TU116 | 7.5 | 575.51.03 | 570 |
 | GTX 1660 SUPER | Turing TU116 | 7.5 | 535.309.01 | 535 |
+| GTX 1660 SUPER | Turing TU116 | 7.5 | 580.95.05 | 580 |
 | RTX 3060 | Ampere GA106 | 8.6 | 545.23.08 | 545 |
 | RTX 3060 | Ampere GA106 | 8.6 | 550.54.14 | 550 |
 | RTX 3060 Ti | Ampere GA104 | 8.6 | 580.95.05 | 580 |
 | RTX 3060 Ti | Ampere GA104 | 8.6 | 595.84 | 580 |
 | RTX 3060 | Ampere GA106 | 8.6 | 610.43.02 | 610 |
+| RTX 4070 | Ada AD104 | 8.9 | 535.309.01 | 535 |
+| RTX 4070 | Ada AD104 | 8.9 | 580.105.08 | 580 |
+| RTX 4070 | Ada AD104 | 8.9 | 610.43.02 | 610 |
 
-The last five rows additionally cleared the PTX JIT path, a matmul checked
+The 580.95.05 Turing row cleared the expanded 30-check suite, including three
+managed allocations and three verified CPU↔GPU coherence cycles. A current
+Ampere GA106 rerun on tree `2dc9465` did the same at 535.309.01 (profile 535),
+570.124.06 (profile 570), the 580.105.08 control (profile 580), and 610.43.02
+(profile 610): every row was **30 PASS / 0 FAIL / 0 SKIP**, and every selected
+profile matched the header. This spans the oldest profile buildable on the
+kernel-6.8 KVM rentals through the newest V610 channel layout. Drivers 515/525
+remain outside that rental's buildable kernel range, not silently counted as
+coverage. An Ada AD104 follow-up on tree `0b48bb5` independently passed the
+same 30-check suite at 535.309.01/profile 535, the 580.105.08 control/profile
+580, and 610.43.02/profile 610. See the 2026-08-26 section of
+[`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md) for exact denials, costs
+and retained evidence.
+
+The older Ampere rows additionally cleared the PTX JIT path, a matmul checked
 against a CPU reference, a Vulkan compute dispatch and offscreen EGL, via
 `tests/validate.sh` — see [`tests/BOOT_MATRIX.md`](../../tests/BOOT_MATRIX.md)
 for the per-check values and for the one failure they surfaced: offscreen
@@ -384,7 +402,7 @@ disabled on the host. `NVKVM_ISOLATE_NO_HARDEN=1` skips all of it
 
 The guest module is an out-of-tree kernel module built against the running guest
 kernel's headers (`src/guest/Makefile:1`). It was developed and tested against
-Ubuntu 24.04 / kernel 6.8 (`scripts/setup_guest.sh:16`, `:80`).
+Ubuntu 24.04 / kernel 6.8 (`scripts/setup_guest.sh:4-5`).
 
 Two guest-side kernel dependencies are worth knowing about:
 

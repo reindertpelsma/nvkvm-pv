@@ -10,6 +10,158 @@ version pinned), re-run `scripts/make_host_bundle.sh`, re-run
 driver version a vast.ai offer advertises is meaningless — all three boxes
 rented for this run advertised 580.95.05 and all three came up on 575.51.03.
 
+## 2026-08-27 — merge verification of `audit-remediation-tested` (tree `bbe7010`)
+
+The merge of `fix/audit-remediation-20260825` into current `main` was swept on
+two architectures before being proposed for merge. Both boxes ran the tarball
+of tree `bbe7010`, and every result row below carries that stamp.
+
+| GPU | arch | host driver | ABI expected | ABI selected | validate.sh |
+|---|---|---|---:|---:|---:|
+| RTX 4090 | Ada AD102 | 575.51.03 (control) | 570 | 570 | 30P/0F/0S |
+| RTX 4090 | Ada AD102 | 595.84 | 580 | 580 | 30P/0F/0S |
+| RTX 4090 | Ada AD102 | 610.43.02 | 610 | 610 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 575.51.03 (control) | 570 | 570 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 535.309.01 | 535 | 535 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 595.84 | 580 | 580 | 30P/0F/0S |
+| RTX 3080 | Ampere GA102 | 610.43.02 | 610 | 610 | 30P/0F/0S |
+
+The selected ABI profile matched `nvkvm_abi.h`'s prediction on every row, which
+is the property this branch is about: it touches the guest module, the stub and
+the ABI headers, so a wrong profile would show up here first.
+
+**The denial set did not grow.** Measured against the table in
+[Control commands denied by the allowlist](#control-commands-denied-by-the-allowlist):
+
+- 595.84 and 610.43.02, on BOTH architectures: exactly `0x00730102` (2x),
+  `0x2080220b` (1x), `0x2080019f` (1x) — the three already-recorded harmless RM
+  control denials, and nothing else. The nvkms `cmdType=60` denial did not
+  reappear (it is allowed since the 2026-08-17 fix).
+- 535.309.01: `0x00730138` (4x) and `0x00730102` (1x). Both are already recorded
+  against 545.23.08 in the same table; no denial code outside the recorded union
+  appeared.
+- Both 575.51.03 controls: `0x00730102` only.
+
+Cost $0.2867 total ($0.2141 Ada, $0.0726 Ampere). Ada instance 48933590 (machine
+28080) and Ampere instance 48933692 (machine 140965) were destroyed and verified
+absent from the listing. The first Ampere rental, instance 48933447 on machine
+18856, never provisioned KVM (`created` with the log frozen at "Domain not
+found"), was destroyed after 208s / $0.005 and the machine was added to
+`scripts/sweep-known-bad-machines.txt`; the sweep recycled onto the RTX 3080.
+That untested unit is why the Ampere run exits 2 — no requested driver was left
+without a verdict. Raw artifacts are retained at
+`/workspace/nvkvm-sweep-audrem-bbe7010/`.
+
+## 2026-08-26 — RR-09 `UVM_REGISTER_GPU` revalidation
+
+Tree `9311bcb` was tested through the unattended sweep on a Vast nested-KVM
+GTX 1660 SUPER (Turing), using the required desktop KVM image. The preinstalled
+open driver 580.105.08 control and the forced 580.95.05 driver both selected ABI
+profile 580 and both passed the expanded suite **30 PASS / 0 FAIL / 0 SKIP**.
+
+The two checks added since the older 28-check matrix are the point of this run:
+
+- `cuda_managed_alloc`: three 4 MiB allocations, each reported
+  `MANAGED_MEMORY=1`.
+- `cuda_managed_coherence`: the host wrote 1,048,576 elements through managed
+  pointers, `vec_add<<<4096,256>>>` ran on them, and the host verified all
+  elements after three CPU↔GPU migration cycles.
+
+The same run also passed the byte-exact 8 MiB CUDA copy, PTX JIT, kernel launch,
+CPU-referenced matmul, Vulkan device selection and compute dispatch, NVIDIA EGL
+renderer, and 64×64 pixel check. The only warning lines were the already-known
+denials `0x00730102` (GET_NUM_HEADS) and `0x20800513`
+(THERMAL_SYSTEM_EXECUTE_V2); the control allowlist was not widened.
+
+Evidence: sweep instance 48712089, machine 54666, requested and observed driver
+580.95.05, 451-second validation, $0.0223 total rental cost. The instance was
+verified absent from the Vast listing after destruction. Raw artifacts remain
+in `/workspace/nvkvm-sweep-rr09-9311bcb/` on the control machine.
+
+### Ampere multi-profile follow-up
+
+Tree `2dc9465` was then tested on the same required nested-KVM desktop image on
+an RTX 3060 (Ampere GA106). The preinstalled 580.105.08 control and all three
+forced driver rows passed **30 PASS / 0 FAIL / 0 SKIP**:
+
+| observed host driver | selected ABI profile | CUDA reported by guest | verdict |
+|---|---:|---:|---:|
+| 580.105.08 (control) | 580 | 13.0 | 30/30 |
+| 535.309.01 | 535 | 12.2 | 30/30 |
+| 570.124.06 | 570 | 12.8 | 30/30 |
+| 610.43.02 | 610 | 13.3 | 30/30 |
+
+Every row passed both managed-memory checks above, the byte-exact CUDA copy,
+PTX JIT and verified kernels, Vulkan compute, NVIDIA EGL and the pixel check.
+The selected profile matched `nvkvm_abi.h` in every case. This is especially
+useful coverage at the two ends exercised here: 535 is the oldest profile that
+can be built on the kernel-6.8 rental, while 610 uses the 376-byte V610 channel
+layout with `hHandleVASpace`.
+
+No control was admitted as a result. Passing runs retained these denials:
+
+- 580.105.08 control: `0x00730102` (2×).
+- 570.124.06: `0x00730102` (1×).
+- 610.43.02: `0x00730102` (2×), `0x2080019f` (1×),
+  `0x2080220b` (1×).
+- 535.309.01: `0x00730102` (1×), `0x00730138` (4×).
+
+The repeated `0x00730102` is
+`NV0073_CTRL_CMD_SYSTEM_GET_NUM_HEADS`; `0x2080220b` is
+`RC_ENABLE_WATCHDOG`. These and the other numeric controls above are evidence,
+not candidates for allowlist widening: the complete workloads passed while
+they were denied.
+
+The original sweep summary printed cumulative counts because the transient
+`nvkvm-vm` unit name is reused and `journalctl -u` includes its earlier
+invocations. The per-driver list above was reconstructed from the retained raw
+log's QEMU PIDs/timestamps. The harness now scopes warning collection with
+`_SYSTEMD_INVOCATION_ID`, and refuses to attribute warnings if that identifier
+cannot be obtained.
+
+Evidence: replacement sweep instance 48715042, machine 35071, three forced
+driver verdicts, zero untested rows, 3,043 seconds and $0.0575 sweep cost. Raw
+logs and the JSON verdicts are in
+`/workspace/nvkvm-sweep-ampere-2dc9465/` on the control machine. The instance
+was destroyed, verified absent from the Vast listing, and the label-scoped
+registry reconciled empty. An earlier interrupted controller had banked a
+separate passing 580.105.08 control on instance 48713616; that instance was
+also destroyed and is not counted as a driver-set row.
+
+### Ada endpoint-profile follow-up
+
+Tree `0b48bb5` was tested on an RTX 4070 (Ada AD104), again using the required
+nested-KVM desktop image. The preinstalled control and both forced endpoint
+profiles passed **30 PASS / 0 FAIL / 0 SKIP**:
+
+| observed host driver | selected ABI profile | CUDA reported by guest | verdict |
+|---|---:|---:|---:|
+| 580.105.08 (control) | 580 | 13.0 | 30/30 |
+| 535.309.01 | 535 | 12.2 | 30/30 |
+| 610.43.02 | 610 | 13.3 | 30/30 |
+
+The two driver-set rows were exact versions, not substitutes, and both selected
+the profile predicted by `nvkvm_abi.h`. Every row passed managed allocation and
+the three CPU↔GPU coherence cycles, CUDA copies/kernels/matmul, Vulkan compute,
+NVIDIA EGL rendering and the pixel check. Warning collection was scoped to each
+systemd invocation:
+
+- 580.105.08 control: `0x00730102` (2×).
+- 610.43.02: `0x00730102` (2×), `0x2080019f` (1×),
+  `0x2080220b` (1×).
+- 535.309.01: `0x00730102` (1×), `0x00730138` (4×).
+
+This was also the paid end-to-end check of the optional driver-cache relay. The
+same Hong Kong provider edge had returned HTTP 403 for both NVIDIA installers
+on the preceding attempt. The coordinator copied canonical runfiles without
+executing them, the remote SHA-256 values matched, and each disposable-VM
+installer reported `Verifying archive integrity... OK` before installation.
+
+Evidence: instance 48751631, machine 57608, two forced verdicts, zero untested
+rows, 4,667 seconds and $0.1055 sweep cost. Raw logs and JSON are retained in
+`/workspace/nvkvm-sweep-ada-0b48bb5/`. The instance was destroyed, verified
+absent, and the label-scoped registry reconciled empty.
+
 ## Coverage against the eight-profile table
 
 | profile | covers | booted here | previously booted | status |
