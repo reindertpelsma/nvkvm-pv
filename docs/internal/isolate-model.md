@@ -179,7 +179,7 @@ each one gives up:
 | preset | layers | requires |
 |---|---|---|
 | `auto` **(default)** | probes, see below | nothing |
-| `namespace` | namespaces + `pivot_root` + seccomp | `CAP_SYS_ADMIN`, or a userns not blocked by seccomp/AppArmor |
+| `namespace` | namespaces + `pivot_root` + seccomp | a userns not blocked by seccomp/AppArmor — plus, **when QEMU is uid 0**, `CAP_SETFCAP` for the map write (measured minimum at uid 0: `CAP_SYS_ADMIN`+`CAP_SETFCAP`). Notably **not** `CAP_SETUID`. |
 | `uid` | unique high UID/GID + seccomp | `CAP_SETUID` + `CAP_SETGID` |
 | `uid+chroot` | as `uid`, plus `chroot("/dev")` | the above + `CAP_SYS_CHROOT` |
 | `seccomp` | seccomp filter only | nothing |
@@ -213,13 +213,50 @@ the acknowledgement below.
 
 Each rung is decided by **attempting** it, never by inference:
 
-- `namespace` — a real `clone()` with the production flag set, child reaped
-  immediately (`nvkvm_iso_probe_namespaces`).
+- `namespace` — **all three** privileged steps of the real spawn, in the real
+  order (`nvkvm_iso_probe_namespaces`): a real `clone()` with the production
+  flags; the parent writing the child's `setgroups`/`uid_map`/`gid_map`, using
+  the very same `nvkvm_map_child_userns()` the spawn calls; and the child's
+  `mount(MS_REC|MS_PRIVATE)` on `/`. The probe reports **which** step failed,
+  and the log names the likely cause for each.
+
+  The map write is there because it can fail on its own, and used not to be
+  attempted. The map is `0 <euid> 1`, so a QEMU running as **uid 0** maps UID 0
+  of the parent namespace, which since Linux 5.12 requires **`CAP_SETFCAP`** in
+  the parent namespace (`user_namespaces(7)`); no other capability substitutes.
+  Measured at uid 0: with `CAP_SYS_ADMIN` **and** `CAP_SETFCAP` the rung works;
+  with `CAP_SYS_ADMIN` alone the clone and the mount both succeed and the map
+  write returns `EPERM`. The old probe therefore reported `namespace` available
+  and every isolate then died in `nvkvm_map_child_userns()` — a **fail-open**
+  probe, the one failure mode a probe exists to prevent.
+  `tests/security/ns_probe_test.c` is the regression test; it compares the
+  probe's verdict against an independent measurement across five capability
+  sets. Running QEMU as a non-root uid removes the `CAP_SETFCAP` requirement,
+  because the map then no longer names parent-UID 0.
 - `uid` — `capget()` for `CAP_SETUID`/`CAP_SETGID`, plus the `/dev/nvidiactl`
-  permission check (`nvkvm_iso_probe_uid`).
+  permission check (`nvkvm_iso_probe_uid`). Those two capabilities really are
+  all `nvkvm_iso_drop_privilege()` needs, so the rung is not fail-open — but
+  **`CAP_SETPCAP` is checked too, and only reported, never used to reject.**
+  `nvkvm_drop_caps_pre()`'s `PR_CAPBSET_DROP` loop needs it and ignores its
+  return value, so without it the isolate silently keeps a **full capability
+  bounding set** (measured: every `PR_CAPBSET_DROP` returns `EPERM` and
+  `CapBnd` stays at `000001fffffffeff`). That is inert — effective and
+  permitted are still zeroed, `no_new_privs` is set, and `execve` is not in the
+  stub's seccomp allowlist — so rejecting the rung over it would push the host
+  down to `seccomp`, which separates nothing. The report says so instead.
+  Namespace mode is unaffected: there the child is ns-root and holds
+  `CAP_SETPCAP` in its own user namespace regardless of what QEMU holds.
 - `seccomp` — `seccomp(SECCOMP_SET_MODE_FILTER, 0, NULL)`, which faults before
   installing anything, so `EFAULT` is the "supported" answer and nothing is
-  applied to QEMU itself (`nvkvm_iso_probe_seccomp`).
+  applied to QEMU itself (`nvkvm_iso_probe_seccomp`). `EACCES` is **also**
+  treated as supported: it means *this* process lacks `no_new_privs` and
+  `CAP_SYS_ADMIN`, which says nothing about the stub, and the stub sets
+  `no_new_privs` in `main()` before it installs its filter. QEMU will not set
+  `no_new_privs` on itself merely to run a probe — it is irreversible and would
+  apply to every later `execve`. (Measured on kernel 7.0.0-29: that kernel
+  checks the filter pointer first and returns `EFAULT` in every combination
+  tried, so this arm is defensive rather than a fix for an observed failure,
+  and it errs fail-closed either way.)
 
 Attempting is not merely more convenient than reading configuration; it is more
 *correct*. The sysctls say user namespaces are available inside a stock Docker
