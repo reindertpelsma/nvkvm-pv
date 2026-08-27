@@ -98,7 +98,7 @@ hung once and has not reproduced since.
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Size | ~16 GB RAM and 4 vCPUs free for the guest (the defaults), plus ~40 GB disk for the guest image and QEMU |
 | Driver | See [supported drivers](docs/reference/supported-drivers.md) |
-| Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 9.2 is built by the provided script |
+| Install | A [container image](#docker-start-here) or a [prebuilt tarball](#prebuilt-tarball-on-a-bare-host); [from source](#from-source-if-you-want-to-hack-on-it) QEMU 11.1 is built by the provided script |
 
 **Check you can actually open `/dev/kvm` before anything else.** That is the
 whole test — not CPU flags, which a container inherits from its host, so
@@ -233,7 +233,7 @@ in-guest module build needs it.
 
 ```bash
 git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm && cd nvkvm
-bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 9.2 with the nvkvm device
+bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 11.1 with the nvkvm device
 bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and prepares a disk
 ```
 

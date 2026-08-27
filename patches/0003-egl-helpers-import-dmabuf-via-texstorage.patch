@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Fri, 21 Aug 2026 02:32:34 +0200
-Subject: [PATCH] ui/egl-helpers: import dma-bufs with
+Date: Thu, 27 Aug 2026 17:10:19 +0200
+Subject: [PATCH 03/12] ui/egl-helpers: import dma-bufs with
  glEGLImageTargetTexStorageEXT
 
 egl_dmabuf_import_texture() binds an imported dma-buf EGLImage with
@@ -42,10 +42,10 @@ Keep it downstream until someone does that work.
  1 file changed, 17 insertions(+), 1 deletion(-)
 
 diff --git a/ui/egl-helpers.c b/ui/egl-helpers.c
-index 81a57fa..b2d69ed 100644
+index d689f187c4..a4276090ba 100644
 --- a/ui/egl-helpers.c
 +++ b/ui/egl-helpers.c
-@@ -354,7 +354,23 @@ void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
+@@ -415,7 +415,23 @@ void egl_dmabuf_import_texture(QemuDmaBuf *dmabuf)
      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
  

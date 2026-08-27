@@ -60,8 +60,11 @@
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-ui.h"
-#include "sysemu/runstate.h"   /* qemu_system_powerdown_request.  QEMU 9.2 path;
-                                 * renamed to system/ in 10.0.               */
+#include "system/runstate.h"    /* qemu_system_powerdown_request.  This was
+                                 * sysemu/runstate.h up to QEMU 9.2; upstream
+                                 * renamed include/sysemu/ to include/system/
+                                 * in 10.0 and include/sysemu/ no longer
+                                 * exists at all in the pinned 11.1.1.      */
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/clipboard.h"

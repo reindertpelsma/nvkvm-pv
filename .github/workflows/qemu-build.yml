@@ -1,7 +1,7 @@
 # qemu-build.yml — the slow lane: does scripts/build_qemu.sh still work?
 #
 # WHY IT IS NOT IN ci.yml
-#     This clones QEMU 9.2, patches virtio-nvgpu into it and builds the whole
+#     This clones QEMU 11.1, patches virtio-nvgpu into it and builds the whole
 #     thing.  ~35 minutes.  Put that on every PR and either people stop waiting
 #     for CI or they stop opening PRs.  So it runs nightly, on pushes to main,
 #     and on demand -- which is often enough to catch breakage within a day and
@@ -49,7 +49,7 @@ permissions:
 
 jobs:
   build:
-    name: QEMU 9.2 + virtio-nvgpu
+    name: QEMU 11.1 + virtio-nvgpu
     runs-on: ubuntu-24.04
     # The build is ~35 min on a 4-core runner. 90 gives real headroom without
     # letting a hung ninja burn a full 6-hour job slot.

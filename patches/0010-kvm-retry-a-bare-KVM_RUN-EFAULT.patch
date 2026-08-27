@@ -1,8 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Reindert Pelsma <reindert.pelsma@gmail.com>
+Date: Thu, 27 Aug 2026 17:10:20 +0200
+Subject: [PATCH 10/12] accel/kvm: retry a bare KVM_RUN EFAULT instead of
+ killing the VM
+
+An NVIDIA GPU mapping is VM_IO|VM_PFNMAP, and the driver's fault handler
+(nv_fault(), kernel-open/nvidia/nv-mmap.c) has two paths that return
+VM_FAULT_NOPAGE *without* installing a PTE -- the PM-lock trylock failing,
+and !nvl->safe_to_mmap while a GPU wakeup is scheduled.  Both mean "come
+back later".  A userspace process honours that by re-faulting; KVM calls
+fixup_user_fault() once, still finds no PTE, and returns a bare -EFAULT,
+which QEMU has always treated as fatal.  The guest therefore dies on a
+mapping that was about to be reinstated.
+
+RIP has not advanced when KVM_RUN returns, so re-entering the guest simply
+re-executes the same access.  This retries a bare EFAULT (i.e. one that is
+NOT a KVM_EXIT_MEMORY_FAULT, which has its own handling) on a 3 s budget in
+5 ms steps, logs once on entry and once on exit, and falls through to the
+original fatal path if it never clears.
+
+The budget is measured, not guessed: on the RTX 3050 laptop the fault
+cleared after 1465 ms.  An earlier attempt used 64 x 200us -- about 13 ms
+total -- and concluded from that that the fault was permanent, which is why
+the number is this large and why it is expressed in milliseconds against a
+GPU wakeup rather than as a spin count.
+
+This patch had no commit message before the 9.2 -> 11.1 rebase (the file in
+patches/ was a bare diff with no mail header); the rationale above is
+recovered from the in-code comment and patches/README.md.
+---
+ accel/kvm/kvm-all.c | 49 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
 diff --git a/accel/kvm/kvm-all.c b/accel/kvm/kvm-all.c
-index 801cff1..03b7eca 100644
+index 83cbd120a8..1300c861bc 100644
 --- a/accel/kvm/kvm-all.c
 +++ b/accel/kvm/kvm-all.c
-@@ -3080,8 +3080,13 @@ out_unref:
+@@ -3424,8 +3424,13 @@ out_unref:
      return ret;
  }
  
@@ -16,7 +50,7 @@ index 801cff1..03b7eca 100644
      struct kvm_run *run = cpu->kvm_run;
      int ret, run_ret;
  
-@@ -3153,6 +3158,44 @@ int kvm_cpu_exec(CPUState *cpu)
+@@ -3490,6 +3495,44 @@ int kvm_cpu_exec(CPUState *cpu)
                  break;
              }
              if (!(run_ret == -EFAULT && run->exit_reason == KVM_EXIT_MEMORY_FAULT)) {
@@ -61,7 +95,7 @@ index 801cff1..03b7eca 100644
                  fprintf(stderr, "error: kvm run failed %s\n",
                          strerror(-run_ret));
  #ifdef TARGET_PPC
-@@ -3168,6 +3211,12 @@ int kvm_cpu_exec(CPUState *cpu)
+@@ -3505,6 +3548,12 @@ int kvm_cpu_exec(CPUState *cpu)
              }
          }
  

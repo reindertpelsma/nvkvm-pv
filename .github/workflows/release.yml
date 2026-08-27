@@ -171,7 +171,7 @@ jobs:
       #
       # The prefix is a staging directory rather than /opt because /opt is not
       # writable by the runner user, and because the tree has to be packed from
-      # somewhere anyway.  QEMU 9.2 locates its data files relative to
+      # somewhere anyway.  QEMU locates its data files relative to
       # /proc/self/exe, so the tree still works wherever it is extracted.
       - name: build the isolate stub and QEMU
         env:
@@ -256,7 +256,7 @@ jobs:
 
           | | |
           |---|---|
-          | \`qemu-nvkvm/\` | the built QEMU 9.2 with \`virtio-nvgpu\` patched in |
+          | \`qemu-nvkvm/\` | the built QEMU 11.1 with \`virtio-nvgpu\` patched in |
           | \`src/stub/nvkvm_stub\` | the built isolate stub (also embedded in the QEMU binary; this is the \`NVKVM_STUB_PATH\` fallback) |
           | everything else | the repository at this tag, verbatim (\`git archive\`) |
 

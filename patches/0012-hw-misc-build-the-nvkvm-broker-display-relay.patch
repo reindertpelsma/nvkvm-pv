@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Sun, 24 Aug 2026 12:00:01 +0200
-Subject: [PATCH] hw/misc: build the nvkvm-broker display relay
+Date: Thu, 27 Aug 2026 17:10:20 +0200
+Subject: [PATCH 12/12] hw/misc: build the nvkvm-broker display relay
 
 One more file in the list patch 0001 introduced.  It implements
 -display nvkvm-broker: connect to the broker's unix socket, relay the
@@ -22,11 +22,14 @@ possible.
 
 Applies on top of 0001, which created the file list.
 ---
+ hw/misc/meson.build | 2 ++
+ 1 file changed, 2 insertions(+)
+
 diff --git a/hw/misc/meson.build b/hw/misc/meson.build
-index ef97efc..8039450 100644
+index 4c1296083f..84c6b5664a 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -166,5 +166,7 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
+@@ -180,5 +180,7 @@ system_ss.add(when: ['CONFIG_VIRTIO'], if_true: files(
    'nvkvm_isolate_handlers.c',
    'nvkvm_tables.c',
    'nvkvm_present_egl.c',

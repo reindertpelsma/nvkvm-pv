@@ -4,7 +4,7 @@ Three artefacts, built in this order:
 
 1. the **isolate stub** — a freestanding static binary, plus a generated header
    that embeds it as a byte array;
-2. **QEMU 9.2.0** with the `virtio-nvgpu` device patched in;
+2. **QEMU 11.1.1** with the `virtio-nvgpu` device patched in;
 3. the **guest kernel module** — built inside the guest, against the guest
    kernel.
 
@@ -15,7 +15,8 @@ copy, so `scripts/build_qemu.sh` is a convenience and not the only path —
 [Building without the script](#building-without-the-script) is the same
 sequence as commands you can type, and
 [`patches/README.md`](../../patches/README.md) is the whole upstream surface in
-one table: ten patches, 760 added lines and 29 removed, against `v9.2.0`.
+one table: twelve patches, 844 added lines and 45 removed, against
+`v11.1.1`.
 
 ## You may not need to build this
 
@@ -209,7 +210,7 @@ This step is load-bearing and its absence is silent — the script's own comment
 **2. Fetch QEMU** (`scripts/build_qemu.sh:99-100`):
 
 ```bash
-git clone --depth=1 --branch v9.2.0 \
+git clone --depth=1 --branch v11.1.1 \
     https://gitlab.com/qemu-project/qemu.git /opt/qemu-src
 ```
 
@@ -269,7 +270,7 @@ through virtio-gpu GL.
 `-DNVKVM_STUB_EMBEDDED` is the define whose absence produces the silent
 forwarding-off failure described above.
 
-**8-9. Build and install** (`scripts/build_qemu.sh:261-268`). QEMU 9.2
+**8-9. Build and install** (`scripts/build_qemu.sh:261-268`). QEMU
 configures out of tree, so ninja runs against `/opt/qemu-src/build`.
 
 Output: `/opt/qemu-nvkvm/bin/qemu-system-x86_64`.

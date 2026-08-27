@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Fri, 21 Aug 2026 02:32:44 +0200
-Subject: [PATCH] ui/console: skip non-graphic consoles in
+Date: Thu, 27 Aug 2026 17:10:19 +0200
+Subject: [PATCH 04/12] ui/console: skip non-graphic consoles in
  qemu_console_lookup_by_device()
 
 *** This is an upstream QEMU bug, not an nvkvm-specific change.  The
@@ -39,10 +39,10 @@ upstream-shaped one.
  1 file changed, 11 insertions(+)
 
 diff --git a/ui/console.c b/ui/console.c
-index 5165f17..6dcc1cd 100644
+index a8a2a247d8..e7e3658ed5 100644
 --- a/ui/console.c
 +++ b/ui/console.c
-@@ -1264,6 +1264,17 @@ QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head)
+@@ -1217,6 +1217,17 @@ QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head)
      uint32_t h;
  
      QTAILQ_FOREACH(con, &consoles, next) {

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Thu, 21 Aug 2026 23:30:00 +0200
-Subject: [PATCH 9/9] sdl2: grab mode owns the input, and only when asked to
+Date: Thu, 27 Aug 2026 17:17:30 +0200
+Subject: [PATCH 09/12] sdl2: grab mode owns the input, and only when asked to
 
 0008 makes the SDL backend show the guest.  This makes its grab mode work, which
 is what pointer lock needs -- and pointer lock is the difference between a VM
@@ -76,7 +76,25 @@ applied in order by scripts/build_qemu.sh, whose idempotency test is
 patch edits lines an earlier one added, because the earlier patch no longer
 reverses cleanly.  A dependent patch would make re-running the build fail on an
 already-patched tree.
+
+--- 9.2 -> 11.1 rebase note (2026-08-27) ---------------------------------
+Conflict was in the include block only, and it was upstream churn, not a
+behavioural change:
+  * upstream moved include/sysemu/ to include/system/ (v10.0), so
+    sysemu/runstate.h, sysemu/runstate-action.h and sysemu/sysemu.h became
+    system/*.h;
+  * upstream dropped the ui/win32-kbd-hook.h include from ui/sdl2.c along
+    with its last use there.  This patch never called win32_kbd_set_grab()
+    -- it only mentions it in a comment -- so the include was dropped
+    rather than restored.
+The one line this patch actually adds to that block, qapi/qapi-commands-ui.h,
+is unchanged.  No hunk of the grab logic itself conflicted.
 ---
+ ui/sdl2.c | 298 +++++++++++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 284 insertions(+), 14 deletions(-)
+
+diff --git a/ui/sdl2.c b/ui/sdl2.c
+index 1703d3f699..9a62a57924 100644
 --- a/ui/sdl2.c
 +++ b/ui/sdl2.c
 @@ -29,6 +29,7 @@
@@ -84,10 +102,10 @@ already-patched tree.
  #include "ui/input.h"
  #include "ui/sdl2.h"
 +#include "qapi/qapi-commands-ui.h"
- #include "sysemu/runstate.h"
- #include "sysemu/runstate-action.h"
- #include "sysemu/sysemu.h"
-@@ -65,6 +66,17 @@
+ #include "system/runstate.h"
+ #include "system/runstate-action.h"
+ #include "system/system.h"
+@@ -69,6 +70,17 @@ static Notifier mouse_mode_notifier;
  
  static void sdl_update_caption(struct sdl2_console *scon);
  
@@ -105,7 +123,7 @@ already-patched tree.
  static struct sdl2_console *get_scon_from_window(uint32_t window_id)
  {
      int i;
-@@ -176,7 +188,7 @@
+@@ -203,7 +215,7 @@ static void sdl_update_caption(struct sdl2_console *scon)
  
      if (!runstate_is_running()) {
          status = " [Stopped]";
@@ -114,7 +132,7 @@ already-patched tree.
          if (alt_grab) {
  #ifdef CONFIG_DARWIN
              status = " - Press ⌃⌥⇧G to exit grab";
-@@ -242,7 +254,154 @@
+@@ -269,7 +281,154 @@ static void sdl_show_cursor(struct sdl2_console *scon)
      SDL_ShowCursor(SDL_ENABLE);
  }
  
@@ -270,7 +288,7 @@ already-patched tree.
  {
      QemuConsole *con = scon ? scon->dcl.con : NULL;
  
-@@ -257,6 +416,40 @@
+@@ -284,6 +443,40 @@ static void sdl_grab_start(struct sdl2_console *scon)
      if (!(SDL_GetWindowFlags(scon->real_window) & SDL_WINDOW_INPUT_FOCUS)) {
          return;
      }
@@ -311,7 +329,7 @@ already-patched tree.
      if (guest_cursor) {
          SDL_SetCursor(guest_sprite);
          if (!qemu_input_is_absolute(scon->dcl.con) && !absolute_enabled) {
-@@ -265,7 +458,27 @@
+@@ -292,7 +485,27 @@ static void sdl_grab_start(struct sdl2_console *scon)
      } else {
          sdl_hide_cursor(scon);
      }
@@ -338,11 +356,11 @@ already-patched tree.
 +        SDL_SetWindowGrab(scon->real_window, SDL_TRUE);
 +    }
      gui_grab = 1;
-     win32_kbd_set_grab(true);
      sdl_update_caption(scon);
-@@ -277,6 +490,17 @@
+ }
+@@ -302,6 +515,17 @@ static void sdl_grab_end(struct sdl2_console *scon)
+     SDL_SetWindowGrab(scon->real_window, SDL_FALSE);
      gui_grab = 0;
-     win32_kbd_set_grab(false);
      sdl_show_cursor(scon);
 +    /*
 +     * nvkvm: AFTER sdl_show_cursor(), which leaves relative mode only while the
@@ -358,7 +376,7 @@ already-patched tree.
      sdl_update_caption(scon);
  }
  
-@@ -288,12 +512,22 @@
+@@ -313,12 +537,22 @@ static void absolute_mouse_grab(struct sdl2_console *scon)
      SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
      if (mouse_x > 0 && mouse_x < scr_w - 1 &&
          mouse_y > 0 && mouse_y < scr_h - 1) {
@@ -382,7 +400,7 @@ already-patched tree.
      if (qemu_input_is_absolute(sdl2_console[0].dcl.con)) {
          if (!absolute_enabled) {
              absolute_enabled = 1;
-@@ -326,10 +560,37 @@
+@@ -351,10 +585,37 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
      }
  
      if (qemu_input_is_absolute(scon->dcl.con)) {
@@ -424,7 +442,7 @@ already-patched tree.
      } else {
          if (guest_cursor) {
              x -= guest_x;
-@@ -352,7 +613,7 @@
+@@ -377,7 +638,7 @@ static void toggle_full_screen(struct sdl2_console *scon)
          SDL_SetWindowFullscreen(scon->real_window,
                                  SDL_WINDOW_FULLSCREEN_DESKTOP);
          gui_saved_grab = gui_grab;
@@ -433,7 +451,7 @@ already-patched tree.
      } else {
          if (!gui_saved_grab) {
              sdl_grab_end(scon);
-@@ -435,8 +696,17 @@
+@@ -447,8 +708,17 @@ static void handle_keydown(SDL_Event *ev)
              break;
          case SDL_SCANCODE_G:
              scon->gui_keysym = true;
@@ -453,7 +471,7 @@ already-patched tree.
              } else if (!gui_fullscreen) {
                  sdl_grab_end(scon);
              }
-@@ -526,7 +796,7 @@
+@@ -538,7 +808,7 @@ static void handle_mousemotion(SDL_Event *ev)
          if (!gui_grab &&
              (ev->motion.x > 0 && ev->motion.x < max_x &&
               ev->motion.y > 0 && ev->motion.y < max_y)) {
@@ -461,8 +479,8 @@ already-patched tree.
 +            sdl_grab_start(scon, false);
          }
      }
-     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
-@@ -549,7 +819,7 @@
+     surf_w = surface_width(scon->surface);
+@@ -571,7 +841,7 @@ static void handle_mousebutton(SDL_Event *ev)
      if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
          if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
              /* start grabbing all events */
@@ -471,7 +489,7 @@ already-patched tree.
          }
      } else {
          if (ev->type == SDL_MOUSEBUTTONDOWN) {
-@@ -976,7 +1246,7 @@
+@@ -1037,7 +1307,7 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
      sdl_cursor_normal = SDL_GetCursor();
  
      if (gui_fullscreen) {
@@ -479,7 +497,4 @@ already-patched tree.
 +        sdl_grab_start(&sdl2_console[0], true);
      }
  
-     atexit(sdl_cleanup);
--- 
-2.43.0
-
+     /* SDL's event polling (in dpy_refresh) must happen on the main thread. */

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Fri, 21 Aug 2026 02:31:59 +0200
-Subject: [PATCH] hw/misc: register the virtio-nvgpu sources with meson
+Date: Thu, 27 Aug 2026 17:10:18 +0200
+Subject: [PATCH 01/12] hw/misc: register the virtio-nvgpu sources with meson
 
 nvkvm's device lives in hw/misc/ as nine .c files copied in from this
 repo's src/qemu/ (see docs/howto/build.md).  Meson has no globbing, so
@@ -35,10 +35,10 @@ Two things a reader will notice and should not "fix" without thinking:
  1 file changed, 14 insertions(+)
 
 diff --git a/hw/misc/meson.build b/hw/misc/meson.build
-index d02d96e..ef97efc 100644
+index 23265f6035..4c1296083f 100644
 --- a/hw/misc/meson.build
 +++ b/hw/misc/meson.build
-@@ -151,4 +151,18 @@ specific_ss.add(when: 'CONFIG_MIPS_ITU', if_true: files('mips_itu.c'))
+@@ -167,4 +167,18 @@ specific_ss.add(when: 'CONFIG_RISCV_MIPS_CPC', if_true: files('riscv_cpc.c'))
  system_ss.add(when: 'CONFIG_SBSA_REF', if_true: files('sbsa_ec.c'))
  
  # HPPA devices

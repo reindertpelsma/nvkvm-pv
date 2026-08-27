@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Reindert Pelsma <reindert.pelsma@gmail.com>
-Date: Fri, 21 Aug 2026 02:47:44 +0200
-Subject: [PATCH] ui/gtk: switch to the guest's display when it first goes live
+Date: Thu, 27 Aug 2026 17:10:19 +0200
+Subject: [PATCH 05/12] ui/gtk: switch to the guest's display when it first
+ goes live
 
 The owner photographed his screen and reported no Mint desktop.  The
 desktop was running fine.  The window was on the wrong console.
@@ -92,10 +93,10 @@ upstreamable version.  Until someone writes that, this stays downstream.
  4 files changed, 48 insertions(+)
 
 diff --git a/include/ui/gtk.h b/include/ui/gtk.h
-index aa3d637..a5b7159 100644
+index 5c9c34a069..b8b083b9db 100644
 --- a/include/ui/gtk.h
 +++ b/include/ui/gtk.h
-@@ -158,6 +158,36 @@ void gd_update_windowsize(VirtualConsole *vc);
+@@ -162,6 +162,36 @@ void gd_update_windowsize(VirtualConsole *vc);
  void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
  void gd_hw_gl_flushed(void *vc);
  
@@ -133,10 +134,10 @@ index aa3d637..a5b7159 100644
  void gd_egl_init(VirtualConsole *vc);
  void gd_egl_draw(VirtualConsole *vc);
 diff --git a/ui/gtk-egl.c b/ui/gtk-egl.c
-index 9831c10..87fc1de 100644
+index adc81f34b1..8e72905032 100644
 --- a/ui/gtk-egl.c
 +++ b/ui/gtk-egl.c
-@@ -210,6 +210,10 @@ void gd_egl_switch(DisplayChangeListener *dcl,
+@@ -211,6 +211,10 @@ void gd_egl_switch(DisplayChangeListener *dcl,
          gd_update_windowsize(vc);
      }
  
@@ -147,7 +148,7 @@ index 9831c10..87fc1de 100644
      eglMakeCurrent(qemu_egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                     EGL_NO_CONTEXT);
  }
-@@ -261,6 +265,8 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
+@@ -260,6 +264,8 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
      gtk_egl_set_scanout_mode(vc, true);
      egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
                           backing_id, false);
@@ -157,10 +158,10 @@ index 9831c10..87fc1de 100644
  
  void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
 diff --git a/ui/gtk-gl-area.c b/ui/gtk-gl-area.c
-index b628b35..ad88878 100644
+index 29497019ee..38f7d43995 100644
 --- a/ui/gtk-gl-area.c
 +++ b/ui/gtk-gl-area.c
-@@ -177,6 +177,10 @@ void gd_gl_area_switch(DisplayChangeListener *dcl,
+@@ -207,6 +207,10 @@ void gd_gl_area_switch(DisplayChangeListener *dcl,
      if (resized) {
          gd_update_windowsize(vc);
      }
@@ -171,7 +172,7 @@ index b628b35..ad88878 100644
  }
  
  static int gd_cmp_gl_context_version(int major, int minor, QEMUGLParams *params)
-@@ -275,6 +279,8 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
+@@ -311,6 +315,8 @@ void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
      gtk_gl_area_set_scanout_mode(vc, true);
      egl_fb_setup_for_tex(&vc->gfx.guest_fb, backing_width, backing_height,
                           backing_id, false);
@@ -181,10 +182,10 @@ index b628b35..ad88878 100644
  
  void gd_gl_area_scanout_disable(DisplayChangeListener *dcl)
 diff --git a/ui/gtk.c b/ui/gtk.c
-index bf9d3dd..daa3dd6 100644
+index 7078d89d67..697e441acb 100644
 --- a/ui/gtk.c
 +++ b/ui/gtk.c
-@@ -490,6 +490,8 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
+@@ -495,6 +495,8 @@ static void gd_cursor_define(DisplayChangeListener *dcl,
      g_object_unref(cursor);
  }
  
@@ -193,7 +194,7 @@ index bf9d3dd..daa3dd6 100644
  static void gd_switch(DisplayChangeListener *dcl,
                        DisplaySurface *surface)
  {
-@@ -551,6 +553,10 @@ static void gd_switch(DisplayChangeListener *dcl,
+@@ -556,6 +558,10 @@ static void gd_switch(DisplayChangeListener *dcl,
      } else {
          gd_update_full_redraw(vc);
      }

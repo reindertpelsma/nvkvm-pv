@@ -1,9 +1,13 @@
 # QEMU patches
 
 Everything nvkvm changes in **upstream QEMU** is in this directory: twelve
-patch files, against the `v9.2.0` tag
-(`ae35f033b874c627d81d51070187fbf55f0bf1a7`). Nothing else in the QEMU tree is
-edited.
+patch files, against the `v11.1.1` tag
+(`5e35f26695645b20931e10d8567c7e0169e62c07`, released 2026-08-26). Nothing else
+in the QEMU tree is edited.
+
+> Rebased from `v9.2.0` on 2026-08-27. What happened to each patch, and the CVE
+> delta that motivated the bump, is in
+> [`docs/internal/qemu-11.1-bump.md`](../docs/internal/qemu-11.1-bump.md).
 
 They exist as patches rather than as `sed` expressions in the build script for
 one reason: a `git apply` is replicable by hand and a `sed` replacement is not.
@@ -16,13 +20,13 @@ string, which used to mean that rewording a comment made a patch apply twice.
 | patch | file | what it does |
 |---|---|---|
 | `0001-meson-register-virtio-nvgpu-sources.patch` | `hw/misc/meson.build` | lists the nine nvkvm `.c` files and the `nvkvm_inc/` include dir, gated on `CONFIG_VIRTIO` |
-| `0002-virtio-add-virtio-nvgpu-to-device-name-table.patch` | `hw/virtio/virtio.c` | adds `[50] = "virtio-nvgpu"` to `virtio_device_names[]`, which otherwise stops at 41 and aborts on our ID |
+| `0002-virtio-add-virtio-nvgpu-to-device-name-table.patch` | `hw/virtio/virtio.c` | adds `[50] = "virtio-nvgpu"` to `virtio_device_names[]`, which otherwise stops at 45 (`VIRTIO_ID_SPI`) and aborts on our ID |
 | `0003-egl-helpers-import-dmabuf-via-texstorage.patch` | `ui/egl-helpers.c` | imports dma-bufs with `glEGLImageTargetTexStorageEXT`; NVIDIA rejects the legacy OES bind for external-only images |
 | `0004-console-do-not-abort-on-deviceless-console.patch` | `ui/console.c` | skips non-graphic consoles in `qemu_console_lookup_by_device()`, which otherwise aborts QEMU on `screendump` |
 | `0005-gtk-switch-to-guest-display-when-it-goes-live.patch` | `include/ui/gtk.h`, `ui/gtk.c`, `ui/gtk-egl.c`, `ui/gtk-gl-area.c` | switches the GTK window to the guest's head the first time it presents real content, once, and only from the page the window opened on |
 | `0006-gtk-no-implicit-grab-on-click.patch` | `ui/gtk.c` | drops upstream's grab-on-first-left-click, so entering grab mode is Ctrl+Alt+G or the View menu and nothing else |
 | `0007-gtk-grab-switches-the-guest-pointing-device.patch` | `ui/gtk.c` | on grab, makes a relative mouse the guest's current device; on ungrab, restores the absolute one. **Not known to work** — see its header |
-| `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | gives the SDL backend a dma-buf scanout path (it had none), creates the window from the GL path, and raises the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
+| `0008-sdl2-show-the-guest-gpu-head.patch` | `include/ui/sdl2.h`, `ui/sdl2.c`, `ui/sdl2-gl.c`, `ui/sdl2-2d.c` | **rewritten for 11.1.** Upstream now has its own SDL dma-buf scanout path (`52053b7e0a`, v10.1.0), so this is no longer "SDL has none" — it is the delta on top: create the window from the GL path, pass the real geometry, keep the EGL display per console instead of clobbering the global, and raise the guest's window once when it goes live. Ran on the RTX 4070 box; **the pixels themselves were only confirmed by eye** — see its header |
 | `0009-sdl2-grab-switches-the-guest-pointing-device.patch` | `ui/sdl2.c` | 0007 for SDL, where `SDL_SetRelativeMouseMode()` is a real Wayland pointer lock. Pointer lock was **reported working** on that box; the evtest that would prove it was never read — see its header |
 | `0010-kvm-retry-a-bare-KVM_RUN-EFAULT.patch` | `accel/kvm/kvm-all.c` | retries a bare `KVM_RUN` `EFAULT` for up to 3 s instead of killing the VM. An NVIDIA GPU mapping is `VM_IO\|VM_PFNMAP`, and `nv_fault()` returns `VM_FAULT_NOPAGE` **without installing a PTE** while the driver reinstates a revoked mapping; KVM turns that "come back later" into a fatal `EFAULT`. Measured clearing after **1465 ms** on the RTX 3050 laptop, which is why it looked permanent |
 | `0011-qapi-ui-add-the-nvkvm-broker-display-type.patch` | `qapi/ui.json` | adds `-display nvkvm-broker,socket=PATH`: the display, the input grab and the compositor connection move into a separate privileged process (`src/broker/`) and QEMU keeps one unix socket. Gated on `CONFIG_LINUX` |
@@ -43,6 +47,21 @@ to submit it to qemu-devel. If you find it merged upstream, or you bump to a
 QEMU that already has it, **delete the patch** — do not forward-port it. There
 is nothing nvkvm-specific left in it once upstream has the fix. This is the one
 with a clear path out, and it is worth actually sending.
+
+> Checked at the 11.1.1 bump (2026-08-27): **still not fixed upstream.**
+> `qemu_console_lookup_by_device()` in `ui/console.c` is unchanged from 9.2 —
+> it still reads `"device"` and `"head"` with `&error_abort` for every console
+> in the list, including text ones. So the patch was carried, not dropped. It
+> is still worth sending.
+
+**`0008` is the one the bump actually changed.** Upstream landed
+`52053b7e0a ui/sdl2: Implement dpy dmabuf functions` (first released in
+v10.1.0), which is the same three `dpy_gl_*_dmabuf` callbacks this patch used
+to add from scratch. Everything redundant was deleted — the `dcl_gl_ops` table
+is now byte-identical to upstream's — and what remains is the delta upstream
+still does not have: window creation on the scanout path, the real dma-buf
+geometry, the per-console `EGLDisplay`, and the window raise. The patch header
+lists it item by item.
 
 `0003` is not upstreamable as written: it resolves the symbol rather than
 checking for `EXT_EGL_image_storage` properly, and has only been tested against
@@ -123,17 +142,47 @@ already-applied test for each patch so a re-run is a no-op.
 `0005`–`0007` only touch files that are compiled when QEMU is configured
 `--enable-gtk`, and `0008`–`0009` only files compiled when it is configured
 `--enable-sdl` (both come from `NVKVM_QEMU_UI=1`). The default headless build
-applies all five and never compiles a line of them.
+applies all five of those and never compiles a line of them.
 
 ## Regenerating them after a QEMU version bump
 
+The 9.2.0 → 11.1.1 bump did it this way, and it worked better than `git am`
+(which needs every patch to carry a mail header — `0010` did not until that
+bump gave it one). Clone with **full history**, not `--depth=1`: proving that a
+patch can be dropped means citing the upstream commit that replaced it, and you
+cannot `git log -S` a shallow tree.
+
 ```bash
-git clone --depth=1 --branch vX.Y.Z https://gitlab.com/qemu-project/qemu.git /tmp/qemu-next
+git clone --filter=blob:none https://gitlab.com/qemu-project/qemu.git /tmp/qemu-next
 cd /tmp/qemu-next
-git checkout -b nvkvm-X.Y
-git am /path/to/nvkvm/patches/*.patch    # fix conflicts, keep the messages
-git format-patch --no-signature --zero-commit -o /path/to/nvkvm/patches vX.Y.Z..HEAD
+
+# 1. Reconstruct the series as commits on the OLD tag, so git's 3-way merge
+#    has something to rebase.  One commit per patch file, in order.
+git checkout -b nvkvm-old vOLD
+for f in /path/to/nvkvm/patches/0*.patch; do
+    git apply "$f" && git add -A && git commit -q -m "$(basename "$f")"
+done
+
+# 2. Rebase onto the new tag and resolve.
+git rebase vNEW
+
+# 3. Regenerate.
+git format-patch --no-signature --zero-commit -o /tmp/newpatches vNEW..HEAD
 ```
 
 Then rename the generated files back to the short names used here, and update
 `QEMU_VERSION` in `scripts/build_qemu.sh`.
+
+**A patch applying cleanly is not the same as it still being needed.** For each
+one, check whether upstream has since fixed the thing it works around — a
+3-way merge will happily re-add a hunk next to upstream's own fix and give you
+two of everything, which is exactly what `0008` did on this bump (duplicate
+function definitions that the textual merge reported as success). Build with
+`NVKVM_QEMU_UI=1` after any bump, or `0005`–`0009` are never compiled and you
+will not find out.
+
+Do **not** forget `src/qemu/` and `src/common/`: those files are copied into
+`hw/misc/`, not patched in, so nothing checks them against the new tree until
+the compiler does. The 11.1 bump needed one change there —
+`nvkvm_display_relay.c` included `sysemu/runstate.h`, and upstream renamed
+`include/sysemu/` to `include/system/` in 10.0.
