@@ -49,7 +49,7 @@
 #include <cpuid.h>
 #endif
 
-#include "hw/boards.h"      /* current_machine->ram_size / maxram_size */
+#include "hw/core/boards.h"      /* current_machine->ram_size / maxram_size */
 #include "hw/core/cpu.h"    /* first_cpu                               */
 #include "qom/object.h"     /* object_property_get_uint("phys-bits")   */
 

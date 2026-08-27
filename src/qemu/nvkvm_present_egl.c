@@ -27,7 +27,7 @@
 #include "ui/dmabuf.h"
 #include "qapi/error.h"
 #include "qemu/main-loop.h"
-#include "hw/qdev-core.h"
+#include "hw/core/qdev.h"
 #include "nvkvm_log.h"
 #include "nvkvm_udmabuf.h"
 

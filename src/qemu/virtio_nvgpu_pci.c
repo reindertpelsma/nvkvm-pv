@@ -11,9 +11,9 @@
 
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio-pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci.h"
-#include "exec/memory.h"
+#include "system/memory.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qom/object.h"

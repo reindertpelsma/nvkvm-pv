@@ -32,18 +32,18 @@
 
 #include "qemu/osdep.h"
 #include "hw/virtio/virtio.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/pci/pci.h"          /* nvkvm-gpu PCI identity device */
 #include "hw/pci/pci_device.h"
-#include "hw/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
+#include "hw/core/boards.h"   /* current_machine->ram_size (#55 GPA-overlap guard) */
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
 #include "qemu/main-loop.h"
 #include "block/thread-pool.h"
-#include "block/aio.h"
-#include "exec/memory.h"
-#include "exec/address-spaces.h"
+#include "qemu/aio.h"
+#include "system/memory.h"
+#include "system/address-spaces.h"
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>

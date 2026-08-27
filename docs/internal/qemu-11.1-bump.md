@@ -184,11 +184,38 @@ and the NULL-window guard in `scanout_flush()`.
 The nvkvm device is **copied** into `hw/misc/`, not patched in, so nothing
 validates it against the new tree until the compiler does.
 
-* `src/qemu/nvkvm_display_relay.c` — `#include "sysemu/runstate.h"` →
-  `"system/runstate.h"`. Upstream renamed `include/sysemu/` to
-  `include/system/` in 10.0 and `include/sysemu/` does not exist at all in
-  11.1.1. (The file's own comment had predicted this.) No other file under
-  `src/` referenced `sysemu/` outside a comment.
+**Upstream moved a lot of headers between 10.0 and 11.1**, and every one of
+these is a hard compile error that only appears at step 8 of the build, roughly
+twenty minutes in:
+
+| was (9.2) | is (11.1.1) | files |
+|---|---|---|
+| `sysemu/runstate.h` | `system/runstate.h` | `nvkvm_display_relay.c` |
+| `hw/qdev-core.h` | `hw/core/qdev.h` (upstream `d1000ecae2`) | `nvkvm_present_egl.c` |
+| `hw/qdev-properties.h` | `hw/core/qdev-properties.h` | `virtio_nvgpu.c`, `virtio_nvgpu_pci.c` |
+| `hw/boards.h` | `hw/core/boards.h` | `virtio_nvgpu.c`, `nvkvm_mmap_host.c` |
+| `block/aio.h` | `qemu/aio.h` | `virtio_nvgpu.c` |
+| `exec/memory.h` | `system/memory.h` | `virtio_nvgpu.c`, `virtio_nvgpu_pci.c` |
+| `exec/address-spaces.h` | `system/address-spaces.h` | `virtio_nvgpu.c` |
+
+Note `hw/qdev-core.h` is not merely moved, it is **renamed**: there is no
+`qdev-core.h` anywhere in 11.1.1.
+
+Finding them one build failure at a time is a bad trade at ~20 minutes a
+cycle. The whole set was found in one pass by listing every `#include "..."`
+in `src/qemu/`, `src/common/` and `src/abi/` and resolving each against
+`git ls-tree -r v11.1.1`, with `include/` as the search prefix — worth
+repeating verbatim on the next bump, before building anything:
+
+```bash
+git -C <qemu> ls-tree -r --name-only vNEW > /tmp/tree.txt
+grep -rhoE '#include "[a-z0-9_/-]+\.h"' src/qemu src/common src/abi |
+  sed 's/.*"\(.*\)"/\1/' | sort -u |
+  while read h; do grep -qE "^(include/)?$h$" /tmp/tree.txt || echo "MISSING: $h"; done
+```
+
+(`qapi/qapi-commands-ui.h` shows up as missing and is a false positive — QAPI
+headers are generated into the build directory, not the source tree.)
 
 * `scripts/build_qemu.sh` —
   * `QEMU_VERSION="9.2.0"` → `"11.1.1"`;
