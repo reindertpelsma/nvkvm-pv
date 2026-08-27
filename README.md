@@ -551,9 +551,7 @@ cell is bimodal where the host's is not: across 40 samples the guest's best run
 mode, so the median lands at 0.52x. It is a mode, not a ceiling. Cause not
 established — the guest carries a long launch+sync tail (p99 38–54 us against
 6.6–8.6) and whether that tail *causes* the slow mode is assumed, not shown.
-What has been ruled out (forwarder serialisation under N-way load, a different
-NCCL algorithm, channel count, CUDA graph capture failure) and the measurement
-that would settle the tail question are in
+What has been ruled out, and the measurement that would settle it, are in
 [the full writeup](docs/reference/parity.md#tp124-scaling-and-the-one-cell-that-does-not-fit).
 
 Separately, on six RTX A4000s a 38 GB model that fits on none of them serves at
