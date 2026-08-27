@@ -518,6 +518,40 @@ the new ≤70-character doc-line rule) and produced a real display backend.
 `gtk` and `sdl` being present is what makes `0005`–`0009` compiled code rather
 than untested patch text.
 
+**Beyond "it linked" — the patched code paths actually execute.** Three checks
+run on a machine with no NVIDIA driver at all, which is exactly what makes the
+failures informative:
+
+```
+$ qemu-system-x86_64 -display nvkvm-broker -machine none
+qemu-system-x86_64: -display nvkvm-broker: Parameter 'socket' is missing
+```
+
+That message comes from the generated QAPI visitor for `DisplayNvkvmBroker`, so
+`0011`'s schema is not merely present in `--help` text — it is being enforced.
+
+```
+$ qemu-system-x86_64 -display nvkvm-broker,socket=/tmp/no-such-socket -machine none
+   (blocks, then killed by timeout)
+```
+
+The relay backend from `0012` was instantiated and went on to attempt the
+connect; it is reached, not skipped.
+
+```
+$ qemu-system-x86_64 -machine q35 -device virtio-nvgpu-pci-non-transitional,id=nvkvm0 ...
+{"QMP": {"version": {"qemu": {"micro": 1, "minor": 1, "major": 11}, ...}}}
+qemu-system-x86_64: -device virtio-nvgpu-pci-non-transitional,id=nvkvm0:
+    nvkvm: cannot open /dev/nvidiactl on host: No such file or directory
+```
+
+The device realizes under 11.1.1 and runs far enough into
+`virtio_nvgpu_device_realize()` to try to open the GPU — the *correct* failure
+on a driverless host. That exercises the ported `class_init`, the rewritten
+property array and `device_class_set_props()`, and the qdev/QOM changes, at run
+time rather than at compile time. What it does **not** show is anything past
+the driver open; that is what the hardware run below is for.
+
 **Unit tests.** `bash tests/unit/run_tests.sh` — all 16 suites built and ran,
 no failures, and the `test_isolate` known-failing set came back with none
 failing:
