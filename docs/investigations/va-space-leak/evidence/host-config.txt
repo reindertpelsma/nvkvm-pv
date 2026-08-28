@@ -1,0 +1,53 @@
+
+==============NVSMI LOG==============
+
+Timestamp                                              : Fri Aug 28 18:57:42 2026
+Driver Version                                         : 595.84
+CUDA Version                                           : 13.2
+
+Attached GPUs                                          : 1
+GPU 00000000:01:00.0
+    Product Name                                       : NVIDIA GeForce RTX 4070
+    Product Brand                                      : GeForce
+    Product Architecture                               : Ada Lovelace
+    Display Mode                                       : Requested functionality has been deprecated
+    Display Attached                                   : Yes
+    Display Active                                     : Enabled
+    Persistence Mode                                   : Disabled
+    Addressing Mode                                    : HMM
+    MIG Mode
+        Current                                        : N/A
+        Pending                                        : N/A
+    Accounting Mode                                    : Disabled
+    Accounting Mode Buffer Size                        : 4000
+    Driver Model
+        Current                                        : N/A
+        Pending                                        : N/A
+    Serial Number                                      : N/A
+    GPU UUID                                           : GPU-66e52545-2112-d450-dc8e-cb07d6f31d6c
+    GPU PDI                                            : 0x3e7fae96a4a0fcc2
+    Minor Number                                       : 0
+    VBIOS Version                                      : 95.04.3E.08.BE
+===
+NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  595.84  Release Build  (dvs-builder@U22-I3-AM25-26-2)  Wed Jun 10 21:06:37 UTC 2026
+GCC version:  gcc version 15.2.0 (Ubuntu 15.2.0-16ubuntu1) 
+===
+nvidia_uvm           2088960  60
+nvidia_drm            147456  38
+nvidia_modeset       1789952  31 nvidia_drm
+nvidia              15110144  681 nvidia_uvm,nvidia_modeset
+drm_ttm_helper         20480  2 amdgpu,nvidia_drm
+video                  77824  2 amdgpu,nvidia_modeset
+===
+/etc/vulkan/icd.d/:
+
+/etc/vulkan/implicit_layer.d/:
+=== CDI ===
+total 24
+drwxr-xr-x  2 root root    60 Aug 28 18:24 .
+drwxr-xr-x 48 root root  1240 Aug 28 18:24 ..
+-rw-r--r--  1 root root 23176 Aug 28 18:24 nvidia.yaml
+=== kata ===
+/opt/kata
+/opt/qemu-nvkvm-kata
+inactive
