@@ -57,6 +57,87 @@ static struct nvkvm_iso_mmap_entry iso_mmap_tbl[NVKVM_ISO_MMAP_MAX];
 static uint32_t iso_mmap_seq = 1;
 static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── rate-limited control-denial reporting ─────────────────────────────────
+ *
+ * A denial is per-ioctl, and a guest that probes a refused control from inside
+ * its render loop produces one every frame: measured ~10 per second on SteamOS,
+ * which buries every other line in the log.
+ *
+ * Rate-limit PER COMMAND rather than globally, because the security signal here
+ * is WHICH surface was refused, not how often.  The first denial of each
+ * distinct command always prints, so nothing is ever silently swallowed; after
+ * that the same command prints once per 1024, carrying its running count.
+ * NVKVM_DEBUG restores every line.
+ *
+ * Callable from any isolate thread, hence the lock.  A duplicated line under a
+ * race would be harmless, but a torn `nseen` would index off the end.
+ */
+#define NVKVM_DENY_SEEN_MAX  32
+#define NVKVM_DENY_EVERY     1024
+
+static pthread_mutex_t deny_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void nvkvm_ctrl_deny_log(uint32_t cc)
+{
+	static struct { uint32_t cmd; uint64_t n; } seen[NVKVM_DENY_SEEN_MAX];
+	static unsigned nseen;
+	static uint64_t overflow;
+	uint64_t count = 0;
+	bool report = false, over = false;
+	unsigned i;
+
+	if (nvkvm_debug_enabled) {
+		fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
+			"(not in allowlist / oversize)\n", cc);
+		return;
+	}
+
+	pthread_mutex_lock(&deny_log_lock);
+	for (i = 0; i < nseen; i++) {
+		if (seen[i].cmd == cc) {
+			break;
+		}
+	}
+	if (i == nseen) {
+		if (nseen < NVKVM_DENY_SEEN_MAX) {
+			seen[nseen].cmd = cc;
+			seen[nseen].n   = 0;
+			nseen++;
+		} else {
+			/* More distinct refused commands than the table holds.
+			 * Count them together rather than falling back to a line
+			 * each, which would reinstate the flood this prevents. */
+			overflow++;
+			over   = (overflow == 1 || (overflow % NVKVM_DENY_EVERY) == 0);
+			count  = overflow;
+			pthread_mutex_unlock(&deny_log_lock);
+			if (over) {
+				fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x and "
+					"others beyond the first %d distinct "
+					"(%llu more denials)\n", cc,
+					NVKVM_DENY_SEEN_MAX,
+					(unsigned long long)count);
+			}
+			return;
+		}
+	}
+	seen[i].n++;
+	count  = seen[i].n;
+	report = (count == 1 || (count % NVKVM_DENY_EVERY) == 0);
+	pthread_mutex_unlock(&deny_log_lock);
+
+	if (report) {
+		if (count == 1) {
+			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
+				"(not in allowlist / oversize)\n", cc);
+		} else {
+			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
+				"(not in allowlist / oversize; %llu times)\n",
+				cc, (unsigned long long)count);
+		}
+	}
+}
+
 /* ── U-9: the host side of the isolate's guest-mapping window ──────────────
  *
  * The stub reserves one PROT_NONE MAP_NORESERVE region before it maps
@@ -3107,8 +3188,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		if (param_buf && req->param_size >= 12)
 			memcpy(&cc, (char *)param_buf + 8, 4);
 		if (!nvkvm_ctrl_cmd_allowed(cc) || req->aux_size > (1u << 20)) {
-			fprintf(stderr, "nvkvm: DENY ctrl cmd 0x%08x "
-				"(not in allowlist / oversize)\n", cc);
+			nvkvm_ctrl_deny_log(cc);
 			/* As above: RM answers an unsupported control with a
 			 * successful ioctl carrying NV_ERR_NOT_SUPPORTED, not
 			 * with a failed ioctl.  The command is still never
