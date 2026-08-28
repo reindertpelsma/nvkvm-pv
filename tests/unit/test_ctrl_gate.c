@@ -52,6 +52,74 @@ int main(void)
 	printf("  ok   %u unlisted commands denied\n",
 	       (unsigned)(sizeof(denied) / sizeof(denied[0])));
 
+	/* ── gamescope scheduling controls (2026-08-28) ──────────────────
+	 *
+	 * SteamOS's gamescope session issues five controls while configuring
+	 * interleaved/realtime runlist scheduling.  One is unprivileged in
+	 * OGKM and is forwarded; four are privileged on ALL 216 supported
+	 * tags (NVOC accessRight = 0x2 = RS_ACCESS_NICE, which resolves to
+	 * capable(CAP_SYS_NICE)) and are answered NV_OK without ever being
+	 * forwarded.  These assertions pin that split so it cannot silently
+	 * become "allowed" later.  See
+	 * docs/reference/gamescope-scheduling-controls.md.
+	 */
+	assert(nvkvm_ctrl_cmd_allowed(0x20801109u));   /* FIFO_GET_INFO      */
+	assert(!nvkvm_ctrl_cmd_noop(0x20801109u));     /* ...really forwarded*/
+	printf("  ok   FIFO_GET_INFO (0x20801109) is forwarded, not no-op'd\n");
+
+	static const uint32_t noop_cmds[] = {
+		0x20801115u,   /* FIFO_RUNLIST_SET_SCHED_POLICY */
+		0xa06f0111u,   /* RESTART_RUNLIST               */
+		0xa06f0109u,   /* SET_INTERLEAVE_LEVEL          */
+		0xa06c0110u,   /* MAKE_REALTIME                 */
+	};
+	for (unsigned i = 0; i < sizeof(noop_cmds) / sizeof(noop_cmds[0]); i++) {
+		/* Answered locally... */
+		if (!nvkvm_ctrl_cmd_noop(noop_cmds[i])) {
+			printf("  FAIL cmd 0x%08x is not no-op'd\n", noop_cmds[i]);
+			return 1;
+		}
+		/* ...and NEVER forwardable.  This is the assertion that
+		 * matters: a privileged command must not reach the driver, so
+		 * the no-op set and the allowlist must stay disjoint. */
+		if (nvkvm_ctrl_cmd_allowed(noop_cmds[i])) {
+			printf("  FAIL cmd 0x%08x is ALLOWED (must be no-op "
+			       "only -- it needs CAP_SYS_NICE on bare metal)\n",
+			       noop_cmds[i]);
+			return 1;
+		}
+	}
+	printf("  ok   %u privileged scheduling cmds no-op'd and not allowed\n",
+	       (unsigned)(sizeof(noop_cmds) / sizeof(noop_cmds[0])));
+
+	/* The two sets must be disjoint in general, not just for the four
+	 * above: a future edit that adds a no-op cmd to the allowlist table
+	 * would silently start forwarding it. */
+	for (unsigned i = 0; i < NVKVM_CTRL_NOOP_N; i++) {
+		if (nvkvm_ctrl_cmd_allowed(nvkvm_ctrl_noop[i])) {
+			printf("  FAIL no-op cmd 0x%08x is also allowlisted\n",
+			       nvkvm_ctrl_noop[i]);
+			return 1;
+		}
+	}
+	printf("  ok   no-op set and allowlist are disjoint (%u no-op entries)\n",
+	       (unsigned)NVKVM_CTRL_NOOP_N);
+
+	/* The readback commands that would expose the lie stay denied. */
+	assert(!nvkvm_ctrl_cmd_allowed(0xa06c0108u));  /* GET_INTERLEAVE_LEVEL */
+	assert(!nvkvm_ctrl_cmd_allowed(0xa06f0110u));  /* GET_INTERLEAVE_LEVEL */
+	assert(!nvkvm_ctrl_cmd_noop(0xa06c0108u));
+	assert(!nvkvm_ctrl_cmd_noop(0xa06f0110u));
+	printf("  ok   GET_INTERLEAVE_LEVEL readbacks stay denied\n");
+
+	/* Nothing else may be no-op'd -- the mechanism is a lie to the guest
+	 * and its blast radius is exactly these four commands. */
+	assert(!nvkvm_ctrl_cmd_noop(0x00000000u));
+	assert(!nvkvm_ctrl_cmd_noop(0xa06c0101u));   /* a real allowed sibling */
+	assert(!nvkvm_ctrl_cmd_noop(0x00008000u));   /* GSS-legacy mask        */
+	assert(NVKVM_CTRL_NOOP_N == 4);
+	printf("  ok   no-op set is exactly the 4 audited commands\n");
+
 	printf("test_ctrl_gate: PASS\n");
 	return 0;
 }

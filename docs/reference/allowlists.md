@@ -209,8 +209,8 @@ but not via `NV_ESC_RM_ALLOC`, which is where this gate sits.)
 
 ## 8. RM control-command allowlist
 
-`src/qemu/nvkvm_ctrl_allowlist.h:28-240`, checked at
-`src/qemu/nvkvm_isolate_handlers.c:1758-1771`. **166 entries**, plus two
+`src/qemu/nvkvm_ctrl_allowlist.h`, checked in
+`src/qemu/nvkvm_isolate_handlers.c`. **167 entries**, plus two
 rule-based passthroughs implemented in code rather than the table
 (`src/qemu/nvkvm_isolate_handlers.c:822-827`):
 
@@ -246,6 +246,41 @@ no embedded pointers, and the identical command under its older class id
 
 That is the expected failure mode when moving to an unexercised driver branch:
 not a crash, a `DENY` line and a CUDA error code.
+
+### The one thing this table cannot express: answered-but-not-forwarded
+
+Beside the allowlist, and deliberately disjoint from it, sits a second and much
+smaller table: `nvkvm_ctrl_noop[]`, four commands QEMU answers `NV_OK` itself
+and **never forwards**. The allowlist means exactly one thing — "may be
+forwarded to the host driver" — so a command that must not be forwarded cannot
+be expressed in it, however benign the answer is.
+
+The four are SteamOS gamescope's runlist-scheduling controls
+(`SET_SCHED_POLICY`, `RESTART_RUNLIST`, `SET_INTERLEAVE_LEVEL`,
+`MAKE_REALTIME`). They are privileged in OGKM on **all 216 supported tags** —
+their NVOC export entries carry `accessRight = 0x2`, which is a one-limb access
+mask selecting `RS_ACCESS_NICE`, i.e. `capable(CAP_SYS_NICE)` — so they can
+never be allowlisted. But they only set scheduling *priority*, so answering
+them with a lie preserves correctness and costs compositing latency alone.
+
+Two things about that entry are worth carrying over to any similar decision:
+
+- **`RMCTRL_FLAGS` is not the privilege test.** All four carry
+  `RMCTRL_FLAGS_NON_PRIVILEGED` and none carries `RMCTRL_FLAGS_PRIVILEGED`. The
+  gate is the adjacent `accessRight` field, which is memcpy'd straight into
+  `rightsRequired.limbs[0]` and is therefore a *mask*, not an index
+  (`src/nvidia/src/kernel/rmapi/resource.c:170-175`). Reading the flags word
+  alone would have allowed all four.
+- **The already-allowed siblings are precedent for the opposite conclusion.**
+  `0xa06c0101`/`0103`/`0105` and `0xa06f0103`/`0104` are all `accessRight = 0x0`
+  on all 216 tags. This table has never contained a command requiring an access
+  right, and `SET_TIMESLICE` (`0xa06c0103`, free) versus `SET_INTERLEAVE_LEVEL`
+  (privileged) is exactly where NVIDIA draws the line: how long *your* channel
+  runs is yours, where you sit relative to everyone else is not.
+
+Full verdict, the per-tag evidence, what the lie costs and the strongest
+argument against it:
+[`gamescope-scheduling-controls.md`](gamescope-scheduling-controls.md).
 
 ## 9. Per-VM RM client allowlist
 
