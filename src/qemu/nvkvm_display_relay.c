@@ -71,6 +71,17 @@
 
 #include "nvkvm_display_relay.h"
 #include "nvkvm_inc/nvkvm_broker_proto.h"
+/*
+ * Declared here rather than by including virtio_nvgpu.h.  That header is
+ * harmless in itself -- no GL, no EGL -- but this file is deliberately outside
+ * the OpenGL gate and deliberately light on QEMU device internals (see the
+ * banner in nvkvm_display_relay.h), and one forwarding function does not
+ * justify pulling in the whole device definition and its include-path
+ * assumptions.  The signature is checked against the definition by the compiler
+ * at link time and by tests/qemu_syntax_check.sh at parse time.
+ */
+void nvkvm_virtio_push_buf_release(struct VirtIONvgpu *nv, uint32_t isolate_id,
+                                   uint32_t stub_handle);
 
 /* Always-visible, like the rest of the present path: these lines are how a
  * user finds out why their screen is black. */
@@ -94,6 +105,100 @@ typedef enum RelayConnState {
     RELAY_CONN_SYNC_COMMIT,
     RELAY_CONN_ACTIVE,
 } RelayConnState;
+
+/* NVKVM_RELAY_BUFMAP_BEGIN -- extracted by test_relay_bufmap. */
+/*
+ * THE ONE TRANSLATION THE RELEASE PATH NEEDS.
+ *
+ * A host dma-buf inode (what the broker calls a buffer) to the (isolate, stub
+ * GEM handle) pair the guest called the same buffer when it presented it.
+ *
+ * Small and fixed: a scanout ring is two or three buffers, occasionally a few
+ * more across a mode change, and a table that cannot allocate cannot fail in
+ * the middle of a frame.  Sixteen is roughly five times the largest ring
+ * anything has been observed to use, and eviction is least-recently-noted, so
+ * the buffers currently being cycled are exactly the ones that survive.
+ *
+ * A miss is not an error and must not be treated as one: the readback tier
+ * submits a VMM-owned LINEAR udmabuf that no guest bo corresponds to, and its
+ * releases legitimately translate to nothing.
+ */
+#define RELAY_BUFMAP_SLOTS 16
+
+typedef struct RelayBufMap {
+    struct {
+        uint64_t id;            /* host dma-buf inode; 0 means the slot is free */
+        uint64_t stamp;         /* monotonic note counter, for LRU eviction     */
+        uint32_t isolate_id;
+        uint32_t stub_handle;
+    } e[RELAY_BUFMAP_SLOTS];
+    uint64_t clock;
+} RelayBufMap;
+
+static void relay_bufmap_reset(RelayBufMap *m)
+{
+    memset(m, 0, sizeof(*m));
+}
+
+/* Record (or refresh) the translation for one presented buffer. */
+static void relay_bufmap_note(RelayBufMap *m, uint64_t id,
+                              uint32_t isolate_id, uint32_t stub_handle)
+{
+    unsigned i, victim = 0;
+    uint64_t oldest;
+
+    if (id == 0 || stub_handle == 0) {
+        return;             /* nothing nameable on one side or the other */
+    }
+    m->clock++;
+    for (i = 0; i < RELAY_BUFMAP_SLOTS; i++) {
+        if (m->e[i].id == id) {
+            m->e[i].isolate_id  = isolate_id;
+            m->e[i].stub_handle = stub_handle;
+            m->e[i].stamp       = m->clock;
+            return;
+        }
+    }
+    /* Free slot first, then the least recently noted. */
+    oldest = m->e[0].stamp;
+    for (i = 0; i < RELAY_BUFMAP_SLOTS; i++) {
+        if (m->e[i].id == 0) {
+            victim = i;
+            goto place;
+        }
+        if (m->e[i].stamp < oldest) {
+            oldest = m->e[i].stamp;
+            victim = i;
+        }
+    }
+place:
+    m->e[victim].id          = id;
+    m->e[victim].isolate_id  = isolate_id;
+    m->e[victim].stub_handle = stub_handle;
+    m->e[victim].stamp       = m->clock;
+}
+
+/* Returns false when this id names nothing the guest owns -- see the readback
+ * note above.  Does NOT remove the entry: the same bo is presented again and
+ * again, and forgetting it here would cost a translation every other frame. */
+static bool relay_bufmap_lookup(const RelayBufMap *m, uint64_t id,
+                                uint32_t *isolate_id, uint32_t *stub_handle)
+{
+    unsigned i;
+
+    if (id == 0) {
+        return false;
+    }
+    for (i = 0; i < RELAY_BUFMAP_SLOTS; i++) {
+        if (m->e[i].id == id) {
+            *isolate_id  = m->e[i].isolate_id;
+            *stub_handle = m->e[i].stub_handle;
+            return true;
+        }
+    }
+    return false;
+}
+/* NVKVM_RELAY_BUFMAP_END */
 
 typedef struct NvkvmRelay {
     int         sock;           /* the broker connection, or -1               */
@@ -207,6 +312,30 @@ typedef struct NvkvmRelay {
     bool        powerdown_pending;
     time_t      powerdown_at;
     unsigned    powerdown_asks;
+    /*
+     * BACKPRESSURE: WHICH GUEST BO IS THE HOST STILL READING?
+     *
+     * The broker names a buffer by its host dma-buf INODE, which is the only
+     * name it has -- it never sees a guest.  The guest names the same buffer by
+     * (isolate, stub GEM handle), which is the only name IT has.  This table is
+     * the translation, and it is the whole reason EV_RELEASE can be forwarded
+     * without inventing a new identifier on the wire.
+     *
+     * VM state, not connection state -- deliberately NOT cleared by
+     * relay_connection_state_reset().  The ids are inodes of descriptors THIS
+     * process holds, so they mean the same thing to the next broker as to the
+     * last one, and a reconnect replays the retained frame with an ATTACH that
+     * never passes back through the present path: clearing here would leave
+     * that frame's release untranslatable for no gain.
+     *
+     * Inode reuse cannot mistranslate: the broker only ever releases a buffer
+     * it was ATTACHed, every ATTACH from the present path is preceded by the
+     * note below, and the note overwrites the entry.  So a lookup always names
+     * the bo that is actually behind that inode now.
+     */
+    struct VirtIONvgpu *nv;     /* set on the first noted present; for VQ_EVT */
+    RelayBufMap bufmap;
+    uint64_t    n_release_fwd, n_release_unmapped;
     uint64_t    n_sent, n_dropped;
     /* ATTACHed but the COMMIT could not be written.  A distinct failure from
      * n_dropped -- see the comment at the counter's only increment. */
@@ -441,11 +570,22 @@ static void relay_drop(NvkvmRelay *r, const char *why)
     }
     relay_close_connection(r);
     relay_forget_format_verdict(r);
+    /*
+     * The two release counters are here because this is the moment someone
+     * reads the line.  `forwarded` at roughly the frame count is the healthy
+     * shape; forwarded == 0 with a nonzero untranslated count means the display
+     * was showing buffers of OURS (the readback tier) and the guest's
+     * backpressure correctly never armed -- not that the release path is
+     * broken.
+     */
     error_report("nvkvm-broker: %s; the display and input are gone for now "
                  "(%" PRIu64 " frames relayed, %" PRIu64 " dropped, "
-                 "%" PRIu64 " attached without a commit). "
+                 "%" PRIu64 " attached without a commit, "
+                 "%" PRIu64 " buffer releases forwarded to the guest, "
+                 "%" PRIu64 " naming no guest buffer). "
                  "The VM keeps running; reconnecting in the background.",
-                 why, r->n_sent, r->n_dropped, r->n_uncommitted);
+                 why, r->n_sent, r->n_dropped, r->n_uncommitted,
+                 r->n_release_fwd, r->n_release_unmapped);
     r->retry_ms = RELAY_RETRY_MIN_MS;
     r->retry_logged = false;
     relay_schedule_retry(r);
@@ -502,6 +642,41 @@ int nvkvm_display_relay_format_verdict(uint32_t fourcc, uint64_t modifier)
         }
     }
     return -1;
+}
+
+/*
+ * "The bo about to be submitted is the guest's (isolate_id, stub_handle)."
+ *
+ * Separate from the submit call, and called only from the ZERO-COPY branch of
+ * the present path, on purpose.  The readback tier submits a VMM-owned LINEAR
+ * udmabuf instead; the host compositor never touches the guest's bo there, so
+ * there is nothing to translate and nothing for the guest to wait on.  Leaving
+ * that tier out of the table is what makes the guest-side mechanism stay
+ * disarmed for it (it arms on the first release that arrives, and none does),
+ * rather than relying on a timeout to discover the same thing.
+ *
+ * The inode is read here rather than remembered from the export because this
+ * is the fd that is actually handed to the broker, and the broker's id is
+ * defined as that fd's inode.  An fstat that fails simply means no translation
+ * for this frame: a missed release, which costs one deferred flip in the guest.
+ */
+void nvkvm_display_relay_note_present(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t isolate_id,
+                                      uint32_t stub_handle)
+{
+    NvkvmRelay *r = nvkvm_relay;
+    struct stat st;
+
+    if (!r || dmabuf_fd < 0) {
+        return;
+    }
+    assert(bql_locked());
+    r->nv = nv;
+    if (fstat(dmabuf_fd, &st) != 0) {
+        return;
+    }
+    relay_bufmap_note(&r->bufmap, (uint64_t)st.st_ino, isolate_id,
+                      stub_handle);
 }
 
 bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
@@ -874,16 +1049,45 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
         }
         break;
     case NVKVM_BROKER_EV_FRAME:
-    case NVKVM_BROKER_EV_RELEASE:
         /*
-         * Pacing and buffer-release.  Nothing to do here: nvkvm's present path
-         * is GUEST-driven — a frame reaches us because the guest flipped it,
-         * not because QEMU asked for one — and the guest recycles its own
-         * scanout bos.  They are carried on the wire so a future consumer
-         * (a paced capture path, or an fd cache keyed on the released buffer)
-         * has them without a protocol change.
+         * Pacing.  Nothing to do here: nvkvm's present path is GUEST-driven —
+         * a frame reaches us because the guest flipped it, not because QEMU
+         * asked for one.  Carried on the wire so a future paced capture path
+         * has it without a protocol change.
          */
         break;
+    case NVKVM_BROKER_EV_RELEASE: {
+        /*
+         * THE HOST COMPOSITOR IS DONE WITH A BUFFER, AND THE GUEST MUST HEAR IT.
+         *
+         * This used to fall through to `break` with a comment arguing that the
+         * guest recycles its own scanout bos and so needs nothing from us.  The
+         * reasoning was right about the guest's own accounting and wrong about
+         * the population: the host compositor is a SECOND consumer of the same
+         * buffer, with a lifetime the guest cannot observe.  When it stalls, the
+         * guest — whose page flips complete off a software vblank timer with no
+         * other input — cycles its whole scanout ring and starts drawing into a
+         * buffer that is still on screen.  The broker detects exactly that and
+         * says so ("REUSE-IN-FLIGHT", nb_session_wl.c); it cannot fix it,
+         * because it cannot stop the guest from drawing.  Only the guest can,
+         * and only if it is told.  So tell it.
+         *
+         * Translated, not forwarded raw: w0/w1 are a host dma-buf inode, which
+         * is not a name the guest has.  A miss is normal and silent-ish — the
+         * readback tier's buffers are ours, not the guest's — so it is counted
+         * rather than logged per frame.
+         */
+        uint64_t buf_id = (uint64_t)p->w0 | ((uint64_t)p->w1 << 32);
+        uint32_t iso = 0, gem = 0;
+
+        if (r->nv && relay_bufmap_lookup(&r->bufmap, buf_id, &iso, &gem)) {
+            r->n_release_fwd++;
+            nvkvm_virtio_push_buf_release(r->nv, iso, gem);
+        } else {
+            r->n_release_unmapped++;
+        }
+        break;
+    }
     case NVKVM_BROKER_EV_FORMAT: {
         /*
          * The question is echoed back, so the reply is matched to its slot by
@@ -1620,6 +1824,7 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
     }
 
     r = g_new0(NvkvmRelay, 1);
+    relay_bufmap_reset(&r->bufmap);
     r->sock = -1;
     r->conn_state = RELAY_CONN_DOWN;
     r->last_fd = -1;
@@ -1716,6 +1921,13 @@ bool nvkvm_display_relay_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     (void)nv; (void)dmabuf_fd; (void)width; (void)height;
     (void)stride; (void)fourcc; (void)modifier;
     return false;
+}
+
+void nvkvm_display_relay_note_present(struct VirtIONvgpu *nv, int dmabuf_fd,
+                                      uint32_t isolate_id,
+                                      uint32_t stub_handle)
+{
+    (void)nv; (void)dmabuf_fd; (void)isolate_id; (void)stub_handle;
 }
 
 #endif /* CONFIG_LINUX */

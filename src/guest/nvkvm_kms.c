@@ -95,6 +95,71 @@ static unsigned int nvkvm_kms_hz = NVKVM_KMS_HZ_DEFAULT;
 static unsigned int nvkvm_kms_max_w = NVKVM_KMS_MAX_W_DEFAULT;
 static unsigned int nvkvm_kms_max_h = NVKVM_KMS_MAX_H_DEFAULT;
 
+/*
+ * PRESENT BACKPRESSURE — how many vblank periods a page flip may be held back
+ * waiting for the host display to say it has finished with the buffer the flip
+ * is about to hand back to the compositor.  0 turns the whole mechanism off.
+ *
+ * WHY IT EXISTS.  This head completes page flips off a software vblank hrtimer
+ * (nvkvm_vblank_fn), vkms-style, slaved to the host's refresh.  That gives the
+ * right average cadence and NO feedback whatsoever from the buffers themselves,
+ * so a host compositor that stalls for a few frames -- and one that COMPOSITES
+ * rather than promoting the surface to a hardware plane holds each buffer
+ * longer -- lets the guest keep flipping on schedule until it laps its scanout
+ * ring and starts drawing into a buffer that is still being read.  The broker
+ * sees the far end of that and logs "REUSE-IN-FLIGHT"; it cannot fix it, since
+ * it cannot stop the guest from drawing.  This is the guest end.
+ *
+ * WHY IT IS SMALL, AND WHY IT IS A PARAMETER.  A guest that stutters is
+ * acceptable; a guest that STOPS is not, and every way this can go wrong ends
+ * in a flip that never completes.  So the wait is bounded in vblank periods,
+ * not in "until the host answers": at the default 2 the worst case a missing
+ * release can cost is two frames of latency on the flip it gates, after which
+ * the flip completes exactly as it does today.  The parameter is writable at
+ * runtime so an operator who does not like what it does can switch it off
+ * without rebooting the guest:
+ *
+ *     echo 0 > /sys/module/nvkvm_guest/parameters/kms_present_wait
+ */
+#define NVKVM_KMS_PRESENT_WAIT_DEFAULT 2u
+#define NVKVM_KMS_PRESENT_WAIT_MAX     8u
+static unsigned int nvkvm_kms_present_wait = NVKVM_KMS_PRESENT_WAIT_DEFAULT;
+
+/*
+ * How many guest scanout bos we remember as "the host may still be reading
+ * this".  A scanout ring is two or three buffers; eight is headroom across a
+ * mode change, and being a fixed array means this can never fail to record.
+ */
+#define NVKVM_KMS_BP_SLOTS   8
+
+/*
+ * Consecutive deadline expiries after which the head gives up on the host and
+ * returns to pure timer-driven flip completion.  It re-arms the moment a
+ * release actually arrives again.
+ *
+ * This is the disarm half of the safety property, and it is the one that covers
+ * the cases a per-flip timeout alone does not: the compositor exited, the window
+ * was unmapped, the broker disconnected, the present tier renegotiated to
+ * readback (where the host reads a buffer of QEMU's and the guest's bo is never
+ * held at all).  In every one of those the releases simply stop, and after four
+ * gated flips -- at the default wait, well under a tenth of a second in total --
+ * the head stops asking and behaves exactly as it did before this existed.
+ */
+#define NVKVM_KMS_BP_DISARM  4u
+
+/*
+ * AN ABSOLUTE CEILING ON THE WAIT, on top of the vblank-period one.
+ *
+ * The period is not a constant: kms_hz accepts anything down to
+ * NVKVM_KMS_HZ_MIN (1), and the host's refresh hint drives it too.  On a 1 Hz
+ * head "two vblank periods" is two SECONDS, which is not backpressure, it is a
+ * hang -- and it would be closing on the 10-second timeout the atomic helpers
+ * put on the previous commit's flip_done before they WARN.  So the deadline is
+ * whichever is smaller.  At any refresh anyone actually runs, the period bound
+ * is the one that binds and this never engages.
+ */
+#define NVKVM_KMS_BP_DEADLINE_MAX_NS  (250ULL * NSEC_PER_MSEC)
+
 module_param_named(kms_width, nvkvm_kms_w, uint, 0444);
 MODULE_PARM_DESC(kms_width, "virtual head width in pixels (default 1920)");
 module_param_named(kms_height, nvkvm_kms_h, uint, 0444);
@@ -107,6 +172,12 @@ MODULE_PARM_DESC(kms_max_width,
 module_param_named(kms_max_height, nvkvm_kms_max_h, uint, 0444);
 MODULE_PARM_DESC(kms_max_height,
 		 "largest height the head can ever be asked for (default 2160)");
+
+/* 0644, unlike the geometry parameters above: this one is a live safety valve,
+ * not a boot-time description of the head. */
+module_param_named(kms_present_wait, nvkvm_kms_present_wait, uint, 0644);
+MODULE_PARM_DESC(kms_present_wait,
+		 "vblank periods a page flip may wait for the host to release the buffer it hands back (0 = never wait, default 2)");
 
 /* The single registered virtual head.  Init keeps the constructed object in
  * ddev->dev_private; activate publishes it here only after drm_dev_register()
@@ -206,6 +277,48 @@ struct nvkvm_kms {
 	 */
 	unsigned int                    host_hz;
 
+	/*
+	 * PRESENT BACKPRESSURE.  All of it is protected by pending_lock except
+	 * the actual delivery of bp_event, which needs the CRTC's event_lock and
+	 * is therefore always done after dropping pending_lock -- see
+	 * nvkvm_bp_take_event()/nvkvm_bp_send().
+	 */
+	struct {
+		u32                     iso;   /* 0 means the slot is free */
+		u32                     gem;
+	}                               bp_inflight[NVKVM_KMS_BP_SLOTS];
+	unsigned int                    bp_next; /* round-robin overwrite cursor */
+	/*
+	 * ARMED ONLY BY EVIDENCE.  False until a release for one of our own bos
+	 * has actually arrived, and back to false after NVKVM_KMS_BP_DISARM
+	 * consecutive deadline expiries.  This is what makes "no broker at all"
+	 * (-display none, headless CI), "a VMM too old to send releases", and
+	 * "the readback tier, where the host never touches our buffer" cost
+	 * exactly nothing: no release ever arrives, so the head never gates a
+	 * single flip and behaves as it always did.
+	 */
+	bool                            bp_armed;
+	unsigned int                    bp_timeouts;
+	struct hrtimer                  bp_timer;
+	/*
+	 * ABSOLUTE, and stored rather than implied by the timer.  A release can
+	 * deliver an event while the deadline for it is still armed; the next
+	 * gated flip re-arms the same hrtimer, but a callback that was ALREADY
+	 * RUNNING and is blocked on pending_lock cannot be recalled, and it would
+	 * otherwise take the new event out early -- completing a flip nobody
+	 * waited for, wiping the in-flight set, and counting a timeout against a
+	 * host that had in fact just answered.  So the handler compares now
+	 * against this and re-arms instead when it has woken for a generation
+	 * that is already gone.
+	 */
+	ktime_t                         bp_deadline;
+	struct drm_pending_vblank_event *bp_event;
+	u32                             bp_wait_iso;
+	u32                             bp_wait_gem;
+	u64                             n_bp_gated;
+	u64                             n_bp_freed;
+	u64                             n_bp_timeout;
+
 	unsigned int                    cur_w;
 	unsigned int                    cur_h;
 	unsigned int                    pending_w;
@@ -213,6 +326,266 @@ struct nvkvm_kms {
 	bool                            active;
 	bool                            stopping;
 };
+
+/* ── Present backpressure helpers ─────────────────────────────────────────── */
+
+/* Is the host still holding this bo?  pending_lock held. */
+static bool nvkvm_bp_inflight(const struct nvkvm_kms *kms, u32 iso, u32 gem)
+{
+	unsigned int i;
+
+	for (i = 0; i < NVKVM_KMS_BP_SLOTS; i++)
+		if (kms->bp_inflight[i].gem == gem &&
+		    kms->bp_inflight[i].iso == iso)
+			return true;
+	return false;
+}
+
+/* Remember that the host has been handed this bo.  pending_lock held. */
+static void nvkvm_bp_track(struct nvkvm_kms *kms, u32 iso, u32 gem)
+{
+	unsigned int i;
+
+	if (!gem || nvkvm_bp_inflight(kms, iso, gem))
+		return;
+	for (i = 0; i < NVKVM_KMS_BP_SLOTS; i++) {
+		if (!kms->bp_inflight[i].gem) {
+			kms->bp_inflight[i].iso = iso;
+			kms->bp_inflight[i].gem = gem;
+			return;
+		}
+	}
+	/* Full.  Overwriting the oldest recorded entry is the right failure:
+	 * a ring deeper than the table means the entries we are dropping are
+	 * the ones least likely to still be held. */
+	i = kms->bp_next++ % NVKVM_KMS_BP_SLOTS;
+	kms->bp_inflight[i].iso = iso;
+	kms->bp_inflight[i].gem = gem;
+}
+
+/* pending_lock held. */
+static void nvkvm_bp_untrack(struct nvkvm_kms *kms, u32 iso, u32 gem)
+{
+	unsigned int i;
+
+	for (i = 0; i < NVKVM_KMS_BP_SLOTS; i++)
+		if (kms->bp_inflight[i].gem == gem &&
+		    kms->bp_inflight[i].iso == iso) {
+			kms->bp_inflight[i].iso = 0;
+			kms->bp_inflight[i].gem = 0;
+		}
+}
+
+/*
+ * Detach the held flip event so the caller can deliver it.  pending_lock held;
+ * delivery must happen after it is dropped, because drm_crtc_send_vblank_event
+ * takes the CRTC's event_lock and we never nest the two the other way.
+ */
+static struct drm_pending_vblank_event *
+nvkvm_bp_take_event(struct nvkvm_kms *kms)
+{
+	struct drm_pending_vblank_event *e = kms->bp_event;
+
+	kms->bp_event = NULL;
+	kms->bp_wait_iso = 0;
+	kms->bp_wait_gem = 0;
+	return e;
+}
+
+/* Complete a flip we had been holding.  No lock held. */
+static void nvkvm_bp_send(struct nvkvm_kms *kms,
+			  struct drm_pending_vblank_event *e)
+{
+	struct drm_crtc *crtc = &kms->pipe.crtc;
+	unsigned long flags;
+
+	if (!e)
+		return;
+	spin_lock_irqsave(&crtc->dev->event_lock, flags);
+	drm_crtc_send_vblank_event(crtc, e);
+	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+}
+
+/*
+ * THE DEADLINE.  Whatever the host is doing, the flip completes now.
+ *
+ * This is the function that makes the difference between a guest that stutters
+ * and a guest that hangs, so it deliberately does the pessimistic thing on
+ * every count: it completes the flip, it forgets EVERY outstanding release
+ * rather than only the one it waited for (a host that missed one is not to be
+ * trusted about the others, and stale entries would gate the next flip too),
+ * and it counts towards disarming the mechanism entirely.
+ */
+static enum hrtimer_restart nvkvm_bp_timer_fn(struct hrtimer *t)
+{
+	struct nvkvm_kms *kms = container_of(t, struct nvkvm_kms, bp_timer);
+	enum hrtimer_restart restart = HRTIMER_NORESTART;
+	struct drm_pending_vblank_event *e = NULL;
+	ktime_t now = ktime_get();
+	unsigned long flags;
+	bool disarmed = false;
+
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	if (kms->bp_event && ktime_before(now, kms->bp_deadline)) {
+		/* Woken for an event that has already been delivered; the one
+		 * held now was armed later and is not due yet.  See bp_deadline. */
+		hrtimer_set_expires(t, kms->bp_deadline);
+		restart = HRTIMER_RESTART;
+		goto out;
+	}
+	e = nvkvm_bp_take_event(kms);
+	if (e) {
+		kms->n_bp_timeout++;
+		memset(kms->bp_inflight, 0, sizeof(kms->bp_inflight));
+		if (++kms->bp_timeouts >= NVKVM_KMS_BP_DISARM) {
+			kms->bp_armed = false;
+			kms->bp_timeouts = 0;
+			disarmed = true;
+		}
+	}
+out:
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	nvkvm_bp_send(kms, e);
+	if (disarmed)
+		pr_info("nvkvm: the host stopped reporting released scanout buffers; pacing the head from the vblank timer alone again\n");
+	return restart;
+}
+
+/*
+ * Should this flip's completion wait?  Returns true having TAKEN @event, which
+ * it then owns until a release arrives or the deadline expires.
+ *
+ * @old_fb is the buffer this flip hands back to the compositor -- the one DRM's
+ * contract declares free the instant the flip event goes out, and therefore the
+ * one that gets drawn into next.  If the host is still reading it, that
+ * contract is a lie, and this is the only place in the system that can decline
+ * to tell it.
+ */
+static bool nvkvm_bp_hold(struct nvkvm_kms *kms,
+			  struct drm_framebuffer *old_fb,
+			  struct drm_framebuffer *new_fb,
+			  struct drm_pending_vblank_event *event)
+{
+	unsigned int periods = READ_ONCE(nvkvm_kms_present_wait);
+	struct nvkvm_fd_ctx *fctx = NULL;
+	unsigned long flags;
+	u32 gem = 0, iso;
+	bool held = false;
+
+	if (!periods || !old_fb)
+		return false;
+	/*
+	 * Same buffer in and out (a damage-only commit).  Gating on it would be
+	 * gating on the buffer we have just presented, which is in flight by
+	 * definition -- every such flip would run to the deadline for nothing.
+	 */
+	if (old_fb == new_fb)
+		return false;
+	if (periods > NVKVM_KMS_PRESENT_WAIT_MAX)
+		periods = NVKVM_KMS_PRESENT_WAIT_MAX;
+	/* A plain shmem dumb fb is not a proxy and was never presented. */
+	if (!nvkvm_fb_stub_handle(old_fb, &gem, &fctx) || !gem || !fctx ||
+	    !fctx->session)
+		return false;
+	/* A zero handle would match the zeroed free slots in bp_inflight[] and
+	 * gate on a buffer that does not exist -- hence the !gem above. */
+	iso = fctx->session->isolate_id;
+
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	if (kms->bp_armed && !kms->stopping && !kms->bp_event &&
+	    nvkvm_bp_inflight(kms, iso, gem)) {
+		u64 ns = (u64)ktime_to_ns(kms->period) * periods;
+
+		if (ns > NVKVM_KMS_BP_DEADLINE_MAX_NS)
+			ns = NVKVM_KMS_BP_DEADLINE_MAX_NS;
+		kms->bp_event    = event;
+		kms->bp_wait_iso = iso;
+		kms->bp_wait_gem = gem;
+		kms->bp_deadline = ktime_add_ns(ktime_get(), ns);
+		kms->n_bp_gated++;
+		/*
+		 * ARMED UNDER THE LOCK THAT GUARDS `stopping`, and not after it.
+		 * With the two split, a hold that had passed the stopping check
+		 * could re-arm the timer AFTER nvkvm_kms_fini()'s last
+		 * hrtimer_cancel(), leaving it live on a drmm-allocated head
+		 * that drm_dev_put() then frees -- the handler would take
+		 * pending_lock on freed memory.  nvkvm_pipe_enable_vblank() arms
+		 * the vblank timer inside this same lock for the same reason.
+		 * hrtimer_start() is safe here: it takes no sleeping lock.
+		 */
+		hrtimer_start(&kms->bp_timer, kms->bp_deadline,
+			      HRTIMER_MODE_ABS);
+		held = true;
+	}
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	return held;
+}
+
+/*
+ * THE HOST IS DONE WITH ONE OF OUR SCANOUT BUFFERS.
+ *
+ * Called from the VQ_EVT virtqueue callback, i.e. softirq context, so nothing
+ * here may sleep -- in particular the deadline timer is NOT cancelled, because
+ * hrtimer_cancel() can wait for a running handler.  It does not need to be:
+ * whichever of this function and nvkvm_bp_timer_fn takes the event under
+ * pending_lock first wins, and the loser finds NULL and does nothing.
+ */
+void nvkvm_kms_buffer_released(u32 isolate_id, u32 stub_handle)
+{
+	struct drm_pending_vblank_event *e = NULL;
+	struct nvkvm_kms *kms;
+	unsigned long head_flags, flags;
+
+	if (!stub_handle)
+		return;
+
+	/* Held across the delivery below for the same reason
+	 * nvkvm_kms_set_host_size() holds it: it is the publication lock, and
+	 * teardown unpublishes under it. */
+	spin_lock_irqsave(&nvkvm_kms_head_lock, head_flags);
+	kms = nvkvm_kms_head;
+	if (!kms) {
+		spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
+		return;
+	}
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	if (!kms->bp_armed) {
+		/*
+		 * ARMING.  Everything recorded before the first release is
+		 * suspect -- it accumulated while nothing was answering -- so
+		 * start from an empty set rather than gate the next few flips
+		 * on bos the host may well have finished with long ago.
+		 */
+		memset(kms->bp_inflight, 0, sizeof(kms->bp_inflight));
+		kms->bp_armed = true;
+		pr_info("nvkvm: the host reports when it has finished with a scanout buffer; page flips will wait for it (up to %u vblank periods)\n",
+			READ_ONCE(nvkvm_kms_present_wait));
+	}
+	kms->bp_timeouts = 0;
+	kms->n_bp_freed++;
+	nvkvm_bp_untrack(kms, isolate_id, stub_handle);
+	if (kms->bp_event && kms->bp_wait_gem == stub_handle &&
+	    kms->bp_wait_iso == isolate_id)
+		e = nvkvm_bp_take_event(kms);
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	nvkvm_bp_send(kms, e);
+	spin_unlock_irqrestore(&nvkvm_kms_head_lock, head_flags);
+}
+
+/* Complete anything we are holding, unconditionally.  Every teardown path calls
+ * this: a flip event that is never delivered is a compositor that never draws
+ * again, which is the one outcome worse than the bug being fixed here. */
+static void nvkvm_bp_flush(struct nvkvm_kms *kms)
+{
+	struct drm_pending_vblank_event *e;
+	unsigned long flags;
+
+	spin_lock_irqsave(&kms->pending_lock, flags);
+	e = nvkvm_bp_take_event(kms);
+	memset(kms->bp_inflight, 0, sizeof(kms->bp_inflight));
+	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	nvkvm_bp_send(kms, e);
+}
 
 /* ── Software vblank (vkms-style): an hrtimer drives the CRTC vblank at a fixed
  * refresh so page-flips pace + complete. Headless has no real scanout timing;
@@ -470,6 +843,12 @@ static void nvkvm_pipe_disable(struct drm_simple_display_pipe *pipe)
 	struct drm_framebuffer *fb;
 	unsigned long flags;
 
+	/* BEFORE drm_crtc_vblank_off(): a flip event we are holding belongs to a
+	 * commit that is still waiting on us, and the compositor is entitled to
+	 * see it complete even though the pipe is going down. */
+	hrtimer_cancel(&kms->bp_timer);
+	nvkvm_bp_flush(kms);
+
 	drm_crtc_vblank_off(&pipe->crtc);
 
 	/* Nothing is scanned out any more: flush the queued present and drop
@@ -506,10 +885,12 @@ static void nvkvm_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
 
 /* Send one framebuffer's present to QEMU.  Runs in process context: the
  * virtio round-trip inside nvkvm_virtio_present() sleeps. */
-static void nvkvm_present_send(struct drm_framebuffer *fb)
+static void nvkvm_present_send(struct nvkvm_kms *kms,
+			       struct drm_framebuffer *fb)
 {
 	__u32 stub_handle = 0;
 	struct nvkvm_fd_ctx *fctx = NULL;
+	unsigned long flags;
 	int pret;
 
 	/* Re-derive owner + handle from the fb we hold a reference on, rather
@@ -526,12 +907,25 @@ static void nvkvm_present_send(struct drm_framebuffer *fb)
 		pr_info_ratelimited(
 			"nvkvm present: export failed %d (flip %ux%u stub_handle=0x%x)\n",
 			pret, fb->width, fb->height, stub_handle);
-	else
+	else {
+		/*
+		 * The host now has this bo.  Recorded only on success, and only
+		 * here: a present the workqueue dropped in favour of a newer
+		 * frame (nvkvm_present_queue) never reached the host, so it can
+		 * never be released and must not be waited for.
+		 */
+		if (fctx && fctx->session) {
+			spin_lock_irqsave(&kms->pending_lock, flags);
+			nvkvm_bp_track(kms, fctx->session->isolate_id,
+				       stub_handle);
+			spin_unlock_irqrestore(&kms->pending_lock, flags);
+		}
 		pr_info_ratelimited(
 			"nvkvm present: flip %ux%u pitch=%u fmt=0x%08x mod=0x%llx stub_handle=0x%x → exported\n",
 			fb->width, fb->height, fb->pitches[0],
 			fb->format ? fb->format->format : 0,
 			(unsigned long long)fb->modifier, stub_handle);
+	}
 }
 
 static void nvkvm_present_work_fn(struct work_struct *w)
@@ -546,7 +940,7 @@ static void nvkvm_present_work_fn(struct work_struct *w)
 	spin_unlock_irqrestore(&kms->pending_lock, flags);
 
 	if (fb) {
-		nvkvm_present_send(fb);
+		nvkvm_present_send(kms, fb);
 		drm_framebuffer_put(fb);
 	}
 }
@@ -586,7 +980,7 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 	struct drm_pending_vblank_event *event = crtc->state->event;
 	struct drm_framebuffer *fb = pipe->plane.state ? pipe->plane.state->fb : NULL;
 
-	(void)old_state;
+	struct nvkvm_kms *kms = container_of(pipe, struct nvkvm_kms, pipe);
 
 	/* Present path (#106) — the host buffer behind this scanout frame. A real
 	 * compositor (weston) flips an NVIDIA bo, which surfaces here as one of our
@@ -596,11 +990,23 @@ static void nvkvm_pipe_update(struct drm_simple_display_pipe *pipe,
 	 * (we still arm the vblank event below). A plain shmem dumb fb (modetest)
 	 * is not a proxy → nothing to present. */
 	if (fb)
-		nvkvm_present_queue(container_of(pipe, struct nvkvm_kms, pipe), fb);
+		nvkvm_present_queue(kms, fb);
 	/* Headless: no real scanout. Pace the flip completion to the software
 	 * vblank so a compositor renders at the refresh rate, not unbounded. */
 	if (event) {
 		crtc->state->event = NULL;
+		/*
+		 * ...and, when the host is demonstrably still reading the buffer
+		 * this flip hands back, do not tell the compositor it is free
+		 * yet.  Bounded: nvkvm_bp_hold() completes the flip from a
+		 * deadline timer if the host never answers, so the worst case is
+		 * a late frame, not a stopped head.  Returns false -- leaving
+		 * everything exactly as it was before -- whenever the mechanism
+		 * is off, unarmed, or has nothing to wait for.
+		 */
+		if (nvkvm_bp_hold(kms, old_state ? old_state->fb : NULL, fb,
+				  event))
+			return;
 		spin_lock_irq(&crtc->dev->event_lock);
 		if (drm_crtc_vblank_get(crtc) == 0)
 			drm_crtc_arm_vblank_event(crtc, event);
@@ -850,6 +1256,8 @@ int nvkvm_kms_init(struct drm_device *ddev)
 
 	nvkvm_hrtimer_setup(&kms->vblank, nvkvm_vblank_fn,
 			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	nvkvm_hrtimer_setup(&kms->bp_timer, nvkvm_bp_timer_fn,
+			    CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	/* Until the host tells us its rate; nvkvm_kms_set_host_size() replaces
 	 * this the moment it does. */
 	kms->period = ns_to_ktime(NSEC_PER_SEC / nvkvm_kms_hz);
@@ -978,7 +1386,12 @@ void nvkvm_kms_fini(struct drm_device *ddev)
 
 	cancel_work_sync(&kms->resize_work);
 	hrtimer_cancel(&kms->vblank);
+	hrtimer_cancel(&kms->bp_timer);
 	cancel_work_sync(&kms->present_work);
+	/* After the timer is dead and before anything drmm-owned goes away: the
+	 * deadline can no longer fire, so this is the last chance to complete a
+	 * flip we are holding. */
+	nvkvm_bp_flush(kms);
 
 	spin_lock_irqsave(&kms->pending_lock, pending_flags);
 	fb = kms->pending_fb;
@@ -990,5 +1403,15 @@ void nvkvm_kms_fini(struct drm_device *ddev)
 		drm_framebuffer_put(fb);
 	if (present_wq)
 		destroy_workqueue(present_wq);
+	/*
+	 * Say what the backpressure actually did.  "gated" without "freed" means
+	 * the host answered once and then stopped; "timeout" approaching "gated"
+	 * means it is costing frames and buying nothing, and kms_present_wait=0
+	 * is the answer.  Printed unconditionally at unbind so it is in the log
+	 * of any run someone is about to ask questions about.
+	 */
+	if (kms->n_bp_gated || kms->n_bp_freed)
+		pr_info("nvkvm: present backpressure: %llu flips gated, %llu buffers released by the host, %llu deadline expiries\n",
+			kms->n_bp_gated, kms->n_bp_freed, kms->n_bp_timeout);
 	ddev->dev_private = NULL;
 }

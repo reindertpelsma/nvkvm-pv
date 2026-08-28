@@ -1782,6 +1782,17 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 			resp->status = 0;
 			return 0;      /* readback owns the fd now */
 		}
+		/*
+		 * ZERO-COPY: the host compositor will read the GUEST's buffer
+		 * directly, so it becomes a second consumer of a bo the guest
+		 * believes it owns alone.  Name it before it goes out, so the
+		 * release that eventually comes back can be translated from the
+		 * broker's inode into (isolate, GEM) and forwarded to the guest.
+		 * Not done on the readback branch above: there the compositor
+		 * reads a buffer of ours, and the guest has nothing to wait for.
+		 */
+		nvkvm_display_relay_note_present(nv, dmabuf_fd, iso_id,
+						 req->stub_handle);
 		if (nvkvm_display_relay_submit(nv, dmabuf_fd, req->width,
 					       req->height, req->pitch,
 					       req->format, req->modifier)) {

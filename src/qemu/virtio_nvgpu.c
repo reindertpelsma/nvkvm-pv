@@ -842,6 +842,62 @@ void nvkvm_virtio_push_ui_info(VirtIONvgpu *nv, uint32_t width,
 	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_ui_info_push_bh, p);
 }
 
+/* ── buffer release: the host display is done reading a guest scanout bo ─────
+ * Same VQ_EVT transport and the same BH hop as the two above, for the same
+ * reason -- this is called from the relay's main-loop socket handler.
+ *
+ * DROPPING WHEN THE QUEUE IS FULL IS SAFE, and that is a property of the
+ * consumer rather than of this function: the guest treats a release as a hint
+ * that one named buffer is free again, and falls back to timer-driven flip
+ * completion when the hints stop (nvkvm_kms.c).  A lost release therefore costs
+ * at most one deferred flip, never a stalled head.  It is NOT superseded by the
+ * next event the way a ui_info is -- each one names a different buffer -- so it
+ * is logged rather than silently dropped.
+ */
+struct nvkvm_release_push {
+	VirtIONvgpu *nv;
+	uint32_t     isolate_id;
+	uint32_t     stub_handle;
+};
+
+static void nvkvm_release_push_bh(void *opaque)
+{
+	struct nvkvm_release_push *p = opaque;
+	VirtQueueElement *elem = virtqueue_pop(p->nv->vq_evt, sizeof(*elem));
+
+	if (elem) {
+		struct nvkvm_evt_release msg = {
+			.isolate_id  = cpu_to_le32(p->isolate_id),
+			.stub_handle = cpu_to_le32(p->stub_handle),
+			.reserved    = 0,
+			.type        = cpu_to_le32(NVKVM_EVT_TYPE_RELEASE),
+		};
+		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
+		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
+		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
+		g_free(elem);
+	} else {
+		NVKVM_DBG("nvkvm: vq_evt full, dropped release iso=%u gem=0x%x\n",
+			  p->isolate_id, p->stub_handle);
+	}
+	g_free(p);
+}
+
+void nvkvm_virtio_push_buf_release(VirtIONvgpu *nv, uint32_t isolate_id,
+				   uint32_t stub_handle)
+{
+	struct nvkvm_release_push *p;
+
+	if (!nv || !nv->vq_evt || !stub_handle) {
+		return;
+	}
+	p = g_malloc(sizeof(*p));
+	p->nv          = nv;
+	p->isolate_id  = isolate_id;
+	p->stub_handle = stub_handle;
+	aio_bh_schedule_oneshot(qemu_get_aio_context(), nvkvm_release_push_bh, p);
+}
+
 static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(vdev);
