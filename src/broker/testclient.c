@@ -189,6 +189,12 @@ int main(int argc, char **argv)
      * catch what is actually on screen: on detach the broker repaints its
      * placeholder, which would otherwise erase the very frame under test. */
     int hold_s = 0;
+    /* --frames N: re-present the SAME buffer N times, 200ms apart, so the
+     * LAST frame of a finite stream can be checked against the broker's own
+     * commit trace.  A guest reuses one buffer; so does this. */
+    unsigned tc_frames = 1;
+    int tc_keep_fd = -1;
+    struct nvkvm_broker_cmd tc_attach;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
     int quiet_after = 0, caps_clipboard = 0;
 
@@ -219,6 +225,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--shm")) { shm_mode = 1; }
         else if (!strcmp(a, "--bad-unsealed")) { shm_mode = 1; tc_unsealed = 1; }
         else if (!strcmp(a, "--hold") && v) { hold_s = atoi(v); i++; }
+        else if (!strcmp(a, "--frames") && v) { tc_frames = (unsigned)atoi(v); i++; }
         else if (!strcmp(a, "--bad-dim"))      { bad_dim = 1; }
         else if (!strcmp(a, "--bad-fd"))       { bad_fd = 1; }
         else if (!strcmp(a, "--bad-frame"))    { bad_frame = 1; }
@@ -447,6 +454,10 @@ int main(int argc, char **argv)
                        pw, ph, stride);
             }
             send_cmd(sock, &c, fds, nfd, sizeof(c));
+            if (tc_frames > 1 && nfd == 1 && fds[0] >= 0) {
+                tc_keep_fd = dup(fds[0]);   /* for the repeat frames below */
+                tc_attach = c;              /* same geometry, new seq */
+            }
             for (i = 0; i < nfd; i++) {
                 if (fds[i] >= 0) {
                     close(fds[i]);
@@ -458,6 +469,25 @@ int main(int argc, char **argv)
 
             printf("  -> COMMIT\n");
             send_cmd(sock, &c, NULL, 0, sizeof(c));
+            if (tc_keep_fd >= 0) {
+                unsigned f;
+
+                for (f = 1; f < tc_frames; f++) {
+                    struct nvkvm_broker_cmd a2 = tc_attach;
+                    struct nvkvm_broker_cmd c2 = {
+                        .type = NVKVM_BROKER_CMD_COMMIT };
+
+                    usleep(200000);
+                    a2.seq = f + 1;
+                    c2.seq = f + 1;
+                    send_cmd(sock, &a2, &tc_keep_fd, 1, sizeof(a2));
+                    send_cmd(sock, &c2, NULL, 0, sizeof(c2));
+                    printf("  -> ATTACH+COMMIT #%u\n", f + 1);
+                    fflush(stdout);
+                }
+                close(tc_keep_fd);
+                tc_keep_fd = -1;
+            }
             if (hold_s > 0) {
                 printf("  -> holding the connection open for %ds\n", hold_s);
                 fflush(stdout);
