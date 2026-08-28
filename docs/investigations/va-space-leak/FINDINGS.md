@@ -298,3 +298,78 @@ The §6 ladder still stands, but the priority has changed:
    against nvkvm's forwarded map/dup/share traffic is the next concrete step,
    and it needs no special hardware — a trace of forwarded RM ioctls on any
    working nvkvm host would do.
+
+---
+
+# UPDATE 2 — DETERMINISTIC REPRODUCTION
+
+## 13. Every fully-initialized guest Vulkan client leaks exactly 59 BAR1 mappings on exit
+
+Measured on the rebooted host, counting with `journalctl -k` (not `dmesg`):
+
+```
+baseline                                   = 1488
+run vkcube in guest 60 s, then SIGKILL     = 1547   (delta +59)
+run vkcube in guest 60 s, then clean SIGTERM = 1606 (delta +59)
+```
+
+**+59 both times.** Two conclusions, both important:
+
+1. **Abnormal termination is irrelevant.** A clean `SIGTERM` leaks exactly as
+   much as a `SIGKILL`. This kills the "isolate dies abnormally and strands
+   handles" hypothesis outright (and with it the remaining relevance of the
+   `isolate_refcount` / `-EBUSY` path in §3).
+2. **The client must actually get going.** Earlier tests that leaked **0** were
+   2-second `vkcube`s and plain `vulkaninfo` — neither creates the rendering
+   resources. The leak is per-client-teardown, and its size is the number of
+   BAR1 mappings that client accumulated.
+
+The "59" matches the per-client grouping seen independently in the histogram of
+the wedged boot (59 failures per `hClient`, across many sequential client
+handles).
+
+**Reproduction recipe (no special tooling needed):**
+```bash
+# host
+journalctl -k -b 0 --no-pager | grep -c "Failed to auto-unmap"
+# guest (SteamOS, via ./steamos-ssh)
+export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0
+setsid nohup vkcube >/dev/null 2>&1 </dev/null & sleep 60; pkill -x vkcube
+# host again -- expect +59
+```
+At 59 mappings per client teardown against a 256 MiB BAR1, roughly **86 client
+teardowns** reproduce the ~5,089 leaks seen in the wedged boot. A SteamOS
+session that restarts gamescope/Steam/KWin repeatedly reaches that quickly,
+which is consistent with the owner's 8-minute boot -2 collapse.
+
+## 14. What the teardown looks like
+
+`evidence/one-client-teardown-59-leaks.txt`. For a single dying client
+(`c1d003f3`), all ~59 failures share **one** context:
+
+```
+Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 40
+hContext: beef0004 at addr 1543C9000
+... hResource: 4b, 4c, 4d, 4e, 4f, 50, 51, 52, 54, 55, 5a, 5b, 5e, 5f, 60, 61, 62,
+    and finally beef00de and beefc360
+```
+
+- `hResource` values are mostly small RM-assigned handles; two are guest
+  userspace handles (`beef00de`, `beefc360`).
+- **`hContext` is `beef0004` for every single one.** One context object, ~59
+  mappings hanging off it, and that context is unresolvable
+  (`NV_ERR_INVALID_CLIENT`) at the moment the client is torn down.
+
+So the failure is not per-mapping bad luck: **the whole client's BAR1 mappings
+are anchored on one context handle whose owning client RM can no longer
+resolve.** Whatever splits that context away from the mappings' client is the
+bug.
+
+**Still UNVERIFIED — the specific nvkvm behaviour responsible.** The prime
+suspect remains the host-initiated extra `NV_ESC_RM_SHARE` issued on **every**
+successful `RM_ALLOC` (`src/qemu/nvkvm_isolate_handlers.c:~3590-3600`), which
+deliberately widens cross-client visibility of freshly allocated objects; and
+`NV_ESC_RM_DUP_OBJECT`, forwarded verbatim. **The decisive next experiment** is
+to disable that post-alloc SHARE and re-run the +59 measurement above. If the
+delta drops to 0, that line is the leak. That is a one-line change and a
+five-minute test, and it is where whoever picks this up should start.
