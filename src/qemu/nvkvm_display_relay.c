@@ -211,10 +211,48 @@ typedef struct NvkvmRelay {
     /* ATTACHed but the COMMIT could not be written.  A distinct failure from
      * n_dropped -- see the comment at the counter's only increment. */
     uint64_t    n_uncommitted;
+    /*
+     * PRODUCED: every frame the guest handed us, counted at the ingress before
+     * any decision is taken about it.  n_sent is what actually reached the
+     * broker, so (n_produced - n_sent) is the loss THIS layer is responsible
+     * for, and n_dropped + n_uncommitted should account for all of it.
+     *
+     * Without this the relay could only report its own drops, which cannot
+     * distinguish "the guest never sent a frame" from "we threw it away" --
+     * exactly the ambiguity a last-frame-drop report turns on.
+     */
+    uint64_t    n_produced;
+    uint64_t    n_stats_at;     /* n_produced when we last logged */
 } NvkvmRelay;
 
 static NvkvmRelay *nvkvm_relay;
 static char *nvkvm_relay_sock_path;
+
+/*
+ * NVKVM_RELAY_FRAME_STATS=N -- log the ingress/egress frame counters every N
+ * frames the guest produces.  0 (the default) disables it entirely, so the
+ * per-frame cost when unset is one compare against a static.
+ *
+ * Off by default because this logs at the guest's flip rate: on a busy desktop
+ * N=600 is about one line every ten seconds, and N=1 would itself perturb the
+ * timing it is measuring.
+ */
+static uint64_t nvkvm_relay_frame_stats;
+
+static void nvkvm_relay_stats_init(void)
+{
+    static bool done;
+    const char *e;
+
+    if (done) {
+        return;
+    }
+    done = true;
+    e = getenv("NVKVM_RELAY_FRAME_STATS");
+    if (e && *e) {
+        nvkvm_relay_frame_stats = strtoull(e, NULL, 10);
+    }
+}
 
 bool nvkvm_display_relay_active(void)
 {
@@ -535,6 +573,22 @@ bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
      * load-bearing: a future worker offload must marshal the whole operation to
      * the main loop instead of creating a second socket owner. */
     assert(bql_locked());
+
+    /*
+     * Count it as PRODUCED before anything can reject it, so the ingress total
+     * is unconditional.  Every early return below is a frame the guest made
+     * and the host never showed.
+     */
+    r->n_produced++;
+    if (nvkvm_relay_frame_stats &&
+        r->n_produced - r->n_stats_at >= nvkvm_relay_frame_stats) {
+        r->n_stats_at = r->n_produced;
+        info_report("nvkvm-relay frames: produced=%" PRIu64 " forwarded=%"
+                    PRIu64 " dropped=%" PRIu64 " uncommitted=%" PRIu64
+                    " lost=%" PRIu64,
+                    r->n_produced, r->n_sent, r->n_dropped, r->n_uncommitted,
+                    r->n_produced - r->n_sent);
+    }
 
     /*
      * Ask -- once per pair -- whether the display can show this at all.  Done
@@ -1606,6 +1660,8 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
     QemuConsole *con = NULL;
     Error *err = NULL;
     int idx;
+
+    nvkvm_relay_stats_init();
 
     for (idx = 0;; idx++) {
         QemuConsole *c = qemu_console_lookup_by_index(idx);

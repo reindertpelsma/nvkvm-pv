@@ -101,6 +101,19 @@ module_param_named(kms_height, nvkvm_kms_h, uint, 0444);
 MODULE_PARM_DESC(kms_height, "virtual head height in pixels (default 1080)");
 module_param_named(kms_hz, nvkvm_kms_hz, uint, 0444);
 MODULE_PARM_DESC(kms_hz, "virtual head refresh rate in Hz (default 60)");
+
+/*
+ * present_stats=N -- report the present counters every N flips.  0 disables.
+ *
+ * This is the GUEST end of the produced-vs-forwarded question: it says how many
+ * frames the compositor actually flipped, which is the only number that can
+ * tell a frame the host threw away from one the guest never made.  Pair it with
+ * NVKVM_RELAY_FRAME_STATS on the QEMU side.
+ */
+static unsigned int nvkvm_present_stats;
+module_param_named(present_stats, nvkvm_present_stats, uint, 0644);
+MODULE_PARM_DESC(present_stats,
+		 "report present counters every N flips (0 = off)");
 module_param_named(kms_max_width, nvkvm_kms_max_w, uint, 0444);
 MODULE_PARM_DESC(kms_max_width,
 		 "largest width the head can ever be asked for (default 3840)");
@@ -196,6 +209,19 @@ struct nvkvm_kms {
 	struct work_struct              resize_work;
 	struct drm_framebuffer          *pending_fb;
 	spinlock_t                      pending_lock;
+	/*
+	 * Present accounting, all under pending_lock except n_sent.
+	 *   n_queued    flips handed to us by the compositor
+	 *   n_coalesced flips replaced in the slot before they were ever sent
+	 *   n_sent      presents actually handed to QEMU
+	 * n_queued - n_coalesced should equal n_sent once the queue drains; a
+	 * standing difference means a frame is stuck in the slot, which is what
+	 * a last-frame-drop looks like from in here.
+	 */
+	u64                             n_queued;
+	u64                             n_coalesced;
+	u64                             n_sent;
+	u64                             n_stats_at;
 	/*
 	 * The host output's refresh in whole Hz, 0 when the host did not say.
 	 * Written from the ui_info event and read when synthesising a mode:
@@ -548,6 +574,9 @@ static void nvkvm_present_work_fn(struct work_struct *w)
 	if (fb) {
 		nvkvm_present_send(fb);
 		drm_framebuffer_put(fb);
+		spin_lock_irqsave(&kms->pending_lock, flags);
+		kms->n_sent++;
+		spin_unlock_irqrestore(&kms->pending_lock, flags);
 	}
 }
 
@@ -558,6 +587,8 @@ static void nvkvm_present_queue(struct nvkvm_kms *kms,
 {
 	struct drm_framebuffer *old;
 	unsigned long flags;
+	u64 q = 0, c = 0, sent = 0;
+	bool report;
 
 	if (!fb)
 		return;
@@ -571,10 +602,24 @@ static void nvkvm_present_queue(struct nvkvm_kms *kms,
 	}
 	old = kms->pending_fb;
 	kms->pending_fb = fb;
+	kms->n_queued++;
+	if (old)
+		kms->n_coalesced++;
 	/* Queue under the same lock shutdown uses to set stopping.  Once fini
 	 * observes the flag, no late producer can race behind cancel_work_sync(). */
 	queue_work(kms->present_wq, &kms->present_work);
+	report = nvkvm_present_stats &&
+		 kms->n_queued - kms->n_stats_at >= nvkvm_present_stats;
+	if (report) {
+		kms->n_stats_at = kms->n_queued;
+		q = kms->n_queued;
+		c = kms->n_coalesced;
+		sent = kms->n_sent;
+	}
 	spin_unlock_irqrestore(&kms->pending_lock, flags);
+	if (report)
+		pr_info("nvkvm present: queued=%llu coalesced=%llu sent=%llu stuck=%llu\n",
+			q, c, sent, q - c - sent);
 	if (old)
 		drm_framebuffer_put(old);
 }
