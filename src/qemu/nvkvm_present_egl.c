@@ -424,6 +424,11 @@ typedef struct NvkvmPresent {
     uint32_t pbo_w, pbo_h;   /* geometry the PBOs were sized for */
     unsigned pbo_idx;        /* the one this frame writes */
     bool     pbo_primed;     /* a transfer is in flight in the other one */
+    /*
+     * The idle drain already delivered the newest buffer, so the next frame
+     * must not deliver it a second time.  See nvkvm_present_drain().
+     */
+    bool     pbo_shown;
 
     /* #125: the readback path no longer touches a DisplaySurface at all -- it
      * fills `stage` below and the main loop wraps that.  The console still
@@ -838,7 +843,7 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, uint8_t *dst,
 
     bool have_frame = false;
     const unsigned prev = p->pbo_idx ^ 1u;
-    if (p->pbo_primed) {
+    if (p->pbo_primed && !p->pbo_shown) {
         glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo[prev]);
         const void *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, sz,
                                            GL_MAP_READ_BIT);
@@ -852,7 +857,45 @@ static bool nvkvm_fb_read_async(NvkvmPresent *p, uint8_t *dst,
 
     p->pbo_idx = prev;
     p->pbo_primed = true;
+    p->pbo_shown  = false;      /* the buffer just queued is undelivered */
     return have_frame;
+}
+
+/*
+ * DELIVER THE FRAME THE PIPELINE IS STILL HOLDING.
+ *
+ * nvkvm_fb_read_async() shows frame N-1 while queueing N -- "one frame of
+ * added latency buys back the stall", which is a fine trade while frames keep
+ * coming and a permanent one when they stop.  An idle desktop flips once and
+ * then nothing, so the last frame sat in the PBO forever and the screen went on
+ * showing the one before it.  That is the "last frame is always dropped"
+ * report, and it is structural rather than an edge case: the display is one
+ * frame behind by construction.
+ *
+ * The transfer was issued at least a drain interval ago, so this map does not
+ * wait on the GPU any more than the normal path's does.
+ *
+ * PRESENT THREAD ONLY: the GL context is current there.
+ */
+static bool nvkvm_fb_drain_async(NvkvmPresent *p, uint8_t *dst,
+                                 uint32_t w, uint32_t h)
+{
+    const size_t sz = (size_t)w * h * 4;
+    bool ok = false;
+
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, p->pbo[p->pbo_idx ^ 1u]);
+    const void *src = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, sz,
+                                       GL_MAP_READ_BIT);
+    if (src) {
+        memcpy(dst, src, sz);
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+        ok = true;
+    }
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    if (ok) {
+        p->pbo_shown = true;
+    }
+    return ok;
 }
 
 /* Size the staging pair for this geometry.  Returns false on OOM. */
@@ -1138,6 +1181,50 @@ static void nvkvm_st_frame(double us, bool shown)
  * never unbound, which is the whole point.  The UI keeps its own context on the
  * main loop and the two never meet.
  */
+/*
+ * HOW LONG THE PIPELINE MAY HOLD THE NEWEST FRAME.
+ *
+ * The readback is one frame deep on purpose, so on a steady stream this never
+ * fires: a new frame always arrives first and delivers its predecessor. It
+ * only fires when the guest STOPS flipping, which is the case that used to
+ * leave the newest frame in the PBO forever.
+ *
+ * 50 ms is three frames at 60 Hz. Below ~20 fps the display is not being paced
+ * any more, so showing the newest frame late beats showing an older one
+ * indefinitely.
+ */
+#define NVKVM_PRESENT_DRAIN_MS 50
+
+/*
+ * Idle drain: publish the frame the PBO pipeline is still holding.  Returns
+ * true when something new was staged and the main loop should be woken.
+ *
+ * PRESENT THREAD ONLY.
+ */
+static bool nvkvm_present_drain(NvkvmPresent *p)
+{
+    uint32_t w = p->pbo_w, h = p->pbo_h;
+    uint8_t *dst;
+
+    if (!nvkvm_pbo_ok() || !p->pbo_primed || p->pbo_shown || !w || !h) {
+        return false;           /* nothing held, or already delivered */
+    }
+    if (!nvkvm_stage_ensure(p, w, h)) {
+        return false;
+    }
+    dst = p->stage[p->stage_write];
+    if (!nvkvm_fb_drain_async(p, dst, w, h)) {
+        return false;
+    }
+    /* Same publish the capture path uses; see nvkvm_readback_to_stage(). */
+    pthread_mutex_lock(&p->lock);
+    p->stage_ready     = p->stage_write;
+    p->stage_has_frame = true;
+    p->stage_write     = (p->stage_write + 1u) % p->stage_n;
+    pthread_mutex_unlock(&p->lock);
+    return true;
+}
+
 static void *nvkvm_present_thread_fn(void *opaque)
 {
     NvkvmPresent *p = opaque;
@@ -1186,7 +1273,20 @@ static void *nvkvm_present_thread_fn(void *opaque)
     }
 
     for (;;) {
-        qemu_sem_wait(&p->wake);
+        /*
+         * Timed, so that a guest which stops flipping still gets its last
+         * frame shown.  A woken semaphore means a real frame; a timeout means
+         * the pipeline may be holding one -- see nvkvm_present_drain().
+         */
+        if (qemu_sem_timedwait(&p->wake, NVKVM_PRESENT_DRAIN_MS) != 0) {
+            if (qatomic_read(&p->thread_stop)) {
+                break;
+            }
+            if (nvkvm_present_drain(p)) {
+                qemu_bh_schedule(p->bh);
+            }
+            continue;
+        }
         if (qatomic_read(&p->thread_stop)) {
             break;
         }
