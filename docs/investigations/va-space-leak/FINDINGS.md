@@ -179,3 +179,122 @@ the same code was clean, and the prime suspects are host-level installs
 (Kata/CDI/Docker) rather than nvkvm. A rented box would reproduce the *nvkvm*
 configuration, which is precisely the part the boot -3 control already
 exonerates. Rent a box only after the Kata test above points back at nvkvm.
+
+---
+
+# UPDATE — the leaked resource identified, with a causal chain
+
+## 7. It is BAR1 aperture address space, and the chain is temporally ordered
+
+From the leaking boot's 76,591-line capture
+(`/workspace/nvkvm-steamos/evidence-pc-final-20260828/va-evidence.txt`):
+
+| NVRM message | count |
+|---|---|
+| `dmaAllocMapping_GM107: can't alloc VA space for mapping.` | 31,805 |
+| `NV_ERR_NO_MEMORY ... mapping_reuse.c:273` | 18,492 |
+| `NV_ERR_NO_MEMORY ... reusemappingdbMap(&pBar1VaInfo->reuseDb, ...) @ kern_bus_gm107.c` | 9,246 |
+| `nvAssertFailedNoLog ... @ rs_client.c:1194` | 5,089 |
+| `clientUnmapResourceRefMappings: hContext: ... at addr ...` | 5,089 |
+| `clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23)` | 5,089 (sum) |
+| `NV_ERR_NO_MEMORY ... kbusMapFbAperture_HAL ... @ kern_bus.c` | 1,779 |
+
+**Timeline in that boot:**
+- first `Failed to auto-unmap`: **17:02:51**
+- first `can't alloc VA space`: **17:09:39** — **6 min 48 s later**
+- both continue to the end of the boot (18:20 / 18:22)
+
+The failures precede the exhaustion by nearly seven minutes, in the right order
+for cause and effect.
+
+**The exhausted resource is named by the driver itself:**
+`pBar1VaInfo->reuseDb` and `kbusMapFbAperture_HAL` — this is the **BAR1
+aperture's VA allocator**, not VRAM.
+
+## 8. Why nothing surfaces it
+
+On this host **BAR1 Total is 256 MiB** (Resizable BAR is off; a 4070 with ReBAR
+would report ~12 GiB). Decisively: in the *wedged* state `nvidia-smi` reported
+**BAR1 Used = 59 MiB of 256 MiB**, i.e. 197 MiB "free". So the leaked mappings
+consume BAR1 **address space** in RM's reuse database **without being accounted
+as used**. `nvidia-smi` cannot see this leak by construction — neither its VRAM
+figures nor its BAR1 figures move. That is the answer to "nothing surfaces it".
+
+5,089 leaked mappings against a 256 MiB aperture is the right order of
+magnitude to exhaust it.
+
+## 9. The mechanism, as far as the evidence supports it
+
+```
+NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0002e: hResource: beef00de
+NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 11E57E000
+```
+- `status=0x23` = `NV_ERR_INVALID_CLIENT`.
+- `clientUnmapResourceRefMappings` is RM's teardown sweep. It is failing, so the
+  BAR1 mapping is never released.
+- The whole handle family is `0xbeef*` (`hContext beef0004`, `hResource
+  beef00de`/`beefc360`). **These are not nvkvm's:** `grep -rni beef src/` in
+  nvkvm-pv finds nothing, and QEMU's admin client uses `0xad000001 /
+  0xad000d00 / 0xad002080` (`src/qemu/nvkvm_isolate_handlers.c:1360-1366`).
+  They are also **not in the open kernel modules** (`grep -rn 0xbeef` across
+  `/workspace/ogkm-src` finds nothing), so they are allocated by NVIDIA's
+  closed **userspace** driver in the guest and forwarded verbatim by nvkvm.
+
+**Working hypothesis (UNVERIFIED):** a BAR1 mapping is created against a context
+owned by one RM client but retired under another, so when the second client is
+destroyed after the first, RM cannot resolve `hContext` and aborts the unmap
+with `INVALID_CLIENT`. nvkvm does enable exactly this class of cross-client
+visibility — it issues an extra host-side `NV_ESC_RM_SHARE` on **every**
+successful `RM_ALLOC` (`src/qemu/nvkvm_isolate_handlers.c:3616`) and forwards
+`NV_ESC_RM_DUP_OBJECT` verbatim. **The experiment that would settle it** is to
+log the (hClient, hDevice, hMemory) triple at every forwarded
+`RM_MAP_MEMORY`/`MAP_MEMORY_DMA` and correlate the leaked `hResource` values
+against which client owned the context.
+
+## 10. Live status on the rebooted host — the leak IS present, just slow
+
+The rebooted host accumulates `Failed to auto-unmap` (1,465 -> 1,488 across a
+guest start) while `can't alloc VA space` stays at **0**. That matches the
+7-minute lead in §7: leaked mappings accumulate first, exhaustion follows only
+once BAR1 fills. So this is a live, quantitative reproduction — the counter to
+watch is:
+
+```
+journalctl -k -b 0 --no-pager | grep -c "Failed to auto-unmap"
+```
+
+**Use `journalctl -k`, not `dmesg`.** The dmesg ring buffer rotates under this
+message volume and silently under-counts — observed going 909 -> 907 -> 903 ->
+874 while the true journal count was 1,465. Two earlier "delta = 0" results in
+§3 were measured with `dmesg` and are therefore weaker than they look; they
+should be re-run against `journalctl` before being relied on.
+
+## 11. Additional measured negatives (rebooted host)
+
+| Test | Result |
+|---|---|
+| 10 Kata GPU containers, **no nvkvm guest at all** | 0 VA errors, Vulkan healthy. Kata alone does not reproduce it. |
+| 8 Kata GPU containers **concurrently with the SteamOS VM** | 0 VA errors, **0** new failed auto-unmaps, Vulkan healthy. |
+| `nvidia-cdi-refresh.service` | Ran once at boot, `NRestarts=0`. Not looping, not a churn source. |
+| ~55 min of guest uptime incl. rendering and isolate churn | 0 VA errors. |
+
+So the *fast* regression of boots -2/-1 (19,321 events in 8 minutes) is still
+not reproduced, and neither Kata alone nor Kata+VM explains it.
+
+## 12. Revised guidance for resuming
+
+The §6 ladder still stands, but the priority has changed:
+
+1. **Watch `Failed to auto-unmap` via `journalctl -k`, not the VA errors.** It
+   leads by ~7 minutes and is present even on a "clean" boot.
+2. **BAR1 size is likely why this host is the one that shows it.** 256 MiB
+   (ReBAR off) is a small budget; a host with ReBAR enabled has ~12 GiB of BAR1
+   and would take ~50x longer to exhaust — the same leak could exist everywhere
+   and only ever be *noticed* here. **Check `nvidia-smi -q -d MEMORY | grep -A3
+   BAR1` on any candidate repro box, and prefer one with ReBAR off.**
+   This materially improves the odds of reproducing on rented hardware, and
+   revises §6's pessimism: a rented box with a small BAR1 is now worth trying.
+3. The `0xbeef*` handles are guest **userspace** handles. Correlating them
+   against nvkvm's forwarded map/dup/share traffic is the next concrete step,
+   and it needs no special hardware — a trace of forwarded RM ioctls on any
+   working nvkvm host would do.
