@@ -95,6 +95,31 @@ typedef enum RelayConnState {
     RELAY_CONN_ACTIVE,
 } RelayConnState;
 
+/*
+ * How much of the retained frame the broker still owes us.  See the `pend`
+ * field for why ATTACH and COMMIT are not the same failure.
+ */
+typedef enum {
+    RELAY_PEND_NONE = 0,
+    RELAY_PEND_ATTACH,
+    RELAY_PEND_COMMIT,
+} RelayPend;
+
+/*
+ * HOW LONG A FRAME MAY SIT UNDELIVERED.
+ *
+ * POLLOUT is the primary mechanism and normally fires within microseconds; this
+ * is the backstop for when it does not.  50 ms is three frames at 60 Hz -- past
+ * that the display is not being paced any more, it is stale, and showing the
+ * newest frame late beats showing an older one forever.
+ *
+ * This is what the industry does with the same problem.  QEMU's own VNC server
+ * keeps unsent output and arms G_IO_OUT rather than discarding it; SPICE pushes
+ * a stale frame on a timer; wlroots' screencopy grew a timeout for exactly this
+ * "the last frame never arrives on an idle desktop" bug.
+ */
+#define RELAY_PEND_DEADLINE_MS 50
+
 typedef struct NvkvmRelay {
     int         sock;           /* the broker connection, or -1               */
     RelayConnState conn_state;  /* owned by the main loop under the BQL       */
@@ -223,6 +248,30 @@ typedef struct NvkvmRelay {
      */
     uint64_t    n_produced;
     uint64_t    n_stats_at;     /* n_produced when we last logged */
+    /*
+     * REDELIVERY OF A FRAME THE SOCKET WOULD NOT TAKE.
+     *
+     * A frame that hit EAGAIN used to be abandoned on the theory that "the next
+     * flip carries a newer buffer".  That holds for every frame except the last
+     * one: an idle desktop produces one frame and then nothing, so the last
+     * frame sat undelivered indefinitely and the screen went on showing the one
+     * before it.
+     *
+     * RELAY_PEND_ATTACH  the broker never heard about the buffer.
+     * RELAY_PEND_COMMIT  ATTACH landed, so the broker has imported the buffer
+     *                    and is holding it as `pending`; only the COMMIT is
+     *                    owed.  Re-sending the ATTACH would import it twice.
+     */
+    RelayPend   pend;
+    QEMUTimer  *pend_timer;
+    bool        last_shm;       /* retained with the frame, for the retry */
+    /*
+     * Whether n_sent was already counted for the owed frame.  The ATTACH case
+     * returns before the counter, the COMMIT case after it, so the retry must
+     * not count the same frame twice or miss it.
+     */
+    bool        pend_counted;
+    uint64_t    n_recovered;    /* frames the retry rescued */
 } NvkvmRelay;
 
 static NvkvmRelay *nvkvm_relay;
@@ -330,6 +379,8 @@ static void relay_retry(void *opaque);
 static void relay_readable(void *opaque);
 static void relay_forget_format_verdict(NvkvmRelay *r);
 static void relay_writable(void *opaque);
+static void relay_set_fd_handlers(NvkvmRelay *r, bool writable);
+static void relay_drop(NvkvmRelay *r, const char *why);
 static void relay_handshake_timeout(void *opaque);
 static int  relay_start_connect(NvkvmRelay *r, const char *path, Error **errp);
 static void relay_sync_flush(NvkvmRelay *r);
@@ -355,6 +406,10 @@ static void relay_connection_state_reset(NvkvmRelay *r)
     r->clip_in_bad = false;
     r->clip_out_count = 0;
     r->clip_out_next = 0;
+    r->pend = RELAY_PEND_NONE;
+    if (r->pend_timer) {
+        timer_del(r->pend_timer);
+    }
 }
 
 /*
@@ -382,6 +437,138 @@ static bool relay_frame_retain(NvkvmRelay *r, int dmabuf_fd,
     r->last_fourcc   = fourcc;
     r->last_modifier = modifier;
     return true;
+}
+
+/*
+ * POLLOUT is shared between the frame retry and the clipboard, so neither may
+ * disarm it while the other still has something to send.  Both call this
+ * instead of passing a literal.
+ */
+static bool relay_want_writable(const NvkvmRelay *r)
+{
+    return r->pend != RELAY_PEND_NONE ||
+           r->clip_out_next < r->clip_out_count;
+}
+
+static void relay_pend_clear(NvkvmRelay *r)
+{
+    r->pend = RELAY_PEND_NONE;
+    if (r->pend_timer) {
+        timer_del(r->pend_timer);
+    }
+}
+
+/*
+ * Re-send as much of the retained frame as the socket will now take.  Mirrors
+ * relay_sync_flush()'s ATTACH -> COMMIT walk, but for the LIVE connection: the
+ * reconnect path already knew how to replay r->last_fd, and this is the same
+ * problem one layer down.
+ *
+ * Leaves r->pend at the first step that would not go, so the next POLLOUT (or
+ * the deadline) resumes exactly there.
+ */
+static void relay_frame_flush(NvkvmRelay *r)
+{
+    struct nvkvm_broker_cmd cmd;
+    int rc;
+
+    assert(bql_locked());
+    if (r->conn_state != RELAY_CONN_ACTIVE || r->sock < 0) {
+        return;
+    }
+    while (r->pend != RELAY_PEND_NONE) {
+        memset(&cmd, 0, sizeof(cmd));
+        if (r->pend == RELAY_PEND_ATTACH) {
+            if (r->last_fd < 0) {
+                relay_pend_clear(r);    /* nothing retained to redeliver */
+                break;
+            }
+            /*
+             * A refused WINDOW normally self-heals, because the next frame
+             * re-sends it -- but the frame being redelivered here may be the
+             * last one, in which case there is no next frame to fix the window
+             * size.  Same order relay_sync_flush() uses: geometry, then buffer.
+             */
+            if (r->last_w != r->last_bw || r->last_h != r->last_bh) {
+                cmd.type = NVKVM_BROKER_CMD_WINDOW;
+                cmd.width = r->last_bw;
+                cmd.height = r->last_bh;
+                rc = relay_send(r, &cmd, -1);
+                if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
+                    break;
+                }
+                if (rc != 0) {
+                    relay_drop(r, "the broker socket failed resending geometry");
+                    return;
+                }
+                r->last_w = r->last_bw;
+                r->last_h = r->last_bh;
+                memset(&cmd, 0, sizeof(cmd));
+            }
+            cmd.type = NVKVM_BROKER_CMD_ATTACH;
+            cmd.flags = r->last_shm ? NVKVM_BROKER_CMD_F_SHM : 0;
+            cmd.width = r->last_bw;
+            cmd.height = r->last_bh;
+            cmd.stride = r->last_stride;
+            cmd.offset = 0;
+            cmd.fourcc = r->last_fourcc;
+            cmd.modifier = r->last_modifier;
+            cmd.seq = (uint32_t)r->n_sent;
+            rc = relay_send(r, &cmd, r->last_fd);
+            if (rc == 0) {
+                r->pend = RELAY_PEND_COMMIT;
+                continue;
+            }
+        } else {
+            cmd.type = NVKVM_BROKER_CMD_COMMIT;
+            rc = relay_send(r, &cmd, -1);
+            if (rc == 0) {
+                if (!r->pend_counted) {
+                    r->n_sent++;
+                }
+                r->n_recovered++;
+                relay_pend_clear(r);
+                break;
+            }
+        }
+        if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
+            break;              /* still full; POLLOUT or the deadline retries */
+        }
+        relay_drop(r, "the broker socket failed redelivering a frame");
+        return;
+    }
+    relay_set_fd_handlers(r, relay_want_writable(r));
+}
+
+/*
+ * The frame has been undeliverable for RELAY_PEND_DEADLINE_MS.  Try again and,
+ * if it still will not go, keep trying on the same period rather than giving
+ * up: an abandoned frame is the bug this exists to prevent.
+ */
+static void relay_pend_deadline(void *opaque)
+{
+    NvkvmRelay *r = opaque;
+
+    assert(bql_locked());
+    relay_frame_flush(r);
+    if (r->pend != RELAY_PEND_NONE && r->sock >= 0) {
+        timer_mod(r->pend_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      RELAY_PEND_DEADLINE_MS);
+    }
+}
+
+/* Note a frame the socket refused, and make sure something comes back for it. */
+static void relay_pend_arm(NvkvmRelay *r, RelayPend what)
+{
+    r->pend = what;
+    r->pend_counted = (what == RELAY_PEND_COMMIT);
+    relay_set_fd_handlers(r, true);
+    if (r->pend_timer) {
+        timer_mod(r->pend_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      RELAY_PEND_DEADLINE_MS);
+    }
 }
 /* NVKVM_RELAY_STATE_HELPERS_END */
 
@@ -585,9 +772,9 @@ bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
         r->n_stats_at = r->n_produced;
         info_report("nvkvm-relay frames: produced=%" PRIu64 " forwarded=%"
                     PRIu64 " dropped=%" PRIu64 " uncommitted=%" PRIu64
-                    " lost=%" PRIu64,
+                    " recovered=%" PRIu64 " lost=%" PRIu64,
                     r->n_produced, r->n_sent, r->n_dropped, r->n_uncommitted,
-                    r->n_produced - r->n_sent);
+                    r->n_recovered, r->n_produced - r->n_sent);
     }
 
     /*
@@ -612,6 +799,15 @@ bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
                             modifier)) {
         return false;
     }
+    /*
+     * A NEWER FRAME SUPERSEDES AN OWED ONE.  This is the case the old code was
+     * right about: when another flip follows, redelivering the previous frame
+     * would put a stale image on screen.  The retry exists for when no flip
+     * follows, so it is cancelled here and re-armed below if this frame is
+     * itself refused.
+     */
+    r->last_shm = shm;
+    relay_pend_clear(r);
 
     if (r->conn_state == RELAY_CONN_SYNC_COMMIT) {
         /* ATTACH for the previous retained frame is already on the stream.
@@ -673,6 +869,7 @@ bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
          * carries a newer buffer.  Counted, not silent.
          */
         r->n_dropped++;
+        relay_pend_arm(r, RELAY_PEND_ATTACH);
         return true;        /* we consumed the fd; do not fall through */
     }
     if (rc != 0) {
@@ -705,6 +902,7 @@ bool nvkvm_display_relay_submit_flags(struct VirtIONvgpu *nv, int dmabuf_fd,
          * "occasional stale frame" invisible to anyone looking for it.
          */
         r->n_uncommitted++;
+        relay_pend_arm(r, RELAY_PEND_COMMIT);
         if (r->n_uncommitted <= 4 || (r->n_uncommitted % 256) == 0) {
             RELAY_LOG("the broker did not drain: frame %u attached but not "
                       "committed, so the display holds the previous frame "
@@ -1315,7 +1513,7 @@ static void relay_clip_flush(NvkvmRelay *r)
     if (r->clip_out_next >= r->clip_out_count) {
         r->clip_out_count = 0;
         r->clip_out_next = 0;
-        relay_set_fd_handlers(r, false);
+        relay_set_fd_handlers(r, relay_want_writable(r));
         return;
     }
     rc = relay_clip_batch_flush(r->clip_out, r->clip_out_count,
@@ -1323,7 +1521,7 @@ static void relay_clip_flush(NvkvmRelay *r)
     if (rc == 0) {
         r->clip_out_count = 0;
         r->clip_out_next = 0;
-        relay_set_fd_handlers(r, false);
+        relay_set_fd_handlers(r, relay_want_writable(r));
     } else if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
         relay_set_fd_handlers(r, true);
     } else {
@@ -1396,6 +1594,8 @@ static void relay_writable(void *opaque)
         return;
     }
     if (r->conn_state == RELAY_CONN_ACTIVE) {
+        /* The frame first: it is on a deadline and the clipboard is not. */
+        relay_frame_flush(r);
         relay_clip_flush(r);
     }
 }
@@ -1683,6 +1883,8 @@ static void nvkvm_relay_init(DisplayState *ds, DisplayOptions *opts)
     r->con = con;
     r->retry_ms = RELAY_RETRY_MIN_MS;
     r->retry = timer_new_ms(QEMU_CLOCK_REALTIME, relay_retry, r);
+    r->pend_timer = timer_new_ms(QEMU_CLOCK_REALTIME,
+                                 relay_pend_deadline, r);
     r->handshake_deadline = timer_new_ms(QEMU_CLOCK_REALTIME,
                                          relay_handshake_timeout, r);
     /*
