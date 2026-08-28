@@ -373,3 +373,100 @@ deliberately widens cross-client visibility of freshly allocated objects; and
 to disable that post-alloc SHARE and re-run the +59 measurement above. If the
 delta drops to 0, that line is the leak. That is a one-line change and a
 five-minute test, and it is where whoever picks this up should start.
+
+---
+
+# UPDATE 3 — the leak is nvkvm-specific, and where it is narrowed to
+
+## 15. Host-native control: the identical app leaks NOTHING on the host
+
+Same host, same GPU, same driver, same binary (`/usr/bin/vkcube`), confirmed
+running on the RTX 4070:
+
+| client | teardown | new `Failed to auto-unmap` |
+|---|---|---|
+| `vkcube` **inside the nvkvm guest**, 60 s | SIGKILL | **+59** |
+| `vkcube` **inside the nvkvm guest**, 60 s | clean SIGTERM | **+59** |
+| `vkcube` **on the host**, 30 s | SIGKILL | **0** |
+| host CUDA client (`va_capacity`, allocates/frees ~11 GiB) | clean exit | **0** |
+| 10 Kata GPU containers (different VMM stack) | clean exit | **0** |
+
+**This is the control the investigation needed.** RM's teardown auto-unmap does
+not fail for ordinary host clients, so this is not a generic driver bug that any
+GPU workload triggers. **Something nvkvm does to the mapping topology makes RM
+unable to unmap on client teardown.**
+
+## 16. What the forwarded RM traffic shows
+
+With `NVKVM_DEBUG=1` on the vmm service (runtime env var,
+`src/qemu/nvkvm_log.h` — no rebuild needed), over one guest session:
+
+| trace | count |
+|---|---|
+| `RM_MAP_MEMORY` | 895 |
+| `A100DBG UNMAP` | 376 |
+| `A100DBG FREE` | 2071 |
+| `post-alloc SHARE` (succeeded) | 1320 |
+| `post-alloc SHARE` (**ret=-22**) | 230 |
+
+- **895 maps vs 376 unmaps.** ~519 mappings are never explicitly unmapped; they
+  rely on client teardown — which is the path that fails.
+- Every map uses `h_device=0xbeef0004`, e.g.
+  `h_client=0xc1d00424 h_device=0xbeef0004 h_memory=0x23 length=0x400000 fd=1343 -> pLinear=0x147e40000 status=0x0`.
+- `0xbeef0004` is **`hClass=0x2080` = NV20_SUBDEVICE_0**, and each client
+  allocates its *own* — so this is not a handle collision across clients.
+- **`0xbeef0004` is never explicitly freed** (`FREE hObject=0xbeef0004` count =
+  **0**). The map context is only ever released implicitly, with its client.
+- 118 of the frees are explicit **client** frees (`hObject == hRoot == hClient`,
+  `nvstatus=0x0`, i.e. they succeed).
+- **The client that actually failed (`c1d004a1`) was never explicitly freed at
+  all** — no `FREE hObject=0xc1d004a1` exists. Its teardown therefore ran via
+  the implicit **fd-close** path.
+
+## 17. Current best hypothesis (UNVERIFIED) and how to settle it
+
+The mappings are anchored on a subdevice context that is only ever released
+implicitly, and the failing teardowns run on the fd-close path rather than an
+explicit client free. nvkvm is the only thing here that changes the *identity
+and number of file descriptions* behind a guest client: the stub opens the real
+device and **QEMU keeps an SCM_RIGHTS duplicate**
+(`src/qemu/nvkvm_isolate_handlers.c:670-694`), QEMU can open nvidia nodes itself
+(`src/qemu/nvkvm_handle.c:127`), and the stub opens a fresh `/dev/nvidia-uvm`
+per REALIZE that it deliberately leaks
+(`src/stub/nvkvm_stub.c:2626`, comment at `:2776-2777`). A guest process that
+believes it holds one device file may be spread across more than one host open
+— and therefore more than one RM client — so the client that owns the map
+context is not the client RM tears down.
+
+**Two experiments, in order, neither needing special hardware beyond a working
+nvkvm host:**
+
+1. **Log the fd->client identity.** `NVKVM_DEBUG=1` already prints the `fd` used
+   by each `RM_MAP_MEMORY`. Add the owning handle/client for that fd and confirm
+   whether `fd`'s RM client == `h_client`. If they differ, that is the bug, and
+   the fix is to make the map's fd and its client the same open.
+2. **Disable the host-initiated post-alloc `NV_ESC_RM_SHARE`**
+   (`src/qemu/nvkvm_isolate_handlers.c:3528` `needs_share`) and re-run the +59
+   measurement in §13. Note this SHARE **already fails 230 times with
+   `ret=-22` (EINVAL)** in one session, so it is not behaving as intended
+   regardless. If the delta drops to 0, that line is the leak.
+
+**Do NOT treat this as fixed.** No code change is included in this branch,
+because the mechanism is not yet proven and a speculative change to RM object
+lifetime is exactly the kind of thing that produces a second, subtler leak.
+
+## 18. Host left as found
+
+`NVKVM_DEBUG` was added to the vmm service's `environment:` in
+`/opt/nvkvm-steamos-two-container/docker-compose.yml` for the traces above and
+has been **reverted** (backup at `/root/docker-compose.yml.bak-vaLeak`). To
+re-enable, add one line under the `vmm:` service:
+```yaml
+      NVKVM_DEBUG: "1"
+```
+then `docker compose up -d vmm`. The vmm image was verified as QEMU **9.2.0**
+before and after every restart, per the silent-rebuild warning.
+
+Sampler units left running on the host (harmless, `--collect`):
+`nvkvm-va-sampler`, `nvkvm-va-sampler2`, `nvkvm-cap-sampler`,
+`nvkvm-leak-sampler`, writing `/root/*log*.txt`.

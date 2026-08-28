@@ -1,0 +1,15 @@
+  17730 nvkvm: ioctl_on_isolate: isolate=N handle=N cmd=H ret=N nvstatus=H fault=H
+  13109 nvkvm: ioctl_on_isolate: isolate=N handle=N cmd=H inner=H ret=N nvstatus=H fault=H
+   3070 nvkvm: A100DBG FREE  hRoot=H hParent=H hObject=H nvstatus=H
+   1424 nvkvm: post-alloc SHARE hClient=H hClass=H hObj=H ret=N nvstatus=H status=H
+   1012 nvkvm: WINMAP fd=N dev_id=N off=H len=N gpa=H qva=H req_prot=H
+    975 nvkvm: RM_MAP_MEMORY: h_client=H h_device=H h_memory=H offset=H length=H flags=H fd=N -> pLinear=H status=H
+    975 nvkvm: A100DBG MAP   hClient=H hDevice=H hMemory=H off=H len=H va=H nvstatus=H
+    940 nvkvm: REAP_HANDLE handle=N gpa=H len=N
+    533 nvkvm: A100DBG UNMAP hClient=H hDevice=H hMemory=H va=H nvstatus=H
+    256 nvkvm: post-alloc SHARE hClient=H hClass=H hObj=H ret=-22 nvstatus=H status=H
+    164 nvkvm: CLASSLIST_V2 ret=N nvstatus=H aux_size=N numClasses=N cap=N hopper_gpfifo_c86f=N ampere_gpfifo_c56f=N hopper_compute_cbc0=N
+     10 nvkvm: DENY ctrl cmd H (not in allowlist / oversize)
+      1 nvkvm: vq_evt full, dropped ui_info 128H
+      1 nvkvm: registered KVM vm fd 16
+      1 nvkvm: host driver 595.84 → ABI profile 580
