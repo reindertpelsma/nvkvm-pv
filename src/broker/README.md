@@ -83,7 +83,30 @@ away.
 ```bash
 cd src/broker && make          # prints which backends it kept
 make check                     # build + selftest.sh
+bash headless_present_test.sh  # real import + present, headless, no monitor
 ```
+
+`selftest.sh` covers everything except the one thing that matters most — the
+actual dma-buf import and present — because that needs a real compositor.
+`headless_present_test.sh` covers it without one attached: weston on its
+headless backend, and a bounded frame stream whose **last** frame must be
+presented rather than left unflushed.
+
+It also reaches a tier that is otherwise untestable on NVIDIA. Mutter
+advertises XR24 + modifier `0x0` (LINEAR) and **NVIDIA then refuses to import
+it**, so on an NVIDIA-only host every frame falls back to shm or to the
+block-linear native tier and the linear path never runs. llvmpipe and AMD both
+import it happily:
+
+```bash
+bash headless_present_test.sh                    # llvmpipe — needs no GPU, runs in CI
+NVKVM_TEST_SOFTWARE=0 bash headless_present_test.sh   # real driver, still headless
+NVKVM_TEST_NODE=/dev/dri/renderD129 ...          # pick the allocator explicitly
+```
+
+The allocator node defaults to a **non-NVIDIA** one when the box has several, since a
+linear buffer allocated on NVIDIA has no consumer on an NVIDIA-only host. Skips
+with status 77 when weston or a render node is missing.
 
 Dependencies — note what is **not** there: no libdrm, no EGL, no GL, no GBM.
 
