@@ -13,10 +13,17 @@
 #   https://us.download.nvidia.com/tesla/$v/NVIDIA-Linux-x86_64-$v.run
 # AVAILABLE means one returned 200/206 and the third column is that URL.
 #
-# NOTE 403 != ABSENT. A rented box saw HTTP 403 for URLs that return 206 from a
-# normal network, i.e. NVIDIA's CDN rate-limits/blocks some hosts. That is what
-# --driver-cache is for: fetch here, upload to the box. Do not re-probe from a
-# rented box and do not let a 403 rewrite this file.
+# NOTE 403 != ABSENT, and the mechanism is GEO-REDIRECTION, not rate-limiting.
+# Measured 2026-08-30 on a box at 191.223.212.127: a request to
+# us.download.nvidia.com is 301'd to us.download.nvidia.CN (the China CDN),
+# which then answers 403 for these paths. Same URL returns 206 from boxes in
+# other regions. So a box's ability to fetch a driver depends on where the
+# provider geolocates it, and every driver on such a box fails identically.
+#
+# Detect it with:  curl -sIL -o /dev/null -w '%{url_effective}' <url>
+# If the effective URL ends up on .cn, that box cannot fetch drivers directly --
+# use --driver-cache (fetch on a trusted network, upload to the box).
+# Never re-probe this file from a rented box and never let a 403 rewrite it.
 #
 # Regenerate from a trusted network; it changes only when NVIDIA publishes or
 # withdraws an installer.
