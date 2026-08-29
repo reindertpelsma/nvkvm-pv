@@ -859,6 +859,52 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 			    struct nvkvm_req_kill_isolate *req,
 			    struct nvkvm_resp_kill_isolate *resp)
 {
+	/*
+	 * S-2 (cross-isolate), audit 2026-08-29 #4: this used to act on a bare
+	 * guest isolate_id with no ownership test of any kind — strictly worse
+	 * than the documented MUNMAP gap below, because it needs no mmap_token
+	 * and the id space is only 4096 slot indices.  What follows the kill is
+	 * not recoverable for the victim: nvkvm_iso_mmap_reap_isolate() restores
+	 * anonymous backing over its live GPU mappings, its window and its
+	 * session are forgotten, and every host fd it owned is force-closed.
+	 *
+	 * Reject id 0 outright (it is never a live isolate; nvkvm_isolate_kill
+	 * would answer -ENOENT, but say so here so the fast path never enters
+	 * the table at all).
+	 */
+	if (req->isolate_id == 0) {
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	/*
+	 * The session→isolate half of the proof the siblings carry
+	 * (PRESENT :2206, XISO_IMPORT :1995, REALIZE :4822 — each takes a
+	 * session_id from QEMU's own handle table and checks the pairing).
+	 *
+	 * KNOWN GAP, and it is the same one MUNMAP_ON_ISOLATE documents below:
+	 * struct nvkvm_req_kill_isolate is { isolate_id, reserved } and carries
+	 * NO caller identity, and there is no handle here to anchor a session to
+	 * the way the siblings do.  Closing it properly needs a caller session_id
+	 * ON THE WIRE.  Rather than bodge one in, we read the (guest-zeroed,
+	 * protocol-reserved) second word as an OPTIONAL caller session_id: when
+	 * the guest supplies one we hold it to the same pairing test the siblings
+	 * apply, and when it is 0 we behave exactly as before.  So this is inert
+	 * against today's guest module (which sends 0) and becomes real the
+	 * moment that field is filled — no flag day, no broken kills in between.
+	 * As with every session_has_isolate() check here, it would bound a
+	 * malicious guest USERSPACE process only: the guest kernel module fills
+	 * the field and is itself untrusted.  Defence in depth, same weight.
+	 */
+	if (req->reserved != 0 &&
+	    !session_has_isolate(nv, req->reserved, req->isolate_id)) {
+		NVKVM_DBG("nvkvm kill_isolate: isolate %u not owned by "
+			  "session %u — refused\n",
+			  req->isolate_id, req->reserved);
+		resp->status = EPERM;
+		return 0;
+	}
+
 	int ret = nvkvm_isolate_kill(&nv->isolates, req->isolate_id);
 
 	/*
