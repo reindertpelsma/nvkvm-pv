@@ -255,19 +255,32 @@ static int nvkvm_mmap_request_isolate(struct nvkvm_fd_ctx *ctx,
 			struct nvkvm_hdr                   hdr;
 			struct nvkvm_req_munmap_on_isolate req;
 		} *umsg;
-		struct nvkvm_inflight uinf;
+		/* Zeroed, not just partly filled: nvkvm_send_sync() branches on
+		 * inf->isolate_id to decide between an interruptible wait and an
+		 * uninterruptible one, and on the interruptible side it asks THAT
+		 * isolate to interrupt txn_id.  Left as stack garbage it would
+		 * interrupt an arbitrary isolate's in-flight ioctl.  This is a
+		 * control-plane request, so isolate_id must stay 0. */
+		struct nvkvm_inflight uinf = { 0 };
+		__u32 utxn;
 		umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
-		if (umsg) {
+		/* Take the txn_id from the allocator, not off the seed: the
+		 * bitmap is what stops a wrapped seed reusing an id that is
+		 * still outstanding on another waiter.  Exhaustion is handled
+		 * exactly like the kzalloc failure -- skip the munmap request,
+		 * which leaves the host mapping to be reaped at isolate exit. */
+		utxn = umsg ? nvkvm_txn_id_alloc(&nvkvm) : 0;
+		if (umsg && utxn) {
 			umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
-			umsg->hdr.txn_id     = cpu_to_le32(
-					atomic_inc_return(&nvkvm.next_txn_id));
+			umsg->hdr.txn_id     = cpu_to_le32(utxn);
 			umsg->req.isolate_id = cpu_to_le32(ctx->session->isolate_id);
 			umsg->req.mmap_token = cpu_to_le32(mmap_token);
 			init_completion(&uinf.done);
-			uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
+			uinf.txn_id = utxn;
 			nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
-			kfree(umsg);
+			nvkvm_txn_id_free(&nvkvm, utxn);
 		}
+		kfree(umsg);
 		return ret;
 	}
 
@@ -1317,19 +1330,28 @@ void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
 				struct nvkvm_hdr                   hdr;
 				struct nvkvm_req_munmap_on_isolate req;
 			} *umsg;
-			struct nvkvm_inflight uinf;
+			/* Zeroed: see the identical unwind in nvkvm_mmap().
+			 * It matters more here -- this runs at process exit with
+			 * a SIGKILL already pending, so nvkvm_send_sync() takes
+			 * the interruptible branch by construction and would act
+			 * on whatever isolate_id the stack happened to hold.
+			 * uinf.isolate_id stays 0: this is control plane, and the
+			 * wait must not be interruptible. */
+			struct nvkvm_inflight uinf = { 0 };
+			__u32 utxn;
 			umsg = kzalloc(sizeof(*umsg), GFP_KERNEL);
-			if (umsg) {
+			utxn = umsg ? nvkvm_txn_id_alloc(&nvkvm) : 0;
+			if (umsg && utxn) {
 				umsg->hdr.type       = cpu_to_le32(NVKVM_REQ_MUNMAP_ON_ISOLATE);
-				umsg->hdr.txn_id     = cpu_to_le32(
-						atomic_inc_return(&nvkvm.next_txn_id));
+				umsg->hdr.txn_id     = cpu_to_le32(utxn);
 				umsg->req.isolate_id = cpu_to_le32(isolate_id);
 				umsg->req.mmap_token = cpu_to_le32(region->mmap_token);
 				init_completion(&uinf.done);
-				uinf.txn_id = le32_to_cpu(umsg->hdr.txn_id);
+				uinf.txn_id = utxn;
 				nvkvm_send_sync(&nvkvm, umsg, sizeof(*umsg), &uinf);
-				kfree(umsg);
+				nvkvm_txn_id_free(&nvkvm, utxn);
 			}
+			kfree(umsg);
 		}
 		list_del(&region->list);
 		kfree(region);
