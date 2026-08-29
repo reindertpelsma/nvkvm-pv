@@ -667,6 +667,30 @@ void nvkvm_evt_ctx_unregister(struct nvkvm_fd_ctx *ctx)
 	spin_unlock_irqrestore(&nvkvm_evt_ctx_lock, flags);
 }
 
+/*
+ * The (isolate_id, handle_id) match below IS the ownership check.
+ *
+ * Recorded because an audit read this as "matches on host-supplied ids with no
+ * ownership check" and rated it a way for a malicious VMM to set poll bits on
+ * any guest process's fd.  Both halves are wrong, and re-deriving that costs
+ * more than a comment:
+ *
+ *  - The ids are compared against ctx->handle_id and ctx->session->isolate_id,
+ *    which are the fd's OWN values, established at open and never taken off the
+ *    wire.  A pair names exactly one handle in one isolate, so no fd can be
+ *    reached with another fd's identifiers.  What the host picks is which of
+ *    the guest's own fds to wake, not whose memory to touch.
+ *  - The host here is the VMM, which is this guest's hypervisor: it owns the
+ *    guest's RAM and its vCPUs.  "A malicious VMM can cause a spurious wakeup"
+ *    is not a threat, because a malicious VMM does not need one.
+ *
+ * The one gap that is real is narrow and benign: an fd that never armed can be
+ * woken, since nothing requires poll_armed to be set.  Left alone on purpose --
+ * dropping unarmed events would silently disable the fast wakeup path if the
+ * host ever delivers one unsolicited, and that exact failure (a silent
+ * permanent fallback to the ~18 ms poll timeout) already went unnoticed once,
+ * across three driver versions.  A spurious wakeup costs one re-poll.
+ */
 void nvkvm_evt_deliver(__u32 isolate_id, __u32 handle_id, __u32 events)
 {
 	struct nvkvm_fd_ctx *ctx;
@@ -2781,6 +2805,40 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	 * its blocking host round trip and shadow commit.  st->lock is acquired
 	 * only briefly inside prepare/record; the sleeping transport runs with
 	 * ext_lock, never the inner state lock. */
+	/*
+	 * LOCK ORDER WARNING -- ext_lock IS HELD ACROSS CODE THAT TOUCHES USER
+	 * MEMORY, AND THAT IS AN AB-BA AGAINST mmap_lock.
+	 *
+	 * The kernel calls ->mmap with mmap_write_lock held, and
+	 * nvkvm_mmap_request() takes ext_lock there (nvkvm_mmap.c).  So the order
+	 * on that side is mmap_lock -> ext_lock, fixed and not ours to change.
+	 * Everything reached from HERE while ext_lock is held must therefore never
+	 * BLOCK on mmap_lock, or two threads of one CUDA process -- one in a UVM
+	 * shadow ioctl, one in mmap() on the same fd -- wedge with mmap_write_lock
+	 * held.  The process is then unkillable and every reader of its
+	 * /proc/<pid>/maps hangs behind it.
+	 *
+	 * The unconditional edge is gone: the VMA whitelist built for every
+	 * forwarded ioctl now uses mmap_read_trylock() and sends an empty list on
+	 * contention, which costs nothing because no host code reads it (see the
+	 * long note in nvkvm_virtio.c).
+	 *
+	 * TWO NARROWER EDGES REMAIN OPEN inside this transaction, and neither can
+	 * be made non-blocking where it stands:
+	 *   - nvkvm_cpu_pages_refresh() below -> nvkvm_cpu_page_entry_live(), which
+	 *     takes mmap_read_lock, and get_user_pages_fast(), which takes it
+	 *     internally -- reachable only when this fd has migrated CPU pages;
+	 *   - nvkvm_efault_resolve() -> nvkvm_cpu_page_migrate(), which takes
+	 *     mmap_write_lock -- reachable only if the host driver EFAULTs on a
+	 *     guest VA, which none of the ten control-plane commands
+	 *     nvkvm_uvm_shadow_cmd() admits is expected to do.
+	 *
+	 * Closing those means moving the blocking host round trip out of ext_lock
+	 * and re-establishing the mmap/ioctl mutual exclusion some other way --
+	 * a redesign of the UVM shadow transaction, not a patch, and it needs an
+	 * owner's decision.  Until then: DO NOT add anything under this lock that
+	 * reads or pins user memory.
+	 */
 	if (ctx->dev_id == NVKVM_DEV_UVM && ctx->uvm_state &&
 	    nvkvm_uvm_shadow_cmd(cmd)) {
 		mutex_lock(&ctx->uvm_state->ext_lock);
@@ -3286,9 +3344,25 @@ static __poll_t nvkvm_poll(struct file *filp, poll_table *wait)
 	 * round-trip done at most once per wait. */
 	if (!events && ctx->handle_id && ctx->session &&
 	    ctx->session->isolate_id &&
-	    atomic_cmpxchg(&ctx->poll_armed, 0, 1) == 0)
-		nvkvm_virtio_poll_arm(ctx->session->isolate_id,
-				      ctx->handle_id, 1);
+	    atomic_cmpxchg(&ctx->poll_armed, 0, 1) == 0) {
+		/*
+		 * PUT poll_armed BACK IF THE ARM DID NOT TAKE.  The cmpxchg above
+		 * claims the flag BEFORE the request goes out (so a completion
+		 * cannot be missed), which means a failed request leaves it set
+		 * with nothing on the host that will ever clear it -- and
+		 * nvkvm_evt_deliver() is the only other writer.  The fd is then
+		 * pinned to the ~18 ms libnvidia poll-timeout fallback for the rest
+		 * of its life, from one transient failure.
+		 *
+		 * This is the same silent-permanent-fallback shape as the missing
+		 * tx_done cases documented in nvkvm_virtio.c: nothing FAILS, so
+		 * nothing is reported -- the fast wakeup simply stops existing.
+		 * That one went unnoticed across three driver versions.
+		 */
+		if (nvkvm_virtio_poll_arm(ctx->session->isolate_id,
+					  ctx->handle_id, 1))
+			atomic_set(&ctx->poll_armed, 0);
+	}
 	return events;
 }
 
