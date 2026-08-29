@@ -86,6 +86,8 @@ export NVKVM_TEST_ARGV="$work/argv"
 warn() { :; }
 eval "$(awk '/^rsh_t\(\) \{/,/^\}/' "$SWEEP")"
 HOSTILE='1.2.3.4; touch '"$work/pwned"
+# Consumed by the extracted rsh_t, not by this script directly.
+# shellcheck disable=SC2034
 SSH_ARGV=(ssh -p 22 "root@$HOSTILE")
 rsh_t 5 'echo hello' >/dev/null 2>&1
 
