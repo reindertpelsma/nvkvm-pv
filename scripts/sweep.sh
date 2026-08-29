@@ -996,6 +996,20 @@ for o in offers:
         continue
     if down_tb > max_down_tb or up_tb > max_up_tb:
         continue
+    # storage_total_cost is 0 for EVERY offer in a search that requests no
+    # disk -- filtering on it silently accepted everyone. The per-unit price is
+    # storage_cost ($/GB/month); scale it by the disk this run will actually
+    # ask for.
+    if (o.get("storage_cost") or 0) > max_stor_gb_mo:
+        continue
+    # Network is NOT in dph_total. An unpriced field means unknown, and unknown
+    # on a spend-capped unattended run is treated as too expensive.
+    down_tb = o.get("internet_down_cost_per_tb")
+    up_tb   = o.get("internet_up_cost_per_tb")
+    if down_tb is None or up_tb is None:
+        continue
+    if down_tb > max_down_tb or up_tb > max_up_tb:
+        continue
     cands.append(o)
 
 if not cands:
