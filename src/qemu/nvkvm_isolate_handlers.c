@@ -77,6 +77,65 @@ static pthread_mutex_t iso_mmap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static pthread_mutex_t deny_log_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* ── which rule admitted a control, for narrowing the two wildcards ─────────
+ *
+ * nvkvm_ctrl_cmd_allowed() reports WHICH rule said yes, and the comment at its
+ * definition claims a single run enumerates the set the wildcards are
+ * load-bearing for.  It did not: nothing read the answer, so the reason code
+ * existed and no run produced anything.  This is the missing half.
+ *
+ * Deliberately OFF unless NVKVM_CTRL_AUDIT=1.  This is an investigation tool,
+ * not a production log: the point is to run a real workload once, collect the
+ * distinct commands that ONLY a wildcard admits, and turn those into explicit
+ * table rows.  Table-admitted commands are not logged -- they are already
+ * justified, and including them would bury the answer.
+ *
+ * One line per distinct command, never repeated, so a long session cannot
+ * flood.  Bounded by the same table size as the denial path.
+ *
+ * NOTE: this instruments the QEMU side only.  src/stub/nvkvm_stub.c consults
+ * the same gate on its own path and is NOT covered here, so an enumeration
+ * from this alone is a lower bound on what the wildcards admit.
+ */
+static bool nvkvm_ctrl_audit_enabled(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		const char *e = getenv("NVKVM_CTRL_AUDIT");
+		on = (e && *e && *e != '0') ? 1 : 0;
+	}
+	return on == 1;
+}
+
+static void nvkvm_ctrl_allow_log(uint32_t cc, int how)
+{
+	static uint32_t seen[NVKVM_DENY_SEEN_MAX];
+	static unsigned nseen;
+	bool fresh = false;
+	unsigned i;
+
+	/* Only the wildcards are in question.  A table row is already a
+	 * justified, enumerated decision. */
+	if (how == NVKVM_CTRL_ALLOW_TABLE || !nvkvm_ctrl_audit_enabled())
+		return;
+
+	pthread_mutex_lock(&deny_log_lock);
+	for (i = 0; i < nseen; i++)
+		if (seen[i] == cc)
+			break;
+	if (i == nseen && nseen < NVKVM_DENY_SEEN_MAX) {
+		seen[nseen++] = cc;
+		fresh = true;
+	}
+	pthread_mutex_unlock(&deny_log_lock);
+
+	if (fresh)
+		fprintf(stderr, "nvkvm: CTRL-AUDIT wildcard-only ALLOW "
+			"cmd 0x%08x via %s\n", cc,
+			how == NVKVM_CTRL_ALLOW_GSS ? "cmd&0x8000 (GSS legacy)"
+						    : "class 0x2081 (BINAPI)");
+}
+
 static void nvkvm_ctrl_deny_log(uint32_t cc)
 {
 	static struct { uint32_t cmd; uint64_t n; } seen[NVKVM_DENY_SEEN_MAX];
@@ -3448,7 +3507,8 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		bool cc_readable = param_buf && req->param_size >= 12;
 		if (cc_readable)
 			memcpy(&cc, (char *)param_buf + 8, 4);
-		if (!cc_readable || !nvkvm_ctrl_cmd_allowed(cc) ||
+		int cc_how = cc_readable ? nvkvm_ctrl_cmd_allowed(cc) : 0;
+		if (!cc_readable || !cc_how ||
 		    req->aux_size > (1u << 20)) {
 			nvkvm_ctrl_deny_log(cc);
 			/* As above: RM answers an unsupported control with a
@@ -3461,6 +3521,9 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			resp->fault_addr = 0;
 			return 0;
 		}
+		/* Allowed.  Record which rule said so, so one real workload
+		 * enumerates what the wildcards are actually carrying. */
+		nvkvm_ctrl_allow_log(cc, cc_how);
 	}
 
 	/*
