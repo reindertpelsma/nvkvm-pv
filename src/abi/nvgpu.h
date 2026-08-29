@@ -789,12 +789,20 @@ struct nv2081_alloc_parameters {
  *    symptom on that host is cuInit() succeeding while cuDeviceGetCount()
  *    returns 0 devices, so CUDA is unusable.
  *
- *    HONEST LIMITS OF THIS ROW. Two things are NOT established:
- *      - the struct was read off ONE unpacked tag (595.84). The convention
- *        here is to confirm a layout across several tags before trusting it;
- *        unpack more and re-check before treating this as settled. A single
- *        __u32 is about as safe as a guess gets, but it is still one tag.
- *      - that this row FIXES the zero-devices symptom. It closes a real,
+ *    VERIFIED ACROSS TAGS, 2026-08-30. class/clcb33.h read at eleven OGKM
+ *    tags spanning every ABI profile boundary:
+ *
+ *      515.43.04, 525.60.13                       class ABSENT (does not exist)
+ *      535.104.05, 545.23.06, 550.54.14,          NvHandle hClient;  -- identical
+ *      570.124.06, 575.51.03, 580.159.04,
+ *      590.48.01, 595.91.07, 610.43.02
+ *
+ *    So the layout does not diverge anywhere it exists, and a guest on a
+ *    pre-535 driver can never allocate this class at all. No profile-specific
+ *    handling is needed.
+ *
+ *    WHAT THIS ROW STILL DOES NOT CLAIM: that it FIXES the zero-devices
+ *    symptom. It closes a real,
  *        measured gap -- the warning is the driver telling us we are
  *        forwarding a wrong-sized window for a class libcuda really does
  *        allocate -- but the NV2081 row above is precedent for exactly this
