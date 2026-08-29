@@ -148,8 +148,16 @@ Clipboard modes are `off` (default), `guest-to-host`, and `consent`. `consent`
 adds host-to-guest transfer only after an explicit paste chord. Text is UTF-8
 and capped at 7 KiB (7168 bytes) in either direction. Automatic `full` sync is
 not implemented and is rejected rather than behaving exactly like `consent`.
-The Wayland backend implements clipboard transfer; X11 rejects every non-off
-mode. The explicit test backend has a simulated clipboard for regression tests.
+Both display backends implement clipboard transfer in both directions: Wayland
+through `wl_data_device`, X11 through `CLIPBOARD` selection ownership and a
+single-property transfer (an `INCR` stream is refused rather than truncated,
+since it only appears well above the 7 KiB cap), and `x11_open()` advertises
+`NB_SESSION_CLIP_G2H | NB_SESSION_CLIP_H2G` for the same reason Wayland does —
+the boundary the broker draws must not depend on which display server the host
+happens to run. This paragraph used to say X11 rejected every non-off mode; it
+had not been true since the X11 clipboard landed, and a doc that under-states
+what a security boundary permits is worse than one that says nothing. The
+explicit test backend has a simulated clipboard for regression tests.
 
 ### Putting the socket into a container
 
