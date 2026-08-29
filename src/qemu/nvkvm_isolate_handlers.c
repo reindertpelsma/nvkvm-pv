@@ -3392,13 +3392,27 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 * check, so a short param_size skipped the only allowlist on this path
 	 * entirely (the stub has none on the socket path, and zero-pads to
 	 * _IOC_SIZE before forwarding).  The size test now selects the sentinel
-	 * command instead of selecting whether to test at all; 0xffffffff is not
-	 * a real RM control cmd and cannot be in the allowlist, so it denies. */
+	 * command instead of selecting whether to test at all.
+	 *
+	 * Audit 2026-08-29: and the sentinel did not work.  It was chosen
+	 * because "0xffffffff is not a real RM control cmd and cannot be in the
+	 * allowlist, so it denies" — true of the table, and irrelevant, because
+	 * 0xffffffff & 0x8000 is non-zero and the GSS-legacy wildcard in
+	 * nvkvm_ctrl_cmd_allowed() answers ALLOW before the table is ever
+	 * consulted.  So a guest that sent NV_ESC_RM_CONTROL with param_size
+	 * < 12 still skipped the entire control allowlist, which is precisely
+	 * the hole S-5 was written to close.  Do not encode the verdict in a
+	 * value another rule can reinterpret: a control whose inner cmd we
+	 * cannot even read is denied here, in the test that discovers it.  No
+	 * legitimate call is lost — NVOS54 carries the command at offset 8, so
+	 * a block shorter than 12 bytes does not contain one. */
 	if (_IOC_TYPE(req->cmd) == 'F' && _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL) {
 		uint32_t cc = 0xffffffffu;
-		if (param_buf && req->param_size >= 12)
+		bool cc_readable = param_buf && req->param_size >= 12;
+		if (cc_readable)
 			memcpy(&cc, (char *)param_buf + 8, 4);
-		if (!nvkvm_ctrl_cmd_allowed(cc) || req->aux_size > (1u << 20)) {
+		if (!cc_readable || !nvkvm_ctrl_cmd_allowed(cc) ||
+		    req->aux_size > (1u << 20)) {
 			nvkvm_ctrl_deny_log(cc);
 			/* As above: RM answers an unsupported control with a
 			 * successful ioctl carrying NV_ERR_NOT_SUPPORTED, not

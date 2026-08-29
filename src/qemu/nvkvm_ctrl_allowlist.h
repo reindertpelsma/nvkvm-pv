@@ -307,16 +307,50 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
  *
  * Returns non-zero if the command may be forwarded.  `int` and not `bool`: the
  * stub is freestanding and does not pull in <stdbool.h>.
+ *
+ * ── Audit 2026-08-29 (serious): the two rule-based passthroughs ──────────
+ *
+ * `cmd & 0x8000` sits AHEAD of a table whose every one of its 167 rows is
+ * justified individually, and admits 2^31 command numbers on a bit that is a
+ * routing hint (GSP legacy), not a safety property.  The class wildcard admits
+ * all of 0x2081.  The header at the top of this file asserts both are
+ * "GSP-routed, no app pointers"; docs/internal/audit-guest-pointers.md already
+ * records that this assertion is not verifiable from the open tree and was not
+ * verified.  So the file's own documentation says default-deny and the gate
+ * does something else for half the command space.
+ *
+ * NOT narrowed here, deliberately.  Narrowing needs evidence about which
+ * commands real libcuda/nvidia-smi traffic actually relies on these two rules
+ * for, and getting that wrong denies a control the guest needs and surfaces as
+ * a CUDA_ERROR_OPERATING_SYSTEM with no obvious cause -- which is exactly how
+ * 0xc36f0101 was found.  That evidence needs a GPU, and there is none here.
+ *
+ * What IS done: say WHICH rule admitted a command, so a single run enumerates
+ * the set the wildcards are load-bearing for and the narrowing stops being a
+ * guess.  Verdicts are unchanged -- every caller tests `!allowed`, and all
+ * three non-zero returns are equally non-zero.
  */
+#define NVKVM_CTRL_ALLOW_TABLE     1  /* an explicit, justified table row     */
+#define NVKVM_CTRL_ALLOW_GSS       2  /* the cmd & 0x8000 wildcard            */
+#define NVKVM_CTRL_ALLOW_BINAPI    3  /* the 0x2081-class wildcard            */
+
 static inline int nvkvm_ctrl_cmd_allowed(uint32_t cmd)
 {
-	if (cmd & 0x8000u)                       /* RM_GSS_LEGACY_MASK */
-		return 1;
-	if (((cmd >> 16) & 0xffffu) == 0x2081u)  /* NV2081_BINAPI class */
-		return 1;
+	/*
+	 * Table first, wildcards second.  The verdict is identical either way
+	 * (a row that also matches a wildcard was allowed before and is allowed
+	 * now), but the REPORTED reason is not: with the wildcards first, the
+	 * four rows that also carry bit 15 -- 0x20808159, 0x20808162,
+	 * 0x2080852e, 0x2080852f -- would be logged as wildcard-only and make
+	 * the wildcard look more load-bearing than it is.
+	 */
 	for (unsigned i = 0; i < NVKVM_CTRL_ALLOWLIST_N; i++)
 		if (nvkvm_ctrl_allowlist[i] == cmd)
-			return 1;
+			return NVKVM_CTRL_ALLOW_TABLE;
+	if (cmd & 0x8000u)                       /* RM_GSS_LEGACY_MASK */
+		return NVKVM_CTRL_ALLOW_GSS;
+	if (((cmd >> 16) & 0xffffu) == 0x2081u)  /* NV2081_BINAPI class */
+		return NVKVM_CTRL_ALLOW_BINAPI;
 	return 0;
 }
 
