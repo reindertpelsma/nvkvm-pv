@@ -770,6 +770,41 @@ struct nv2081_alloc_parameters {
 	__u32 reserved;       /* [IN] @0 -- unused, per cl2081.h */
 };
 
+/* -- NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS -- for NV_CONFIDENTIAL_COMPUTE ---- */
+/*    (0xcb33).  4 bytes: a single NvHandle, read off class/clcb33.h --
+ *
+ *        typedef struct NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS {
+ *            NvHandle hClient;
+ *        } NV_CONFIDENTIAL_COMPUTE_ALLOC_PARAMS;
+ *
+ *    One __u32, so no padding ambiguity is possible -- the same shape as
+ *    NV2081 above.
+ *
+ *    MEASURED (nvkvm-kata on the PC, 2026-08-30, host driver 580.173.02):
+ *    libcuda allocates this class during CUDA initialisation, and the guest
+ *    logged
+ *        nvkvm: RM_ALLOC hClass=0xcb33 has no alloc-param size entry;
+ *               forwarding a 256-byte window
+ *    -- 252 bytes past the guest's real 4-byte params buffer. The observed
+ *    symptom on that host is cuInit() succeeding while cuDeviceGetCount()
+ *    returns 0 devices, so CUDA is unusable.
+ *
+ *    HONEST LIMITS OF THIS ROW. Two things are NOT established:
+ *      - the struct was read off ONE unpacked tag (595.84). The convention
+ *        here is to confirm a layout across several tags before trusting it;
+ *        unpack more and re-check before treating this as settled. A single
+ *        __u32 is about as safe as a guess gets, but it is still one tag.
+ *      - that this row FIXES the zero-devices symptom. It closes a real,
+ *        measured gap -- the warning is the driver telling us we are
+ *        forwarding a wrong-sized window for a class libcuda really does
+ *        allocate -- but the NV2081 row above is precedent for exactly this
+ *        kind of fix removing its warning without curing the failure that
+ *        prompted the search. Verify on hardware before claiming a fix. */
+#define NV_CONFIDENTIAL_COMPUTE 0x0000cb33U
+struct nv_confidential_compute_alloc_params {
+	__u32 h_client;       /* [IN] @0 -- per clcb33.h */
+};
+
 /* ── NV_MEMORY_ALLOCATION_PARAMS — for NV50_MEMORY_VIRTUAL (0x50A0) and ──── */
 /*    several other generic memory classes. V545 layout (driver >= 545.23.06,
  *    matches our 575.51.03): adds numa_node + pad. */

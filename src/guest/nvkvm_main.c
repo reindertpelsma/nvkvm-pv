@@ -2498,6 +2498,16 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * four. */
 				ap_size = sizeof(struct nv2081_alloc_parameters);
 				break;
+			case NV_CONFIDENTIAL_COMPUTE:
+				/* 0xcb33: 4B; libcuda allocates this during CUDA init
+				 * with alloc_parms_size=0, exactly like 0x503c above.
+				 * Without this case the probe guesses a 256-byte
+				 * window -- MEASURED in the kata guest on 2026-08-30,
+				 * 252 bytes past the real 4-byte buffer. Sized from
+				 * class/clcb33.h (a single NvHandle). See the row in
+				 * abi/nvgpu.h for what this does and does not claim. */
+				ap_size = sizeof(struct nv_confidential_compute_alloc_params);
+				break;
 			case NV50_MEMORY_VIRTUAL:
 			case NV01_MEMORY_LOCAL_USER:
 			case NV01_MEMORY_SYSTEM:
@@ -2652,6 +2662,10 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					case NV2081_BINAPI:
 						/* 0x2081: 4B; see the sibling switch above. */
 						ap_size = sizeof(struct nv2081_alloc_parameters);
+						break;
+					case NV_CONFIDENTIAL_COMPUTE:
+						/* 0xcb33: 4B; see the sibling switch above. */
+						ap_size = sizeof(struct nv_confidential_compute_alloc_params);
 						break;
 				case NV50_MEMORY_VIRTUAL:
 				case NV01_MEMORY_LOCAL_USER:
