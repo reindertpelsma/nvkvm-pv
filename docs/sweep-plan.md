@@ -137,16 +137,57 @@ fail:
   at qualification and fails now, the host's GPU is wedged, and that is a
   finding in its own right, reported separately from the test that preceded it.
 
+### What is implemented, as of 2026-08-29
+
+| Stage | Status | How to run it |
+|---|---|---|
+| Driver swap across the matrix | built | `--arch <a> [--drivers …]` |
+| Machine qualification + destroy-unsuitable | built | automatic; unsuitable boxes are not counted as failures |
+| Terminal `validate.sh` re-run | built | automatic when `--steamos` is on |
+| **nvkvm-steamos end to end** | **built** | `--steamos` (`scripts/sweep_stage_steamos.sh`) |
+| Kernel swap | not built | — |
+| Desktop distro (Mint) as an nvkvm guest | not built | — |
+| README app-parity list | not built | — |
+| UVM | partly — `validate.sh` covers the ABI path, not an app | — |
+| nvkvm-kata with apps | not built | — |
+| QEMU SDL rendering + broker | not built (broker runs headless inside the SteamOS stage) | — |
+
+The SteamOS stage reports six independently attributable verdicts — `install`,
+`provision`, `boot`, `display`, `ota`, `slotb` — plus `preflight`, `clone` and
+`image`. A phase that never reported is recorded as `untested`, never as a pass.
+
+Two things it does that are worth knowing before reading its results:
+
+- **Flips are read from the vmm container, not from the guest.** `nvkvm present:
+  flip` is a QEMU-side log; the guest only ever sees its own KMS. A guest-side
+  probe for it returns 0 forever and reads as a display failure that is not one.
+- **The NVIDIA userspace is checked file by file, not by version.** An
+  OOM-killed installer leaves a tree that reports the right version and is
+  missing `nvidia-drm_gbm.so`, and gbm then hands an NVIDIA device to Mesa. That
+  is one missing symlink between "working desktop" and "frozen screen", and a
+  version check cannot see it.
+
 ## 4. Rules that are not negotiable
 
 - **Vast hosts are untrusted.** Never copy executable data back; only logs.
   Never build a shell command from anything a host returned. Treat every byte
   from a host as data, never as code.
-- **The repo arrives from GitHub at a pinned SHA**, and everything else is
-  installed from the internet on the host — because that is what a user does.
-  No local artifacts are shipped. Only logs come back.
+- **Everything a user would install arrives from the internet on the host** —
+  nvkvm-steamos from GitHub at a pinned ref, Valve's recovery image from Valve's
+  CDN, the NVIDIA `.run` from NVIDIA. Only logs come back.
+
+  **Corrected 2026-08-29:** this rule used to say the repo *always* arrives from
+  GitHub, and the SteamOS stage was written that way. That is wrong for
+  nvkvm-pv, which is the code **under test**: cloning `main` would test a
+  different commit than the driver loop just validated, so a release gate could
+  pass on code that is not the code being released. nvkvm-pv therefore comes
+  from the tree the sweep shipped to the box. The provenance is recorded in the
+  `clone` verdict so a result can never be ambiguous about which tree ran.
 - **Destroy on success, keep on failure** — so a failure can be inspected.
-  With a hard cap (see below).
+  Implemented; `--destroy-on-error` opts out. The cap is the auto-destroy timer
+  armed at startup, which sweeps the whole registry at `+--budget-hours`
+  regardless of what this process does, including if it is `kill -9`'"'"'d. A kept
+  box is bounded, not indefinite.
 - **Resumable**: the run is journalled per host per step, so an interrupted
   sweep continues instead of restarting.
 
