@@ -2365,6 +2365,20 @@ static void x11_client_detach_clip(struct nb_session *s, uint64_t generation)
         x->fetch_active = false;
         x->fetch_generation = 0;
     }
+    /*
+     * DROP THE TEXT WE ARE HOLDING FOR A VM THAT HAS GONE (audit 2026-08-29).
+     *
+     * nb_client_state_reset() exists so a later VMM cannot inherit paste state,
+     * and this copy is exactly that — a guest's clipboard content, accepted but
+     * never applied because the window was not focused.  Kept here it survives
+     * the disconnect, and the next focus-in puts a departed VM's text on the
+     * user's clipboard, attributed by the notice to whatever VM is on screen
+     * now.  Already-applied text (src_text) is NOT dropped: that is the user's
+     * clipboard now and taking it back is not ours to do.
+     */
+    free(x->clip_pending);
+    x->clip_pending = NULL;
+    x->clip_pending_len = 0;
 }
 
 static const struct nb_session_ops x11_ops = {
