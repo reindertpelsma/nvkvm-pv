@@ -4584,10 +4584,41 @@ static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
 
 /* ── Poll on isolate ─────────────────────────────────────────────────────── */
 
+/*
+ * Audit 2026-08-29 (minor): both POLL handlers validated NEITHER id half —
+ * they were two of the eight isolate_id-taking handlers with no ownership
+ * check at all (the MUNMAP comment's "three of the five" undercounts).  The
+ * effect is smaller than the kill/close pair, but it is the same shape:
+ * arm or disarm a poll registration inside a NEIGHBOUR's stub on a
+ * guest-chosen (isolate, handle) pair, and — for UNPOLL — silence the
+ * os-event wakeups another session's process is blocked on.
+ *
+ * Same pairing proof as CLOSE_HANDLE_ON_ISOLATE: the handle must exist with a
+ * live fd (handle→session), and its session must own the isolate named
+ * (session→isolate).  Defence in depth, the same weight as every other
+ * session_has_isolate() check here: the guest kernel module fills session_id
+ * and is itself untrusted, so this bounds a malicious guest USERSPACE process.
+ */
+static bool poll_pair_ok(VirtIONvgpu *nv, uint32_t handle_id,
+			 uint32_t isolate_id)
+{
+	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, handle_id);
+	if (!h || h->fd < 0)
+		return false;
+	return session_has_isolate(nv, h->session_id, isolate_id);
+}
+
 int nvkvm_req_poll_on_isolate(VirtIONvgpu *nv,
 			       struct nvkvm_req_poll_on_isolate *req,
 			       struct nvkvm_resp_poll_on_isolate *resp)
 {
+	if (!poll_pair_ok(nv, req->handle_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm poll_on_isolate: handle %u does not belong to "
+			  "isolate %u — refused\n",
+			  req->handle_id, req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
 	int ret = nvkvm_isolate_poll(&nv->isolates,
 				     req->isolate_id,
 				     req->handle_id,
@@ -4600,6 +4631,13 @@ int nvkvm_req_unpoll_on_isolate(VirtIONvgpu *nv,
 				 struct nvkvm_req_unpoll_on_isolate *req,
 				 struct nvkvm_resp_unpoll_on_isolate *resp)
 {
+	if (!poll_pair_ok(nv, req->handle_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm unpoll_on_isolate: handle %u does not belong "
+			  "to isolate %u — refused\n",
+			  req->handle_id, req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
 	int ret = nvkvm_isolate_unpoll(&nv->isolates,
 				       req->isolate_id,
 				       req->handle_id);
