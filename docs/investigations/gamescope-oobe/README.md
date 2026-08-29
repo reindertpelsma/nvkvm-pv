@@ -72,8 +72,29 @@ afternoon's testing. So:
 
 - keep `sddm` stopped and start it for exactly one cycle at a time,
 - check `nvidia-smi -q | grep -A3 "BAR1 Memory Usage"` before and after,
-- reboot the host when Free drops under ~50 MiB, and re-baseline after,
+- recover when Free drops under ~50 MiB, and re-baseline after,
 - never leave a retry loop running unattended.
+
+**Recovery is a module reload, not a reboot** (~30 s, measured 68 -> 223 MiB
+free):
+
+```
+systemctl stop gdm3          # the desktop pins the modules
+rmmod nvidia_drm nvidia_modeset nvidia_uvm nvidia
+modprobe nvidia_drm modeset=1
+systemctl start gdm3
+```
+
+Do NOT use `nvidia-smi --query-compute-apps` to argue that nothing holds the
+GPU -- it lists only COMPUTE contexts, so a desktop compositor never shows up
+there. Use `fuser -v /dev/nvidia0`.
+
+Where the leak lives, measured: with the stack down, the desktop stopped and
+`fuser /dev/nvidia0` empty, BAR1 still read `used=188MiB`. All four `nvidia*`
+modules then unloaded with plain `rmmod` -- nothing pinning them -- and a reload
+returned it to `used=33MiB`. The host desktop accounts for ~1 MiB of that. Since
+nvkvm has NO host kernel module (our host side is QEMU plus the isolate stub,
+both userspace), the retained state is inside NVIDIA'"'"'s driver.
 
 KWin/Plasma does reach the display on this same build (connector enabled, flips
 counted), so the DRM path itself works — this is specific to the gamescope
