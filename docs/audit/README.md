@@ -70,16 +70,18 @@ in one does not block another. Nothing is merged to `main`.
 | `fix/isolate-boundary` | 6 isolate findings incl. 4 criticals | compiles + unit tests, reviewed — **one critical only half-closed** |
 | `fix/vmm-lifetime` | 5 VMM findings | front-end compiles, reviewed, ready |
 | `fix/broker-work-bounds` | broker serious | in progress |
-| `fix/packaging-supply-chain` | remaining packaging critical + serious | in progress |
+| `fix/packaging-supply-chain` | nvkvm-pv: dockerignore, action pinning, workflow injection, 9p | done, reviewed |
+| `fix/kata-supply-chain` | nvkvm-kata: the HTTP modprobe critical | done, **verified live** |
+| `fix/steamos-warn` | nvkvm-steamos: the undefined `warn()` | done, `make check` 17/17 |
 
-### Critical status: 7 of 9 closed, 1 half-closed, 1 outstanding
+### Critical status: 8 of 9 closed, 1 half-closed
 
 | # | critical | state |
 |---|---|---|
 | 1 | guest UAF on a borrowed `fd_ctx` | fixed, reviewed |
 | 2 | sweep.sh `eval`s vast API fields as root | fixed on `main`, test proves it |
 | 3 | test guest ssh on 0.0.0.0 | fixed on `main` |
-| 4 | kata `modprobe` over plain HTTP | in progress |
+| 4 | kata `modprobe` over plain HTTP | fixed, **verified live** (real fetch + digest match; forced mismatch dies) |
 | 5 | ring `_IOC_SIZE` stack smash | fixed (oversize is PUNTed) |
 | 6 | reader abandons a claimed pending entry | fixed (explicit `-ECONNRESET` wake) |
 | 7 | `CLOSE_HANDLE_ON_ISOLATE` cross-isolate | fixed (both checks, before the reap) |
@@ -154,3 +156,32 @@ workload) is the one thing review cannot settle.
 Still open in the guest, deliberately not attempted because both are
 lock-ordering changes rather than patches: the `ext_lock`/`mmap_lock` AB-BA
 deadlock, and the false "no caller holds mmap_lock" invariant.
+
+
+## Corrections the remediation made to the audit itself
+
+Two, both worth more than a fix, and both the result of telling agents to verify
+in the code rather than trust the finding.
+
+**The `warn()` crash loop was half wrong.** The audit said an undefined `warn()`
+turns the documented image fallback into a `set -e` abort and a restart loop. It
+does not, at `steamos-container-entrypoint.sh:136-137`: those calls sit inside
+`$(latest_recovery_url)`, and **bash does not inherit `errexit` into a command
+substitution** unless `shopt -s inherit_errexit` is set, which nothing in the
+repo sets. The fallback did run — just silently, emitting two spurious
+"command not found" lines instead of its explanation. The `:537` call **is** in
+the main flow and does abort, so that half stands. `warn()` is defined either way.
+
+**A kata function that could never have succeeded.** Fixing the HTTP fetch
+surfaced that `fetch_deb_kmod`'s parse is
+
+```sh
+printf '%s' "$pkgs" | awk '... { print fn; exit }'
+```
+
+under `set -euo pipefail`. `kmod` sorts early in a Packages index, so awk exits
+with most of the ~7 MB still unwritten, `printf` takes SIGPIPE, and the installer
+dies with a bare exit 141. Reproduced here exactly: the same construct under the
+same shell options exits 141. This is a plain functional bug, unrelated to
+security, that the audit did not look for and that no test covered — the guest
+rootfs build was broken for anyone whose mirror served a full index.
