@@ -45,6 +45,16 @@
 #   L1  one box, one driver     --arch ampere --drivers 580.95.05 --go
 #   L2  one box, N drivers      --arch ampere --go
 #   L3  every architecture      --all-arches --go
+#   S   the SteamOS product     --arch ada --drivers 580.95.05 --steamos --go
+#
+# L1-L3 answer "does the ABI hold". They install no product and open no window.
+# The S stage answers a different and, before a release, more important
+# question: does a user who follows the README end up at a desktop. It runs once
+# per box after the driver loop and reports its own six verdicts.
+#
+# BOXES ARE DESTROYED ON SUCCESS AND KEPT ON FAILURE -- a failing box is the
+# only copy of the state that produced the failure, and the auto-destroy timer
+# bounds what that costs. --destroy-on-error restores unconditional teardown.
 #
 # ---------------------------------------------------------------------------
 # RELATIONSHIP TO scripts/sweep_matrix.py
@@ -113,11 +123,20 @@ KVM_IMAGE="${NVKVM_SWEEP_IMAGE:-docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16
 # (docker.io/vastai/kvm:ubuntu_desktop_22.04-2025-11-21) is the one to use for
 # anything interactive; this sweep is headless, so the cli image is correct and
 # faster to pull.
-# The vast label every instance this run creates carries.  Overridable because
-# reap_strays() destroys BY LABEL: two sweeps running concurrently under the
-# same label can reap each other's boxes mid-build.  Give each concurrent run
-# its own label (and each its own --out) and that cannot happen.
-SWEEP_LABEL="${NVKVM_SWEEP_LABEL:-nvkvm-sweep}"
+# The vast label every instance this run creates carries.
+#
+# reap_strays() destroys BY LABEL, so two runs sharing one label reap each
+# other's boxes mid-build.  That used to be documented here as an instruction to
+# the operator -- "give each concurrent run its own label" -- and OBSERVED
+# 2026-08-29: two runs each had their own --out, both kept a correct per-run
+# registry, and the first to finish destroyed the second's box anyway, calling
+# it a STRAY. A rule that only holds when someone remembers it is not a rule.
+#
+# So the label is now UNIQUE PER RUN by default, derived below from the run
+# directory (which is already required to be unique). NVKVM_SWEEP_LABEL still
+# overrides it for anyone who wants two runs to share a reaper on purpose.
+SWEEP_LABEL_PREFIX="nvkvm-sweep"
+SWEEP_LABEL="${NVKVM_SWEEP_LABEL:-}"
 STOP_FILE="/tmp/nvkvm-sweep.stop"
 KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
 
@@ -132,7 +151,45 @@ GUEST_IMAGE_NAME="noble-server-cloudimg-amd64.img"
 GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/$GUEST_IMAGE_NAME"
 PRESET="boundary"
 MIN_DRIVERS=5
+# The SteamOS product stage: off by default because it costs ~2h of box time and
+# many GB of transfer per box, and it is orthogonal to driver-ABI coverage.
+RUN_STEAMOS=0
+STEAMOS_REF="${NVKVM_SWEEP_STEAMOS_REF:-main}"
+# Keep a failing box alive so the failure can be inspected.  The auto-destroy
+# timer bounds it; --destroy-on-error restores unconditional teardown.
+DESTROY_ON_ERROR=0
 MAX_DPH=0.50
+# COST HAS THREE COMPONENTS AND dph_total ONLY CARRIES TWO.
+#
+# MEASURED against the offer API: dph_total == dph_base + storage_total_cost.
+# NETWORK IS NOT IN IT, and this harness is network-heavy by construction --
+# one NVIDIA .run per driver, 300-450 MB each.
+#
+# MEASURED DISTRIBUTION over 95 vms_enabled offers (2026-08-29):
+#
+#   network in   $/TB       median  4.00   p75 12.00   p90 26.67   max 40.00
+#   network out  $/TB       median  4.00   p75 12.67   p90 30.67   max 40.00
+#   storage      $/GB/month median  0.200  p75 0.200   p90 0.333   max 0.667
+#   gpu base     $/hr       median  0.33   p75 0.72    p90 1.09    max 5.60
+#
+# Two things follow, and both corrected an earlier guess here.
+#
+# The market CEILING for network is $40/TB -- p95, p98 and max are all 40.00 --
+# so the $60 cap this file first shipped rejected nothing at all. And for a
+# 3-hour box with a 150 GB disk moving ~8 GB, STORAGE COSTS MORE THAN NETWORK:
+# $0.12-0.41 against $0.03-0.31. Both are noise beside compute ($0.21-3.27 for
+# the same box), so neither belongs in the selection as a hard preference.
+#
+# Hence: the caps below are OUTLIER GUARDS set from the observed maxima, not
+# tuning knobs. They reject a host that is off the market or that declines to
+# state a price; they do not shave pennies, because shaving pennies here costs
+# coverage -- and on a rare architecture, excluding the top decile of hosts can
+# mean no offer at all. Preference is expressed in the RANKING instead, which
+# scores every candidate on what this job will actually cost it.
+MAX_STORAGE_PER_GB_MONTH=0.70   # observed max 0.667
+MAX_INET_DOWN_PER_TB=40         # observed max 40.00 -- the market ceiling
+MAX_INET_UP_PER_TB=40           # observed max 40.00
+EST_DOWN_GB_PER_BOX=8           # repo + guest image + one .run per driver + apt
 MAX_SPEND=10.00
 BUDGET_HOURS=8
 DISK=64
@@ -221,7 +278,13 @@ while [ $# -gt 0 ]; do
         --guest-image-cache) GUEST_IMAGE_CACHE="$2"; shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
+        --steamos)      RUN_STEAMOS=1; shift ;;
+        --steamos-ref)  STEAMOS_REF="$2"; shift 2 ;;
+        --destroy-on-error) DESTROY_ON_ERROR=1; shift ;;
         --max-dph)      MAX_DPH="$2"; shift 2 ;;
+        --max-storage-gb-month) MAX_STORAGE_PER_GB_MONTH="$2"; shift 2 ;;
+        --max-inet-down-tb)   MAX_INET_DOWN_PER_TB="$2"; shift 2 ;;
+        --max-inet-up-tb)     MAX_INET_UP_PER_TB="$2"; shift 2 ;;
         --max-spend)    MAX_SPEND="$2"; shift 2 ;;
         --budget-hours) BUDGET_HOURS="$2"; shift 2 ;;
         --disk)         DISK="$2"; shift 2 ;;
@@ -599,9 +662,11 @@ try: d = json.load(sys.stdin)
 except Exception: sys.exit(0)
 if isinstance(d, dict): d = d.get("instances", []) or []
 for i in d:
-    if (i.get("label") or "") == sys.argv[1]:
+    lab = i.get("label") or ""
+    if (lab.startswith(sys.argv[1]) if len(sys.argv) > 2 and sys.argv[2] == "prefix"
+        else lab == sys.argv[1]):
         print(i.get("id"), i.get("gpu_name"))
-' "$SWEEP_LABEL" 2>/dev/null)"
+' "$SWEEP_LABEL" "${RECONCILE_PREFIX:+prefix}" 2>/dev/null)"
     [ -z "$ids" ] && return 0
     while read -r id gpu; do
         [ -z "$id" ] && continue
@@ -754,9 +819,12 @@ pick_offer() {
     # "no rentable offer" for every architecture on a market full of them.
     offers_json="$(mktemp)"
     vj search offers 'vms_enabled=true num_gpus=1 rentable=true' -o dph >"$offers_json"
-    python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" <<'PY'
+    python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" \
+             "$MAX_STORAGE_PER_GB_MONTH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" \
+             "$EST_DOWN_GB_PER_BOX" "$DISK" <<'PY'
 import json, sys, os, importlib.util
 repo, want_arch, max_dph, gpu_filter, tried, kbfile, offers_path = sys.argv[1:8]
+max_stor_gb_mo, max_down_tb, max_up_tb, est_down_gb, disk_gb = (float(x) for x in sys.argv[8:13])
 spec = importlib.util.spec_from_file_location(
     "sweep_matrix", os.path.join(repo, "scripts", "sweep_matrix.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -788,15 +856,45 @@ for o in offers:
         continue
     if (o.get("dph_total") or 99) > float(max_dph):
         continue
+    # storage_total_cost is 0 for EVERY offer in a search that requests no
+    # disk -- filtering on it silently accepted everyone. The per-unit price is
+    # storage_cost ($/GB/month); scale it by the disk this run will actually
+    # ask for.
+    if (o.get("storage_cost") or 0) > max_stor_gb_mo:
+        continue
+    # Network is NOT in dph_total. An unpriced field means unknown, and unknown
+    # on a spend-capped unattended run is treated as too expensive.
+    down_tb = o.get("internet_down_cost_per_tb")
+    up_tb   = o.get("internet_up_cost_per_tb")
+    if down_tb is None or up_tb is None:
+        continue
+    if down_tb > max_down_tb or up_tb > max_up_tb:
+        continue
     cands.append(o)
 
 if not cands:
     sys.exit(1)
-o = min(cands, key=lambda x: x.get("dph_total", 99))
+
+# Rank on what the box will ACTUALLY cost for this job, not on the sticker
+# price: an hour of compute plus the transfer the sweep is about to do. Two
+# offers an hour apart in dph can invert once ~8 GB of driver downloads is
+# priced in.
+def expected(o, hours=3.0):
+    """What this box costs for THIS job: compute + its disk + its transfer.
+    Storage dominates network at these volumes, so both are counted."""
+    compute = (o.get("dph_base") or 99) * hours
+    storage = (o.get("storage_cost") or 0) * disk_gb / 730.0 * hours
+    network = (o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0)
+    return compute + storage + network
+
+o = min(cands, key=expected)
 print("\t".join(str(x) for x in [
     o.get("id"), o.get("machine_id"), o.get("gpu_name"),
     o.get("dph_total"), o.get("geolocation") or "?", o.get("inet_down") or "?",
-    o.get("driver_version") or "?"]))
+    o.get("driver_version") or "?",
+    round((o.get("storage_cost") or 0) * disk_gb / 730.0, 5),
+    round(o.get("internet_down_cost_per_tb") or 0, 2),
+    round((o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0), 4)]))
 PY
     rc=$?
     rm -f "$offers_json"
@@ -1555,7 +1653,7 @@ sweep_one_box() {
                 ts "$(date -u +%FT%TZ)")"
         return 2
     }
-    IFS=$'\t' read -r offer_id machine gpu dph geo inet advdrv <<<"$offer_line"
+    IFS=$'\t' read -r offer_id machine gpu dph geo inet advdrv stor down_tb net_est <<<"$offer_line"
     TRIED_MACHINES="$TRIED_MACHINES $machine"
 
     # Cost gate BEFORE the create.  Project the worst case for this box: one
@@ -1571,6 +1669,8 @@ sweep_one_box() {
     fi
 
     info "renting $gpu (arch=$arch) offer=$offer_id machine=$machine \$$dph/hr $geo"
+    info "  cost: \$$dph/hr (storage \$$stor of it) + network at \$$down_tb/TB in"
+    info "        -> ~\$$net_est of transfer for this box's driver set, on top of the hourly"
     info "  vast advertises driver=$advdrv, inet_down=$inet -- BOTH IGNORED"
     info "  (the advertised driver describes the physical host, not a KVM rental;"
     info "   advertised bandwidth has been wrong by five orders of magnitude)"
@@ -1659,6 +1759,23 @@ sweep_one_box() {
         destroy_verified "$iid" || warn "  DESTROY $iid FAILED -- see the reconciliation at the end"
     elif [ "$KEEP" = 1 ]; then
         warn "  --keep: leaving $iid alive at root@$CUR_HOST:$CUR_PORT (timer still armed)"
+    elif [ "$BOX_FAILED" -gt 0 ] && [ "$box_status" = "ok" ] && [ "$DESTROY_ON_ERROR" = 0 ]; then
+        # DESTROY ON SUCCESS, KEEP ON ERROR.  A failing box is the only copy of
+        # the state that produced the failure: the guest's dmesg, the
+        # half-written rootfs, the QEMU log.  Destroying it turns a reproducible
+        # bug into a sentence in a JSON file, which is how the 5 GiB rootfs
+        # overflow got rediscovered three times.
+        #
+        # The ceiling that makes this affordable is the auto-destroy timer armed
+        # at startup: it sweeps the whole registry at +$BUDGET_HOURS whatever
+        # happens here, including if this process is kill -9'"'"'d.  A kept box is
+        # bounded, not indefinite.
+        warn "  $BOX_FAILED failure(s) on this box -- KEEPING it for inspection (--destroy-on-error to opt out)"
+        warn "    ssh -p $CUR_PORT root@$CUR_HOST     # auto-destroys at +${BUDGET_HOURS}h regardless"
+        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "box-kept-for-inspection" \
+                instance "$iid" role "box" \
+                detail "kept because $BOX_FAILED driver(s)/phase(s) failed; reachable at root@$CUR_HOST:$CUR_PORT until the +${BUDGET_HOURS}h auto-destroy" \
+                ts "$(date -u +%FT%TZ)")"
     else
         destroy_verified "$iid" || warn "  DESTROY $iid FAILED -- see the reconciliation at the end"
     fi
@@ -1836,6 +1953,29 @@ sweep_drivers_on_box() {
         say "    -> $VR_STATUS ${VR_SUMMARY:-} (${dur}s)"
     done <<<"$todo"
 
+    if [ "$RUN_STEAMOS" = 1 ]; then
+        run_steamos_stage "$arch" "$gpu" "${actual:-${drv:-unknown}}" "$iid" "$logdir/steamos"
+
+        # TERMINAL RE-CHECK.  The stage installed a product, bound /dev/dri into
+        # a container, ran a multi-GB OTA and rebooted a guest.  Re-run
+        # validate.sh afterwards so that "the sweep passed" cannot quietly mean
+        # "it passed before the stage wedged the host".  A regression here is
+        # about the stage, not about the driver, so it is recorded separately
+        # and never counted toward --min-drivers.
+        info "  terminal re-check: does validate.sh still pass after the stage?"
+        boot_and_validate "${actual:-unknown}" "$gpu"
+        say "    terminal re-check: ${VR_STATUS:-unknown} ${VR_SUMMARY:-}"
+        [ "${VR_STATUS:-}" = pass ] || {
+            warn "    the host no longer validates AFTER the SteamOS stage -- investigate the stage, not the driver"
+            BOX_FAILED=$(( BOX_FAILED + 1 ))
+        }
+        emit "$(jrec arch "$arch" gpu "$gpu" driver "${actual:-unknown}" \
+                status "steamos-terminal-recheck" role "steamos" instance "$iid" \
+                validate_status "${VR_STATUS:-unknown}" summary "${VR_SUMMARY:-}" \
+                detail "validate.sh re-run after the SteamOS stage; not counted toward --min-drivers" \
+                ts "$(date -u +%FT%TZ)")"
+    fi
+
     collect_logs "$logdir"
     info "  raw logs pulled to $logdir"
 
@@ -1850,6 +1990,96 @@ sweep_drivers_on_box() {
                 detail "$tested of $applicable applicable drivers produced a validate.sh verdict; --min-drivers is $MIN_DRIVERS" \
                 ts "$(date -u +%FT%TZ)")"
         BOX_UNTESTED=$(( BOX_UNTESTED + 1 ))
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# SteamOS product stage
+#
+# validate.sh proves the ABI holds.  It does not install a product.  Every bug
+# found by hand on 2026-08-29 -- the 5 GiB rootfs overflow, the OOM-truncated
+# NVIDIA install that a version check then called "already installed", the vmm
+# container with no /dev/dri -- lives on this path and on no other.  So the
+# stage boots the real thing and drives it to a desktop.
+#
+# It runs ONCE PER BOX, against whichever driver the box finished on, because
+# the expensive part (a 3.2 GB image plus a multi-GB OTA) is per-box, not
+# per-driver.
+#
+# UNTRUSTED-HOST DISCIPLINE: the stage is launched detached and polled, so a
+# dropped ssh does not abandon a two-hour install; and its verdicts come back as
+# JSON that is PARSED IN PYTHON against an allowlist -- no value from the box is
+# ever interpolated into a shell command or into a jrec field unchecked.
+# ---------------------------------------------------------------------------
+run_steamos_stage() {
+    local arch="$1" gpu="$2" drv="$3" iid="$4" logdir="$5"
+    local t0 t1 waited=0 launcher last parsed nfail=0 npass=0 ph st det
+
+    info "  SteamOS stage: installing and booting a real SteamOS guest (up to 3h)"
+    t0="$(date +%s)"
+
+    # Detached: a single `rsh_t 10800` ties the whole stage to one TCP
+    # connection, and these boxes drop ssh under load.  Poll for a sentinel.
+    rsh_t 120 "rm -rf /root/steamos-stage; mkdir -p /root/steamos-stage; cd /root/nvkvm && STEAMOS_REF='$STEAMOS_REF' NVKVM_REF='$STEAMOS_REF' nohup setsid bash scripts/sweep_stage_steamos.sh >/root/steamos-stage/run.log 2>&1 </dev/null; echo done >/root/steamos-stage/DONE" >/dev/null 2>&1 &
+    launcher=$!
+
+    while [ "$waited" -lt 10800 ]; do
+        sleep 60; waited=$(( waited + 60 ))
+        rsh_t 60 'test -f /root/steamos-stage/DONE' >/dev/null 2>&1 && break
+        if stop_requested; then
+            warn "  stop requested -- leaving the SteamOS stage running on the box"
+            break
+        fi
+        # progress, so an unattended run is not a black box for three hours
+        if [ $(( waited % 600 )) -eq 0 ]; then
+            last="$(rsh_t 60 'tail -1 /root/steamos-stage/stage.log 2>/dev/null' 2>/dev/null | tr -dc '[:print:]')"
+            info "    [$(( waited / 60 ))m] ${last:0:140}"
+        fi
+    done
+    kill "$launcher" 2>/dev/null || true
+    t1="$(date +%s)"
+
+    mkdir -p "$logdir"
+    timeout 300 scp $SSH_OPTS -P "$SCP_PORT" -q \
+        "root@$SCP_HOST:/root/steamos-stage/stage.log" \
+        "root@$SCP_HOST:/root/steamos-stage/verdicts.jsonl" \
+        "root@$SCP_HOST:/root/steamos-stage/install-serial.log" \
+        "$logdir/" 2>/dev/null
+
+    if [ ! -s "$logdir/verdicts.jsonl" ]; then
+        emit "$(jrec arch "$arch" gpu "$gpu" driver "$drv" status "steamos-no-verdicts" \
+                instance "$iid" role "steamos" seconds "$(( t1 - t0 ))" \
+                detail "the stage produced no verdicts in $(( t1 - t0 ))s -- see $logdir/stage.log" \
+                ts "$(date -u +%FT%TZ)")"
+        BOX_UNTESTED=$(( BOX_UNTESTED + 1 ))
+        warn "  SteamOS stage produced NO verdicts -- UNTESTED, not a pass"
+        return 0
+    fi
+
+    # Parsed in python, phase and status allowlisted, detail stripped to
+    # printable and truncated.  A hostile box controls every byte of this file.
+    parsed="$(python3 "$REPO/scripts/sweep_parse_steamos.py" "$logdir/verdicts.jsonl")"
+
+    while IFS=$'\t' read -r ph st det; do
+        [ -n "$ph" ] || continue
+        case "$st" in
+            pass) npass=$(( npass + 1 )); say  "    steamos/$ph: pass  ${det:0:90}" ;;
+            fail) nfail=$(( nfail + 1 )); warn "    steamos/$ph: FAIL  ${det:0:160}" ;;
+            *)    say "    steamos/$ph: untested -- the stage never reached it" ;;
+        esac
+        emit "$(jrec arch "$arch" gpu "$gpu" driver "$drv" \
+                status "steamos-$st" phase "$ph" instance "$iid" \
+                role "steamos" seconds "$(( t1 - t0 ))" \
+                detail "$det" ts "$(date -u +%FT%TZ)")"
+    done <<<"$parsed"
+
+    if [ "$nfail" -gt 0 ]; then
+        BOX_FAILED=$(( BOX_FAILED + 1 ))
+        # BOX_FAILED is what the keep-on-error decision at the end of
+        # sweep_one_box() reads, so bumping it is what actually keeps the box.
+        warn "  SteamOS stage: $nfail phase(s) failed, $npass passed -- the box will be kept for inspection"
+    else
+        say "  SteamOS stage: all $npass phases passed in $(( (t1 - t0) / 60 ))m"
     fi
 }
 
@@ -2015,7 +2245,14 @@ command -v python3 >/dev/null || die "python3 not found (used for JSON and for t
     || die "no vast.ai api key (~/.config/vastai/vast_api_key)"
 
 if [ "$RECONCILE" = 1 ]; then
-    info "reconcile-only: destroying anything labelled '$SWEEP_LABEL'. Spends nothing."
+    # Labels are per-run now, so a reconcile scoped to THIS run's label would
+    # find nothing. Reconcile is the cross-run cleanup tool, so it matches the
+    # prefix on purpose -- and says so, because that reaches other runs' boxes.
+    SWEEP_LABEL="$SWEEP_LABEL_PREFIX"
+    RECONCILE_PREFIX=1
+    info "reconcile-only: destroying anything whose label starts '$SWEEP_LABEL_PREFIX'."
+    info "  This is CROSS-RUN by design: it will destroy boxes belonging to other"
+    info "  sweeps that are still running. Spends nothing."
     REGISTRY="$(mktemp)"; CLEANED=1
     reap_strays
     say "still live:"
@@ -2063,6 +2300,24 @@ Commit it, stash it, or pass --allow-dirty to ship it knowingly." 3
     fi
 fi
 
+# ---- run identity ---------------------------------------------------------
+# Settle the run directory and the label BEFORE the plan prints, because the
+# plan reports both. Deriving the label after the plan left it blank there --
+# and a blank label in the plan is exactly how the shared-label reaping bug
+# stays invisible until it destroys someone's box.
+if [ -n "$RESUME_DIR" ]; then
+    OUT_DIR="$RESUME_DIR"
+else
+    OUT_DIR="${OUT_DIR:-$REPO/sweep-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)}"
+fi
+if [ -z "$SWEEP_LABEL" ]; then
+    # Unique by construction: two concurrent runs cannot share an --out, since
+    # the registry, journal and log all live in it. vast labels are short, so
+    # keep it recognisable and bounded.
+    _run_tag="$(basename "$OUT_DIR" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/-$//' | tail -c 40)"
+    SWEEP_LABEL="$SWEEP_LABEL_PREFIX-$_run_tag"
+fi
+
 # ---- plan -----------------------------------------------------------------
 say ""
 say "nvkvm sweep plan"
@@ -2073,7 +2328,13 @@ say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_
 say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
+say "  vast label    : $SWEEP_LABEL"
+say "                  (per-run: reap_strays destroys BY LABEL, so a shared one lets"
+say "                   concurrent runs reap each other -- OBSERVED 2026-08-29)"
 say "  caps          : \$$MAX_DPH/hr per box, \$$MAX_SPEND total, ${BUDGET_HOURS}h auto-destroy"
+say "                  storage <= \$$MAX_STORAGE_PER_GB_MONTH/GB/mo, network <= \$$MAX_INET_DOWN_PER_TB/TB in"
+say "                  (outlier guards at the observed market maxima; network is NOT in dph_total."
+say "                   Preference is in the ranking, which scores compute + disk + transfer.)"
 say ""
 total_units=0
 nboxes=0
@@ -2098,13 +2359,16 @@ if [ "$GO" != 1 ]; then
     est=0
     for a in ${ARCHES//,/ }; do
         line="$(pick_offer "$a")" || { printf '    %-10s NO RENTABLE KVM OFFER under $%s/hr\n' "$a" "$MAX_DPH"; continue; }
-        IFS=$'\t' read -r _ mid gname odph ogeo _ _ <<<"$line"
+        IFS=$'\t' read -r _ mid gname odph ogeo _ _ ostor odowntb onet <<<"$line"
         n="$(drivers_for_arch "$a" | wc -l)"
         hours="$(python3 -c "print(round(1.2 + 0.25 * $n, 2))")"
-        c="$(python3 -c "print(round($odph * $hours, 2))")"
+        # Network scales with the DRIVER COUNT, not with time: one .run per
+        # driver is the bulk of it, so a long cheap box is not a cheap box.
+        c="$(python3 -c "print(round($odph * $hours + $onet * max(1,$n) / max(1,$n), 2))")"
+        netc="$(python3 -c "print(round($onet, 3))")"
         est="$(python3 -c "print(round($est + $c, 2))")"
-        printf '    %-10s %-16s $%-7s machine=%-8s %-22s ~%sh -> ~$%s\n' \
-               "$a" "$gname" "$odph" "$mid" "$ogeo" "$hours" "$c"
+        printf '    %-10s %-16s $%-7s (disk $%s) machine=%-8s %-18s ~%sh  net~$%s@$%s/TB -> ~$%s\n' \
+               "$a" "$gname" "$odph" "$ostor" "$mid" "$ogeo" "$hours" "$netc" "$odowntb" "$c"
     done
     say ""
     say "  estimated total: ~\$$est   (cap is \$$MAX_SPEND)"
@@ -2121,6 +2385,7 @@ if [ -n "$RESUME_DIR" ]; then
     info "resuming into $OUT_DIR (units with a terminal status are not paid for again)"
 else
     OUT_DIR="${OUT_DIR:-$REPO/sweep-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)}"
+
     mkdir -p "$OUT_DIR"
 fi
 mkdir -p "$OUT_DIR/logs"
