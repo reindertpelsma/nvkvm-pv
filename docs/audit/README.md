@@ -67,10 +67,65 @@ in one does not block another. Nothing is merged to `main`.
 | branch | covers | state |
 |---|---|---|
 | `fix/guest-lifetime` | guest: the critical UAF + 5 serious | **builds**, reviewed, ready |
-| `fix/isolate-boundary` | isolate criticals | in progress |
-| `fix/vmm-lifetime` | VMM serious | in progress |
+| `fix/isolate-boundary` | 6 isolate findings incl. 4 criticals | compiles + unit tests, reviewed — **one critical only half-closed** |
+| `fix/vmm-lifetime` | 5 VMM findings | front-end compiles, reviewed, ready |
 | `fix/broker-work-bounds` | broker serious | in progress |
 | `fix/packaging-supply-chain` | remaining packaging critical + serious | in progress |
+
+### Critical status: 7 of 9 closed, 1 half-closed, 1 outstanding
+
+| # | critical | state |
+|---|---|---|
+| 1 | guest UAF on a borrowed `fd_ctx` | fixed, reviewed |
+| 2 | sweep.sh `eval`s vast API fields as root | fixed on `main`, test proves it |
+| 3 | test guest ssh on 0.0.0.0 | fixed on `main` |
+| 4 | kata `modprobe` over plain HTTP | in progress |
+| 5 | ring `_IOC_SIZE` stack smash | fixed (oversize is PUNTed) |
+| 6 | reader abandons a claimed pending entry | fixed (explicit `-ECONNRESET` wake) |
+| 7 | `CLOSE_HANDLE_ON_ISOLATE` cross-isolate | fixed (both checks, before the reap) |
+| 8 | sparse-GPA extents leaked ×3 | fixed |
+| 9 | **`KILL_ISOLATE` unauthenticated** | **HALF-CLOSED — see below** |
+
+### `KILL_ISOLATE` is still unauthenticated, and needs a protocol decision
+
+`struct nvkvm_req_kill_isolate` is `{isolate_id, reserved}` and carries **no
+caller identity at all**. The fix reads `reserved` as an optional caller
+session_id:
+
+```c
+if (req->reserved != 0 && !session_has_isolate(nv, req->reserved, req->isolate_id))
+```
+
+Today's guest calls `nvkvm_virtio_kill_isolate(isolate_id)` and leaves `reserved`
+zero, so **the check is skipped and any guest can still destroy any isolate in
+the VM**. The fix is inert now and becomes real the moment the field is filled.
+
+Closing it needs both halves, which is a protocol change across two components:
+1. guest fills `reserved` with `session->id` (`src/guest/nvkvm_session.c:136` →
+   `nvkvm_virtio_kill_isolate`), then
+2. QEMU fails closed on `reserved == 0`.
+
+Failing closed first would break every kill today, which is why it was not done
+unilaterally.
+
+### Review notes on the branches I checked by hand
+
+- **`fix/vmm-lifetime`**: the present fix widens `p->lock` to cover the buffers,
+  not just the indices — so I checked for self-deadlock. `nvkvm_stage_ensure()`
+  takes the lock itself and both its call sites enter with a balance of 0;
+  `nvkvm_stage_release()` documents "caller must hold" and its one external call
+  site enters holding it. Correct. The agent also **deviated from its brief** —
+  it was told to touch only the embedded-fd lines, and it added an `emb_fd[2]`
+  array plus two close loops, because confining the change would have leaked an
+  fd per UVM ioctl. It flagged the deviation; I verified the only escape path
+  between the dup and the close closes them first. The deviation was right.
+- **`fix/isolate-boundary`**: compiles to real `.o` with the exact flags from the
+  existing build, diffed against baseline for new diagnostics; the stub compiles
+  *and links*; unit tests pass. `CLOSE_HANDLE_ON_ISOLATE` trades a refcount
+  underflow for a bounded leak when the stub never registered a handle QEMU
+  thinks it holds — a good trade, disclosed in the commit.
+
+Nothing is runtime-tested. No branch is merged.
 
 ### `fix/guest-lifetime` — reviewed 2026-08-29
 
