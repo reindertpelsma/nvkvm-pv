@@ -21,3 +21,4 @@
 11908	# 2026-08-23
 24044	# single RTX 4070S, Quebec -- instance 48910285, 2026-08-27; sshd never listened, instance log frozen at 'Domain not found: no domain with matching name' past 35 min
 18856	# KVM never provisioned: created + 'Domain not found' frozen log (instance 48933447, 2026-08-27)
+91962	# SSH refused on BOTH direct (191.223.212.127:32512) and proxy (ssh1.vast.ai:25476) across two independent runs on 2026-08-29; box reached actual_status=running but never accepted a connection. Added by hand: the SSH-timeout path deliberately does not auto-blacklist, and this machine is the cheapest ampere offer, so it is re-picked every run.
