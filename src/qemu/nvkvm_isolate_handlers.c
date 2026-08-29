@@ -4108,6 +4108,15 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 				"nvkvm: mmap_on_isolate: sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);
+			/* Audit 2026-08-29 #5: the alloc above TRANSFERRED
+			 * ownership of the extent to us, and nothing records it
+			 * until iso_mmap_alloc() far below — so returning here
+			 * without freeing loses it permanently: no reclaim path,
+			 * not munmap, not isolate death, can find an extent that
+			 * is in no table.  Free it the way the token == 0 path
+			 * already does. */
+			if (gpa)
+				nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 			resp->status = ENOMEM;
 			return 0;
 		}
@@ -4144,6 +4153,14 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			/* Restore the anonymous backing we just clobbered so the
 			 * window stays fully mapped for KVM. */
 			nvkvm_window_restore_anon(target, len);
+			/* …and give the GPA extent back (audit 2026-08-29 #5).
+			 * This is the reachable half of that finding:
+			 * TYPE_NVIDIA handles skip the S-1 extent check above,
+			 * so a bogus offset makes this mmap() fail
+			 * deterministically AFTER the allocation — one request
+			 * with length == sparse_size permanently consumed the
+			 * whole 128 GiB window. */
+			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 			resp->status = (uint32_t)se;
 			return 0;
 		}
@@ -4307,6 +4324,16 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			}
 			munmap(qva, len);
 		}
+		/* Audit 2026-08-29 #5: the stub-mirror rollback unwound the
+		 * mapping but not the GPA reservation behind it.  Same reason
+		 * as the two sites above — the extent is not in iso_mmap_tbl
+		 * yet, so leaving it allocated leaks window space that nothing
+		 * can ever reclaim.  Ordered after the anon restore, exactly
+		 * like the token == 0 unwind below.  (Only the in-window case
+		 * holds an extent; the UVM path takes a KVM slot and gpa
+		 * stays 0.) */
+		if (gpa)
+			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 		resp->status = (uint32_t)-ret;
 		return 0;
 	}
