@@ -1,0 +1,17 @@
+[Unit]
+Description=Enlarge the NVIDIA BAR1 aperture (nvkvm)
+Documentation=https://github.com/reindertpelsma/nvkvm-pv
+DefaultDependencies=no
+After=sysinit.target
+Before=display-manager.service graphical.target
+ConditionPathExistsGlob=/sys/bus/pci/devices/*/resource1_resize
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/nvkvm-bar1-resize.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
