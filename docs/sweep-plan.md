@@ -61,7 +61,27 @@ HEAD against `us.download.nvidia.com`):
 `610.57.04` **does** ship a 442 MB `.run`, so it can be exercised with matching
 userspace rather than only built from source.
 
-### Why not all 216
+### The sampling rule
+
+Two constraints, and together they make the long tail free:
+
+- **Within one host: never two versions from the same section.** Both exercise
+  identical code in all three tables, so the second one is a paid run whose
+  result is already known.
+- **Across hosts: never the same exact version twice, ever.** Each section has
+  to be covered on several GPU architectures anyway. When a new host comes up on
+  a different arch, spending its slot for that section on an *unseen*
+  minor.patch costs exactly the same as repeating the one we used last time.
+
+So each host runs one version per section — 13 runs — every one of them a
+version no host has run before. Coverage of the boundaries is complete on the
+first host; coverage of the individual versions accumulates across sweeps at
+zero marginal cost, and no run is ever spent on a combination we can predict.
+
+The bookkeeping this needs is a persisted set of (version) already used, which
+the journal already has to carry for resumability.
+
+### Why not all 216 in one sweep
 
 `tools/abi_derive.sh` already measures **every** OGKM tag offline and is the
 complete check — cheap, exhaustive, no GPU required. An end-to-end sweep run
@@ -141,11 +161,10 @@ alive, what it costs per hour, and when it dies. (This exact guard has already
 saved this project once, and once destroyed evidence I had not collected — both
 of which argue for "keep, but bounded and loud".)
 
-**"Never reuse a driver version until all 216 are tested" is the wrong default.**
-Applied literally it means ~200 sweeps that exercise identical code paths before
-the 13 interesting ones are covered twice. Inverted — always the 13 boundaries,
-plus a rotating random sample that never repeats — coverage of the *interesting*
-space is complete on run one, and the long tail still accumulates.
+**"Never reuse a driver version until all 216 are tested"** — agreed as stated,
+once it is read per-host rather than per-sweep. One version per section per
+host, never the same version on two hosts. See "The sampling rule" above; this
+was settled with the owner rather than decided here.
 
 ---
 
@@ -204,6 +223,25 @@ The audit initially read `nvkvm_iso_auto_select()` as leaving isolates without
 uid separation. It does not: `auto` picks `NS | SECCOMP` via `CLONE_NEWUSER`
 with uid/gid maps — the rung the code itself calls strongest — and the shipped
 compose additionally pins `uid+chroot`.
+
+### The release gate: audit until clean
+
+A security and reliability audit runs before release, split by component so each
+auditor holds one boundary in its head rather than skimming everything:
+
+| component | scope |
+|---|---|
+| VMM | `src/qemu/` minus the isolate files, plus `src/common/`, `src/abi/` |
+| isolate | `nvkvm_isolate*.{c,h}`, `nvkvm_ctrl_allowlist.h`, `src/stub/` |
+| guest | `src/guest/` — a kernel module, hostile *guest userspace* below it |
+| broker | `src/broker/` — trusted, holds the session, fed by an untrusted VMM |
+| misc | compose/Dockerfiles/scripts, `nvkvm-steamos`, `nvkvm-kata` |
+
+It is re-run **after every substantive change**, and the gate is that an audit
+comes back **clean** — not that the findings were triaged. Each auditor is told
+that comments in this repo are frequently stale, and to verify every claimed
+guard in the code, because that is exactly how the last round produced two
+"open" bugs that were fixed and one "finding" that was a misreading.
 
 ### Also worth a decision before release
 
