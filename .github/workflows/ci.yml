@@ -74,6 +74,14 @@ jobs:
       - name: guest cloud-image cache interruption safety
         run: bash tests/setup_guest_image_offline_test.sh
 
+      # The Dockerfile's runtime stage does `COPY . /opt/nvkvm` into an image
+      # published under the ghcr name.  .gitignore is where *.key, .env and
+      # data/authorized_keys are kept out of a PUBLIC repo; a rule that lives
+      # there and not in .dockerignore protects nothing, because the file goes
+      # straight into a published layer instead.
+      - name: .dockerignore covers every .gitignore rule
+        run: bash tests/dockerignore_superset_test.sh
+
       # run_tests.sh, not `make run`.  `make run` exits non-zero by design --
       # test_isolate fails 5 of its 7 cases at runtime on pre-existing API
       # drift -- which makes it useless as a pass/fail signal.  run_tests.sh
