@@ -149,9 +149,65 @@ space is complete on run one, and the long tail still accumulates.
 
 ---
 
-## 6. Open before the sweep runs
+## 6. Open before the sweep runs — VERIFIED AGAINST THE CODE 2026-08-29
 
-The sweep is worth money only against stable code. Confirmed-open items are
-tracked separately; the sweep should not start while a release-blocker is
-outstanding, because every failure it finds will be suspected of being that
-blocker.
+The sweep is worth money only against stable code. Each item below was checked
+in the source and git history, not in prose, because several docs in this repo
+describe as open things that are fixed, and vice versa.
+
+**Verdict: not yet. One release-blocker and three serious gaps are open.**
+
+### Release-blocker
+
+- **BAR1 aperture VA leak**, ~59 mappings per guest Vulkan client teardown.
+  `origin/va-space-leak` is **not merged and contains no fix** — its own
+  `FINDINGS.md` says "NOT ROOT-CAUSED. No fix committed." The leak sites are
+  live on main: `src/qemu/nvkvm_isolate_handlers.c:3606` (`needs_share`),
+  `:2071` (`g_mapva`), and a deliberate one at `src/stub/nvkvm_stub.c:2776`
+  ("For now leak; a future commit will add a realize-token → fd map").
+  It wedges the **host** GPU for host and guest clients alike after enough
+  client churn, recoverable only by reloading the NVIDIA stack. A sweep run on
+  top of this cannot distinguish its own failures from the leak.
+
+### Serious, knowingly scoped
+
+- **Guest-triggerable QEMU kill (P-10b).** The out-of-bounds map size check at
+  `src/qemu/nvkvm_isolate_handlers.c:3956` exempts `TYPE_NVIDIA` handles
+  ("h->size is 0 and means unknown") and the prefault loop it guards is
+  unprotected; there is no SIGBUS handler anywhere in `src/qemu/`. A guest can
+  therefore take down the VMM. Sharpest of the four.
+- **Cross-isolate munmap (P-4b).** `:4302` says plainly "KNOWN GAP, do not read
+  this as a closed boundary": a caller naming a neighbour's `isolate_id` with
+  that neighbour's token passes. Not fixable without a wire change —
+  `struct nvkvm_req_munmap_on_isolate` is `{isolate_id, mmap_token}`
+  (`src/common/nvkvm_proto.h:499`).
+- **Allowlisted control commands with no parameter validation**
+  (`src/qemu/nvkvm_ctrl_allowlist.h:53`, `:132` — the latter carries an NvP64).
+  The header concedes at `:39` that there is no per-command validation, only a
+  1 MiB aux cap.
+- **systemsettings wedges on the Wayland GL path** — 98% CPU inside
+  `libnvidia-eglcore` under `QWaylandGLContext::swapBuffers`. One app today, but
+  the busy-wait is in the shared present path, not in the app.
+
+### Confirmed FIXED — docs describing these as open are stale
+
+- Guest NULL-deref in `nvkvm_send_sync` on first open with no virtio device:
+  fixed by `c8277f2`; both open paths now gate on `nvkvm_transport_ready()` and
+  return `-ENODEV`.
+- `validate.sh` greening a system whose module oopses: both validators now open
+  `/dev/nvidiactl` for real, scan dmesg for oops markers, and distinguish
+  `UNTESTED` from `SKIP` rather than passing.
+
+### Corrected during verification
+
+The audit initially read `nvkvm_iso_auto_select()` as leaving isolates without
+uid separation. It does not: `auto` picks `NS | SECCOMP` via `CLONE_NEWUSER`
+with uid/gid maps — the rung the code itself calls strongest — and the shipped
+compose additionally pins `uid+chroot`.
+
+### Also worth a decision before release
+
+**23 remote branches are unmerged**, several carrying real work (present
+backpressure, the PBO ring, broker v2, security type-confusion fixes, a
+`GET_DEV_INFO` struct off-by-one). Sweeping `main` while that much is stranded
+risks finding bugs already fixed on a branch.
