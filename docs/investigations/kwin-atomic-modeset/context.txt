@@ -1,0 +1,27 @@
+### os
+VARIANT_ID=steamdeck
+BUILD_ID=20260716.1
+6.16.12-valve24.5-1-neptune-616-gb2f7cfe85e45
+### kwin
+kwin 6.4.3
+mesa 25.3.0.213835.radeonsi_25.3.0-4.1
+libdrm 2.4.129-1.1
+### drm
+card0
+controlD64
+renderD128
+by-path
+card0
+renderD128
+connected
+disabled
+### kwin atomic-path failure
+Aug 29 03:32:32 steamdeck kwin_wayland[17024]: kwin_core: Failed to open drm node: ""
+Aug 29 03:32:32 steamdeck kwin_wayland[17024]: kwin_scene_opengl: couldn't find dev node for drm device
+Aug 29 03:32:35 steamdeck kwin_wayland[17445]: kwin_core: Failed to open drm node: ""
+Aug 29 03:32:35 steamdeck kwin_wayland[17445]: kwin_scene_opengl: couldn't find dev node for drm device
+Aug 29 03:32:41 steamdeck kwin_wayland[18353]: kwin_core: Failed to open drm node: ""
+Aug 29 03:32:41 steamdeck kwin_wayland[18353]: kwin_scene_opengl: couldn't find dev node for drm device
+### present counters (legacy path, frames DID flow)
+[ 1997.324921] nvkvm present: queued=656 coalesced=0 sent=655 stuck=1
+[ 2036.193885] nvkvm present: queued=716 coalesced=0 sent=715 stuck=1

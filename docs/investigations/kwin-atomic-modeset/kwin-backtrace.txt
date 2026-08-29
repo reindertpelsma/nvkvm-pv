@@ -1,0 +1,70 @@
+           PID: 16790 (kwin_wayland)
+           UID: 1000 (deck)
+           GID: 1000 (deck)
+        Signal: 11 (SEGV)
+     Timestamp: Sat 2026-08-29 03:32:31 CEST (13min ago)
+  Command Line: /usr/bin/kwin_wayland --wayland-fd 7 --socket wayland-0 --xwayland-fd 8 --xwayland-fd 9 --xwayland-display :0 --xwayland-xauthority /run/user/1000/xauth_yMDLYV --xwayland
+    Executable: /usr/bin/kwin_wayland
+ Control Group: /user.slice/user-1000.slice/user@1000.service/session.slice/plasma-kwin_wayland.service
+          Unit: user@1000.service
+     User Unit: plasma-kwin_wayland.service
+         Slice: user-1000.slice
+     Owner UID: 1000 (deck)
+       Boot ID: f162c80533514ee0bc064edcf670d390
+    Machine ID: 69c405edb9c04a33889b4fd3efd0f661
+      Hostname: steamdeck
+       Storage: /var/lib/systemd/coredump/core.kwin_wayland.1000.f162c80533514ee0bc064edcf670d390.16790.1787967151000000.zst (present)
+  Size on Disk: 7.5M
+       Message: Process 16790 (kwin_wayland) of user 1000 dumped core.
+                
+                Stack trace of thread 16813:
+                #0  0x00007fdff82d4362 n/a (n/a + 0x0)
+                #1  0x00007fe02242323c n/a (libgallium-25.3.0.so + 0x82323c)
+                #2  0x00007fe02242336b n/a (libgallium-25.3.0.so + 0x82336b)
+                #3  0x00007fe022422da6 n/a (libgallium-25.3.0.so + 0x822da6)
+                #4  0x00007fe022423154 n/a (libgallium-25.3.0.so + 0x823154)
+                #5  0x00007fe0224221e2 n/a (libgallium-25.3.0.so + 0x8221e2)
+                #6  0x00007fe0224222e6 n/a (libgallium-25.3.0.so + 0x8222e6)
+                #7  0x00007fe022141c1d n/a (libgallium-25.3.0.so + 0x541c1d)
+                #8  0x00007fe02f0a57eb n/a (libc.so.6 + 0x957eb)
+                #9  0x00007fe02f12920c n/a (libc.so.6 + 0x11920c)
+                
+                Stack trace of thread 16804:
+                #0  0x00007fe02f0ade22 n/a (libc.so.6 + 0x9de22)
+                #1  0x00007fe02f0a1fda n/a (libc.so.6 + 0x91fda)
+                #2  0x00007fe02f0a2024 n/a (libc.so.6 + 0x92024)
+                #3  0x00007fe02f11c626 ppoll (libc.so.6 + 0x10c626)
+                #4  0x00007fe02e4ece04 n/a (libglib-2.0.so.0 + 0x5fe04)
+                #5  0x00007fe02e4ecee5 g_main_context_iteration (libglib-2.0.so.0 + 0x5fee5)
+                #6  0x00007fe02fa3c5e2 _ZN20QEventDispatcherGlib13processEventsE6QFlagsIN10QEventLoop17ProcessEventsFlagEE (libQt6Core.so.6 + 0x43c5e2)
+                #7  0x00007fe02f7744b6 _ZN10QEventLoop4execE6QFlagsINS_17ProcessEventsFlagEE (libQt6Core.so.6 + 0x1744b6)
+                #8  0x00007fe02f88e054 _ZN7QThread3runEv (libQt6Core.so.6 + 0x28e054)
+                #9  0x00007fe02f91ee69 n/a (libQt6Core.so.6 + 0x31ee69)
+                #10 0x00007fe02f0a57eb n/a (libc.so.6 + 0x957eb)
+                #11 0x00007fe02f12920c n/a (libc.so.6 + 0x11920c)
+                
+                Stack trace of thread 16818:
+                #0  0x00007fe02f0ade22 n/a (libc.so.6 + 0x9de22)
+                #1  0x00007fe02f0a1fda n/a (libc.so.6 + 0x91fda)
+                #2  0x00007fe02f0a264c n/a (libc.so.6 + 0x9264c)
+                #3  0x00007fe02f0a4d1e pthread_cond_wait (libc.so.6 + 0x94d1e)
+                #4  0x00007fe022141cee n/a (libgallium-25.3.0.so + 0x541cee)
+                #5  0x00007fe02241da0d n/a (libgallium-25.3.0.so + 0x81da0d)
+                #6  0x00007fe022141c1d n/a (libgallium-25.3.0.so + 0x541c1d)
+                #7  0x00007fe02f0a57eb n/a (libc.so.6 + 0x957eb)
+                #8  0x00007fe02f12920c n/a (libc.so.6 + 0x11920c)
+                
+                Stack trace of thread 16819:
+                #0  0x00007fe02f0ade22 n/a (libc.so.6 + 0x9de22)
+                #1  0x00007fe02f0a1fda n/a (libc.so.6 + 0x91fda)
+                #2  0x00007fe02f0a264c n/a (libc.so.6 + 0x9264c)
+                #3  0x00007fe02f0a4d1e pthread_cond_wait (libc.so.6 + 0x94d1e)
+                #4  0x00007fe022141cee n/a (libgallium-25.3.0.so + 0x541cee)
+                #5  0x00007fe02241da0d n/a (libgallium-25.3.0.so + 0x81da0d)
+                #6  0x00007fe022141c1d n/a (libgallium-25.3.0.so + 0x541c1d)
+                #7  0x00007fe02f0a57eb n/a (libc.so.6 + 0x957eb)
+                #8  0x00007fe02f12920c n/a (libc.so.6 + 0x11920c)
+                
+                Stack trace of thread 16790:
+                #0  0x00007fe02f0ade22 n/a (libc.so.6 + 0x9de22)
+                #1  0x00007fe02f0a1fda n/a (libc.so.6 + 0x91fda)
