@@ -1401,6 +1401,38 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         return -EINVAL;
     }
+    /*
+     * AND IT MUST NOT BE ARBITRARILY WIDER THAN THEM EITHER.
+     *
+     * Only the lower bound existed, so stride was bounded from above solely by
+     * the `need <= INT32_MAX` test further down -- which a 1-PIXEL-WIDE buffer
+     * satisfies with a 256 KiB stride over 8192 rows.  The extent is then 2 GiB
+     * of wl_shm_pool handed to the user's unsandboxed compositor for an image
+     * containing 8192 pixels.  Nothing over-reads (the fd really is that big,
+     * and the pool size is checked), but a compositor that copies the pool
+     * rather than the image commits 2 GiB of host RAM on the VMM's say-so, and
+     * a legitimate buffer at this backend's maximum 8192x8192 needs only
+     * 268 MiB.
+     *
+     * The bound is relative to THIS buffer's own row rather than a global
+     * constant, so it scales with what is actually being displayed.  Twice the
+     * pixel row plus a page is far past any real padding: a tiled pitch is the
+     * width rounded up to a tile (at most 128 pixels, so +512 bytes at 32bpp),
+     * and hardware pitch alignment is 256 or 512 bytes.  Reject rather than
+     * clamp, like every other bound here -- the message carries all four
+     * numbers, so a false rejection is one log line to diagnose.
+     */
+    if ((uint64_t)c->stride > (uint64_t)c->width * bpp * 2 + 4096) {
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: stride %u is more than double the %llu-byte pixel "
+                   "row of a %u-wide %u-bpp buffer plus a page of padding; "
+                   "REJECTED (an over-wide row buys the client a huge shared "
+                   "mapping for a tiny image)",
+                   c->stride, (unsigned long long)((uint64_t)c->width * bpp),
+                   c->width, bpp);
+        }
+        return -EINVAL;
+    }
     /* HARDENING 1: measure the fd, do not believe the sender.  The in-tree
      * pattern is nvkvm_isolate_handlers.c:1332. */
     size = lseek(fd, 0, SEEK_END);
@@ -2775,6 +2807,10 @@ int main(int argc, char **argv)
      * socket belongs to whoever handed it over. */
     bool socket_is_ours = true;
     bool had_client = false;
+    /* Sticky within one loop iteration; see the single exit check at the
+     * bottom of the loop for why the check cannot live where the detach
+     * is noticed. */
+    bool client_lost = false;
     sigset_t mask;
 
     memset(&cfg, 0, sizeof(cfg));
@@ -3123,17 +3159,12 @@ int main(int argc, char **argv)
                 }
             }
             /*
-             * The VMM went away.  By default so do we: a broker window that
-             * outlives its VM shows nothing and still holds a window, a
-             * compositor connection and the hotkeys.  --persist keeps it and
-             * waits for another client, which is what makes a VMM restart --
-             * or a broker that was told to close and let QEMU shut the guest
-             * down gracefully -- survivable without restarting both.
+             * The VMM went away.  Recorded, not acted on here: the exit
+             * itself happens at the bottom of the loop, because this is not
+             * the only place a client can be lost.  See there.
              */
-            if (sink.client_fd < 0 && !cfg.persist) {
-                nb_log("the client is gone; exiting (use --persist to keep "
-                       "the window and wait for another)");
-                break;
+            if (sink.client_fd < 0) {
+                client_lost = true;
             }
         }
 
@@ -3179,14 +3210,51 @@ int main(int argc, char **argv)
             nb_sink_detach(&sink, "write failed");
         }
 
-        /* The VM is gone: say so, rather than leaving its last frame frozen
-         * on screen looking like a hung guest. */
+        /*
+         * THE ONE EXIT CHECK, AND IT HAS TO BE HERE.
+         *
+         * It used to sit inside the `sink.client_fd >= 0` block above, which
+         * means it was only ever evaluated for a client that was still
+         * attached when that block ran.  A client lost LATER in the same
+         * iteration therefore never reached it, and on the next iteration the
+         * block is skipped entirely (client_fd is already < 0) -- so the check
+         * was never reached again either.  The broker then polls forever with
+         * no client and no window content, which is exactly the state
+         * --persist exists to opt INTO.
+         *
+         * Two paths do that today, both after the block above:
+         *   - nb_emit() -> nb_sink_detach("client stopped draining its
+         *     socket"), reached from inside sess->ops->dispatch(); and
+         *   - the post-dispatch nb_sink_flush() failure a few lines up.
+         *
+         * client_lost is sticky for the iteration rather than re-derived from
+         * client_fd, so a replacement client accepted in the same poll cycle
+         * cannot swallow the loss -- which preserves exactly what the old
+         * early break did, since it ran before accept().
+         */
         if (had_client && sink.client_fd < 0) {
+            client_lost = true;
+        }
+        had_client = (sink.client_fd >= 0);
+        if (client_lost) {
+            client_lost = false;
+            if (!cfg.persist) {
+                /* A broker window that outlives its VM shows nothing and still
+                 * holds a window, a compositor connection and the hotkeys.
+                 * --persist keeps it and waits for another client, which is
+                 * what makes a VMM restart -- or a broker told to close so
+                 * QEMU can shut the guest down gracefully -- survivable
+                 * without restarting both. */
+                nb_log("the client is gone; exiting (use --persist to keep "
+                       "the window and wait for another)");
+                break;
+            }
+            /* The VM is gone: say so, rather than leaving its last frame
+             * frozen on screen looking like a hung guest. */
             if (sess->ops->show_idle) {
                 sess->ops->show_idle(sess);
             }
         }
-        had_client = (sink.client_fd >= 0);
     }
 
     if (sink.client_fd >= 0) {

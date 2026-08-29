@@ -1501,12 +1501,54 @@ static long ioctl_on_isolate_common(__u32 isolate_id, __u32 handle_id,
 	vma_buf = (want_vma_whitelist && current->mm)
 		? kzalloc(sizeof(*vma_buf) * NVKVM_MAX_VMA_ENTRIES, GFP_KERNEL)
 		: NULL;
+	/*
+	 * TRYLOCK, NOT mmap_read_lock() -- THIS IS THE AB-BA EDGE.
+	 *
+	 * This function is reached from nvkvm_do_ioctl() with uvm_state->ext_lock
+	 * HELD (nvkvm_main.c: the UVM shadow transaction spans the whole host
+	 * round trip).  The other direction exists too and is not ours to change:
+	 * the kernel calls ->mmap with mmap_write_lock already held, and
+	 * nvkvm_mmap_request() then takes ext_lock (nvkvm_mmap.c).  So one thread
+	 * of a CUDA process doing a state-changing UVM ioctl and another doing
+	 * mmap() on the same UVM fd close the cycle:
+	 *
+	 *     T1: ext_lock            -> waits for mmap_lock (here)
+	 *     T2: mmap_write_lock     -> waits for ext_lock  (nvkvm_mmap.c)
+	 *
+	 * Both waits were uninterruptible, so the pair wedges with
+	 * mmap_write_lock held -- the process becomes unkillable and every reader
+	 * of its /proc/<pid>/maps hangs behind it.
+	 *
+	 * Blocking here buys nothing, which is what makes the trylock the right
+	 * answer rather than a compromise: NOTHING ON THE HOST READS THIS
+	 * WHITELIST.  vma_whitelist_nentries / vma_whitelist_slot are written by
+	 * this function and read by no code in QEMU or the stub (grep the tree);
+	 * the "demand-fault resolution" the protocol header describes is done by
+	 * nvkvm_efault_resolve() from the returned fault address instead.  So on
+	 * contention we send vma_count == 0, which is already an ordinary case
+	 * (GEM_CLOSE at process exit takes it), and lose nothing that is used.
+	 *
+	 * THIS DOES NOT FULLY CLOSE THE CYCLE.  Two narrower ext_lock -> mmap_lock
+	 * edges remain, both inside the same transaction:
+	 *   - nvkvm_cpu_pages_refresh() -> nvkvm_cpu_page_entry_live(), which takes
+	 *     mmap_read_lock or calls get_user_pages_fast(), when the fd has
+	 *     migrated CPU pages; and
+	 *   - nvkvm_efault_resolve() -> nvkvm_cpu_page_migrate(), which takes
+	 *     mmap_write_lock, if the host driver faults on a guest VA.
+	 * Neither can be a trylock (one is inside GUP), and neither is reachable
+	 * for the ten control-plane commands nvkvm_uvm_shadow_cmd() admits without
+	 * the fd ALSO holding migrated CPU pages.  Closing them properly means
+	 * moving the blocking host round trip out of ext_lock, which is a redesign
+	 * of the UVM shadow transaction, not a patch.  See the note at the
+	 * ext_lock acquisition in nvkvm_main.c.
+	 */
 	if (vma_buf) {
 		struct mm_struct *mm = current->mm;
 		struct vm_area_struct *vma;
 		VMA_ITERATOR(vmi, mm, 0);
 
-		mmap_read_lock(mm);
+		if (!mmap_read_trylock(mm))
+			goto whitelist_done;
 		for_each_vma(vmi, vma) {
 			if (vma_count >= NVKVM_MAX_VMA_ENTRIES)
 				break;
@@ -1538,6 +1580,7 @@ static long ioctl_on_isolate_common(__u32 isolate_id, __u32 handle_id,
 				vma_count = 0;
 			}
 		}
+whitelist_done:
 		kfree(vma_buf);
 	}
 
@@ -1619,6 +1662,13 @@ long nvkvm_virtio_ioctl_on_isolate(struct nvkvm_fd_ctx *ctx,
  * fallback issues its RM and UVM ioctls from inside ->mmap() and ->close() on a
  * VMA, i.e. with mmap_write_lock ALREADY HELD — taking the read side there is a
  * self-deadlock on a non-recursive rwsem, not a lock-order nicety.
+ *
+ * That reasoning is still right and still the reason this variant exists, but
+ * it only ever considered the mmap -> ioctl direction.  The ioctl -> mmap
+ * direction is real too and is the AB-BA documented at the whitelist itself;
+ * a trylock there is what stops the ordinary forwarding path from closing the
+ * cycle.  This variant remains the correct call for the ->mmap/->close paths,
+ * because a trylock that succeeded would still be recursive acquisition.
  *
  * Dropping it is also correct rather than merely necessary: every ioctl on that
  * path is composed by this module out of handles and lengths and embeds no user

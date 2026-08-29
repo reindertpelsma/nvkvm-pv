@@ -459,11 +459,33 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
                    "DRM_FORMAT_MOD_INVALID; it should declare the real "
                    "modifier.");
         }
-        /* DRI3 1.0.  `size` is the whole buffer; the server derives the rest. */
-        uint32_t size = (uint32_t)(d->size > 0xffffffffu ? 0xffffffffu
-                                                         : d->size);
+        /*
+         * REFUSE RATHER THAN TRUNCATE.  DRI3 1.0's stride is CARD16 and its
+         * size CARD32, and this used to cast straight into them -- so a
+         * declared stride above 65535, or a buffer past 4 GiB, meant the
+         * server was handed a DIFFERENT geometry from the one the ATTACH
+         * validator bounded against the real fd size.  Nothing over-reads (a
+         * smaller stride reads fewer bytes per row, a smaller size fewer
+         * bytes), so this is not a memory-safety bug -- it is the checked
+         * value and the used value quietly ceasing to be the same number,
+         * which is the property every later change to either side would
+         * assume still held.
+         *
+         * Costs nothing real: 65535 bytes is a 16383-pixel row, twice
+         * NVKVM_BROKER_MAX_DIM, so no buffer this backend can display is
+         * turned away.
+         */
+        if (d->stride > 0xffffu || d->size > 0xffffffffu) {
+            nb_err("ATTACH: stride %u / size %llu do not fit DRI3 1.0's wire "
+                   "fields; refusing rather than sending the server a geometry "
+                   "we never validated",
+                   d->stride, (unsigned long long)d->size);
+            close(dupfd);
+            return -EINVAL;
+        }
+        /* `size` is the whole buffer; the server derives the rest. */
         ck = xcb_dri3_pixmap_from_buffer_checked(
-                 x->c, pix, x->content, size,
+                 x->c, pix, x->content, (uint32_t)d->size,
                  (uint16_t)d->width, (uint16_t)d->height,
                  (uint16_t)d->stride, 24, 32, dupfd);
     } else {

@@ -479,6 +479,9 @@ static void bg_layout(struct nb_wl *w, int dw, int dh);
 static void wl_report_surface(struct nb_wl *w, int lw, int lh);
 static void bd_layout(struct nb_wl *w);
 static int  bd_index(const struct nb_wl *w, const struct wl_surface *s);
+/* Forward: the idle placeholder is released by wl_commit once a real frame is
+ * on screen; defined with the rest of the placeholder code. */
+static void wl_idle_drop(struct nb_wl *w);
 /* Forward: presentation feedback is requested by wl_commit, defined below. */
 extern const struct wp_presentation_feedback_listener nb_pres_listener;
 
@@ -1007,7 +1010,12 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
 
     /* A real frame supersedes the placeholder; drop its mapping rather than
-     * hold a megabyte of shm for the life of the VM. */
+     * hold a megabyte of shm for the life of the VM.
+     *
+     * The DROP happens after the commit below, not here -- see there.  This
+     * comment described the drop for a long time while the code only cleared
+     * the two flags, so the mapping and its wl_buffer were in fact held for
+     * the life of the VM. */
     if (w->idle_wanted) {
         w->idle_wanted = false;
         w->idle_shown = false;
@@ -1098,6 +1106,27 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      */
     bd_layout(w);
     wl_surface_commit(w->surf);
+
+    /*
+     * NOW drop the idle placeholder, and only now.
+     *
+     * Its mapping and wl_buffer used to survive the whole life of the VM
+     * despite the comment above claiming otherwise -- around a megabyte of shm
+     * plus a protocol object, per broker, held for a picture that has been off
+     * screen since the first guest frame.
+     *
+     * After wl_surface_commit(), for the same reason wl_idle_make() gives for
+     * destroying in that order: the compositor processes attach+commit before
+     * it sees the destroy, so the placeholder cannot be yanked out from under
+     * a frame it is still scanning out.  Dropping it BEFORE the attach would
+     * do exactly that.
+     *
+     * Safe to repeat and safe to lose: wl_idle_drop() is idempotent, and
+     * ops->show_idle re-makes the buffer if the VM goes away again.
+     */
+    if (w->idle_buf) {
+        wl_idle_drop(w);
+    }
 
     sl->held = true;
     sl->commits++;

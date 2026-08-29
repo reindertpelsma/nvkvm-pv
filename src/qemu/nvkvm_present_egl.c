@@ -1119,7 +1119,27 @@ static void nvkvm_present_reap_dead(NvkvmPresent *p)
  *
  * Off unless the environment variable is set, so a normal run pays nothing.
  */
-static unsigned nvkvm_st_consumed, nvkvm_st_dropped;
+/*
+ * nvkvm_st_dropped / nvkvm_st_bucket_dropped ARE WRITTEN FROM A THIRD THREAD.
+ *
+ * The consumed/failed/us counters below stay plain, and that is deliberate:
+ * they are touched only by nvkvm_st_frame(), which runs on the main loop for
+ * the GL path and on the present thread for the readback path -- never both,
+ * now that present_sync_relay_generation() no longer un-latches the mode.
+ *
+ * The two dropped counters are different.  They are incremented in
+ * nvkvm_present_submit()/_submit_readback(), i.e. on whatever thread services
+ * the guest's PRESENT (a virtio TX or thread-pool context), and read and reset
+ * by nvkvm_st_frame() on one of the other two.  A plain `unsigned++` from two
+ * threads is a lost-update RMW, and the counter losing increments is precisely
+ * the failure this whole block was written to prevent: the comment above says a
+ * rate must come from a COUNTER because counting log lines once produced a
+ * phantom "21 presents/s" on a 60 fps pipeline.  A counter that silently drops
+ * increments under load is the same phantom with a different cause -- it
+ * under-reports drops exactly when drops are worth seeing.
+ */
+static unsigned nvkvm_st_consumed;
+static unsigned nvkvm_st_dropped;              /* atomic; see above */
 /*
  * Whether the frame actually reached the display.  This is not pedantry: with
  * EGL unavailable the present path returns at its first line, and the old code
@@ -1129,7 +1149,8 @@ static unsigned nvkvm_st_consumed, nvkvm_st_dropped;
  * stats, because someone acts on them.
  */
 static unsigned nvkvm_st_failed, nvkvm_st_bucket_failed;
-static unsigned nvkvm_st_bucket_consumed, nvkvm_st_bucket_dropped;
+static unsigned nvkvm_st_bucket_consumed;
+static unsigned nvkvm_st_bucket_dropped;       /* atomic; see above */
 static double   nvkvm_st_present_us, nvkvm_st_bucket_us;
 static double   nvkvm_st_bucket_t0;
 static bool     nvkvm_st_on, nvkvm_st_checked;
@@ -1163,7 +1184,9 @@ static double nvkvm_st_now(void)
 
 /* One consumed frame, `us` spent presenting it.  Called from the main loop on
  * the GL path and from the present thread on the readback path -- never both
- * in one run, since the mode is decided once. */
+ * in one run, since the mode is decided once.  That "once" is now actually
+ * enforced: see present_sync_relay_generation(), which used to un-latch the
+ * mode on a broker reconnect and so could put both paths in one run. */
 static void nvkvm_st_frame(double us, bool shown)
 {
     double now;
@@ -1184,22 +1207,29 @@ static void nvkvm_st_frame(double us, bool shown)
         return;
     }
     if (now - nvkvm_st_bucket_t0 >= 1.0) {
+        /*
+         * XCHG, not read-then-zero: a drop landing between the two would be
+         * counted in this bucket's line and then wiped, so it would appear in
+         * no bucket at all.  Take the bucket and leave zero in one step.
+         */
+        unsigned bdropped = qatomic_xchg(&nvkvm_st_bucket_dropped, 0u);
+
         fprintf(stderr,
                 "nvkvm disp stats: %.1f frames/s dropped=%u failed=%u "
                 "present_mean=%.2fms (total consumed=%u dropped=%u "
                 "failed=%u)%s\n",
                 nvkvm_st_bucket_consumed / (now - nvkvm_st_bucket_t0),
-                nvkvm_st_bucket_dropped, nvkvm_st_bucket_failed,
+                bdropped, nvkvm_st_bucket_failed,
                 nvkvm_st_bucket_consumed
                     ? nvkvm_st_bucket_us / nvkvm_st_bucket_consumed / 1000.0
                     : 0.0,
-                nvkvm_st_consumed, nvkvm_st_dropped, nvkvm_st_failed,
+                nvkvm_st_consumed, qatomic_read(&nvkvm_st_dropped),
+                nvkvm_st_failed,
                 (nvkvm_st_consumed == 0 && nvkvm_st_failed > 0)
                     ? "  <-- NOTHING IS BEING DISPLAYED" : "");
         fflush(stderr);
         nvkvm_st_bucket_t0       = now;
         nvkvm_st_bucket_consumed = 0;
-        nvkvm_st_bucket_dropped  = 0;
         nvkvm_st_bucket_failed   = 0;
         nvkvm_st_bucket_us       = 0.0;
     }
@@ -1752,6 +1782,38 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
  *
  * The relay already does exactly this for its own format verdict and names it
  * the RR-07 class of bug: a reconnect inheriting partial protocol state.
+ *
+ * BUT `mode` AND `relay_readback` ARE NOT THE SAME KIND OF LATCH, and clearing
+ * them together was wrong.
+ *
+ * `relay_readback` is a per-connection verdict ("this display cannot import the
+ * guest's tiling"), and clearing it is the whole mirror fix: the next PRESENT
+ * re-asks nvkvm_display_relay_format_verdict() and goes zero-copy again if the
+ * new broker can take the buffer.  That stays.
+ *
+ * `mode` is not a verdict about the broker at all -- it is the QEMU-console
+ * choice, read only by nvkvm_present_gfx_update(), and this function can only
+ * ever run while the RELAY is active: with no relay
+ * nvkvm_display_relay_generation() is a constant 0, the generation never
+ * changes, and we return above.  So clearing `mode` fixes neither measured
+ * case, and once the present thread exists it is actively unsafe:
+ *
+ *   nvkvm_present_thread_start() hands the render-node EGL context to the
+ *   present thread and releases it from the main loop, permanently -- nothing
+ *   gives it back short of nvkvm_present_console_fini().  A re-probe can then
+ *   answer 1, and nvkvm_present_gl() runs ON THE MAIN LOOP: it calls
+ *   glDeleteTextures()/eglDestroyImageKHR() over p->cache[] with no context
+ *   current on that thread, while the present thread is concurrently importing
+ *   into and reaping those same entries (nvkvm_present_cached_tex,
+ *   nvkvm_present_reap_dead, both of which run where our context IS current).
+ *   That is both present paths live at once -- exactly the state
+ *   nvkvm_st_frame()'s comment says cannot happen.
+ *
+ * So the mode latch is scoped to the present THREAD's lifetime, not to the
+ * broker connection: re-probe only while no thread owns the context.  The cost
+ * is that a VM which once fell back to console readback keeps that path until
+ * the VMM restarts; the alternative is GL calls on a thread that holds no
+ * context and a use-after-free of the import cache.
  */
 static void present_sync_relay_generation(struct VirtIONvgpu *nv)
 {
@@ -1766,12 +1828,18 @@ static void present_sync_relay_generation(struct VirtIONvgpu *nv)
         return;
     }
     p->relay_gen = gen;
-    if (p->relay_readback || p->mode != -1) {
+    if (p->relay_readback || (p->mode != -1 && !p->thread_started)) {
         p->relay_readback = false;
-        p->mode = -1;                 /* re-probed on the next frame */
+        if (!p->thread_started) {
+            p->mode = -1;             /* re-probed on the next frame */
+        }
         fprintf(stderr, "nvkvm present: the broker reconnected -- forgetting "
                         "the present path chosen for the previous one and "
-                        "re-probing\n");
+                        "re-probing%s\n",
+                p->thread_started
+                    ? " (the console mode stays latched: the present thread "
+                      "owns the EGL context for the life of this device)"
+                    : "");
     }
 }
 
@@ -1790,8 +1858,8 @@ bool nvkvm_present_submit(struct VirtIONvgpu *nv, int dmabuf_fd,
     if (p->fd >= 0) {
         close(p->fd);        /* drop the frame the display hasn't taken yet */
         if (nvkvm_disp_stats()) {
-            nvkvm_st_dropped++;
-            nvkvm_st_bucket_dropped++;
+            qatomic_inc(&nvkvm_st_dropped);
+            qatomic_inc(&nvkvm_st_bucket_dropped);
         }
     }
     p->fd       = dmabuf_fd;
@@ -1857,8 +1925,8 @@ bool nvkvm_present_submit_readback(struct VirtIONvgpu *nv, int dmabuf_fd,
     if (p->fd >= 0) {
         close(p->fd);        /* drop the frame the thread has not taken yet */
         if (nvkvm_disp_stats()) {
-            nvkvm_st_dropped++;
-            nvkvm_st_bucket_dropped++;
+            qatomic_inc(&nvkvm_st_dropped);
+            qatomic_inc(&nvkvm_st_bucket_dropped);
         }
     }
     p->fd       = dmabuf_fd;

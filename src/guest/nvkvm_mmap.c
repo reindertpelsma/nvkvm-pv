@@ -33,6 +33,8 @@
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
 #include <linux/pgtable.h>
+#include <linux/fs.h>          /* file_inode() — VMA type check below */
+#include <uapi/linux/magic.h>  /* TMPFS_MAGIC  — VMA type check below */
 #include <asm/pgtable_types.h>
 
 #include "nvkvm.h"
@@ -715,18 +717,49 @@ static unsigned long nvkvm_zap_entry_ptes(struct mm_struct *mm,
  * Locking.  The lock order in this file is cpu_pages_lock -> mmap_lock (see
  * nvkvm_cpu_page_entry_live); nothing takes them the other way.  Both callers
  * have already unlinked the entry onto a private list and dropped
- * cpu_pages_lock, so we take mmap_lock with no nvkvm lock held.  Neither
- * caller is ever reached with mmap_lock already held:
+ * cpu_pages_lock, so we take mmap_lock with no nvkvm lock held.
  *
  *   nvkvm_cpu_pages_reap_stale() runs from the two migration entry points —
  *   nvkvm_efault_resolve() drops mmap_read_lock before calling
  *   nvkvm_cpu_page_migrate(), and nvkvm_cpu_pages_migrate_range() reaps before
- *   it takes mmap_write_lock itself.
+ *   it takes mmap_write_lock itself.  Neither reaches here holding mmap_lock.
  *
- *   nvkvm_cpu_pages_free() runs only from nvkvm_fd_ctx_destroy(), i.e. from
- *   ->release (fput() defers the last put to task_work, so it never fires
- *   under the munmap/exit_mmap mmap_write_lock) or from a proxy-GEM /
- *   dma-buf put, none of which hold mmap_lock.
+ * BUT ONE CALLER OF nvkvm_cpu_pages_free() DOES HOLD mmap_write_lock, AND THIS
+ * COMMENT USED TO CLAIM NONE DID.  The claim was that it runs only from
+ * ->release, where fput() defers the last put to task_work, or from a proxy-GEM
+ * / dma-buf put.  There is a third way in, and it is a straight self-deadlock
+ * on a non-recursive rwsem:
+ *
+ *   remove_vma()                       [kernel, mmap_write_lock HELD]
+ *     -> nvkvm_vma_close()             (this file)
+ *     -> nvkvm_uvm_ext_release()       (nvkvm_uvm_ext.c)
+ *     -> ext_unwind()
+ *     -> nvkvm_fd_ctx_put(r->ext_map_ctl)
+ *     -> nvkvm_fd_ctx_destroy()        (nvkvm_main.c)
+ *     -> nvkvm_cpu_pages_free()
+ *     -> here -> mmap_write_lock(mm)   [SAME mm]
+ *
+ * It does not fire today, and only by luck: ext_map_ctl is an internally
+ * created NVKVM_DEV_CTL context whose ioctls all go down the _nomm path, so it
+ * never runs nvkvm_efault_resolve() and never accumulates a cpu_pages entry —
+ * and with the list empty this function is never called.  NOTHING ENFORCES
+ * THAT.  One forwarded ioctl on that context that EFAULTs, or one future
+ * migration recorded against it, and a plain munmap() of a managed range wedges
+ * the calling thread with mmap_write_lock held: unkillable, and every reader of
+ * its /proc/<pid>/maps hangs behind it.  Process exit is the one safe case,
+ * because mmget_not_zero() below already fails once exit_mmap() has run.
+ *
+ * NOT FIXED HERE, deliberately, because every available fix is a design choice
+ * and not a patch:
+ *   - a trylock here would have to skip the zap on failure, which reinstates
+ *     the H-9 cross-process aliasing this function exists to prevent;
+ *   - deferring the ext_map_ctl put to a workqueue fixes it but adds a new
+ *     deferred-teardown lifetime (and a module-unload flush) to a path whose
+ *     whole point is that the host range teardown must NOT be deferred; and
+ *   - splitting the ctl-context teardown so the cpu_pages part runs outside
+ *     mmap_lock changes the ordering nvkvm_fd_ctx_destroy() documents.
+ * Pick one with the UVM state machine's owner.  Until then: DO NOT let an
+ * ext_map_ctl context acquire cpu_pages entries.
  *
  * Lifetime.  cp->mm is pinned by the mmgrab() taken when the entry was
  * recorded, so the struct is guaranteed to still be there.  mmget_not_zero()
@@ -1380,6 +1413,22 @@ bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len)
 }
 
 /*
+ * Is this VMA's file one of the kernel's in-memory pseudo-filesystems, i.e. is
+ * the mapping still just process memory?  MAP_SHARED|MAP_ANONYMOUS carries an
+ * internal shmem (or, without CONFIG_SHMEM, ramfs) file; a mapping of anything
+ * else is a real file whose pages we must not replace.
+ */
+static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
+{
+	struct inode *inode = file_inode(vma->vm_file);
+
+	if (!inode || !inode->i_sb)
+		return false;
+	return inode->i_sb->s_magic == TMPFS_MAGIC ||
+	       inode->i_sb->s_magic == RAMFS_MAGIC;
+}
+
+/*
  * nvkvm_cpu_pages_migrate_range — migrate every guest page covering
  * [gva, gva+len) onto memfds shared with the isolate.  Pages already
  * migrated are skipped (cpu_page_migrate dedupes by gva).  Used to set
@@ -1529,6 +1578,40 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	if (!vma || vma->vm_start > start || vma->vm_end < end) {
 		mmap_write_unlock(mm);
 		ret = -EFAULT; goto err_unpin;
+	}
+	/*
+	 * IT MUST BE PLAIN PROCESS MEMORY BEFORE WE RETYPE IT.
+	 *
+	 * The VA comes from userspace (the UVM ioctl at nvkvm_ioctl.c names it),
+	 * so find_vma() returns whatever the caller pointed at -- and the next
+	 * line converts that VMA to VM_PFNMAP|VM_IO and remaps window pages over
+	 * it.  Doing that to a file mapping replaces the caller's view of a FILE
+	 * with GPA-window memory while the fs's vm_ops stay installed, and doing
+	 * it to hugetlb or to another driver's mapping corrupts state that is not
+	 * ours.  The pin loop above does not catch this: get_user_pages_fast()
+	 * with FOLL_WRITE succeeds perfectly well on a writable file mapping.
+	 *
+	 * The blast radius is the caller's own address space, which is why this is
+	 * minor -- but the comments below reason about "ordinary user memory" and
+	 * nothing checked it.
+	 *
+	 * What is admitted: MAP_PRIVATE|MAP_ANONYMOUS (no vm_file at all) and the
+	 * MAP_SHARED anonymous case, which Linux backs with an internal shmem file
+	 * and which the remap_pfn_range note below records as a supported input.
+	 * shmem is recognised by its superblock magic rather than by
+	 * vma_is_shmem(), which the kernel declares but does not export to modules.
+	 * RAMFS_MAGIC is accepted alongside it because that is what backs the same
+	 * MAP_SHARED anonymous mapping on a CONFIG_SHMEM=n kernel.  Everything else
+	 * -- a real filesystem, hugetlbfs, an existing device mapping -- is refused.
+	 */
+	if ((vma->vm_flags & (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB)) ||
+	    (vma->vm_file && !nvkvm_vma_file_is_memory(vma))) {
+		mmap_write_unlock(mm);
+		pr_warn_ratelimited(
+			"nvkvm: refusing to migrate 0x%lx-0x%lx: the VMA is not plain anonymous memory (vm_flags=0x%lx file=%d)\n",
+			start, end, (unsigned long)vma->vm_flags,
+			!!vma->vm_file);
+		ret = -EINVAL; goto err_unpin;
 	}
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*

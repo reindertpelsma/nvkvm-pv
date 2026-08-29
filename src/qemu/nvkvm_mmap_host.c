@@ -558,13 +558,51 @@ uint64_t nvkvm_sparse_ensure(VirtIONvgpu *nv)
 		 * taking the VM down.
 		 */
 		/*
+		 * THE WINDOW MUST NOT SIT BELOW GUEST RAM, and the shm/mmap
+		 * overlap check below never said that.
+		 *
+		 * A BAR base anywhere under gpa.block_base with
+		 * base + sparse_size <= block_base passed both of the old
+		 * checks, and we then installed a RAW KVM memslot spanning the
+		 * whole window there.  A raw memslot wins over anything QEMU
+		 * emulates in that range, so the 128 GiB span would swallow
+		 * guest RAM, the 32-bit PCI hole, every other device's BARs and
+		 * the ROM -- turning MMIO that must trap into plain reads of our
+		 * anonymous window.  That is a silently broken VM, not a refused
+		 * mapping.
+		 *
+		 * gpa.ram_top is 4 GiB + ram_size, so everything below it is
+		 * guest RAM or 32-bit MMIO, and the block placer already refuses
+		 * to put the block under it.  Hold firmware's BAR to the same
+		 * rule.  It cannot reject a legitimate placement: the floor the
+		 * placer reserves for this very BAR is itself above ram_top.
+		 */
+		if (base < nv->gpa.ram_top) {
+			fprintf(stderr,
+				"nvkvm: firmware placed the window BAR at GPA=0x%llx, below "
+				"the top of guest RAM (0x%llx) -- a raw memslot there would "
+				"shadow RAM and MMIO; using the computed base 0x%llx "
+				"instead\n",
+				(unsigned long long)base,
+				(unsigned long long)nv->gpa.ram_top,
+				(unsigned long long)nv->gpa.sparse_base);
+			base = nv->gpa.sparse_base;
+		}
+		/*
 		 * Firmware could also place the BAR on top of the shm or legacy
 		 * mmap regions, which are plain memslots it does not know
 		 * about.  Installing the window there would shadow shm and
 		 * corrupt every ioctl parameter slot, so prefer our own base.
+		 *
+		 * Deliberately not written as `base + nv->sparse_size`: that sum
+		 * wraps for a large enough base, and a wrapped end compares BELOW
+		 * block_base, so the test would pass exactly the placement it
+		 * exists to catch.  The GPA-limit check below would usually catch
+		 * that as well, but it is skipped when gpa.limit is 0.
 		 */
 		if (base < nv->gpa.sparse_base &&
-		    base + nv->sparse_size > nv->gpa.block_base) {
+		    (base >= nv->gpa.block_base ||
+		     nv->sparse_size > nv->gpa.block_base - base)) {
 			fprintf(stderr,
 				"nvkvm: firmware placed the window BAR at GPA=0x%llx, "
 				"overlapping the shm/mmap regions at 0x%llx; using the "
@@ -635,13 +673,38 @@ void nvkvm_sparse_fini(VirtIONvgpu *nv)
 	pthread_mutex_destroy(&nv->sparse_lock);
 }
 
+/*
+ * PAGE ROUND-UP THAT REFUSES TO WRAP.
+ *
+ * `(size + 4095) & ~4095` turns any size within 4095 bytes of SIZE_MAX into 0
+ * or a couple of pages.  The allocator would then hand back a real GPA for an
+ * extent a few pages long while the caller believes it reserved the size it
+ * asked for -- its own `off + size > sparse_size` guard passes, because the
+ * size it checks is the wrapped one.  Everything downstream of that GPA is then
+ * writing outside anything the window reserved.
+ *
+ * Returns 0 on overflow, which every caller here already treats as failure.
+ *
+ * NOT REACHABLE FROM ANY CURRENT CALLER -- MMAP_ON_ISOLATE caps len at
+ * nv->sparse_size, REALIZE_UVM_MAPPING caps it at 1 TiB, and the isolate ring
+ * passes its own region size.  This is the allocator declining to depend on
+ * every future caller remembering to do that first.
+ */
+static uint64_t nvkvm_page_round_up(uint64_t size)
+{
+	if (size > UINT64_MAX - 4095)
+		return 0;
+	return (size + 4095) & ~4095ULL;
+}
+
 uint64_t nvkvm_sparse_gpa_alloc(VirtIONvgpu *nv, size_t size)
 {
 	if (!nv->sparse_vmm_va) return 0;
 	/* #55: install the memslot at the resolved (BAR-assigned) base on first
 	 * use; returns 0 if the window couldn't be installed. */
 	if (nvkvm_sparse_ensure(nv) == 0) return 0;
-	size = (size + 4095) & ~4095ULL;
+	size = nvkvm_page_round_up(size);
+	if (size == 0) return 0;      /* zero, or a round-up that would wrap */
 	pthread_mutex_lock(&nv->sparse_lock);
 
 	/*
@@ -798,7 +861,10 @@ void nvkvm_sparse_gpa_free(VirtIONvgpu *nv, uint64_t gpa, size_t size)
 	uint32_t ndrain = 0;
 
 	if (!nv || !size) return;
-	size = (size + 4095) & ~4095ULL;
+	size = nvkvm_page_round_up(size);
+	/* An extent this large was never handed out, so there is nothing to give
+	 * back; dropping it is correct, and leaks nothing that exists. */
+	if (size == 0) return;
 
 	pthread_mutex_lock(&nvkvm_gpa_quar_lock);
 	/* Append; the array has one spare slot so the append always fits and
@@ -829,7 +895,7 @@ static void nvkvm_sparse_gpa_release(VirtIONvgpu *nv, uint64_t gpa, size_t size)
 	if (!nv->sparse_vmm_va || !nv->sparse_free) return;
 	if (gpa < nv->sparse_gpa_base) return;
 	uint64_t off = gpa - nv->sparse_gpa_base;
-	size = (size + 4095) & ~4095ULL;
+	size = nvkvm_page_round_up(size);
 	if (size == 0 || off + size > nv->sparse_size) return;
 
 	pthread_mutex_lock(&nv->sparse_lock);

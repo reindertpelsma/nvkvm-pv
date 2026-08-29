@@ -230,6 +230,30 @@ static void *slot_ptr(VirtIONvgpu *nv, uint32_t slot)
 }
 
 /*
+ * A MALFORMED REQUEST IS A GUEST GESTURE, SO ITS LOG LINE IS A GUEST-CONTROLLED
+ * WRITE INTO THE HOST'S JOURNAL.
+ *
+ * The two error_report() sites on the TX path (short header, unknown request
+ * type) sit with nothing between them and the guest: a loop posting truncated
+ * descriptors emits one line per descriptor, as fast as the queue can be
+ * driven.  That is not a crash — it is unbounded host disk written on the
+ * guest's say-so, and it buries whatever real message was logged either side of
+ * it, which is the part that costs an operator an incident.
+ *
+ * Power-of-two backoff rather than a rate limit: log occurrence 1, 2, 4, 8, …,
+ * so the first few are all visible (that is when a genuine driver bug shows
+ * up), a flood costs O(log n) lines, and every line carries the running total,
+ * so the volume is still reported rather than hidden.  No clock and no new
+ * dependency, deliberately — this must not be the thing that fails.
+ */
+static bool nvkvm_log_backoff(uint64_t *count)
+{
+	uint64_t n = ++*count;
+
+	return (n & (n - 1)) == 0;
+}
+
+/*
  * Audit C-1: a guest-controlled `size` (param_size/aux_size/req->size, up to the
  * stub's 256 KiB cap) must NEVER exceed the 64 KiB slot it indexes, or the
  * subsequent send/recv/pread on slot_ptr() over-reads/over-writes past the slot
@@ -251,6 +275,25 @@ static void *slot_blob(VirtIONvgpu *nv, uint32_t slot, uint64_t size)
 		return NULL;
 	return slot_ptr(nv, slot);
 }
+
+/*
+ * WHY EVERY virtqueue_push() BELOW TAKES iov_from_buf()'s RETURN VALUE.
+ *
+ * The third argument to virtqueue_push() is the used-ring `len`, and virtio
+ * 1.3 §2.7.8 defines it as "the number of bytes written into the device
+ * writable portion of the buffer".  Every site here used to pass
+ * sizeof(response) unconditionally — but the GUEST chooses the in_sg it
+ * posted, so when it posts a descriptor chain shorter than the response,
+ * iov_from_buf() copies only what fits and returns that smaller count.  We were
+ * then telling the guest we had written more than we had.
+ *
+ * The damage lands inside the guest, which is why this is minor and not
+ * serious: a guest that sizes its copy-out from used.len rather than from the
+ * descriptor it posted reads past its own buffer.  But it is our number and it
+ * was wrong, and "the host says N bytes are valid" is exactly the kind of claim
+ * a driver is entitled to believe.  Taking the return value costs nothing and
+ * makes the used ring describe what actually happened.
+ */
 
 /*
  * Legacy NVKVM_REQ_OPEN / _CLOSE / _IOCTL / _MMAP / _MUNMAP request handlers.
@@ -326,9 +369,9 @@ static void handle_open(VirtIONvgpu *nv, VirtQueue *vq,
 		dev_id, session->id, hfd->token, hfd->fd);
 
 send:
-	iov_from_buf(elem->in_sg, elem->in_num, 0,
-		     &resp_msg, sizeof(resp_msg));
-	virtqueue_push(vq, elem, sizeof(resp_msg));
+	virtqueue_push(vq, elem,
+		       iov_from_buf(elem->in_sg, elem->in_num, 0,
+				    &resp_msg, sizeof(resp_msg)));
 	virtio_notify(VIRTIO_DEVICE(nv), vq);
 }
 
@@ -374,9 +417,9 @@ static void handle_close(VirtIONvgpu *nv, VirtQueue *vq,
 	resp_msg.resp.status = 0;
 
 send:
-	iov_from_buf(elem->in_sg, elem->in_num, 0,
-		     &resp_msg, sizeof(resp_msg));
-	virtqueue_push(vq, elem, sizeof(resp_msg));
+	virtqueue_push(vq, elem,
+		       iov_from_buf(elem->in_sg, elem->in_num, 0,
+				    &resp_msg, sizeof(resp_msg)));
 	virtio_notify(VIRTIO_DEVICE(nv), vq);
 }
 
@@ -551,9 +594,9 @@ static void handle_mmap(VirtIONvgpu *nv, VirtQueue *vq,
 	resp_msg.resp.status      = 0;
 
 send:
-	iov_from_buf(elem->in_sg, elem->in_num, 0,
-		     &resp_msg, sizeof(resp_msg));
-	virtqueue_push(vq, elem, sizeof(resp_msg));
+	virtqueue_push(vq, elem,
+		       iov_from_buf(elem->in_sg, elem->in_num, 0,
+				    &resp_msg, sizeof(resp_msg)));
 	virtio_notify(VIRTIO_DEVICE(nv), vq);
 }
 
@@ -601,9 +644,9 @@ static void handle_munmap(VirtIONvgpu *nv, VirtQueue *vq,
 	resp_msg.resp.status = 0;
 
 send:
-	iov_from_buf(elem->in_sg, elem->in_num, 0,
-		     &resp_msg, sizeof(resp_msg));
-	virtqueue_push(vq, elem, sizeof(resp_msg));
+	virtqueue_push(vq, elem,
+		       iov_from_buf(elem->in_sg, elem->in_num, 0,
+				    &resp_msg, sizeof(resp_msg)));
 	virtio_notify(VIRTIO_DEVICE(nv), vq);
 }
 #endif /* legacy NVKVM_REQ_OPEN/CLOSE/IOCTL/MMAP/MUNMAP handlers */
@@ -691,8 +734,9 @@ static void nvkvm_ioctl_work_done(void *opaque, int ret)
 		 struct nvkvm_resp_ioctl_on_isolate r; } out;
 	out.h = w->hdr;
 	out.r = w->resp;
-	iov_from_buf(w->elem->in_sg, w->elem->in_num, 0, &out, sizeof(out));
-	virtqueue_push(w->vq, w->elem, sizeof(out));
+	virtqueue_push(w->vq, w->elem,
+		       iov_from_buf(w->elem->in_sg, w->elem->in_num, 0,
+				    &out, sizeof(out)));
 	virtio_notify(VIRTIO_DEVICE(w->nv), w->vq);
 	g_free(w->elem);
 	g_free(w);
@@ -728,8 +772,9 @@ static void nvkvm_enter_loop_work_done(void *opaque, int ret)
 		 struct nvkvm_resp_enter_loop r; } out;
 	out.h = w->hdr;
 	out.r = w->resp;
-	iov_from_buf(w->elem->in_sg, w->elem->in_num, 0, &out, sizeof(out));
-	virtqueue_push(w->vq, w->elem, sizeof(out));
+	virtqueue_push(w->vq, w->elem,
+		       iov_from_buf(w->elem->in_sg, w->elem->in_num, 0,
+				    &out, sizeof(out)));
 	virtio_notify(VIRTIO_DEVICE(w->nv), w->vq);
 	g_free(w->elem);
 	g_free(w);
@@ -762,8 +807,9 @@ static void nvkvm_evt_push_bh(void *opaque)
 			.events     = cpu_to_le32(p->revents),
 			.type       = cpu_to_le32(NVKVM_EVT_TYPE_POLL),
 		};
-		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
-		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
+		virtqueue_push(p->nv->vq_evt, elem,
+			       iov_from_buf(elem->in_sg, elem->in_num, 0,
+					    &msg, sizeof(msg)));
 		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
 		g_free(elem);
 	} else {
@@ -815,8 +861,9 @@ static void nvkvm_ui_info_push_bh(void *opaque)
 			.refresh_mhz = cpu_to_le32(p->refresh_mhz),
 			.type     = cpu_to_le32(NVKVM_EVT_TYPE_UI_INFO),
 		};
-		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
-		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
+		virtqueue_push(p->nv->vq_evt, elem,
+			       iov_from_buf(elem->in_sg, elem->in_num, 0,
+					    &msg, sizeof(msg)));
 		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
 		g_free(elem);
 	} else {
@@ -872,8 +919,9 @@ static void nvkvm_release_push_bh(void *opaque)
 			.reserved    = 0,
 			.type        = cpu_to_le32(NVKVM_EVT_TYPE_RELEASE),
 		};
-		iov_from_buf(elem->in_sg, elem->in_num, 0, &msg, sizeof(msg));
-		virtqueue_push(p->nv->vq_evt, elem, sizeof(msg));
+		virtqueue_push(p->nv->vq_evt, elem,
+			       iov_from_buf(elem->in_sg, elem->in_num, 0,
+					    &msg, sizeof(msg)));
 		virtio_notify(VIRTIO_DEVICE(p->nv), p->nv->vq_evt);
 		g_free(elem);
 	} else {
@@ -910,7 +958,12 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 		hdr_len = iov_to_buf(elem->out_sg, elem->out_num,
 				     0, &hdr, sizeof(hdr));
 		if (hdr_len < sizeof(hdr)) {
-			error_report("nvkvm: short request header");
+			static uint64_t n_short;   /* see nvkvm_log_backoff */
+
+			if (nvkvm_log_backoff(&n_short)) {
+				error_report("nvkvm: short request header "
+					     "(%" PRIu64 " so far)", n_short);
+			}
 			virtqueue_push(vq, elem, 0);
 			g_free(elem);
 			continue;
@@ -928,8 +981,9 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 				   &req, sizeof(req)); \
 			handler(nv, &req, &resp); \
 			out.h = hdr; out.r = resp; \
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out)); \
-			virtqueue_push(vq, elem, sizeof(out)); \
+			virtqueue_push(vq, elem, \
+				       iov_from_buf(elem->in_sg, elem->in_num, \
+						    0, &out, sizeof(out))); \
 			virtio_notify(VIRTIO_DEVICE(nv), vq); \
 			break; \
 		}
@@ -1066,8 +1120,9 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_mmap_on_isolate r; } out;
 			out.h = hdr; out.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out));
-			virtqueue_push(vq, elem, sizeof(out));
+			virtqueue_push(vq, elem,
+				       iov_from_buf(elem->in_sg, elem->in_num, 0,
+						    &out, sizeof(out)));
 			virtio_notify(VIRTIO_DEVICE(nv), vq);
 			break;
 		}
@@ -1081,8 +1136,9 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_munmap_on_isolate r; } out;
 			out.h = hdr; out.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &out, sizeof(out));
-			virtqueue_push(vq, elem, sizeof(out));
+			virtqueue_push(vq, elem,
+				       iov_from_buf(elem->in_sg, elem->in_num, 0,
+						    &out, sizeof(out)));
 			virtio_notify(VIRTIO_DEVICE(nv), vq);
 			break;
 		}
@@ -1098,8 +1154,9 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_write_memory_handle r; } wout;
 			wout.h = hdr; wout.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &wout, sizeof(wout));
-			virtqueue_push(vq, elem, sizeof(wout));
+			virtqueue_push(vq, elem,
+				       iov_from_buf(elem->in_sg, elem->in_num, 0,
+						    &wout, sizeof(wout)));
 			virtio_notify(VIRTIO_DEVICE(nv), vq);
 			break;
 		}
@@ -1115,8 +1172,9 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_read_memory_handle r; } rout;
 			rout.h = hdr; rout.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &rout, sizeof(rout));
-			virtqueue_push(vq, elem, sizeof(rout));
+			virtqueue_push(vq, elem,
+				       iov_from_buf(elem->in_sg, elem->in_num, 0,
+						    &rout, sizeof(rout)));
 			virtio_notify(VIRTIO_DEVICE(nv), vq);
 			break;
 		}
@@ -1131,8 +1189,9 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_read_host_file r; } hout;
 			hout.h = hdr; hout.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &hout, sizeof(hout));
-			virtqueue_push(vq, elem, sizeof(hout));
+			virtqueue_push(vq, elem,
+				       iov_from_buf(elem->in_sg, elem->in_num, 0,
+						    &hout, sizeof(hout)));
 			virtio_notify(VIRTIO_DEVICE(nv), vq);
 			break;
 		}
@@ -1151,19 +1210,27 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			struct { struct nvkvm_hdr h;
 				 struct nvkvm_resp_realize_uvm_mapping r; } rout;
 			rout.h = hdr; rout.r = resp;
-			iov_from_buf(elem->in_sg, elem->in_num, 0, &rout, sizeof(rout));
-			virtqueue_push(vq, elem, sizeof(rout));
+			virtqueue_push(vq, elem,
+				       iov_from_buf(elem->in_sg, elem->in_num, 0,
+						    &rout, sizeof(rout)));
 			virtio_notify(VIRTIO_DEVICE(nv), vq);
 			break;
 		}
 
 #undef ISOLATE_REQ
 
-		default:
-			error_report("nvkvm: unknown request type %u",
-				     le32_to_cpu(hdr.type));
+		default: {
+			static uint64_t n_unknown; /* see nvkvm_log_backoff */
+
+			if (nvkvm_log_backoff(&n_unknown)) {
+				error_report("nvkvm: unknown request type %u "
+					     "(%" PRIu64 " unknown requests so "
+					     "far)", le32_to_cpu(hdr.type),
+					     n_unknown);
+			}
 			virtqueue_push(vq, elem, 0);
 			break;
+		}
 		}
 		g_free(elem);
 	}

@@ -44,6 +44,14 @@
  * have it. We gate on a compile-time symbol set by the test build. */
 #ifndef NVKVM_TABLES_NO_KVM
 #  include <linux/kvm.h>
+/*
+ * The process-wide KVM memslot pool, from nvkvm_mmap_host.c.  Declared here
+ * rather than pulled in through virtio_nvgpu.h on purpose: this file is
+ * deliberately free of QEMU headers (the unit test builds it standalone), and
+ * these two are the only symbols it needs from over there.
+ */
+int  nvkvm_kvm_slot_alloc(void);
+void nvkvm_kvm_slot_release(int slot);
 #endif
 
 /* ── Generation-tagged ID encoding ──────────────────────────────────────── */
@@ -574,6 +582,7 @@ static void window_destroy_locked(struct nvkvm_gpa_window *w, int kvm_vm_fd)
 			.userspace_addr  = (uint64_t)(uintptr_t)w->qva,
 		};
 		ioctl(kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr);
+		nvkvm_kvm_slot_release(w->kvm_slot);
 	}
 #else
 	(void)kvm_vm_fd;
@@ -650,9 +659,33 @@ int nvkvm_tables_window_create(struct nvkvm_tables *t, uint64_t size,
 
 #ifndef NVKVM_TABLES_NO_KVM
 	if (kvm_vm_fd >= 0) {
-		/* Use a slot # = window slot index for simplicity. */
+		/*
+		 * A TABLE INDEX IS NOT A MEMSLOT NUMBER.  This used to pass
+		 * `.slot = s`, the window's index in t->windows.windows[], which
+		 * is 1..NVKVM_TABLES_MAX_WINDOWS-1 -- squarely inside the low
+		 * slots QEMU installs its OWN static regions into (guest RAM,
+		 * BIOS, virtio BARs).  KVM_SET_USER_MEMORY_REGION addresses a
+		 * slot by number and replaces whatever is in it, so creating the
+		 * first window would have re-pointed guest RAM's memslot at an
+		 * 8-window memfd.  Not a mapping error -- the VM's memory would
+		 * simply stop being where the guest left it.
+		 *
+		 * nvkvm_mmap_host.c already carves [64, 512) out for exactly this
+		 * and enforces both range and ownership on release (A-21); take a
+		 * number from there, like every other dynamic mapping does.
+		 *
+		 * This path has no callers outside the unit test today.  It is
+		 * fixed because "dead code with a live landmine in it" is how the
+		 * next caller gets written.
+		 */
+		int slot = nvkvm_kvm_slot_alloc();
+		if (slot < 0) {
+			window_destroy_locked(w, -1);
+			pthread_mutex_unlock(&t->windows.lock);
+			return -ENOSPC;
+		}
 		struct kvm_userspace_memory_region mr = {
-			.slot            = s,
+			.slot            = (uint32_t)slot,
 			.flags           = 0,
 			.guest_phys_addr = w->gpa_base,
 			.memory_size     = size,
@@ -660,11 +693,12 @@ int nvkvm_tables_window_create(struct nvkvm_tables *t, uint64_t size,
 		};
 		if (ioctl(kvm_vm_fd, KVM_SET_USER_MEMORY_REGION, &mr) < 0) {
 			int e = -errno;
+			nvkvm_kvm_slot_release(slot);
 			window_destroy_locked(w, -1);
 			pthread_mutex_unlock(&t->windows.lock);
 			return e;
 		}
-		w->kvm_slot = (int)s;
+		w->kvm_slot = slot;
 	}
 #else
 	(void)kvm_vm_fd;

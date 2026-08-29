@@ -295,3 +295,129 @@ component's handler. None traced **backwards into the guest module** to ask who
 can actually compose the request. That is the question that separates
 "unprivileged guest process" from "compromised guest kernel", and the two
 deserve different severities. Put it in the next audit brief.
+
+
+## Second remediation pass — `close/vmm-guest-broker`, 2026-08-29
+
+The VMM, guest and broker findings left open above, closed or explicitly not
+closed. One branch, `close/vmm-guest-broker`, off
+`integration/audit-2026-08-29`.
+
+### The build gate got better, and that is the most reusable result here
+
+`tests/qemu_syntax_check.sh` skips `virtio_nvgpu.c`, `virtio_nvgpu_pci.c` and
+`nvkvm_mmap_host.c`, and — less obviously — its stubs do not define
+`CONFIG_OPENGL`, so the **entire body of `nvkvm_present_egl.c` is preprocessed
+away** and "ok" for that file means nothing at all. Every earlier VMM branch was
+therefore reviewed rather than compiled on the display path.
+
+The configured QEMU 11.1.1 tree at `/workspace/qemu-build-src` already has the
+nvkvm sources patched in and a working `build.ninja`. Lifting the exact `ARGS`
+line out of it and pointing `gcc -c` at the repo's own sources (repo headers
+first, tree headers as fallback, output to `/tmp`) compiles any `src/qemu/*.c`
+with production flags **without touching the shared tree**. All 11 translation
+units now compile to real `.o` files: 0 errors, and the only warnings are the
+pre-existing `nvkvm_isolate_uid.h` format-attribute suggestion. Worth wiring
+into the syntax-check script as an optional second tier.
+
+### Closed
+
+| finding | what changed |
+|---|---|
+| VMM: `p->mode` un-latched on broker reconnect | The mode latch is now scoped to the present THREAD, not the connection. `relay_readback` still clears (that is the whole mirror fix); `mode` does not, once the present thread owns the EGL context, because a re-probe answering "GL" runs `nvkvm_present_gl()` on the main loop with no context current and concurrently with the present thread's use of `p->cache[]`. Also: `present_sync_relay_generation()` can only ever run with the relay ACTIVE, so clearing `mode` never helped either measured case. |
+| VMM: BAR base accepted below the shm block | Refuse any firmware base below `gpa.ram_top`. A raw 128 GiB memslot placed under guest RAM shadows RAM, the 32-bit PCI hole, other BARs and the ROM. The shm/mmap overlap test was also rewritten without `base + sparse_size`, which wraps and then compares *below* `block_base`. |
+| VMM: wrapping page round-up in the sparse allocator | `nvkvm_page_round_up()` returns 0 instead of wrapping, at alloc, free and release. **Unreachable from any current caller** — every one caps its length first — and the commit says so. |
+| VMM: `nvkvm_tables.c` used a table index as a KVM memslot number | Takes a number from the `[64, 512)` pool `nvkvm_mmap_host.c` already carves out, and releases it on destroy. `.slot = s` would have re-pointed **guest RAM's memslot** at an 8-window memfd. No callers outside the unit test; fixed because dead code with a live landmine is how the next caller gets written. |
+| VMM: used-ring length reported as `sizeof(out)` | All 16 sites pass `iov_from_buf()`'s return value. |
+| VMM: unthrottled `error_report` per malformed request | Power-of-two backoff, running total on every line, no clock and no new dependency. |
+| VMM: non-atomic present statistics | Only the two `dropped` counters actually cross threads; they are `qatomic_inc`/`qatomic_xchg` now. The rest are single-threaded *because* the mode-latch fix makes "never both paths in one run" true. |
+| GUEST: `poll_armed` never cleared on failure | Cleared when the arm request fails. Same silent-permanent-fallback shape as the missing `tx_done` cases, which went unnoticed across three driver versions. |
+| GUEST: `migrate_range` retypes any VMA | Admits only plain process memory (no `vm_file`, or shmem/ramfs) and refuses PFNMAP/IO/MIXEDMAP/HUGETLB. `get_user_pages_fast(FOLL_WRITE)` succeeds on a writable *file* mapping, so the pin loop was not the check anyone assumed. shmem is detected by superblock magic: the kernel does not export `vma_is_shmem()` to modules. |
+| BROKER: detach inside dispatch never reached the exit check | One exit check at the bottom of the loop, with a sticky per-iteration flag so a replacement client accepted in the same poll cycle cannot swallow the loss. |
+| BROKER: DRI3 1.0 stride truncated to `uint16_t` | Refused rather than truncated. 65535 bytes is a 16383-pixel row, twice this backend's maximum, so nothing displayable is turned away. |
+| BROKER: `stride` unbounded independently of extent | Bounded against this buffer's own pixel row (twice it, plus a page), so a 1-pixel-wide buffer can no longer buy a 2 GiB `wl_shm` pool. |
+| BROKER: the placeholder mapping is never dropped | It is now, after `wl_surface_commit()` — the ordering `wl_idle_make()` already argues for. The comment had claimed the drop for a long time. |
+| BROKER: README vs `x11_open()` on clipboard modes | The README was the wrong one. X11 implements both directions and advertises both. |
+
+### Half-closed, and the code says so at both ends
+
+**The guest `ext_lock` / `mmap_lock` AB-BA.** The edge taken on *every* forwarded
+ioctl is the VMA whitelist, and removing it costs nothing: **no code in QEMU or
+the stub reads `vma_whitelist_nentries` or `vma_whitelist_slot`** — grep the
+tree. It is `mmap_read_trylock()` now, sending an empty list on contention,
+which is already an ordinary case.
+
+Two narrower edges remain inside the same transaction, both documented at the
+`ext_lock` acquisition: `cpu_pages_refresh() -> entry_live()` (`mmap_read_lock`,
+and `get_user_pages_fast()` which takes it internally), and
+`efault_resolve() -> cpu_page_migrate()` (`mmap_write_lock`). Neither can be a
+trylock — one is *inside* GUP. Closing them means moving the blocking host round
+trip out of `ext_lock` and re-establishing the mmap/ioctl mutual exclusion some
+other way, which is a redesign of the UVM shadow transaction. **Needs an
+owner's decision.**
+
+### Not fixed, with the argument written into the code
+
+**The false "no caller holds `mmap_lock`" invariant.** The comment enumerated
+callers and missed one:
+
+```
+remove_vma()                    [mmap_write_lock HELD]
+  -> nvkvm_vma_close()
+  -> nvkvm_uvm_ext_release() -> ext_unwind()
+  -> nvkvm_fd_ctx_put(ext_map_ctl) -> nvkvm_fd_ctx_destroy()
+  -> nvkvm_cpu_pages_free() -> nvkvm_cpu_page_unmap_guest()
+  -> mmap_write_lock(mm)        [SAME mm]
+```
+
+It does not fire only because that internal ctl context never accumulates
+`cpu_pages`, and nothing enforces that. Every available fix is a design choice:
+a trylock would have to skip the zap and reinstate the H-9 cross-process
+aliasing; deferring the `ext_map_ctl` put adds a deferred-teardown lifetime to a
+path whose whole point is that teardown must *not* be deferred; splitting the
+ctl teardown changes the ordering `nvkvm_fd_ctx_destroy()` documents. The
+comment now states the real path and the constraint — which is the part that was
+actually dangerous, since it is the repo's own "comment describes the safe
+behaviour, code does something else" class.
+
+### Over-rated, in the same way the isolate criticals were
+
+**Guest finding 12, `nvkvm_evt_deliver()` "matches on host-supplied ids with no
+ownership check".** Both halves fail the backwards test:
+
+- The ids are compared against `ctx->handle_id` and `ctx->session->isolate_id`,
+  which are the **fd's own** values, set at open and never taken off the wire. A
+  pair names exactly one handle in one isolate, so no fd can be reached with
+  another fd's identifiers. **That match IS the ownership check.** What the host
+  chooses is which of the guest's own fds to wake, not whose memory to touch.
+- The "malicious VMM" in the premise is this guest's hypervisor. It owns the
+  guest's RAM and its vCPUs. A spurious `poll` wakeup is not a capability it
+  needs.
+
+The one real gap is narrow and benign — an fd that never armed can be woken —
+and it is deliberately left alone: dropping unarmed events would silently kill
+the fast wakeup path if the host ever delivers one unsolicited, and that exact
+failure mode already went unnoticed once. The reasoning is recorded above the
+function so it is not re-raised.
+
+### What builds, what ran, and what did not
+
+- **VMM**: all 11 `src/qemu/*.c` compile to real `.o` with production flags
+  against the configured QEMU 11.1.1 tree, 0 errors, warnings identical to
+  baseline. `tests/qemu_syntax_check.sh` clean. **Never linked, never run.**
+- **Guest**: real `nvkvm-guest.ko` against 7.0.0-29 headers from clean; same
+  three pre-existing warnings, none new. `tests/guest_wiring_test.py` passes.
+- **Broker**: builds clean; `make check` (82 checks + adopted-socket, clipboard,
+  lifecycle) and `make check-sanitize` (ASan+UBSan) both pass. The ATTACH
+  geometry guards are **compile-verified only** — the `--bad-*` cases live in
+  `selftest.sh`, which needs a real display server.
+- **Unit**: `make -C tests/unit check` from clean, 17/17 suites, 9 isolate cases,
+  no known failures.
+- **Nothing is runtime-tested.** No VM, no GPU, no compositor, no broker
+  connection.
+- One flake worth knowing about: `make -C src/broker check-sanitize` failed once
+  with `ConnectionRefusedError` in `test_clipboard.py` and passed on two
+  re-runs. It is a pre-existing harness race, not a code change — `nb_listen()`
+  creates the socket path at `bind()` and then does `chmod`, `getgrnam` and
+  `chown` before `listen()`, while the test only polls for the path to *exist*.
+  ASan widens that window. Worth polling for a successful `connect()` instead.
