@@ -61,11 +61,27 @@ PY
 die_stage() { verdict "$1" fail "${2:-}"; say "STAGE FAILED at $1"; exit 1; }
 
 # ---------------------------------------------------------------- preflight --
-command -v qemu-system-x86_64 >/dev/null || {
-    export DEBIAN_FRONTEND=noninteractive
+# OBSERVED on the first real run (vast box 49152403): this was one apt
+# transaction including docker.io, the box already had Docker CE from
+# docker.list, Ubuntu's docker.io CONFLICTS with containerd.io/docker-ce-cli,
+# and apt therefore installed NOTHING -- so the stage died reporting "missing
+# qemu-system-x86_64" on a box where `apt-get install qemu-system-x86` alone
+# succeeds. Two mistakes: bundling an already-satisfied package into an atomic
+# transaction, and sending apt's stderr to /dev/null so the real conflict never
+# reached stage.log. Install only what is missing, and keep the error.
+export DEBIAN_FRONTEND=noninteractive
+missing=""
+command -v qemu-system-x86_64 >/dev/null || missing="$missing qemu-system-x86 qemu-utils ovmf"
+command -v bzip2 >/dev/null           || missing="$missing bzip2"
+command -v git   >/dev/null           || missing="$missing git"
+command -v docker >/dev/null          || missing="$missing docker.io"
+if [ -n "$missing" ]; then
+    say "installing:$missing"
     apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -qq qemu-system-x86 qemu-utils ovmf bzip2 git docker.io >/dev/null 2>&1
-}
+    # shellcheck disable=SC2086
+    apt-get install -y -qq $missing >"$WORK/apt.log" 2>&1 \
+        || say "apt reported: $(tail -3 "$WORK/apt.log" | tr '\n' ' ')"
+fi
 for t in qemu-system-x86_64 git docker curl; do
     command -v "$t" >/dev/null || die_stage preflight "missing $t"
 done

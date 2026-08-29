@@ -138,6 +138,9 @@ KVM_IMAGE="${NVKVM_SWEEP_IMAGE:-docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16
 SWEEP_LABEL_PREFIX="nvkvm-sweep"
 SWEEP_LABEL="${NVKVM_SWEEP_LABEL:-}"
 STOP_FILE="/tmp/nvkvm-sweep.stop"
+# Assigned for real once OUT_DIR exists; empty here so the --reconcile path,
+# which runs reap_strays() before that point, cannot trip `set -u`.
+KEPT_FILE=""
 KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
 
 ARCHES=""
@@ -681,6 +684,13 @@ for i in d:
     [ -z "$ids" ] && return 0
     while read -r id gpu; do
         [ -z "$id" ] && continue
+        # A box kept for inspection is not a stray.  PROTECTED covers this
+        # process; the file covers a --resume, where the keep was decided by an
+        # earlier invocation that is no longer running.
+        if is_protected "$id" || { [ -n "${KEPT_FILE:-}" ] && [ -f "$KEPT_FILE" ] && grep -qx "$id" "$KEPT_FILE" 2>/dev/null; }; then
+            info "keeping $id ($gpu) for inspection -- not a stray"
+            continue
+        fi
         warn "STRAY $id ($gpu) still alive -- destroying"
         destroy_verified "$id" || warn "STRAY $id COULD NOT BE DESTROYED -- DESTROY IT BY HAND"
     done <<<"$ids"
@@ -696,6 +706,23 @@ reconcile() {
             [ -z "$id" ] && continue
             if printf '%s\n' "$live" | grep -qx "$id"; then leaked="$leaked $id"; fi
         done < <(grep -oE '^[0-9]+' "$REGISTRY" 2>/dev/null | sort -u)
+    fi
+    # A deliberate keep is not a leak, whether it came from --keep or from the
+    # keep-on-error policy.  Calling it one makes the exit code that means "go
+    # destroy something by hand" fire on ordinary runs, which is how a real leak
+    # later gets ignored.
+    if [ -n "$leaked" ] && [ "$KEEP" != 1 ] && [ -n "${KEPT_FILE:-}" ] && [ -s "$KEPT_FILE" ]; then
+        local still=""
+        for id in $leaked; do
+            grep -qx "$id" "$KEPT_FILE" 2>/dev/null || still="$still $id"
+        done
+        if [ -z "$still" ]; then
+            info "kept alive on purpose (failures to inspect):$leaked"
+            info "  the auto-destroy timer (pid ${TIMER_PID:-?}) still holds them; destroy early with:"
+            for id in $leaked; do info "    yes | vastai destroy instance $id -y"; done
+            return 0
+        fi
+        leaked="$still"
     fi
     if [ -n "$leaked" ] && [ "$KEEP" = 1 ]; then
         # --keep means "leave it up on purpose".  Calling that a leak and
@@ -1781,6 +1808,22 @@ sweep_one_box() {
         # at startup: it sweeps the whole registry at +$BUDGET_HOURS whatever
         # happens here, including if this process is kill -9'"'"'d.  A kept box is
         # bounded, not indefinite.
+        # OBSERVED 2026-08-29, first run of this policy: the sweep printed
+        # "KEEPING it for inspection ... auto-destroys at +6h" and then
+        # destroyed the box TWELVE SECONDS LATER from its own exit trap, via
+        # cleanup() -> reap_strays(), which reaps by label and knew nothing
+        # about a per-box decision.  The promise was real; the protection was
+        # not, so the run destroyed exactly the evidence it had just undertaken
+        # to preserve.  A keep has to be enforced where the destroying happens.
+        #
+        # is_protected() already guards destroy_verified(), and reap_strays()
+        # goes through destroy_verified(), so adding the id to PROTECTED covers
+        # both the reaper and any later direct call.  It is deliberately NOT
+        # given to the auto-destroy timer: the timer was armed with its own
+        # protect list and is the ceiling that makes keeping affordable, so a
+        # kept box must still die at the deadline.
+        PROTECTED="$PROTECTED $iid"
+        [ -n "${KEPT_FILE:-}" ] && { printf '%s\n' "$iid" >>"$KEPT_FILE" 2>/dev/null; sync 2>/dev/null || true; }
         warn "  $BOX_FAILED failure(s) on this box -- KEEPING it for inspection (--destroy-on-error to opt out)"
         warn "    ssh -p $CUR_PORT root@$CUR_HOST     # auto-destroys at +${BUDGET_HOURS}h regardless"
         emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "box-kept-for-inspection" \
@@ -1973,17 +2016,27 @@ sweep_drivers_on_box() {
         # "it passed before the stage wedged the host".  A regression here is
         # about the stage, not about the driver, so it is recorded separately
         # and never counted toward --min-drivers.
+        # OBSERVED 2026-08-29: this warned "the host no longer validates AFTER
+        # the SteamOS stage" on a box where validate.sh had ALREADY been failing
+        # identically before the stage ran. A terminal check that reads only the
+        # final state cannot tell a regression from a pre-existing failure, and
+        # reporting the two the same way points the next reader at the wrong
+        # code. Compare against the status the driver loop last recorded.
+        local pre_status="${VR_STATUS:-unknown}"
         info "  terminal re-check: does validate.sh still pass after the stage?"
         boot_and_validate "${actual:-unknown}" "$gpu"
-        say "    terminal re-check: ${VR_STATUS:-unknown} ${VR_SUMMARY:-}"
-        [ "${VR_STATUS:-}" = pass ] || {
-            warn "    the host no longer validates AFTER the SteamOS stage -- investigate the stage, not the driver"
+        say "    terminal re-check: ${VR_STATUS:-unknown} (before the stage: $pre_status)"
+        if [ "${VR_STATUS:-}" != pass ] && [ "$pre_status" = pass ]; then
+            warn "    REGRESSION: validated before the SteamOS stage and not after -- investigate the stage"
             BOX_FAILED=$(( BOX_FAILED + 1 ))
-        }
+        elif [ "${VR_STATUS:-}" != pass ]; then
+            warn "    still '${VR_STATUS:-unknown}', and it was '$pre_status' before the stage too -- NOT attributable to the stage"
+        fi
         emit "$(jrec arch "$arch" gpu "$gpu" driver "${actual:-unknown}" \
                 status "steamos-terminal-recheck" role "steamos" instance "$iid" \
-                validate_status "${VR_STATUS:-unknown}" summary "${VR_SUMMARY:-}" \
-                detail "validate.sh re-run after the SteamOS stage; not counted toward --min-drivers" \
+                validate_status "${VR_STATUS:-unknown}" validate_status_before "$pre_status" \
+                summary "${VR_SUMMARY:-}" \
+                detail "validate.sh re-run after the SteamOS stage; a regression is only claimed when it passed before; not counted toward --min-drivers" \
                 ts "$(date -u +%FT%TZ)")"
     fi
 
@@ -2416,8 +2469,11 @@ else
 fi
 mkdir -p "$OUT_DIR/logs"
 RESULTS="$OUT_DIR/sweep.jsonl"
+# Instances deliberately kept for inspection.  In the run dir, so a --resume
+# inherits the decision instead of reaping what the previous pass preserved.
+KEPT_FILE="$OUT_DIR/kept.instances"
 REGISTRY="$OUT_DIR/instances.registry"
-touch "$RESULTS" "$REGISTRY"
+touch "$RESULTS" "$REGISTRY" "$KEPT_FILE"
 rm -f "${REGISTRY}.done"
 info "results: $RESULTS"
 
