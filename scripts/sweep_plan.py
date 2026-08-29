@@ -83,6 +83,13 @@ def main():
     ap.add_argument("--arches", default="ampere,turing,ada,blackwell,hopper")
     ap.add_argument("--nodes-per-arch", type=int, default=1,
                     help="how many hosts to plan per architecture")
+    ap.add_argument("--available",
+                    default=os.path.join(REPO, "scripts", "sweep-driver-availability.tsv"),
+                    help="TSV of which versions actually ship a .run installer; "
+                         "versions absent from it are never planned")
+    ap.add_argument("--allow-unobtainable", action="store_true",
+                    help="plan versions with no published installer anyway "
+                         "(they will fail the box; for diagnosis only)")
     ap.add_argument("--used", default="",
                     help="file of versions already tested in earlier runs; they "
                          "are skipped so successive sweeps walk the whole set")
@@ -93,6 +100,31 @@ def main():
     abiq = build_abiq()
 
     tags = [l.strip() for l in open(a.tags) if l.strip()]
+
+    # Publishing an OGKM tag and publishing a downloadable driver are different
+    # things. Planning a version with no .run sends a box to a guaranteed
+    # driver-install-failed and burns the rental, so filter here rather than
+    # discovering it three minutes into a paid box.
+    obtainable, unobtainable = None, []
+    if not a.allow_unobtainable:
+        if not os.path.exists(a.available):
+            sys.exit("no driver-availability map at %s -- regenerate it from a "
+                     "trusted network, or pass --allow-unobtainable to plan "
+                     "without it (boxes will fail)" % a.available)
+        obtainable = set()
+        for line in open(a.available):
+            if line.startswith("#") or not line.strip():
+                continue
+            f = line.split("\t")
+            if len(f) >= 2 and f[1].strip() == "AVAILABLE":
+                obtainable.add(f[0].strip())
+        unobtainable = [t for t in tags if t not in obtainable]
+        tags = [t for t in tags if t in obtainable]
+        if not tags:
+            sys.exit("every tag is unobtainable per %s -- the map is likely "
+                     "stale or was probed from a blocked network (403 != 404)"
+                     % a.available)
+
     used = set()
     if a.used and os.path.exists(a.used):
         used = {l.strip() for l in open(a.used) if l.strip()}
@@ -140,8 +172,12 @@ def main():
 
     print(f"sweep plan: {len(plan)} node(s), "
           f"{sum(len(p['drivers']) for p in plan)} driver run(s)")
-    print(f"  {len(tags)} published tags; {len(taken - used)} newly claimed this plan; "
-          f"{len(tags) - len(taken)} still untested after it\n")
+    print(f"  {len(tags)} obtainable tags; {len(taken - used)} newly claimed this plan; "
+          f"{len(tags) - len(taken)} still untested after it")
+    if unobtainable:
+        print(f"  {len(unobtainable)} of {len(tags) + len(unobtainable)} published OGKM tags "
+              f"ship no .run installer and are NOT planned (they would fail the box)")
+    print()
     for p in plan:
         print(f"  node {p['node']}: {p['arch']:10s} guest-image={p['guest_image']}")
         for v, b, note in zip(p["drivers"], p["boundaries"], p["notes"]):

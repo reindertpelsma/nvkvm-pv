@@ -1,0 +1,240 @@
+# Which OGKM tags actually ship a public NVIDIA .run installer.
+#
+# WHY THIS EXISTS: sweep_plan.py used to choose driver versions from the 216
+# supported OGKM tags alone. Publishing an open-gpu-kernel-modules tag and
+# publishing a downloadable driver are DIFFERENT THINGS -- 87 of the 216 tags
+# have no .run at either public path. A plan built without this file sends
+# boxes to install drivers that cannot be obtained, and every one of them
+# burns a rental and returns `driver-install-failed`. Observed 2026-08-30:
+# 10 of 24 planned versions (42%) were unobtainable.
+#
+# Probed by range-requesting one byte of each candidate URL, in this order:
+#   https://us.download.nvidia.com/XFree86/Linux-x86_64/$v/NVIDIA-Linux-x86_64-$v.run
+#   https://us.download.nvidia.com/tesla/$v/NVIDIA-Linux-x86_64-$v.run
+# AVAILABLE means one returned 200/206 and the third column is that URL.
+#
+# NOTE 403 != ABSENT. A rented box saw HTTP 403 for URLs that return 206 from a
+# normal network, i.e. NVIDIA's CDN rate-limits/blocks some hosts. That is what
+# --driver-cache is for: fetch here, upload to the box. Do not re-probe from a
+# rented box and do not let a 403 rewrite this file.
+#
+# Regenerate from a trusted network; it changes only when NVIDIA publishes or
+# withdraws an installer.
+#
+# version	status	url
+515.105.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.105.01/NVIDIA-Linux-x86_64-515.105.01.run
+515.43.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.43.04/NVIDIA-Linux-x86_64-515.43.04.run
+515.48.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.48.07/NVIDIA-Linux-x86_64-515.48.07.run
+515.49.05	ABSENT	-
+515.49.06	ABSENT	-
+515.49.10	ABSENT	-
+515.49.14	ABSENT	-
+515.49.15	ABSENT	-
+515.49.18	ABSENT	-
+515.49.19	ABSENT	-
+515.49.24	ABSENT	-
+515.49.25	ABSENT	-
+515.57	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.57/NVIDIA-Linux-x86_64-515.57.run
+515.65.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.65.01/NVIDIA-Linux-x86_64-515.65.01.run
+515.65.07	AVAILABLE	https://us.download.nvidia.com/tesla/515.65.07/NVIDIA-Linux-x86_64-515.65.07.run
+515.76	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.76/NVIDIA-Linux-x86_64-515.76.run
+515.86.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/515.86.01/NVIDIA-Linux-x86_64-515.86.01.run
+520.56.06	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/520.56.06/NVIDIA-Linux-x86_64-520.56.06.run
+520.61.05	AVAILABLE	https://us.download.nvidia.com/tesla/520.61.05/NVIDIA-Linux-x86_64-520.61.05.run
+520.61.07	AVAILABLE	https://us.download.nvidia.com/tesla/520.61.07/NVIDIA-Linux-x86_64-520.61.07.run
+525.105.17	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.105.17/NVIDIA-Linux-x86_64-525.105.17.run
+525.116.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.116.03/NVIDIA-Linux-x86_64-525.116.03.run
+525.116.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.116.04/NVIDIA-Linux-x86_64-525.116.04.run
+525.125.06	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.125.06/NVIDIA-Linux-x86_64-525.125.06.run
+525.147.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.147.05/NVIDIA-Linux-x86_64-525.147.05.run
+525.47.04	ABSENT	-
+525.47.06	ABSENT	-
+525.47.07	ABSENT	-
+525.47.11	ABSENT	-
+525.47.13	ABSENT	-
+525.47.14	ABSENT	-
+525.47.15	ABSENT	-
+525.47.18	ABSENT	-
+525.47.22	ABSENT	-
+525.47.24	ABSENT	-
+525.47.26	ABSENT	-
+525.47.27	ABSENT	-
+525.47.31	ABSENT	-
+525.47.34	ABSENT	-
+525.47.35	ABSENT	-
+525.53	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.53/NVIDIA-Linux-x86_64-525.53.run
+525.60.11	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.60.11/NVIDIA-Linux-x86_64-525.60.11.run
+525.60.13	AVAILABLE	https://us.download.nvidia.com/tesla/525.60.13/NVIDIA-Linux-x86_64-525.60.13.run
+525.78.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.78.01/NVIDIA-Linux-x86_64-525.78.01.run
+525.85.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.85.05/NVIDIA-Linux-x86_64-525.85.05.run
+525.85.12	AVAILABLE	https://us.download.nvidia.com/tesla/525.85.12/NVIDIA-Linux-x86_64-525.85.12.run
+525.89.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/525.89.02/NVIDIA-Linux-x86_64-525.89.02.run
+530.30.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/530.30.02/NVIDIA-Linux-x86_64-530.30.02.run
+530.41.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/530.41.03/NVIDIA-Linux-x86_64-530.41.03.run
+535.104.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.104.05/NVIDIA-Linux-x86_64-535.104.05.run
+535.104.12	AVAILABLE	https://us.download.nvidia.com/tesla/535.104.12/NVIDIA-Linux-x86_64-535.104.12.run
+535.113.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.113.01/NVIDIA-Linux-x86_64-535.113.01.run
+535.129.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.129.03/NVIDIA-Linux-x86_64-535.129.03.run
+535.146.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.146.02/NVIDIA-Linux-x86_64-535.146.02.run
+535.154.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.154.05/NVIDIA-Linux-x86_64-535.154.05.run
+535.161.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.161.07/NVIDIA-Linux-x86_64-535.161.07.run
+535.161.08	AVAILABLE	https://us.download.nvidia.com/tesla/535.161.08/NVIDIA-Linux-x86_64-535.161.08.run
+535.171.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.171.04/NVIDIA-Linux-x86_64-535.171.04.run
+535.179	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.179/NVIDIA-Linux-x86_64-535.179.run
+535.183.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.183.01/NVIDIA-Linux-x86_64-535.183.01.run
+535.183.06	AVAILABLE	https://us.download.nvidia.com/tesla/535.183.06/NVIDIA-Linux-x86_64-535.183.06.run
+535.216.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.216.01/NVIDIA-Linux-x86_64-535.216.01.run
+535.216.03	AVAILABLE	https://us.download.nvidia.com/tesla/535.216.03/NVIDIA-Linux-x86_64-535.216.03.run
+535.230.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.230.02/NVIDIA-Linux-x86_64-535.230.02.run
+535.247.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.247.01/NVIDIA-Linux-x86_64-535.247.01.run
+535.261.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.261.03/NVIDIA-Linux-x86_64-535.261.03.run
+535.274.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.274.02/NVIDIA-Linux-x86_64-535.274.02.run
+535.288.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.288.01/NVIDIA-Linux-x86_64-535.288.01.run
+535.309.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.309.01/NVIDIA-Linux-x86_64-535.309.01.run
+535.43.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.43.02/NVIDIA-Linux-x86_64-535.43.02.run
+535.43.08	ABSENT	-
+535.43.09	ABSENT	-
+535.43.10	ABSENT	-
+535.43.11	ABSENT	-
+535.43.13	ABSENT	-
+535.43.15	ABSENT	-
+535.43.16	ABSENT	-
+535.43.19	ABSENT	-
+535.43.20	ABSENT	-
+535.43.22	ABSENT	-
+535.43.23	ABSENT	-
+535.43.24	ABSENT	-
+535.43.25	ABSENT	-
+535.43.28	ABSENT	-
+535.54.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.54.03/NVIDIA-Linux-x86_64-535.54.03.run
+535.86.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.86.05/NVIDIA-Linux-x86_64-535.86.05.run
+535.86.10	AVAILABLE	https://us.download.nvidia.com/tesla/535.86.10/NVIDIA-Linux-x86_64-535.86.10.run
+535.98	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/535.98/NVIDIA-Linux-x86_64-535.98.run
+545.23.06	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/545.23.06/NVIDIA-Linux-x86_64-545.23.06.run
+545.23.08	ABSENT	-
+545.29.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/545.29.02/NVIDIA-Linux-x86_64-545.29.02.run
+545.29.03	ABSENT	-
+545.29.06	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/545.29.06/NVIDIA-Linux-x86_64-545.29.06.run
+550.100	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.100/NVIDIA-Linux-x86_64-550.100.run
+550.107.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.107.02/NVIDIA-Linux-x86_64-550.107.02.run
+550.120	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.120/NVIDIA-Linux-x86_64-550.120.run
+550.127.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.127.05/NVIDIA-Linux-x86_64-550.127.05.run
+550.127.08	AVAILABLE	https://us.download.nvidia.com/tesla/550.127.08/NVIDIA-Linux-x86_64-550.127.08.run
+550.135	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.135/NVIDIA-Linux-x86_64-550.135.run
+550.142	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.142/NVIDIA-Linux-x86_64-550.142.run
+550.144.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.144.03/NVIDIA-Linux-x86_64-550.144.03.run
+550.163.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.163.01/NVIDIA-Linux-x86_64-550.163.01.run
+550.40.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.40.07/NVIDIA-Linux-x86_64-550.40.07.run
+550.40.53	ABSENT	-
+550.40.55	ABSENT	-
+550.40.59	ABSENT	-
+550.40.61	ABSENT	-
+550.40.63	ABSENT	-
+550.40.65	ABSENT	-
+550.40.67	ABSENT	-
+550.40.70	ABSENT	-
+550.40.71	ABSENT	-
+550.40.75	ABSENT	-
+550.40.76	ABSENT	-
+550.40.79	ABSENT	-
+550.40.80	ABSENT	-
+550.40.81	ABSENT	-
+550.40.82	ABSENT	-
+550.40.83	ABSENT	-
+550.40.85	ABSENT	-
+550.54.14	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.54.14/NVIDIA-Linux-x86_64-550.54.14.run
+550.54.15	AVAILABLE	https://us.download.nvidia.com/tesla/550.54.15/NVIDIA-Linux-x86_64-550.54.15.run
+550.67	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.67/NVIDIA-Linux-x86_64-550.67.run
+550.76	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.76/NVIDIA-Linux-x86_64-550.76.run
+550.78	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.78/NVIDIA-Linux-x86_64-550.78.run
+550.90.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/550.90.07/NVIDIA-Linux-x86_64-550.90.07.run
+550.90.12	AVAILABLE	https://us.download.nvidia.com/tesla/550.90.12/NVIDIA-Linux-x86_64-550.90.12.run
+555.42.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/555.42.02/NVIDIA-Linux-x86_64-555.42.02.run
+555.42.06	ABSENT	-
+555.52.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/555.52.04/NVIDIA-Linux-x86_64-555.52.04.run
+555.58	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/555.58/NVIDIA-Linux-x86_64-555.58.run
+555.58.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/555.58.02/NVIDIA-Linux-x86_64-555.58.02.run
+560.28.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/560.28.03/NVIDIA-Linux-x86_64-560.28.03.run
+560.31.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/560.31.02/NVIDIA-Linux-x86_64-560.31.02.run
+560.35.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/560.35.03/NVIDIA-Linux-x86_64-560.35.03.run
+565.57.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/565.57.01/NVIDIA-Linux-x86_64-565.57.01.run
+565.77	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/565.77/NVIDIA-Linux-x86_64-565.77.run
+570.123.01	ABSENT	-
+570.123.06	ABSENT	-
+570.123.07	ABSENT	-
+570.123.10	ABSENT	-
+570.123.11	ABSENT	-
+570.123.14	ABSENT	-
+570.123.18	ABSENT	-
+570.123.19	ABSENT	-
+570.124.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.124.04/NVIDIA-Linux-x86_64-570.124.04.run
+570.124.06	AVAILABLE	https://us.download.nvidia.com/tesla/570.124.06/NVIDIA-Linux-x86_64-570.124.06.run
+570.133.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.133.07/NVIDIA-Linux-x86_64-570.133.07.run
+570.133.20	AVAILABLE	https://us.download.nvidia.com/tesla/570.133.20/NVIDIA-Linux-x86_64-570.133.20.run
+570.144	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.144/NVIDIA-Linux-x86_64-570.144.run
+570.148.08	AVAILABLE	https://us.download.nvidia.com/tesla/570.148.08/NVIDIA-Linux-x86_64-570.148.08.run
+570.153.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.153.02/NVIDIA-Linux-x86_64-570.153.02.run
+570.158.01	AVAILABLE	https://us.download.nvidia.com/tesla/570.158.01/NVIDIA-Linux-x86_64-570.158.01.run
+570.169	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.169/NVIDIA-Linux-x86_64-570.169.run
+570.172.08	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.172.08/NVIDIA-Linux-x86_64-570.172.08.run
+570.181	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.181/NVIDIA-Linux-x86_64-570.181.run
+570.190	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.190/NVIDIA-Linux-x86_64-570.190.run
+570.195.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.195.03/NVIDIA-Linux-x86_64-570.195.03.run
+570.207	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.207/NVIDIA-Linux-x86_64-570.207.run
+570.211.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.211.01/NVIDIA-Linux-x86_64-570.211.01.run
+570.86.15	AVAILABLE	https://us.download.nvidia.com/tesla/570.86.15/NVIDIA-Linux-x86_64-570.86.15.run
+570.86.16	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/570.86.16/NVIDIA-Linux-x86_64-570.86.16.run
+575.51.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/575.51.02/NVIDIA-Linux-x86_64-575.51.02.run
+575.51.03	ABSENT	-
+575.57.08	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/575.57.08/NVIDIA-Linux-x86_64-575.57.08.run
+575.64	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/575.64/NVIDIA-Linux-x86_64-575.64.run
+575.64.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/575.64.03/NVIDIA-Linux-x86_64-575.64.03.run
+575.64.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/575.64.05/NVIDIA-Linux-x86_64-575.64.05.run
+580.105.08	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.105.08/NVIDIA-Linux-x86_64-580.105.08.run
+580.119.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.119.02/NVIDIA-Linux-x86_64-580.119.02.run
+580.126.09	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.126.09/NVIDIA-Linux-x86_64-580.126.09.run
+580.126.16	AVAILABLE	https://us.download.nvidia.com/tesla/580.126.16/NVIDIA-Linux-x86_64-580.126.16.run
+580.126.18	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.126.18/NVIDIA-Linux-x86_64-580.126.18.run
+580.126.20	AVAILABLE	https://us.download.nvidia.com/tesla/580.126.20/NVIDIA-Linux-x86_64-580.126.20.run
+580.142	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.142/NVIDIA-Linux-x86_64-580.142.run
+580.159.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.159.03/NVIDIA-Linux-x86_64-580.159.03.run
+580.159.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.159.04/NVIDIA-Linux-x86_64-580.159.04.run
+580.167.08	AVAILABLE	https://us.download.nvidia.com/tesla/580.167.08/NVIDIA-Linux-x86_64-580.167.08.run
+580.173.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.173.02/NVIDIA-Linux-x86_64-580.173.02.run
+580.178.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.178.04/NVIDIA-Linux-x86_64-580.178.04.run
+580.65.06	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.65.06/NVIDIA-Linux-x86_64-580.65.06.run
+580.76.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.76.05/NVIDIA-Linux-x86_64-580.76.05.run
+580.82.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.82.07/NVIDIA-Linux-x86_64-580.82.07.run
+580.82.09	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.82.09/NVIDIA-Linux-x86_64-580.82.09.run
+580.94.02	ABSENT	-
+580.94.03	ABSENT	-
+580.94.06	ABSENT	-
+580.94.10	ABSENT	-
+580.94.11	ABSENT	-
+580.94.13	ABSENT	-
+580.94.16	ABSENT	-
+580.94.17	ABSENT	-
+580.94.18	ABSENT	-
+580.95.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/580.95.05/NVIDIA-Linux-x86_64-580.95.05.run
+590.44.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/590.44.01/NVIDIA-Linux-x86_64-590.44.01.run
+590.48.01	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/590.48.01/NVIDIA-Linux-x86_64-590.48.01.run
+595.44.02	ABSENT	-
+595.44.03	ABSENT	-
+595.44.05	ABSENT	-
+595.44.06	ABSENT	-
+595.44.07	ABSENT	-
+595.44.08	ABSENT	-
+595.44.09	ABSENT	-
+595.44.10	ABSENT	-
+595.44.11	ABSENT	-
+595.44.13	ABSENT	-
+595.44.14	ABSENT	-
+595.45.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/595.45.04/NVIDIA-Linux-x86_64-595.45.04.run
+595.58.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/595.58.03/NVIDIA-Linux-x86_64-595.58.03.run
+595.71.05	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/595.71.05/NVIDIA-Linux-x86_64-595.71.05.run
+595.80	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/595.80/NVIDIA-Linux-x86_64-595.80.run
+595.84	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/595.84/NVIDIA-Linux-x86_64-595.84.run
+595.91.07	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/595.91.07/NVIDIA-Linux-x86_64-595.91.07.run
+610.43.02	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/610.43.02/NVIDIA-Linux-x86_64-610.43.02.run
+610.43.03	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/610.43.03/NVIDIA-Linux-x86_64-610.43.03.run
+610.57.04	AVAILABLE	https://us.download.nvidia.com/XFree86/Linux-x86_64/610.57.04/NVIDIA-Linux-x86_64-610.57.04.run
