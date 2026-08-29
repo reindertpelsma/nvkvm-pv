@@ -2966,6 +2966,20 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 */
 	bool nvkms_vblank_enable  = false;
 	bool nvkms_vblank_disable = false;
+	/*
+	 * Audit 2026-08-29 (minor): the enable/disable fixups below bounded
+	 * their reads of the inner NVKMS params with req->aux_size, which is
+	 * the length of the shm slot and NOT the field that says how long the
+	 * command's parameter block is — that is NvKmsIoctlParams.size, the
+	 * one the driver itself keys on.  The two are independent guest fields
+	 * (the guest module sets aux_size from the same paramsSize it puts in
+	 * the header, so they agree only while the guest cooperates), and when
+	 * they disagree the retire below reads its reservation key from bytes
+	 * the driver never treated as disable params — releasing quota that
+	 * belongs to a vblank control still live.  Carry the driver's size out
+	 * here for the same reason the two bools are carried out here.
+	 */
+	uint32_t nvkms_params_size = 0;
 
 	/* Graphics gate (defense-in-depth; handle_open already blocks the device
 	 * opens). Refuse all DRM ('d') and NVKMS ('m') ioctls on compute-only VMs. */
@@ -3006,6 +3020,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			? *(const uint32_t *)param_buf : 0xffffffffu;
 		uint32_t nvkms_sz = (param_buf && req->param_size >= 8)
 			? *(const uint32_t *)((const char *)param_buf + 4) : 0;
+		nvkms_params_size = nvkms_sz;
 		/* Key the gate on the host driver's MAJOR: NvKmsIoctlCommand is
 		 * an unvalued enum that NVIDIA edits in the middle, so the same
 		 * number names different commands on different branches.  The
@@ -3523,6 +3538,17 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	bool     gpi_active = false;
 	uint32_t gpi_count  = 0;
 	static __thread uint32_t gpi_iso[200];   /* per-entry isolate (0 = skip) */
+	/*
+	 * Audit 2026-08-29 (minor): the substitution below writes the isolate's
+	 * real HOST tgid into the guest's aux slot so the driver attributes the
+	 * query correctly, and nothing ever put the guest's own value back — so
+	 * the guest read a host PID out of the buffer it had just written.  Host
+	 * PIDs are the prerequisite for signal/ptrace, and on the rungs without
+	 * a PID namespace that is a usable one.  Keep the original so the
+	 * substitution stays what it is meant to be: an internal rewrite for the
+	 * driver's benefit, invisible from the guest.
+	 */
+	static __thread uint32_t gpi_pid[200];   /* the guest's own value at +0 */
 	if (_IOC_TYPE(req->cmd) == 'F' &&
 	    _IOC_NR(req->cmd) == NV_ESC_RM_CONTROL &&
 	    param_buf && req->param_size >= 12 &&
@@ -3551,6 +3577,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 					break;
 				}
 				memcpy(&v, (char *)aux_buf + off, 4);
+				gpi_pid[i] = v;
 				if (v & 0x80000000u) {
 					uint32_t iso = v & 0x7fffffffu;
 					pid_t hp = nvkvm_isolate_host_pid(
@@ -3636,7 +3663,8 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 	 */
 	if (nvkms_vblank_enable) {
 		uint32_t device = 0, disp = 0, control = 0;
-		bool ok = ret == 0 && aux_buf && req->aux_size >= 28;
+		bool ok = ret == 0 && aux_buf && req->aux_size >= 28 &&
+			  nvkms_params_size >= 28;
 		if (ok) {
 			memcpy(&device,  (char *)aux_buf + 0,  4);
 			memcpy(&disp,    (char *)aux_buf + 4,  4);
@@ -3646,7 +3674,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			&nv->isolates, req->isolate_id, nvkms_vblank_reservation,
 			ok, device, disp, control);
 	} else if (nvkms_vblank_disable && ret == 0 && aux_buf &&
-		   req->aux_size >= 12) {
+		   req->aux_size >= 12 && nvkms_params_size >= 12) {
 		uint32_t device, disp, control;
 		memcpy(&device,  (char *)aux_buf + 0, 4);
 		memcpy(&disp,    (char *)aux_buf + 4, 4);
@@ -3698,6 +3726,18 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			uint32_t result = any ? 0u : 0xffffu; /* NV_OK / NOT_FOUND */
 			memcpy((char *)aux_buf + off + 8, &result, 4);
 			memcpy((char *)aux_buf + off + 16, &sum, 8);
+		}
+	}
+	/*
+	 * …and put the guest's own pid values back (see gpi_pid).  Outside the
+	 * `ret == 0` block on purpose: a failed forward is exactly the case
+	 * where the substituted host PIDs would otherwise be left sitting in a
+	 * buffer the guest can read.
+	 */
+	if (gpi_active && aux_buf) {
+		for (uint32_t i = 0; i < gpi_count; i++) {
+			uint32_t off = 8 + i * NVKVM_PIDINFO_STRIDE;
+			memcpy((char *)aux_buf + off, &gpi_pid[i], 4);
 		}
 	}
 
@@ -4589,11 +4629,34 @@ int nvkvm_req_munmap_on_isolate(VirtIONvgpu *nv,
 	 * { isolate_id, mmap_token } and nothing else.  So the test is
 	 * "the token you named must belong to the isolate you named", not "…to
 	 * you": a caller that names a neighbour's isolate_id together with that
-	 * neighbour's token passes it.  Three of the five isolate_id-taking
-	 * handlers additionally check session_has_isolate() against a session_id
-	 * they take from QEMU's own handle table; there is no handle here to
-	 * anchor to, and anchoring to the mapping entry's own handle_id would be
-	 * circular (the entry's isolate_id is already required to match).
+	 * neighbour's token passes it.
+	 *
+	 * The census this used to give — "three of the five isolate_id-taking
+	 * handlers additionally check session_has_isolate()" — was wrong when it
+	 * was written and is worth stating correctly, because a wrong count here
+	 * is what makes an unchecked handler look like a known, bounded
+	 * exception.  There are TWELVE handlers that take an isolate_id off the
+	 * wire.  Seven anchor it: PRESENT, XISO_IMPORT, CLOSE_HANDLE_ON_ISOLATE,
+	 * MMAP_ON_ISOLATE, POLL_ON_ISOLATE, UNPOLL_ON_ISOLATE and
+	 * REALIZE_UVM_MAPPING.  Five do not, for three different reasons:
+	 *   - IOCTL_ON_ISOLATE and INTERRUPT deliberately, because intra-VM
+	 *     access control is the guest module's job (see the note at the top
+	 *     of nvkvm_req_ioctl_on_isolate);
+	 *   - KILL_ISOLATE only optionally, via `reserved` read as a caller
+	 *     session_id, which today's guest leaves zero;
+	 *   - this handler and COPY_HANDLE_TO_ISOLATE structurally, because
+	 *     neither request carries any caller identity to anchor to.
+	 * COPY_HANDLE_TO_ISOLATE is the one worth naming next to this one: it is
+	 * this gap's mirror image and the sharper half, since it PUSHES a live
+	 * host device fd into a guest-named isolate rather than tearing a
+	 * mapping down.  It cannot simply be given the check its siblings have —
+	 * it IS the mechanism by which the guest legitimately shares a handle
+	 * across isolates (CUDA IPC), so a session test would reject the traffic
+	 * it exists to carry.  Both need a caller session_id on the wire.
+	 *
+	 * There is no handle here to anchor to, and anchoring to the mapping
+	 * entry's own handle_id would be circular (the entry's isolate_id is
+	 * already required to match).
 	 * Closing this needs a caller session_id ON THE WIRE — a protocol
 	 * change, deliberately not bodged in here.  Note it would bound a
 	 * malicious guest USERSPACE process only: the guest kernel module fills
