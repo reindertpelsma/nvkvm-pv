@@ -2349,9 +2349,25 @@ static void handle_xiso_import(struct isolate_cmd_xiso_import *cmd,
 
 static void handle_close_fd(uint32_t handle_id)
 {
+	/*
+	 * Audit 2026-08-29 #3: this used to send_ok() even when this stub held
+	 * no fd under handle_id, so QEMU saw ret == 0 for EVERY close and
+	 * unref'd nvkvm_handle's isolate_refcount unconditionally.  Repeating
+	 * the call on a handle_id we never held therefore walked that count
+	 * down to 0 and defeated the -EBUSY guard that stops a handle from
+	 * being closed while an isolate still holds it.  Report the truth:
+	 * -EBADF for a handle this isolate does not hold, so the refcount only
+	 * moves for a close that actually released something.
+	 */
 	fs_mutex_lock(&fd_mutex);
-	handle_remove(handle_id);
+	int held = handle_lookup(handle_id) >= 0;
+	if (held)
+		handle_remove(handle_id);
 	fs_mutex_unlock(&fd_mutex);
+	if (!held) {
+		send_error(-EBADF);
+		return;
+	}
 	send_ok();
 }
 

@@ -1052,6 +1052,42 @@ int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
 				       struct nvkvm_req_close_handle_on_isolate *req,
 				       struct nvkvm_resp_close_handle_on_isolate *resp)
 {
+	/*
+	 * S-2 (cross-isolate), audit 2026-08-29 #3: this carried NEITHER half of
+	 * the pairing proof its siblings carry, and handle ids and isolate ids
+	 * are one VM-global sequential space — so naming a neighbour's
+	 * isolate_id ran nvkvm_iso_mmap_reap_handle() against it, restoring
+	 * anonymous backing over that isolate's live device mappings WHILE IT IS
+	 * STILL WRITING THROUGH THEM, and purged UVM VA-ownership records that
+	 * belong to another session.  Both happen before the close is even
+	 * attempted, so a request that ultimately fails still did the damage.
+	 *
+	 * Half one, handle→session: the handle must exist and must still have a
+	 * live fd (a closed slot has nothing to close on an isolate).
+	 * Half two, session→isolate: the isolate named must belong to that
+	 * handle's session — the same test PRESENT (:2206) and XISO_IMPORT
+	 * (:1995) apply to their (isolate, handle) pairs.  A stub would answer
+	 * -EBADF for a handle it does not hold, but that is the stub catching
+	 * what the boundary should have — and it does not undo the reap above.
+	 *
+	 * It also closes the refcount walk in the same finding: with the stub
+	 * now reporting failure for a handle it never held (nvkvm_stub.c
+	 * handle_close_fd), repeated calls naming a FOREIGN handle_id can no
+	 * longer drive isolate_refcount to 0 and defeat close-handle's -EBUSY.
+	 */
+	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
+	if (!h || h->fd < 0) {
+		resp->status = EBADF;
+		return 0;
+	}
+	if (!session_has_isolate(nv, h->session_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm close_handle_on_isolate: handle %u (sess=%u) "
+			  "does not belong to isolate %u — refused\n",
+			  req->handle_id, h->session_id, req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
+
 	/* U-6: see nvkvm_req_close_handle. */
 	nvkvm_uvm_va_purge_handle(req->handle_id);
 	/* Drop any window extent this handle still owns before the fd goes, so
