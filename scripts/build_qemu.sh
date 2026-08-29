@@ -247,39 +247,62 @@ else
     echo "[2/9] QEMU source already present at $QEMU_SRC — skipping clone."
 fi
 
-# ── 2b. Guard: is that tree the version the patches are written against? ──
+# ── 2b. Guard: is that tree the exact commit the patches are written against? ──
 #
 # Added with the 9.2.0 -> 11.1.1 bump, because the failure it catches is the
 # single most likely way to hit this upgrade badly.  The clone above is skipped
 # whenever $QEMU_SRC merely EXISTS, so a box that built the old QEMU keeps its
 # 9.2.0 tree, every one of the twelve patches then fails to apply, and the
-# error you get blames the patches.  Checking the tag turns that into one line
-# naming the real problem and the one-command fix.
+# error you get blames the patches.
 #
-# Only the tag is checked, not the working tree: patches are applied with
-# `git apply` and never committed, so HEAD stays on the tag for the whole
-# build and a re-run is still a no-op.  If the tag cannot be determined (a
-# hand-made tree, a mirror without tags) this warns and continues rather than
-# refusing -- the patch-apply step below is the real gate.
-_qemu_tag="$(git -C "$QEMU_SRC" describe --tags --exact-match HEAD 2>/dev/null || true)"
-if [ -z "$_qemu_tag" ]; then
-    echo "  WARNING: cannot determine the tag of $QEMU_SRC."
-    echo "  Expected v$QEMU_VERSION. Continuing; step 3 will fail if it is wrong."
-elif [ "$_qemu_tag" != "v$QEMU_VERSION" ]; then
+# IT NOW CHECKS THE COMMIT, NOT THE TAG, and the difference is the whole point.
+# It used to run `git describe --tags --exact-match HEAD` -- which asks the tree
+# we just cloned what tag it is on.  The clone was `--branch v11.1.1`, so the
+# answer was always "the tag the server gave us", and the check could only ever
+# agree with itself.  A git tag is a mutable pointer on a third-party host: if
+# gitlab.com's tag moved, or a mirror or a local tree carried a v11.1.1 pointing
+# somewhere else, the tree changed and this guard still said "as the patches
+# expect".  A commit id cannot be re-pointed.
+#
+# The pin below was read from gitlab.com's API on 2026-08-29 for the v11.1.1
+# tag.  That is the same trust root as the clone, so this does not
+# independently authenticate upstream QEMU -- what it buys is that the tree
+# STOPS CHANGING: a moved tag now fails the build loudly instead of silently
+# swapping the hypervisor the guests run on.  Verifying QEMU's release signature
+# would be the real anchor, and needs their signing key, which is a larger
+# change than this file should make alone.
+#
+# Still only HEAD, not the working tree: patches are applied with `git apply`
+# and never committed, so HEAD stays put for the whole build and a re-run is a
+# no-op.  Unlike the tag check this FAILS CLOSED -- an unreadable commit id
+# means we do not know what we are about to patch and compile into the thing
+# that runs every guest, and "continue and let the patches decide" was how a
+# check that never fired looked correct for a whole release cycle.
+QEMU_COMMIT="c3d48b7d1e89604920e5b81b91140c2ad39a1943"   # tag v11.1.1
+_qemu_head="$(git -C "$QEMU_SRC" rev-parse HEAD 2>/dev/null || true)"
+if [ "$_qemu_head" = "$QEMU_COMMIT" ]; then
+    echo "  tree is at $QEMU_COMMIT (v$QEMU_VERSION), as the patches expect."
+else
+    _qemu_tag="$(git -C "$QEMU_SRC" describe --tags --always HEAD 2>/dev/null || echo unknown)"
     cat >&2 <<EOF
 
-ERROR: $QEMU_SRC is QEMU $_qemu_tag, but the patches in patches/ are written
-       against v$QEMU_VERSION and nothing else.
+ERROR: $QEMU_SRC is not the QEMU the patches in patches/ are written against.
 
-This is almost certainly a tree left over from an earlier nvkvm build (the
-clone above is skipped whenever the directory exists).  Remove it and re-run:
+  expected commit : $QEMU_COMMIT  (tag v$QEMU_VERSION)
+  this tree is at : ${_qemu_head:-<not a git tree>}  ($_qemu_tag)
+
+Usually a tree left over from an earlier nvkvm build -- the clone above is
+skipped whenever the directory exists.  Remove it and re-run:
 
     rm -rf $QEMU_SRC && $0 --force
 
+If you meant to build a DIFFERENT QEMU, change QEMU_VERSION and QEMU_COMMIT
+together and re-check the twelve patches against it.  They are written against
+this commit and nothing else, and a patch that applies with fuzz to a different
+tree is how you get a QEMU that builds and then misbehaves under load.
+
 EOF
     exit 1
-else
-    echo "  tree is at v$QEMU_VERSION, as the patches expect."
 fi
 
 # ── 3. Apply the QEMU patch series ────────────────────────────────────────

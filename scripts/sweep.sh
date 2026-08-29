@@ -435,11 +435,23 @@ print(json.dumps(o))
 # was built from", which is the question worth asking.
 # ---------------------------------------------------------------------------
 ABIQ=""
+ABIQ_DIR=""
 build_abiq() {
     local src="$REPO/src/common/nvkvm_abi.h"
     [ -f "$src" ] || { warn "no $src -- expected ABI profiles will read '?'"; return 1; }
     command -v cc >/dev/null || { warn "no cc -- expected ABI profiles will read '?'"; return 1; }
-    ABIQ="$(mktemp -u /tmp/nvkvm-abiq.XXXXXX)"
+    # `mktemp -u` RESERVES NOTHING -- it prints a name and returns, which
+    # mktemp's own man page calls unsafe.  Both writes below then landed in the
+    # world-writable /tmp through an unreserved name: `cat > "$ABIQ.c"` and
+    # `cc -o "$ABIQ"` are plain O_CREAT|O_TRUNC, so a local user who plants a
+    # symlink at either name between the mktemp and the write has the sweep
+    # truncate and overwrite a file of their choosing, as whoever runs the
+    # sweep -- root, on the machine that holds the vast.ai API key.  A
+    # directory created with mode 0700 by mktemp -d fixes both names at once,
+    # which is why the binary and its source move inside one rather than
+    # getting an mktemp each.
+    ABIQ_DIR="$(mktemp -d /tmp/nvkvm-abiq.XXXXXX)" || { warn "mktemp -d failed -- expected ABI profiles will read '?'"; return 1; }
+    ABIQ="$ABIQ_DIR/abiq"
     cat >"$ABIQ.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
@@ -458,6 +470,8 @@ int main(int argc, char **argv)
 }
 EOF
     cc -I "$REPO/src" -o "$ABIQ" "$ABIQ.c" 2>/dev/null || { ABIQ=""; return 1; }
+    # Leaving the ABI helper behind on every run is how /tmp fills up on a
+    # coordinator that sweeps nightly; cleanup() already runs on EXIT and INT.
     return 0
 }
 abi_expected() {   # abi_expected 580.95.05 -> 580  (or '?')
@@ -670,6 +684,28 @@ destroy_verified() {
 # ever touches instances carrying OUR label.
 reap_strays() {
     local ids id gpu
+
+    # AN EMPTY LABEL IS NOT "MATCH EVERYTHING". It means we do not yet know what
+    # is ours, and the only safe action is none.
+    #
+    # `trap cleanup EXIT` is installed ~1700 lines before SWEEP_LABEL is derived
+    # from the run directory, so ANY early exit -- a die(), a `set -u` trip, a
+    # Ctrl-C, arm_autodestroy() refusing to proceed -- reaches cleanup() ->
+    # reap_strays() with SWEEP_LABEL still "". The matcher below does
+    # `lab = i.get("label") or ""`, so "" == "" would then match every
+    # UNLABELLED instance on the account and destroy it: other people's boxes,
+    # other projects' boxes, anything rented by hand.
+    #
+    # Found 2026-08-29 while reviewing a test failure that looked like a stale
+    # fixture. The test only ever exercised the library path, where SWEEP_LABEL
+    # is likewise unset -- so the inversion it reported ("the unlabelled box was
+    # destroyed") was the real behaviour, correctly observed, and dismissed as a
+    # test artifact. It was not.
+    if [ -z "${SWEEP_LABEL:-}" ]; then
+        warn "reap_strays: no sweep label set -- REFUSING to reap."
+        warn "  An empty label matches every unlabelled instance on the account."
+        return 0
+    fi
     ids="$(vj show instances | python3 -c '
 import json,sys
 try: d = json.load(sys.stdin)
@@ -751,6 +787,7 @@ reconcile() {
 }
 
 CLEANED=0
+TREE_TGZ=""
 cleanup() {
     [ "$CLEANED" = 1 ] && return
     CLEANED=1
@@ -766,6 +803,11 @@ cleanup() {
     # Tell the timer the sweep is over.  It only stands down once the LISTING
     # agrees that nothing registered is alive, so this is a hint, not a disarm.
     [ -n "$REGISTRY" ] && : >"${REGISTRY}.done"
+    # Own private temporaries. Both are mktemp'd, so an unset value here means
+    # they were never created rather than that a path needs guessing.
+    [ -n "$ABIQ_DIR" ] && rm -rf -- "$ABIQ_DIR"
+    [ -n "$TREE_TGZ" ] && rm -f -- "$TREE_TGZ"
+    return 0
 }
 trap cleanup EXIT
 trap 'warn "interrupted"; exit 130' INT TERM
@@ -892,18 +934,64 @@ for o in offers:
         continue
     if str(o.get("machine_id")) in bad:
         continue
-    if (o.get("dph_total") or 99) > float(max_dph):
+    # COERCE THE PRICE, and skip the offer if it will not coerce.
+    #
+    # This was `(o.get("dph_total") or 99) > float(max_dph)`, which compares
+    # whatever the API sent against a float.  A price that arrives as a JSON
+    # STRING -- "0.9", which is a perfectly ordinary way for an API to encode a
+    # decimal -- raises TypeError there, and the traceback aborts pick_offer for
+    # EVERY offer, not just the malformed one.  One bad listing anywhere in the
+    # marketplace response and the sweep finds no box at all, with an error that
+    # names Python rather than the listing.
+    #
+    # Coercing also keeps dph_total a NUMBER by the time it is printed on the
+    # tab-separated line below, which is what the shell then substitutes into
+    # the cost arithmetic.  That was safe before only by accident of this
+    # comparison raising first; it is now safe by construction, which is the
+    # property worth having in a value that comes from a marketplace listing.
+    # A missing or zero price is still treated as "assume expensive, skip",
+    # which is what the old `or 99` did and is the right way round: a listing
+    # that will not say what it costs is not one to rent under a spend cap.
+    try:
+        dph = float(o.get("dph_total"))
+    except (TypeError, ValueError):
         continue
+    # COERCE EVERY MARKETPLACE NUMBER, and skip the offer if one will not
+    # coerce.  A price that arrives as a JSON STRING -- "0.9", an ordinary way
+    # for an API to encode a decimal -- raises TypeError when compared against a
+    # float, and the traceback aborts pick_offer for EVERY offer, not just the
+    # malformed one: one bad listing anywhere in the marketplace response and
+    # the sweep finds no box at all, with an error naming Python rather than the
+    # listing.  close/packaging-pv fixed that for dph_total; the storage and
+    # network filters below have exactly the same shape, so fixing only dph
+    # would have left the same bug in three more places.
+    #
+    # A missing or zero PRICE is still "assume expensive, skip" -- a listing
+    # that will not say what it costs is not one to rent under a spend cap.
+    def num(key):
+        v = o.get(key)
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    dph = num("dph_total")
+    if dph is None or not (dph > 0) or dph > float(max_dph):
+        continue
+    o["dph_total"] = dph
     # storage_total_cost is 0 for EVERY offer in a search that requests no
     # disk -- filtering on it silently accepted everyone. The per-unit price is
     # storage_cost ($/GB/month); scale it by the disk this run will actually
-    # ask for.
-    if (o.get("storage_cost") or 0) > max_stor_gb_mo:
+    # ask for.  Unpriced storage is treated as free, which is what it is for a
+    # box that does not charge for it.
+    if (num("storage_cost") or 0.0) > max_stor_gb_mo:
         continue
     # Network is NOT in dph_total. An unpriced field means unknown, and unknown
     # on a spend-capped unattended run is treated as too expensive.
-    down_tb = o.get("internet_down_cost_per_tb")
-    up_tb   = o.get("internet_up_cost_per_tb")
+    down_tb = num("internet_down_cost_per_tb")
+    up_tb   = num("internet_up_cost_per_tb")
     if down_tb is None or up_tb is None:
         continue
     if down_tb > max_down_tb or up_tb > max_up_tb:
@@ -919,10 +1007,18 @@ if not cands:
 # priced in.
 def expected(o, hours=3.0):
     """What this box costs for THIS job: compute + its disk + its transfer.
-    Storage dominates network at these volumes, so both are counted."""
-    compute = (o.get("dph_base") or 99) * hours
-    storage = (o.get("storage_cost") or 0) * disk_gb / 730.0 * hours
-    network = (o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0)
+    Storage dominates network at these volumes, so both are counted.
+    Every field is coerced for the reason given in the filter above: a string
+    price here would raise inside min()'s key and abort the whole search."""
+    def f(key, default):
+        v = o.get(key)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+    compute = f("dph_base", 99.0) * hours
+    storage = f("storage_cost", 0.0) * disk_gb / 730.0 * hours
+    network = f("internet_down_cost_per_tb", 0.0) * (est_down_gb / 1024.0)
     return compute + storage + network
 
 o = min(cands, key=expected)
@@ -1225,10 +1321,20 @@ provision_box() {
     # stale .o/.cmd files while still labelling the payload "clean HEAD".  A
     # guest then imports absolute Kbuild paths from another kernel/worktree.
     # Honour the repo's ignore rules at the shipment boundary as well.
+    # mktemp, not a fixed /tmp/nvkvm-sweep-tree.tgz.  The old fixed name was in
+    # world-writable /tmp with no O_EXCL, so a local user who pre-created it as
+    # a symlink had the next sweep truncate and overwrite the target -- as the
+    # user running the sweep, which on a coordinator is root.  It also meant two
+    # concurrent sweeps silently shipped each other's tree, which is the more
+    # likely of the two to actually happen here.
+    TREE_TGZ="$(mktemp /tmp/nvkvm-sweep-tree.XXXXXX.tgz)" \
+        || { PROVISION_FAIL_DETAIL="mktemp for the tree tarball failed"; PROVISION_FAILED_STEP="ship"; return 1; }
     tar --exclude-vcs-ignores --exclude=.git --exclude=sweep-runs \
-        -czf /tmp/nvkvm-sweep-tree.tgz -C "$REPO" . 2>/dev/null \
+        -czf "$TREE_TGZ" -C "$REPO" . 2>/dev/null \
         || { PROVISION_FAIL_DETAIL="could not tar the repo"; PROVISION_FAILED_STEP="ship"; return 1; }
-    timeout 900 scp $SSH_OPTS -P "$SCP_PORT" -q /tmp/nvkvm-sweep-tree.tgz "root@$SCP_HOST:/root/" \
+    # The REMOTE name stays fixed: it lands in root's home on a box this sweep
+    # rented and destroys, and the unpack step below names it literally.
+    timeout 900 scp $SSH_OPTS -P "$SCP_PORT" -q "$TREE_TGZ" "root@$SCP_HOST:/root/nvkvm-sweep-tree.tgz" \
         || { PROVISION_FAIL_DETAIL="scp of the tree failed"; PROVISION_FAILED_STEP="ship"; return 1; }
     rsh_t 180 'mkdir -p /root/nvkvm && tar -xzf /root/nvkvm-sweep-tree.tgz -C /root/nvkvm' >/dev/null 2>&1 \
         || { PROVISION_FAIL_DETAIL="could not unpack the tree on the box"; PROVISION_FAILED_STEP="ship"; return 1; }
