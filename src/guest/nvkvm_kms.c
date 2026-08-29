@@ -1119,11 +1119,47 @@ static const uint64_t nvkvm_pipe_modifiers[] = {
 	 * client that picks an invented modifier gets a buffer the driver
 	 * cannot use as a render target, and fails exactly where wlroots does
 	 * ("Failed to create FBO") and Xorg/glamor does ("Failed to create
-	 * pixmap").  LINEAR is excluded for the same reason -- see the accept
-	 * callback, which still allows it for cursors.
+	 * pixmap").  LINEAR WAS excluded for the same reason; it is listed again
+	 * below, last, because gamescope will not scan out without seeing it --
+	 * the full argument and the residual risk are at that entry.
 	 */
 	NVKVM_MOD_BL2D(0, 1, 2, 6, 4),    /* 0x0300000000606014 scanout+render */
 	NVKVM_MOD_BL2D(0, 1, 2, 14, 4),   /* 0x0300000000e08014 render         */
+	/*
+	 * LINEAR, LAST — added 2026-08-29, and it reverses the paragraph above,
+	 * so here is the whole trade rather than a quiet edit.
+	 *
+	 * MEASURED on the PC: gamescope refuses to scan out at all without it.
+	 * It pre-checks IN_FORMATS itself (wlr_drm_format_set_has) and never
+	 * reaches AddFB2:
+	 *   drm: Cannot import FB to DRM: format 0x34325241 and modifier 0x0
+	 *        not supported for scan-out
+	 * That is the Steam Deck OOBE session, which is what Valve's own
+	 * download serves, so "gamescope does not start" means the out-of-box
+	 * flow cannot be completed at all.
+	 *
+	 * The advertisement was also simply INCONSISTENT with the code:
+	 * nvkvm_plane_format_mod_supported() below already returns true for
+	 * LINEAR, so the kernel would have accepted the very AddFB2 that
+	 * IN_FORMATS told userspace not to attempt. This makes the blob say what
+	 * the driver actually does.
+	 *
+	 * THE RISK, stated plainly: the reason LINEAR was excluded is real and
+	 * measured -- NVIDIA cannot use a LINEAR dma-buf as an EGLImage render
+	 * target, and weston and wlroots both took LINEAR, failed to build their
+	 * render FBO and composited nothing. Offering it again lets a compositor
+	 * make that choice. Mitigations: it is listed LAST, after both
+	 * block-linear modifiers, since IN_FORMATS order is preserved and a
+	 * compositor walking the list in order meets the good ones first.
+	 *
+	 * VERIFIED with LINEAR re-added: gamescope reaches scanout (connector
+	 * enabled, 30 flips, and the flips carry mod=0x300000000606014 -- it
+	 * takes block-linear once offered the choice), and Plasma/KWin still
+	 * works (enabled, 20 flips, no PlaceholderOutput).
+	 * NOT VERIFIED: weston and wlroots, the two that originally failed this
+	 * way. Re-test them before treating this as settled.
+	 */
+	DRM_FORMAT_MOD_LINEAR,
 	DRM_FORMAT_MOD_INVALID
 };
 
