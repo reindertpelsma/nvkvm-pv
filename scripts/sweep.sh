@@ -135,21 +135,35 @@ MIN_DRIVERS=5
 MAX_DPH=0.50
 # COST HAS THREE COMPONENTS AND dph_total ONLY CARRIES TWO.
 #
-# MEASURED against the offer API: dph_total == dph_base + storage_total_cost
-# (0.4267 + 0.0037 = 0.4304 on a sampled offer).  NETWORK IS NOT IN IT.  That
-# matters here specifically, because a sweep is network-heavy by construction:
-# every box downloads one NVIDIA .run per driver (300-450 MB each, so ~5 GB for
-# the 13-driver boundary set) plus a guest image and apt.  At the ~$27/TB a
-# typical host charges that is pennies; a host charging ten times that turns an
-# $0.07/hr box into the most expensive thing in the run, and dph_total would
-# never show it.
+# MEASURED against the offer API: dph_total == dph_base + storage_total_cost.
+# NETWORK IS NOT IN IT, and this harness is network-heavy by construction --
+# one NVIDIA .run per driver, 300-450 MB each.
 #
-# So cap the three separately, and default to "generous but not unbounded":
-# these are not tuned prices, they are outlier filters.
-MAX_STORAGE_DPH=0.05        # $/hr for the allocated disk
-MAX_INET_DOWN_PER_TB=60     # $/TB in  -- we pull GBs per box
-MAX_INET_UP_PER_TB=100      # $/TB out -- we only ship logs, so this is loose
-EST_DOWN_GB_PER_BOX=8       # repo + guest image + one .run per driver + apt
+# MEASURED DISTRIBUTION over 95 vms_enabled offers (2026-08-29):
+#
+#   network in   $/TB       median  4.00   p75 12.00   p90 26.67   max 40.00
+#   network out  $/TB       median  4.00   p75 12.67   p90 30.67   max 40.00
+#   storage      $/GB/month median  0.200  p75 0.200   p90 0.333   max 0.667
+#   gpu base     $/hr       median  0.33   p75 0.72    p90 1.09    max 5.60
+#
+# Two things follow, and both corrected an earlier guess here.
+#
+# The market CEILING for network is $40/TB -- p95, p98 and max are all 40.00 --
+# so the $60 cap this file first shipped rejected nothing at all. And for a
+# 3-hour box with a 150 GB disk moving ~8 GB, STORAGE COSTS MORE THAN NETWORK:
+# $0.12-0.41 against $0.03-0.31. Both are noise beside compute ($0.21-3.27 for
+# the same box), so neither belongs in the selection as a hard preference.
+#
+# Hence: the caps below are OUTLIER GUARDS set from the observed maxima, not
+# tuning knobs. They reject a host that is off the market or that declines to
+# state a price; they do not shave pennies, because shaving pennies here costs
+# coverage -- and on a rare architecture, excluding the top decile of hosts can
+# mean no offer at all. Preference is expressed in the RANKING instead, which
+# scores every candidate on what this job will actually cost it.
+MAX_STORAGE_PER_GB_MONTH=0.70   # observed max 0.667
+MAX_INET_DOWN_PER_TB=40         # observed max 40.00 -- the market ceiling
+MAX_INET_UP_PER_TB=40           # observed max 40.00
+EST_DOWN_GB_PER_BOX=8           # repo + guest image + one .run per driver + apt
 MAX_SPEND=10.00
 BUDGET_HOURS=8
 DISK=64
@@ -239,7 +253,7 @@ while [ $# -gt 0 ]; do
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
         --max-dph)      MAX_DPH="$2"; shift 2 ;;
-        --max-storage-dph)    MAX_STORAGE_DPH="$2"; shift 2 ;;
+        --max-storage-gb-month) MAX_STORAGE_PER_GB_MONTH="$2"; shift 2 ;;
         --max-inet-down-tb)   MAX_INET_DOWN_PER_TB="$2"; shift 2 ;;
         --max-inet-up-tb)     MAX_INET_UP_PER_TB="$2"; shift 2 ;;
         --max-spend)    MAX_SPEND="$2"; shift 2 ;;
@@ -775,10 +789,11 @@ pick_offer() {
     offers_json="$(mktemp)"
     vj search offers 'vms_enabled=true num_gpus=1 rentable=true' -o dph >"$offers_json"
     python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" \
-             "$MAX_STORAGE_DPH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" "$EST_DOWN_GB_PER_BOX" <<'PY'
+             "$MAX_STORAGE_PER_GB_MONTH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" \
+             "$EST_DOWN_GB_PER_BOX" "$DISK" <<'PY'
 import json, sys, os, importlib.util
 repo, want_arch, max_dph, gpu_filter, tried, kbfile, offers_path = sys.argv[1:8]
-max_stor, max_down_tb, max_up_tb, est_down_gb = (float(x) for x in sys.argv[8:12])
+max_stor_gb_mo, max_down_tb, max_up_tb, est_down_gb, disk_gb = (float(x) for x in sys.argv[8:13])
 spec = importlib.util.spec_from_file_location(
     "sweep_matrix", os.path.join(repo, "scripts", "sweep_matrix.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -810,10 +825,11 @@ for o in offers:
         continue
     if (o.get("dph_total") or 99) > float(max_dph):
         continue
-    # Storage is inside dph_total but is worth its own ceiling: a host with a
-    # cheap GPU and absurd disk pricing passes the dph gate on a small --disk
-    # and then bites when the sweep asks for the space a guest image needs.
-    if (o.get("storage_total_cost") or 0) > max_stor:
+    # storage_total_cost is 0 for EVERY offer in a search that requests no
+    # disk -- filtering on it silently accepted everyone. The per-unit price is
+    # storage_cost ($/GB/month); scale it by the disk this run will actually
+    # ask for.
+    if (o.get("storage_cost") or 0) > max_stor_gb_mo:
         continue
     # Network is NOT in dph_total. An unpriced field means unknown, and unknown
     # on a spend-capped unattended run is treated as too expensive.
@@ -832,19 +848,22 @@ if not cands:
 # price: an hour of compute plus the transfer the sweep is about to do. Two
 # offers an hour apart in dph can invert once ~8 GB of driver downloads is
 # priced in.
-def expected(o):
-    dph  = o.get("dph_total") or 99
-    down = (o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0)
-    return dph + down
+def expected(o, hours=3.0):
+    """What this box costs for THIS job: compute + its disk + its transfer.
+    Storage dominates network at these volumes, so both are counted."""
+    compute = (o.get("dph_base") or 99) * hours
+    storage = (o.get("storage_cost") or 0) * disk_gb / 730.0 * hours
+    network = (o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0)
+    return compute + storage + network
 
 o = min(cands, key=expected)
 print("\t".join(str(x) for x in [
     o.get("id"), o.get("machine_id"), o.get("gpu_name"),
     o.get("dph_total"), o.get("geolocation") or "?", o.get("inet_down") or "?",
     o.get("driver_version") or "?",
-    round(o.get("storage_total_cost") or 0, 4),
+    round((o.get("storage_cost") or 0) * disk_gb / 730.0, 5),
     round(o.get("internet_down_cost_per_tb") or 0, 2),
-    round(expected(o) - (o.get("dph_total") or 0), 4)]))
+    round((o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0), 4)]))
 PY
     rc=$?
     rm -f "$offers_json"
@@ -2124,8 +2143,9 @@ say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from 
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
 say "  caps          : \$$MAX_DPH/hr per box, \$$MAX_SPEND total, ${BUDGET_HOURS}h auto-destroy"
-say "                  storage <= \$$MAX_STORAGE_DPH/hr, network <= \$$MAX_INET_DOWN_PER_TB/TB in"
-say "                  (network is NOT part of vast's dph_total -- it is capped separately)"
+say "                  storage <= \$$MAX_STORAGE_PER_GB_MONTH/GB/mo, network <= \$$MAX_INET_DOWN_PER_TB/TB in"
+say "                  (outlier guards at the observed market maxima; network is NOT in dph_total."
+say "                   Preference is in the ranking, which scores compute + disk + transfer.)"
 say ""
 total_units=0
 nboxes=0
