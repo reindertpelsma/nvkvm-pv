@@ -1220,6 +1220,41 @@ static void *isolate_reader_fn(void *arg)
 	}
 
 reader_exit:
+	/*
+	 * Audit 2026-08-29 (serious), OPEN — needs a decision, not more code.
+	 *
+	 * Reaching here means the stub is gone: it exited, was OOM-killed, or
+	 * tripped its seccomp filter.  We mark the isolate not-alive and wake
+	 * its waiters, and that is ALL that happens.  Everything that reclaims
+	 * a dead isolate — waitpid()ing the child, releasing its run_uid,
+	 * clearing in_use so the slot can be reused, and (in the handler layer)
+	 * nvkvm_iso_mmap_reap_isolate / nvkvm_present_forget_isolate /
+	 * nvkvm_mapva_forget_isolate plus the session prune — hangs off
+	 * NVKVM_REQ_KILL_ISOLATE arriving from the guest.  `in_use` is cleared
+	 * in exactly one function, nvkvm_isolate_kill().
+	 *
+	 * In practice reclaim is deferred rather than lost: the guest module
+	 * sends KILL_ISOLATE from session teardown on last-fd-close, and Linux
+	 * closes fds on process exit, so a cooperative guest gets there
+	 * eventually.  The unbounded case is a stub that dies while the guest
+	 * holds its fd open indefinitely — then the child stays a zombie, the
+	 * uid stays reserved against reuse, and the GPA window extents stay
+	 * allocated, for as long as the guest likes.
+	 *
+	 * Two reasons this is not fixed in place here:
+	 *   - this thread cannot call nvkvm_isolate_kill(), which pthread_join()s
+	 *     this very thread;
+	 *   - the reclaim steps that matter most (the window extents and the
+	 *     session) live in nvkvm_isolate_handlers.c, not in kill(), so even
+	 *     a correct trigger reclaims only half of it.
+	 * Closing it means either moving those steps into kill() the way
+	 * nvkvm_present_forget_isolate() was already moved — explicitly so the
+	 * invariant would be structural rather than a list of call sites — and
+	 * then having something outside this thread notice the death, or a
+	 * sweeper on the device AioContext that finds (in_use && !alive) slots.
+	 * Both are lifecycle changes with locking against the TX thread to get
+	 * right, which is a design call and not a patch.
+	 */
 	/* Wake every pending IOCTL caller with a transport error. */
 	pthread_mutex_lock(&iso->lock);
 	iso->alive = false;

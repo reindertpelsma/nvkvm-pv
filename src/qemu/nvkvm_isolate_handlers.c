@@ -515,6 +515,43 @@ static bool iso_mmap_translate(uint32_t isolate_id, uint64_t base, uint64_t len,
 	return ok;
 }
 
+/*
+ * Audit 2026-08-29 (serious), OPEN — needs a decision, not more code.
+ *
+ * The token this returns is a bare round-robin index into a VM-global 8192-slot
+ * array: no randomness, no generation.  So the cross-isolate munmap gap
+ * documented at nvkvm_req_munmap_on_isolate — whose wording leans on the token
+ * being hard to name — is enumerable in at most 8191 requests, and a token
+ * freed and reissued is indistinguishable from the one it replaced.
+ *
+ * Correcting the premise, because it decides how expensive the fix is: adding a
+ * generation does NOT change the wire.  The field is already __le32 in both
+ * struct nvkvm_req_mmap_on_isolate's reply and struct
+ * nvkvm_req_munmap_on_isolate, and the guest already treats it as opaque —
+ * src/guest/nvkvm.h declares it a plain __u32 and calls it "opaque token from
+ * host", stored and echoed back with no arithmetic on it anywhere in the guest
+ * module.  Only 13 of its 32 bits are
+ * used.  And QEMU consumes the token in exactly one place, iso_mmap_free()
+ * below.  So splitting it into (generation << 13 | index) is confined to these
+ * two static functions in this file, with no guest change and no flag day.
+ *
+ * The three options, then, are:
+ *   1. Generation in the high 19 bits, bumped per slot reuse.  Kills reuse
+ *      confusion outright; leaves the index guessable in 8191 tries.
+ *   2. A per-slot random nonce in the high bits (getrandom at alloc).  Makes
+ *      guessing infeasible rather than merely tedious, and has no counter to
+ *      wrap; costs a syscall per mapping on a path that already does an mmap.
+ *   3. Neither — put a caller session_id on the wire and check it, which is
+ *      what nvkvm_req_munmap_on_isolate says the real fix is.  That subsumes
+ *      the problem: with an ownership check, guessing a neighbour's token buys
+ *      nothing, and the token stops being a capability at all.
+ *
+ * 3 is the right answer and the only one that needs a protocol change; 1 and 2
+ * are cheap mitigations that make the gap harder to walk without closing it.
+ * Deliberately NOT chosen here — picking between "harden the capability" and
+ * "stop treating it as a capability" is a design call, and doing 1 or 2 would
+ * make the gap look closed while leaving 3 undone.
+ */
 static uint32_t iso_mmap_alloc(uint32_t isolate_id, uint64_t gva,
 				uint64_t stub_va, void *qva,
 				size_t len, int kvm_slot, uint64_t gpa,
