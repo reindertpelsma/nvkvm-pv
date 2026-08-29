@@ -1881,6 +1881,51 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 #define NB_RX_BUDGET 64
 
 /*
+ * AND HOW MUCH WORK, not just how many commands (audit 2026-08-29 S-1, S-2).
+ *
+ * NB_RX_BUDGET is a bound only if commands cost roughly the same.  On the X11
+ * shm tier one COMMIT copies the whole frame — `stride != width*4` adds a
+ * second full copy on top of the PutImage — so 64 of them at the 8192x8192
+ * maximum is gigabytes of memcpy between two dispatches of the display queue.
+ *
+ * 64 MB is a shade under two 4K frames, so no honest client ever meets it: a
+ * VMM sends one COMMIT per frame and waits for the pacing reply.  The charge is
+ * taken AFTER the copy, deliberately — the first command of a wakeup always
+ * runs however big it is, so a legitimate 8K frame still displays, and what is
+ * bounded is how many more follow it before the loop lets poll() run again.
+ *
+ * The round-trip allowance is separate because its cost is not bytes but
+ * LATENCY: an xcb_request_check() takes as long as the X server takes, and
+ * takes forever while any other client holds an XGrabServer.  Four per wakeup
+ * is far more than the three or four imports an honest VM performs in its whole
+ * life, and it is the ceiling on how many times one wakeup can be made to wait
+ * on the display server.  (It does not bound a SINGLE trip; nothing on this
+ * path can, short of the asynchronous import the Wayland backend uses.)
+ */
+#define NB_WORK_BUDGET_BYTES (64u * 1024u * 1024u)
+#define NB_WORK_ROUNDTRIPS   4u
+
+void nb_sink_charge_work(struct nb_sink *s, uint64_t bytes)
+{
+    s->work_bytes += bytes;
+}
+
+bool nb_sink_take_roundtrip(struct nb_sink *s)
+{
+    if (s->work_trips >= NB_WORK_ROUNDTRIPS) {
+        return false;
+    }
+    s->work_trips++;
+    return true;
+}
+
+/* True once this wakeup has done as much work as it is allowed to. */
+static bool nb_work_spent(const struct nb_sink *s)
+{
+    return s->work_bytes >= NB_WORK_BUDGET_BYTES;
+}
+
+/*
  * Sustained commands per second above which a client is hung up on (B-1b).
  *
  * A VMM sends an ATTACH, a COMMIT and occasionally a WINDOW per frame -- about
@@ -1932,6 +1977,10 @@ static bool nb_rate_exceeded(struct nb_sink *s)
 void nb_sink_readable(struct nb_sink *s)
 {
     unsigned budget = NB_RX_BUDGET;
+
+    /* A wakeup's allowances are its own; nothing carries over. */
+    s->work_bytes = 0;
+    s->work_trips = 0;
 
     for (;;) {
         union {
@@ -2033,7 +2082,7 @@ void nb_sink_readable(struct nb_sink *s)
             }
             nb_handle_cmd(s, &c, fd);
         }
-        if (--budget == 0) {
+        if (--budget == 0 || nb_work_spent(s)) {
             return;             /* let the display server have the loop */
         }
     }

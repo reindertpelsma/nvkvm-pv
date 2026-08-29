@@ -405,6 +405,30 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
     }
 
     /*
+     * A CACHE MISS COSTS A BLOCKING ROUND TRIP, AND THE CLIENT PICKS THE KEY.
+     *
+     * Ask before spending one.  Everything below this point talks to the X
+     * server and then waits for the answer (see the request_check comment), and
+     * the cache above does NOT make that rare: its key includes offset, stride,
+     * width, height and modifier, every one of them a wire value.  Re-ATTACHing
+     * one real dma-buf with a walking offset misses on every command, so the
+     * "three or four times per VM" this used to assume is three or four times
+     * per VM only for a client that is trying to display something.
+     *
+     * Refusing is the right failure: a rejected ATTACH drops one frame, is
+     * counted, and leaves the connection up — while a round trip we cannot
+     * afford stalls the loop that has to deliver focus-loss and CTRL+ALT+G
+     * while the broker holds the user's keyboard.  The dropped frame does not
+     * cost the VMM its pacing token either: the COMMIT that follows returns
+     * -ENOENT with no FRAME, and x11_tick()'s 100 ms watchdog re-primes it.
+     * An honest client never sees this at all — it imports a handful of buffers
+     * for the life of the VM, not four per wakeup.
+     */
+    if (s->sink && !nb_sink_take_roundtrip(s->sink)) {
+        return -EAGAIN;
+    }
+
+    /*
      * xcb takes ownership of every fd handed to it and closes it once sent
      * (xcbext.h: "the file descriptor given is owned by xcb").  Our caller
      * owns desc->fd, so we must hand over a duplicate.
@@ -456,9 +480,21 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
      * _checked + request_check is a round trip, but it is the only way to hear
      * "the server refused this buffer" at all: an unchecked DRI3 error arrives
      * later as an event with nothing to attribute it to, and the pixmap id
-     * silently refers to nothing.  It happens once per NEW buffer — three or
-     * four times for the whole life of a VM, not once per frame — because the
-     * cache above catches every repeat.
+     * silently refers to nothing.
+     *
+     * IT IS NOT RARE BECAUSE THE CACHE SAYS SO.  This comment used to claim
+     * "once per NEW buffer — three or four times for the whole life of a VM,
+     * because the cache above catches every repeat", and that reasoning is
+     * wrong: the cache key is built from wire values, so how often it hits is
+     * the client's decision, not the buffer's.  What actually bounds this is
+     * the round-trip allowance taken above.
+     *
+     * And the wait itself is unbounded: xcb_request_check() returns when the X
+     * server answers, and the X server does not answer at all while another
+     * client holds an XGrabServer.  Nothing here can shorten that — only an
+     * asynchronous import could, which is what the Wayland backend does
+     * (create_immed; "input must never block on rendering").  The allowance
+     * bounds how many times per wakeup we agree to find out.
      */
     err = xcb_request_check(x->c, ck);
     if (err) {
@@ -633,6 +669,22 @@ static int x11_commit(struct nb_session *s, struct nb_sink *sink)
         x11_blit(x, x->content, x->idle_gc, (const uint32_t *)src,
                  (int)sl->w, (int)sl->h);
         xcb_flush(x->c);
+        /*
+         * SAY WHAT THAT COST (audit 2026-08-29 S-2).  This rung is the one that
+         * cannot be refused, so it is also the one a hostile client will pick:
+         * every COMMIT here is a full frame pushed through the X connection —
+         * up to 8192*8192*4 = 256 MB — and a client that always declares
+         * `stride != width*4` gets a wire-sized malloc and a row-by-row memcpy
+         * of the same size on top, both on the thread that dispatches input.
+         *
+         * The command budget alone let 32 ATTACH+COMMIT pairs through per
+         * wakeup, which is gigabytes; charging the bytes is what makes the
+         * drain loop stop and give the display server the thread back.  The
+         * frame we just drew is not refused — the charge lands after the work,
+         * so what it bounds is the NEXT one.
+         */
+        nb_sink_charge_work(sink,
+                            (uint64_t)packed * sl->h * (tmp ? 2u : 1u));
         free(tmp);
         x->current = x->pending;
         x->pending = -1;
