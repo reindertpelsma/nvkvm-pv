@@ -2642,6 +2642,7 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			 * handle_id on response so libcuda sees what it sent. */
 			uint32_t saved_val[2];
 			int      saved_off[2];
+			int      emb_fd[2];
 			int      nsaved = 0;
 			for (int k = 0; k < 2 && d->fd_off[k] != 0xffff; k++) {
 				uint32_t off = d->fd_off[k];
@@ -2651,14 +2652,26 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				memcpy(&hid, (char *)param_buf + off, 4);
 				if (hid == 0 || hid == (uint32_t)-1)
 					continue;
-				struct nvkvm_handle *hh =
-					nvkvm_handle_get(&nv->handles, hid);
-				if (!hh || hh->fd < 0)
+				/* C-2, same reason as the target fd below: this
+				 * runs on a pool worker and writes a raw fd
+				 * NUMBER into a blob the host UVM driver then
+				 * resolves.  nvkvm_handle_get() drops the table
+				 * lock before returning, so reading hh->fd here
+				 * raced a CLOSE_HANDLE on the TX thread and
+				 * could hand the driver a number QEMU had since
+				 * recycled onto an unrelated file.  Dup under
+				 * the lock and give the driver the dup, which
+				 * we own for the whole call. */
+				int efd = nvkvm_handle_acquire_fd(&nv->handles,
+								  hid, NULL,
+								  NULL);
+				if (efd < 0)
 					continue;
 				saved_val[nsaved] = hid;
 				saved_off[nsaved] = (int)off;
+				emb_fd[nsaved]    = efd;
 				nsaved++;
-				uint32_t fd32 = (uint32_t)hh->fd;
+				uint32_t fd32 = (uint32_t)efd;
 				memcpy((char *)param_buf + off, &fd32, 4);
 			}
 			/* C-2: dup the target fd under the table lock so a
@@ -2670,6 +2683,8 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 							  req->handle_id, NULL,
 							  NULL);
 			if (tfd < 0) {
+				for (int k = 0; k < nsaved; k++)
+					close(emb_fd[k]);
 				resp->retval     = (uint64_t)(int64_t)(-EBADF);
 				resp->status     = 0;
 				resp->nvstatus   = 0x1f; /* NV_ERR_INVALID_ARGUMENT */
@@ -2719,6 +2734,11 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			int r = ioctl(tfd, (unsigned long)req->cmd, bounce);
 			int saved_errno = errno;
 			close(tfd);
+			/* The embedded dups outlived the ioctl, which is the
+			 * whole point of taking them; the driver is done with
+			 * the numbers now. */
+			for (int k = 0; k < nsaved; k++)
+				close(emb_fd[k]);
 			/*
 			 * U-6 — the driver's real verdict for the ownership
 			 * table.  The `st` computed further down is read from

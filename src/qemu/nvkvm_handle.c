@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <linux/memfd.h>
 #include <sys/syscall.h>
 #include <sys/eventfd.h>
@@ -33,7 +34,28 @@ static inline int memfd_create_compat(const char *name, unsigned int flags)
 #define memfd_create memfd_create_compat
 
 #include "nvkvm_handle.h"
+#include "nvkvm_drm_node.h"
 #include "../../src/common/nvkvm_proto.h"
+
+/*
+ * R2-M2: the largest object NVKVM_REQ_OPEN_MEMORY_HANDLE may mint.
+ *
+ * The guest picks this size and QEMU ftruncate()s to it, so it is both the
+ * amount of host page commit one request can drive through MMAP_ON_ISOLATE's
+ * prefault AND — because every later bound on the object is written against
+ * the recorded h->size (mmap_on_isolate, read/write_memory_handle) — the value
+ * that decides whether those checks mean anything.  A size of 2^62 does not
+ * fail anywhere; it simply makes "offset > h->size" unsatisfiable and every
+ * downstream extent check vacuous.  So the cap is not a resource knob, it is
+ * what keeps h->size a bound at all.
+ *
+ * 1 GiB against what the path actually asks for: the two live callers are the
+ * guest's CPU-page migration (PAGE_SIZE) and its range migration
+ * (NVKVM_MIG_CHUNK, 2 MiB, src/guest/nvkvm_mmap.c) — 512x the largest real
+ * request, and still small enough that the ftruncate is a real statement about
+ * the object rather than a number no allocation will ever reach.
+ */
+#define NVKVM_HANDLE_MEM_MAX  (1ULL << 30)
 
 /* Device path table indexed by NVKVM_DEV_* */
 static const char *nvidia_dev_path(int dev_id)
@@ -170,11 +192,74 @@ int nvkvm_handle_alloc_pending(struct nvkvm_handle_table *t,
 	return 0;
 }
 
+/*
+ * The HOST path a dev_id names, for checking an fd an isolate handed back.
+ *
+ * Deliberately not nvidia_dev_path(): that one is the list QEMU is willing to
+ * open ITSELF, which is narrower on purpose (no DRM render node, no NVKMS) and
+ * must stay that way.  This one has to cover every device the stub may open,
+ * because those are exactly the ones whose fd arrives over SCM_RIGHTS.
+ *
+ * DRM render nodes resolve through nvkvm_nvidia_render_minor(): the sandbox
+ * renumbers the k-th NVIDIA node to renderD(128+k) for the stub, so 128+k is
+ * the isolate's name for it and not necessarily the host's minor.  Comparing
+ * st_rdev sidesteps the naming entirely — it is the same device node either
+ * way.
+ */
+static const char *attach_expect_path(int dev_id, char *buf, size_t buflen)
+{
+	if (dev_id == NVKVM_DEV_CTL)
+		return "/dev/nvidiactl";
+	if (dev_id == NVKVM_DEV_UVM)
+		return "/dev/nvidia-uvm";
+	if (dev_id == NVKVM_DEV_MODESET)
+		return "/dev/nvidia-modeset";
+	if (dev_id >= NVKVM_DEV_GPU(0) && dev_id < NVKVM_DEV_GPU(16)) {
+		snprintf(buf, buflen, "/dev/nvidia%d", dev_id - NVKVM_DEV_GPU(0));
+		return buf;
+	}
+	if (dev_id >= NVKVM_DEV_DRM_RD(0) && dev_id < NVKVM_DEV_DRM_RD(16))
+		return nvkvm_nvidia_render_path(
+			(unsigned)(dev_id - NVKVM_DEV_DRM_RD(0)), buf, buflen);
+	return NULL;
+}
+
+/* Is `fd` really the device `dev_id` names?  Fails closed on anything it
+ * cannot establish, including a dev_id it does not recognise. */
+static bool attach_fd_matches_dev(int fd, int dev_id)
+{
+	struct stat st, dev;
+	char buf[64];
+	const char *path;
+
+	if (fstat(fd, &st) < 0)
+		return false;
+
+	if (dev_id == NVKVM_DEV_EVENTFD) {
+		/* eventfd2() lives on anon_inodefs, whose inodes carry no
+		 * file-type bits at all, so there is no st_rdev to match.  What
+		 * can still be asserted is the thing this gate exists to catch:
+		 * a substituted /dev/nvidia* fd is a character device, and an
+		 * eventfd is not. */
+		return !S_ISCHR(st.st_mode) && !S_ISBLK(st.st_mode);
+	}
+
+	path = attach_expect_path(dev_id, buf, sizeof(buf));
+	if (!path || stat(path, &dev) < 0 || !S_ISCHR(dev.st_mode))
+		return false;
+	return S_ISCHR(st.st_mode) && st.st_rdev == dev.st_rdev;
+}
+
 int nvkvm_handle_attach_fd(struct nvkvm_handle_table *t,
 			   uint32_t handle_id, int fd)
 {
+	int dev_id;
+
 	if (handle_id == 0 || handle_id >= NVKVM_HANDLE_MAX || fd < 0)
 		return -EINVAL;
+
+	/* Read the claim first so the identity check below runs without the
+	 * table lock held — resolving a DRM render node walks sysfs. */
 	pthread_mutex_lock(&t->lock);
 	struct nvkvm_handle *h = &t->handles[handle_id % NVKVM_HANDLE_MAX];
 	if (!h->in_use || h->id != handle_id) {
@@ -184,6 +269,41 @@ int nvkvm_handle_attach_fd(struct nvkvm_handle_table *t,
 	if (h->fd >= 0) {
 		pthread_mutex_unlock(&t->lock);
 		return -EEXIST;   /* attach is one-shot */
+	}
+	dev_id = h->dev_id;
+	pthread_mutex_unlock(&t->lock);
+
+	/*
+	 * R2-M2: bind the fd to the claim.  The slot was allocated with the
+	 * GUEST's dev_id and the stub was merely asked to open it; until now
+	 * nothing checked that what came back over SCM_RIGHTS was that device —
+	 * only (R2-M1) that it arrived on the right response type.  A stub that
+	 * substitutes any other fd it holds keeps the whole labelling intact:
+	 * QEMU goes on calling the slot NVKVM_DEV_CTL/_GPU(n)/_DRM_RD(n), dup's
+	 * it into other isolates on COPY_HANDLE_TO_ISOLATE, and writes it as an
+	 * embedded fd into UVM ioctls QEMU issues in its OWN privileged process.
+	 * Every later gate that reasons about h->dev_id — R-1's _IOC_TYPE bind
+	 * included — would then be reasoning about a different object.  This is
+	 * the one place the fd and the claim meet, so check here and fail closed;
+	 * the caller closes the fd and aborts the open.
+	 */
+	if (!attach_fd_matches_dev(fd, dev_id)) {
+		fprintf(stderr,
+			"nvkvm: DENY attach of isolate-supplied fd %d to handle "
+			"%u — it is not the device the handle claims (dev_id=%d) "
+			"(R2-M2)\n", fd, handle_id, dev_id);
+		return -EBADF;
+	}
+
+	pthread_mutex_lock(&t->lock);
+	/* Re-validate: the lock was dropped for the check above. */
+	if (!h->in_use || h->id != handle_id) {
+		pthread_mutex_unlock(&t->lock);
+		return -EBADF;
+	}
+	if (h->fd >= 0) {
+		pthread_mutex_unlock(&t->lock);
+		return -EEXIST;
 	}
 	h->fd = fd;
 	pthread_mutex_unlock(&t->lock);
@@ -207,6 +327,12 @@ int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 			     uint32_t session_id, uint64_t size,
 			     uint32_t *handle_id_out)
 {
+	/* R2-M2: cap the guest's size BEFORE the ftruncate — see
+	 * NVKVM_HANDLE_MEM_MAX for why an uncapped h->size disarms every
+	 * downstream bound rather than merely costing memory. */
+	if (size > NVKVM_HANDLE_MEM_MAX)
+		return -EFBIG;
+
 	int fd = memfd_create("nvkvm_mem", MFD_CLOEXEC);
 	if (fd < 0)
 		return -errno;

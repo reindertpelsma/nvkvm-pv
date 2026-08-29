@@ -33,7 +33,10 @@ struct nvkvm_handle {
 	 * record of how big the object is, without which no (offset, length)
 	 * a guest names can ever be bounds-checked against the thing it names
 	 * (an out-of-range mmap of a memfd faults SIGBUS on first touch, and
-	 * MMAP_ON_ISOLATE prefaults every page inside the VMM).
+	 * MMAP_ON_ISOLATE prefaults every page inside the VMM).  The guest
+	 * chooses it, so it is only a bound because nvkvm_handle_open_memory()
+	 * caps it (NVKVM_HANDLE_MEM_MAX); uncapped, "offset > h->size" is
+	 * unsatisfiable and every check written against it says nothing.
 	 * TYPE_NVIDIA: 0 — a device fd has no meaningful length and `offset`
 	 * there is an RM mapping token, not a byte offset, so callers must
 	 * skip the check for those rather than treat 0 as "empty".
@@ -79,7 +82,20 @@ int nvkvm_handle_open_memory(struct nvkvm_handle_table *t,
 			     uint32_t session_id, uint64_t size,
 			     uint32_t *handle_id_out);
 
-/* Look up a handle (caller must hold no lock; returns pointer under table lock). */
+/*
+ * Look up a handle.  The returned pointer is NOT protected: the table lock is
+ * taken only to validate the slot and is DROPPED before returning, so every
+ * field read through it — h->fd above all — is a plain unsynchronised read of
+ * an array a concurrent CLOSE_HANDLE may already have reused.  The pointer
+ * itself stays valid (the table is a fixed array, never freed) which is why
+ * this looks safe and is not.
+ *
+ * Use it only for advisory reads made on the same thread that owns the
+ * request, and NEVER to obtain an fd to operate on — take
+ * nvkvm_handle_acquire_fd() for that, which dups under the lock.  The comment
+ * this replaces claimed the pointer was returned "under table lock", which is
+ * what made the remaining call sites look correct.
+ */
 struct nvkvm_handle *nvkvm_handle_get(struct nvkvm_handle_table *t,
 				      uint32_t handle_id);
 

@@ -898,7 +898,29 @@ static bool nvkvm_fb_drain_async(NvkvmPresent *p, uint8_t *dst,
     return ok;
 }
 
-/* Size the staging pair for this geometry.  Returns false on OOM. */
+/*
+ * Size the staging pair for this geometry.  Returns false on OOM.
+ *
+ * THE STAGING SET IS SHARED, AND THE GUEST DECIDES WHEN IT IS REBUILT.
+ *
+ * These buffers are written by the present thread and read by the main loop
+ * (nvkvm_present_publish, and the relay branch of nvkvm_present_bh), and a
+ * PRESENT with new geometry frees and reallocates every one of them.  The
+ * readers used to snapshot (have, idx, w, h) under p->lock and then touch
+ * p->stage[idx] with the lock dropped, which is a use-after-free the guest
+ * triggers by resizing: a stale (w,h) against a smaller new buffer memcpy's up
+ * to ~268 MB of QEMU heap into a surface the host DISPLAYS and screendump can
+ * capture, and the relay branch dup()s a stage_buf fd that may already have
+ * been closed and its number recycled onto an unrelated QEMU descriptor —
+ * which it then hands to the broker.
+ *
+ * So p->lock now covers the buffers themselves and not just the indices: the
+ * allocation happens under it here, and both readers hold it across their USE.
+ * The allocation is per mode change, not per frame, so the main loop blocks on
+ * it only when the guest re-modes.
+ *
+ * nvkvm_stage_release(): CALLER MUST HOLD p->lock.
+ */
 static void nvkvm_stage_release(NvkvmPresent *p)
 {
     for (unsigned i = 0; i < NVKVM_STAGE_MAX; i++) {
@@ -910,13 +932,20 @@ static void nvkvm_stage_release(NvkvmPresent *p)
             p->stage[i] = NULL;
         }
     }
+    /* No buffers, so no geometry: a reader that still holds the old (w,h)
+     * must not be able to match it against the set that is gone. */
+    p->stage_w = 0;
+    p->stage_h = 0;
+    p->stage_has_frame = false;
 }
 
 static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
 {
     const size_t sz = (size_t)w * h * 4;
 
+    pthread_mutex_lock(&p->lock);
     if (p->stage[0] && p->stage_w == w && p->stage_h == h) {
+        pthread_mutex_unlock(&p->lock);
         return true;
     }
     nvkvm_stage_release(p);
@@ -930,6 +959,7 @@ static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
         for (unsigned i = 0; i < p->stage_n; i++) {
             if (!nvkvm_udmabuf_alloc(&p->stage_buf[i], sz)) {
                 nvkvm_stage_release(p);
+                pthread_mutex_unlock(&p->lock);
                 fprintf(stderr, "nvkvm present: could not allocate udmabuf "
                                 "staging for %ux%u; the cross-vendor path is "
                                 "unavailable\n", w, h);
@@ -941,6 +971,7 @@ static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
         p->stage_h = h;
         p->stage_write = 0;
         p->stage_has_frame = false;
+        pthread_mutex_unlock(&p->lock);
         return true;
     }
 
@@ -951,7 +982,9 @@ static bool nvkvm_stage_ensure(NvkvmPresent *p, uint32_t w, uint32_t h)
     p->stage_h = h;
     p->stage_write = 0;
     p->stage_has_frame = false;
-    return p->stage[0] && p->stage[1];
+    bool ok = p->stage[0] && p->stage[1];
+    pthread_mutex_unlock(&p->lock);
+    return ok;
 }
 
 /*
@@ -1381,7 +1414,7 @@ static void nvkvm_present_publish(NvkvmPresent *p)
     p->stage_has_frame = false;
     pthread_mutex_unlock(&p->lock);
 
-    if (!have || !p->stage[idx]) {
+    if (!have) {
         return;
     }
 
@@ -1393,6 +1426,23 @@ static void nvkvm_present_publish(NvkvmPresent *p)
         return;
     }
 
+    /*
+     * Take the lock for the COPY, not just for the indices, and re-check the
+     * geometry it was snapshotted against -- see nvkvm_stage_ensure().  The
+     * present thread may have freed and resized the whole staging set while we
+     * were resizing the console; if it did, (w,h) no longer describes
+     * p->stage[idx] and this frame is void.  Dropping it costs one frame and
+     * the next PRESENT is already on its way; copying it reads past the new,
+     * smaller allocation into QEMU's heap and puts the result on the screen.
+     *
+     * The console ops above stay OUTSIDE the lock: they re-enter the UI
+     * backend, which reaches back into GraphicHwOps, and those take p->lock.
+     */
+    pthread_mutex_lock(&p->lock);
+    if (p->stage_w != w || p->stage_h != h || !p->stage[idx]) {
+        pthread_mutex_unlock(&p->lock);
+        return;
+    }
     const uint8_t *src        = p->stage[idx];
     const size_t   dst_stride = surface_stride(ds);
     if (dst_stride == (size_t)w * 4) {
@@ -1403,6 +1453,7 @@ static void nvkvm_present_publish(NvkvmPresent *p)
                    src + (size_t)y * w * 4, (size_t)w * 4);
         }
     }
+    pthread_mutex_unlock(&p->lock);
 
     /*
      * NVKVM_PRESENT_DUMP=<path>: write what the window is about to show, as a
@@ -1539,38 +1590,51 @@ static void nvkvm_present_bh(void *opaque)
      */
     if (p->relay_readback) {
         unsigned idx;
-        bool have;
+        bool have, staged;
         uint32_t w, h;
+        int fd = -1;
 
+        /*
+         * TIER 3.  If the display has told us it cannot take even
+         * XR24 + LINEAR as a dma-buf -- which happens when it advertised
+         * the modifier and then refused the import -- fall to the SAME
+         * pages as a plain memfd.  wl_shm is a core Wayland global, so a
+         * compositor cannot refuse it for want of import support; it just
+         * pays an upload per frame.
+         *
+         * udmabuf gives us both handles to one allocation, so this costs
+         * nothing but choosing a different fd.
+         *
+         * Asked before the lock is taken: it is a property of the display, not
+         * of the staging set, and the relay is BQL-owned like this callback.
+         */
+        bool shm = nvkvm_display_relay_format_verdict(DRM_FORMAT_XR24_LOCAL,
+                                                      0) == 0;
+
+        /*
+         * dup(): relay_submit takes ownership of the fd it is given and
+         * retains it as the last frame, but ours belongs to the staging
+         * set and is reused every frame.
+         *
+         * UNDER p->lock, because the fd is only ours while the buffer is --
+         * see nvkvm_stage_ensure().  Read outside it, a geometry change that
+         * already ran nvkvm_udmabuf_free() leaves a closed number here, and
+         * dup() would resolve it to whatever QEMU opened next and send THAT to
+         * the broker over SCM_RIGHTS.
+         */
         pthread_mutex_lock(&p->lock);
         have = p->stage_has_frame;
         idx  = p->stage_ready;
         w    = p->stage_w;
         h    = p->stage_h;
+        staged = have && p->stage_buf[idx].size;
+        if (staged) {
+            fd = dup(shm ? p->stage_buf[idx].memfd
+                         : p->stage_buf[idx].dmabuf);
+        }
         pthread_mutex_unlock(&p->lock);
 
-        if (have && p->stage_buf[idx].size) {
-            /*
-             * TIER 3.  If the display has told us it cannot take even
-             * XR24 + LINEAR as a dma-buf -- which happens when it advertised
-             * the modifier and then refused the import -- fall to the SAME
-             * pages as a plain memfd.  wl_shm is a core Wayland global, so a
-             * compositor cannot refuse it for want of import support; it just
-             * pays an upload per frame.
-             *
-             * udmabuf gives us both handles to one allocation, so this costs
-             * nothing but choosing a different fd.
-             */
-            bool shm = nvkvm_display_relay_format_verdict(DRM_FORMAT_XR24_LOCAL,
-                                                          0) == 0;
-            /*
-             * dup(): relay_submit takes ownership of the fd it is given and
-             * retains it as the last frame, but ours belongs to the staging
-             * set and is reused every frame.
-             */
-            int fd = dup(shm ? p->stage_buf[idx].memfd
-                             : p->stage_buf[idx].dmabuf);
-
+        if (staged) {
             if (shm) {
                 static bool told;
 
@@ -1650,7 +1714,12 @@ void nvkvm_present_console_fini(struct VirtIONvgpu *nv)
         qemu_thread_join(&p->thread);
     }
     qemu_sem_destroy(&p->wake);
-    nvkvm_stage_release(p);   /* g_free or munmap+close, per how it was made */
+    /* g_free or munmap+close, per how it was made.  Under the lock like every
+     * other release: the present thread is joined by now, but the contract is
+     * what the next reader of this code will trust. */
+    pthread_mutex_lock(&p->lock);
+    nvkvm_stage_release(p);
+    pthread_mutex_unlock(&p->lock);
     if (p->bh) {
         qemu_bh_delete(p->bh);
     }

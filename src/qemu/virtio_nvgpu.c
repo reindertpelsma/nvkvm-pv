@@ -1505,6 +1505,19 @@ static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 	nvkvm_isolate_table_fini(&nv->isolates);
 	nvkvm_handle_table_fini(&nv->handles);
 
+	/*
+	 * H-9: tear the sparse window down, which is also the ONLY thing that
+	 * purges this device's entries from the process-wide GPA quarantine.
+	 * Unrealize used to skip it entirely, so freed extents stayed queued
+	 * holding a VirtIONvgpu * that is about to be freed — and the queue
+	 * drains lazily, from whichever device frees next, straight into
+	 * nvkvm_sparse_gpa_release() dereferencing nv->sparse_vmm_va.  The
+	 * quarantine's contract is that the device outlives its entries; this
+	 * is the call that makes that true.  Ordered after the isolate and
+	 * handle teardown, since those are what can still be freeing extents.
+	 */
+	nvkvm_sparse_fini(nv);
+
 	g_free(nv->isolate_mode_active);
 	nv->isolate_mode_active = NULL;
 
