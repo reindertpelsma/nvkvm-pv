@@ -40,6 +40,19 @@
 #     creating the GitHub Release, so the pipeline can be exercised end to end
 #     -- artifact built, image pushed, attestations created and verifiable --
 #     without an announcement attached to it.
+#
+# EVERY ACTION IS PINNED BY COMMIT SHA, with the version in a trailing comment.
+#     A tag like `@v4` is a MUTABLE pointer owned by someone else: whoever can
+#     move it substitutes their code into this workflow on the next run, and
+#     the jobs below hold `packages: write` and `id-token: write` -- so that
+#     substituted code can push to ghcr and mint the OIDC token the provenance
+#     attestation is signed with.  The attestation would then be a true
+#     statement about a build nobody here wrote.  This is exactly how
+#     tj-actions/changed-files was used in March 2025.
+#     nvkvm-steamos already pins every action this way; nvkvm-pv did not.
+#     To bump one: read the release notes, resolve the new tag to its commit
+#     with `gh api repos/<owner>/<action>/git/ref/tags/<tag>`, and update both
+#     the SHA and the comment.
 name: release
 
 on:
@@ -155,7 +168,7 @@ jobs:
     outputs:
       digest: ${{ steps.sum.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The same list qemu-build.yml installs, for the same reason: a
       # dependency problem should fail in an obviously-labelled step rather
@@ -318,14 +331,14 @@ jobs:
       # well would add nothing: the attestation already binds the tarball's
       # digest, which is strictly more than the checksum file says.
       - name: attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ needs.meta.outputs.tarball }}
 
       # Uploaded as a workflow artifact rather than straight to a release, so
       # that a workflow_dispatch run produces something downloadable and
       # verifiable too.  Proving the pipeline should not require cutting a tag.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ${{ needs.meta.outputs.tarball }}
           path: |
@@ -346,11 +359,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -392,7 +405,7 @@ jobs:
       # pull` gets. The attestation this project promises is the GitHub one.
       - name: build and push
         id: push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           push: true
@@ -437,7 +450,7 @@ jobs:
       # push-to-registry puts the attestation in ghcr next to the image, so
       # `gh attestation verify oci://...` resolves it from the registry.
       - name: attest build provenance
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ needs.meta.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
@@ -457,9 +470,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: ${{ needs.meta.outputs.tarball }}
 
