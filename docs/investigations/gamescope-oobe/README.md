@@ -25,6 +25,46 @@ the physical PC (RTX 4070, driver 595.84) 2026-08-29 against nvkvm-pv d135fe9.
   XB48, the 16-bit-float HDR formats, not the 8-bit ones. We advertise XR24/AR24
   only, so this is expected and appears benign. (Misread as AR24/XR24 earlier.)
 
+## ELIMINATION, completed 2026-08-29/30 with a two-machine crossover
+
+A second machine settled this. A laptop (RTX 3050 Laptop, Ampere) runs the
+gamescope session successfully; the PC (RTX 4070, Ada) does not. Both machines
+were then driven to identical software, one variable at a time.
+
+| variable | how it was excluded |
+|---|---|
+| our 89 nvkvm-pv commits since `d28d603` | the laptop was upgraded to `1dc47d4` and still works. The new module was verified LIVE (`kms_present_wait` present) and backpressure ACTIVE (=2), not merely absent |
+| nvkvm-steamos | the `dbd1d26` + `d28d603` pair also fails on the PC |
+| the disk image | **crossover**: the PC's qcow2 boots the OOBE wizard fine on the laptop; the laptop's qcow2 fails on the PC |
+| SteamOS build / variant / gamescope version | both images fail on the PC and work on the laptop (3.8.14/`oobe`/gamescope .2 and 3.8.16/`steamdeck`/.4) |
+| NVIDIA driver version | PC swapped 595.84 -> 580.173.02, byte-identical build string to the laptop. Still fails |
+| kernel module flavour | open kernel module -> proprietary. Still fails |
+| BAR1 aperture size | fails at both 256 MiB and 8 GiB |
+| host compositor | both hosts run Wayland |
+| session entry method | an sddm autologin override AND the official `steamosctl switch-to-game-mode` fail identically |
+| **present tier** | `auto`, `NVKVM_BROKER_LINEAR_ONLY=1` and `NVKVM_BROKER_PRESENT_MODE=shm` all fail |
+
+**Control, in every one of those configurations: Plasma/KWin renders on the PC**
+(connector `enabled`, kwin_wayland + plasmashell, nvkvm refs ~1500). The GPU path
+works; this is specific to gamescope.
+
+### The present-tier test deserves its own note
+
+The laptop's NVIDIA card has **no display output at all** (no MUX; GNOME runs on
+the Intel iGPU), so its guest frames MUST cross GPUs and it can never take the
+top rung of the present ladder. Forcing the PC onto the bottom rung (`shm`) --
+the tier the laptop is structurally confined to -- does NOT reproduce the
+laptop's success. So the cross-GPU present path is not what makes it work there.
+
+### What is left
+
+**GPU architecture (Ada AD104 vs Ampere GA107), and the host kernel.** With
+everything else pinned, an architecture-dependent difference in what we forward
+is the leading explanation. NEXT TEST: rent an Ampere box and run this stage on
+it. Ampere working against Ada failing would confirm it and give a reproducible
+target; both failing would point at the host kernel or the desktop-vs-laptop
+platform.
+
 ## The two real findings
 
 ### 1. `TimeoutStartSec=5` is too short — confirmed, and a fix exists
