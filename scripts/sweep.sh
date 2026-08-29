@@ -133,6 +133,23 @@ GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/$GUEST_IMAGE_NAME
 PRESET="boundary"
 MIN_DRIVERS=5
 MAX_DPH=0.50
+# COST HAS THREE COMPONENTS AND dph_total ONLY CARRIES TWO.
+#
+# MEASURED against the offer API: dph_total == dph_base + storage_total_cost
+# (0.4267 + 0.0037 = 0.4304 on a sampled offer).  NETWORK IS NOT IN IT.  That
+# matters here specifically, because a sweep is network-heavy by construction:
+# every box downloads one NVIDIA .run per driver (300-450 MB each, so ~5 GB for
+# the 13-driver boundary set) plus a guest image and apt.  At the ~$27/TB a
+# typical host charges that is pennies; a host charging ten times that turns an
+# $0.07/hr box into the most expensive thing in the run, and dph_total would
+# never show it.
+#
+# So cap the three separately, and default to "generous but not unbounded":
+# these are not tuned prices, they are outlier filters.
+MAX_STORAGE_DPH=0.05        # $/hr for the allocated disk
+MAX_INET_DOWN_PER_TB=60     # $/TB in  -- we pull GBs per box
+MAX_INET_UP_PER_TB=100      # $/TB out -- we only ship logs, so this is loose
+EST_DOWN_GB_PER_BOX=8       # repo + guest image + one .run per driver + apt
 MAX_SPEND=10.00
 BUDGET_HOURS=8
 DISK=64
@@ -222,6 +239,9 @@ while [ $# -gt 0 ]; do
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
         --max-dph)      MAX_DPH="$2"; shift 2 ;;
+        --max-storage-dph)    MAX_STORAGE_DPH="$2"; shift 2 ;;
+        --max-inet-down-tb)   MAX_INET_DOWN_PER_TB="$2"; shift 2 ;;
+        --max-inet-up-tb)     MAX_INET_UP_PER_TB="$2"; shift 2 ;;
         --max-spend)    MAX_SPEND="$2"; shift 2 ;;
         --budget-hours) BUDGET_HOURS="$2"; shift 2 ;;
         --disk)         DISK="$2"; shift 2 ;;
@@ -754,9 +774,11 @@ pick_offer() {
     # "no rentable offer" for every architecture on a market full of them.
     offers_json="$(mktemp)"
     vj search offers 'vms_enabled=true num_gpus=1 rentable=true' -o dph >"$offers_json"
-    python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" <<'PY'
+    python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" \
+             "$MAX_STORAGE_DPH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" "$EST_DOWN_GB_PER_BOX" <<'PY'
 import json, sys, os, importlib.util
 repo, want_arch, max_dph, gpu_filter, tried, kbfile, offers_path = sys.argv[1:8]
+max_stor, max_down_tb, max_up_tb, est_down_gb = (float(x) for x in sys.argv[8:12])
 spec = importlib.util.spec_from_file_location(
     "sweep_matrix", os.path.join(repo, "scripts", "sweep_matrix.py"))
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -788,15 +810,41 @@ for o in offers:
         continue
     if (o.get("dph_total") or 99) > float(max_dph):
         continue
+    # Storage is inside dph_total but is worth its own ceiling: a host with a
+    # cheap GPU and absurd disk pricing passes the dph gate on a small --disk
+    # and then bites when the sweep asks for the space a guest image needs.
+    if (o.get("storage_total_cost") or 0) > max_stor:
+        continue
+    # Network is NOT in dph_total. An unpriced field means unknown, and unknown
+    # on a spend-capped unattended run is treated as too expensive.
+    down_tb = o.get("internet_down_cost_per_tb")
+    up_tb   = o.get("internet_up_cost_per_tb")
+    if down_tb is None or up_tb is None:
+        continue
+    if down_tb > max_down_tb or up_tb > max_up_tb:
+        continue
     cands.append(o)
 
 if not cands:
     sys.exit(1)
-o = min(cands, key=lambda x: x.get("dph_total", 99))
+
+# Rank on what the box will ACTUALLY cost for this job, not on the sticker
+# price: an hour of compute plus the transfer the sweep is about to do. Two
+# offers an hour apart in dph can invert once ~8 GB of driver downloads is
+# priced in.
+def expected(o):
+    dph  = o.get("dph_total") or 99
+    down = (o.get("internet_down_cost_per_tb") or 0) * (est_down_gb / 1024.0)
+    return dph + down
+
+o = min(cands, key=expected)
 print("\t".join(str(x) for x in [
     o.get("id"), o.get("machine_id"), o.get("gpu_name"),
     o.get("dph_total"), o.get("geolocation") or "?", o.get("inet_down") or "?",
-    o.get("driver_version") or "?"]))
+    o.get("driver_version") or "?",
+    round(o.get("storage_total_cost") or 0, 4),
+    round(o.get("internet_down_cost_per_tb") or 0, 2),
+    round(expected(o) - (o.get("dph_total") or 0), 4)]))
 PY
     rc=$?
     rm -f "$offers_json"
@@ -1555,7 +1603,7 @@ sweep_one_box() {
                 ts "$(date -u +%FT%TZ)")"
         return 2
     }
-    IFS=$'\t' read -r offer_id machine gpu dph geo inet advdrv <<<"$offer_line"
+    IFS=$'\t' read -r offer_id machine gpu dph geo inet advdrv stor down_tb net_est <<<"$offer_line"
     TRIED_MACHINES="$TRIED_MACHINES $machine"
 
     # Cost gate BEFORE the create.  Project the worst case for this box: one
@@ -1571,6 +1619,8 @@ sweep_one_box() {
     fi
 
     info "renting $gpu (arch=$arch) offer=$offer_id machine=$machine \$$dph/hr $geo"
+    info "  cost: \$$dph/hr (storage \$$stor of it) + network at \$$down_tb/TB in"
+    info "        -> ~\$$net_est of transfer for this box's driver set, on top of the hourly"
     info "  vast advertises driver=$advdrv, inet_down=$inet -- BOTH IGNORED"
     info "  (the advertised driver describes the physical host, not a KVM rental;"
     info "   advertised bandwidth has been wrong by five orders of magnitude)"
@@ -2074,6 +2124,8 @@ say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from 
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
 say "  caps          : \$$MAX_DPH/hr per box, \$$MAX_SPEND total, ${BUDGET_HOURS}h auto-destroy"
+say "                  storage <= \$$MAX_STORAGE_DPH/hr, network <= \$$MAX_INET_DOWN_PER_TB/TB in"
+say "                  (network is NOT part of vast's dph_total -- it is capped separately)"
 say ""
 total_units=0
 nboxes=0
@@ -2098,13 +2150,16 @@ if [ "$GO" != 1 ]; then
     est=0
     for a in ${ARCHES//,/ }; do
         line="$(pick_offer "$a")" || { printf '    %-10s NO RENTABLE KVM OFFER under $%s/hr\n' "$a" "$MAX_DPH"; continue; }
-        IFS=$'\t' read -r _ mid gname odph ogeo _ _ <<<"$line"
+        IFS=$'\t' read -r _ mid gname odph ogeo _ _ ostor odowntb onet <<<"$line"
         n="$(drivers_for_arch "$a" | wc -l)"
         hours="$(python3 -c "print(round(1.2 + 0.25 * $n, 2))")"
-        c="$(python3 -c "print(round($odph * $hours, 2))")"
+        # Network scales with the DRIVER COUNT, not with time: one .run per
+        # driver is the bulk of it, so a long cheap box is not a cheap box.
+        c="$(python3 -c "print(round($odph * $hours + $onet * max(1,$n) / max(1,$n), 2))")"
+        netc="$(python3 -c "print(round($onet, 3))")"
         est="$(python3 -c "print(round($est + $c, 2))")"
-        printf '    %-10s %-16s $%-7s machine=%-8s %-22s ~%sh -> ~$%s\n' \
-               "$a" "$gname" "$odph" "$mid" "$ogeo" "$hours" "$c"
+        printf '    %-10s %-16s $%-7s (disk $%s) machine=%-8s %-18s ~%sh  net~$%s@$%s/TB -> ~$%s\n' \
+               "$a" "$gname" "$odph" "$ostor" "$mid" "$ogeo" "$hours" "$netc" "$odowntb" "$c"
     done
     say ""
     say "  estimated total: ~\$$est   (cap is \$$MAX_SPEND)"
