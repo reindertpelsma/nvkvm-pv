@@ -358,11 +358,23 @@ print(json.dumps(o))
 # was built from", which is the question worth asking.
 # ---------------------------------------------------------------------------
 ABIQ=""
+ABIQ_DIR=""
 build_abiq() {
     local src="$REPO/src/common/nvkvm_abi.h"
     [ -f "$src" ] || { warn "no $src -- expected ABI profiles will read '?'"; return 1; }
     command -v cc >/dev/null || { warn "no cc -- expected ABI profiles will read '?'"; return 1; }
-    ABIQ="$(mktemp -u /tmp/nvkvm-abiq.XXXXXX)"
+    # `mktemp -u` RESERVES NOTHING -- it prints a name and returns, which
+    # mktemp's own man page calls unsafe.  Both writes below then landed in the
+    # world-writable /tmp through an unreserved name: `cat > "$ABIQ.c"` and
+    # `cc -o "$ABIQ"` are plain O_CREAT|O_TRUNC, so a local user who plants a
+    # symlink at either name between the mktemp and the write has the sweep
+    # truncate and overwrite a file of their choosing, as whoever runs the
+    # sweep -- root, on the machine that holds the vast.ai API key.  A
+    # directory created with mode 0700 by mktemp -d fixes both names at once,
+    # which is why the binary and its source move inside one rather than
+    # getting an mktemp each.
+    ABIQ_DIR="$(mktemp -d /tmp/nvkvm-abiq.XXXXXX)" || { warn "mktemp -d failed -- expected ABI profiles will read '?'"; return 1; }
+    ABIQ="$ABIQ_DIR/abiq"
     cat >"$ABIQ.c" <<'EOF'
 #include <stdio.h>
 #include <stdlib.h>
@@ -381,6 +393,8 @@ int main(int argc, char **argv)
 }
 EOF
     cc -I "$REPO/src" -o "$ABIQ" "$ABIQ.c" 2>/dev/null || { ABIQ=""; return 1; }
+    # Leaving the ABI helper behind on every run is how /tmp fills up on a
+    # coordinator that sweeps nightly; cleanup() already runs on EXIT and INT.
     return 0
 }
 abi_expected() {   # abi_expected 580.95.05 -> 580  (or '?')
@@ -648,6 +662,7 @@ reconcile() {
 }
 
 CLEANED=0
+TREE_TGZ=""
 cleanup() {
     [ "$CLEANED" = 1 ] && return
     CLEANED=1
@@ -663,6 +678,11 @@ cleanup() {
     # Tell the timer the sweep is over.  It only stands down once the LISTING
     # agrees that nothing registered is alive, so this is a hint, not a disarm.
     [ -n "$REGISTRY" ] && : >"${REGISTRY}.done"
+    # Own private temporaries. Both are mktemp'd, so an unset value here means
+    # they were never created rather than that a path needs guessing.
+    [ -n "$ABIQ_DIR" ] && rm -rf -- "$ABIQ_DIR"
+    [ -n "$TREE_TGZ" ] && rm -f -- "$TREE_TGZ"
+    return 0
 }
 trap cleanup EXIT
 trap 'warn "interrupted"; exit 130' INT TERM
@@ -786,13 +806,36 @@ for o in offers:
         continue
     if str(o.get("machine_id")) in bad:
         continue
-    if (o.get("dph_total") or 99) > float(max_dph):
+    # COERCE THE PRICE, and skip the offer if it will not coerce.
+    #
+    # This was `(o.get("dph_total") or 99) > float(max_dph)`, which compares
+    # whatever the API sent against a float.  A price that arrives as a JSON
+    # STRING -- "0.9", which is a perfectly ordinary way for an API to encode a
+    # decimal -- raises TypeError there, and the traceback aborts pick_offer for
+    # EVERY offer, not just the malformed one.  One bad listing anywhere in the
+    # marketplace response and the sweep finds no box at all, with an error that
+    # names Python rather than the listing.
+    #
+    # Coercing also keeps dph_total a NUMBER by the time it is printed on the
+    # tab-separated line below, which is what the shell then substitutes into
+    # the cost arithmetic.  That was safe before only by accident of this
+    # comparison raising first; it is now safe by construction, which is the
+    # property worth having in a value that comes from a marketplace listing.
+    # A missing or zero price is still treated as "assume expensive, skip",
+    # which is what the old `or 99` did and is the right way round: a listing
+    # that will not say what it costs is not one to rent under a spend cap.
+    try:
+        dph = float(o.get("dph_total"))
+    except (TypeError, ValueError):
         continue
+    if not (dph > 0) or dph > float(max_dph):
+        continue
+    o["dph_total"] = dph
     cands.append(o)
 
 if not cands:
     sys.exit(1)
-o = min(cands, key=lambda x: x.get("dph_total", 99))
+o = min(cands, key=lambda x: x["dph_total"])
 print("\t".join(str(x) for x in [
     o.get("id"), o.get("machine_id"), o.get("gpu_name"),
     o.get("dph_total"), o.get("geolocation") or "?", o.get("inet_down") or "?",
@@ -1089,10 +1132,20 @@ provision_box() {
     # stale .o/.cmd files while still labelling the payload "clean HEAD".  A
     # guest then imports absolute Kbuild paths from another kernel/worktree.
     # Honour the repo's ignore rules at the shipment boundary as well.
+    # mktemp, not a fixed /tmp/nvkvm-sweep-tree.tgz.  The old fixed name was in
+    # world-writable /tmp with no O_EXCL, so a local user who pre-created it as
+    # a symlink had the next sweep truncate and overwrite the target -- as the
+    # user running the sweep, which on a coordinator is root.  It also meant two
+    # concurrent sweeps silently shipped each other's tree, which is the more
+    # likely of the two to actually happen here.
+    TREE_TGZ="$(mktemp /tmp/nvkvm-sweep-tree.XXXXXX.tgz)" \
+        || { PROVISION_FAIL_DETAIL="mktemp for the tree tarball failed"; PROVISION_FAILED_STEP="ship"; return 1; }
     tar --exclude-vcs-ignores --exclude=.git --exclude=sweep-runs \
-        -czf /tmp/nvkvm-sweep-tree.tgz -C "$REPO" . 2>/dev/null \
+        -czf "$TREE_TGZ" -C "$REPO" . 2>/dev/null \
         || { PROVISION_FAIL_DETAIL="could not tar the repo"; PROVISION_FAILED_STEP="ship"; return 1; }
-    timeout 900 scp $SSH_OPTS -P "$SCP_PORT" -q /tmp/nvkvm-sweep-tree.tgz "root@$SCP_HOST:/root/" \
+    # The REMOTE name stays fixed: it lands in root's home on a box this sweep
+    # rented and destroys, and the unpack step below names it literally.
+    timeout 900 scp $SSH_OPTS -P "$SCP_PORT" -q "$TREE_TGZ" "root@$SCP_HOST:/root/nvkvm-sweep-tree.tgz" \
         || { PROVISION_FAIL_DETAIL="scp of the tree failed"; PROVISION_FAILED_STEP="ship"; return 1; }
     rsh_t 180 'mkdir -p /root/nvkvm && tar -xzf /root/nvkvm-sweep-tree.tgz -C /root/nvkvm' >/dev/null 2>&1 \
         || { PROVISION_FAIL_DETAIL="could not unpack the tree on the box"; PROVISION_FAILED_STEP="ship"; return 1; }
