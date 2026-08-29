@@ -6,7 +6,7 @@ findings were triaged.
 
 | component | file | verdict |
 |---|---|---|
-| guest kernel module | [2026-08-29-guest.md](2026-08-29-guest.md) | 12 findings — **1 critical**, 8 serious, 3 minor |
+| guest kernel module | [2026-08-29-guest.md](2026-08-29-guest.md) | 12 findings — **1 critical**, 8 serious, 3 minor — **6 fixed on `fix/guest-lifetime`** |
 | VMM | [2026-08-29-vmm.md](2026-08-29-vmm.md) | 13 findings — 6 serious, 7 minor |
 | packaging / scripts / kata | [2026-08-29-packaging.md](2026-08-29-packaging.md) | 54 findings — **3 critical**, 21 serious, 30 minor |
 | broker | [2026-08-29-broker.md](2026-08-29-broker.md) | 9 findings — 2 serious, 7 minor |
@@ -57,3 +57,45 @@ Bounds checking is the easy class. The audits were explicitly re-weighted toward
 (silent dup, double free, UAF) and signedness**. That re-weighting is what found
 the guest critical and, on a second pass, a VMM type confusion the first pass
 missed. Keep that emphasis on re-runs.
+
+
+## Remediation status
+
+One branch per component, so each can be re-audited independently and a mistake
+in one does not block another. Nothing is merged to `main`.
+
+| branch | covers | state |
+|---|---|---|
+| `fix/guest-lifetime` | guest: the critical UAF + 5 serious | **builds**, reviewed, ready |
+| `fix/isolate-boundary` | isolate criticals | in progress |
+| `fix/vmm-lifetime` | VMM serious | in progress |
+| `fix/broker-work-bounds` | broker serious | in progress |
+| `fix/packaging-supply-chain` | remaining packaging critical + serious | in progress |
+
+### `fix/guest-lifetime` — reviewed 2026-08-29
+
+The critical UAF fix was checked by hand rather than taken on trust, because a
+wrong refcount fix is worse than the bug it replaces:
+
+- `nvkvm_gem_resolve_fwd()` now returns an **owned** reference; the contract is
+  written at the definition and at both call sites, which is what the two
+  disagreeing sites lacked.
+- Three `get` sites (same-isolate, cached cross-isolate under `xiso_lock`,
+  broker) against four `put` sites in the single caller, one immediately before
+  each of its four late returns.
+- The two early returns cannot leak: one precedes `resolve_fwd` entirely, and on
+  every failure path `resolve_fwd` returns before taking any reference.
+- The broker branch deliberately takes **two** references — one for the
+  single-entry cache, one for the returned pointer — so the caller's put cannot
+  tear down the cache entry. On failure it takes none.
+- `nvkvm_fb_stub_handle()` stays borrowed, which is correct under the framebuffer
+  reference the KMS path holds, and that contract is now stated too.
+
+It builds against real kernel headers, and the warning set is identical to
+pristine `main` (three pre-existing warnings, none new). **Not runtime-tested** —
+no VM, no GPU. The reference balance under real eviction traffic (a two-compositor
+workload) is the one thing review cannot settle.
+
+Still open in the guest, deliberately not attempted because both are
+lock-ordering changes rather than patches: the `ext_lock`/`mmap_lock` AB-BA
+deadlock, and the false "no caller holds mmap_lock" invariant.
