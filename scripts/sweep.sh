@@ -113,11 +113,20 @@ KVM_IMAGE="${NVKVM_SWEEP_IMAGE:-docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16
 # (docker.io/vastai/kvm:ubuntu_desktop_22.04-2025-11-21) is the one to use for
 # anything interactive; this sweep is headless, so the cli image is correct and
 # faster to pull.
-# The vast label every instance this run creates carries.  Overridable because
-# reap_strays() destroys BY LABEL: two sweeps running concurrently under the
-# same label can reap each other's boxes mid-build.  Give each concurrent run
-# its own label (and each its own --out) and that cannot happen.
-SWEEP_LABEL="${NVKVM_SWEEP_LABEL:-nvkvm-sweep}"
+# The vast label every instance this run creates carries.
+#
+# reap_strays() destroys BY LABEL, so two runs sharing one label reap each
+# other's boxes mid-build.  That used to be documented here as an instruction to
+# the operator -- "give each concurrent run its own label" -- and OBSERVED
+# 2026-08-29: two runs each had their own --out, both kept a correct per-run
+# registry, and the first to finish destroyed the second's box anyway, calling
+# it a STRAY. A rule that only holds when someone remembers it is not a rule.
+#
+# So the label is now UNIQUE PER RUN by default, derived below from the run
+# directory (which is already required to be unique). NVKVM_SWEEP_LABEL still
+# overrides it for anyone who wants two runs to share a reaper on purpose.
+SWEEP_LABEL_PREFIX="nvkvm-sweep"
+SWEEP_LABEL="${NVKVM_SWEEP_LABEL:-}"
 STOP_FILE="/tmp/nvkvm-sweep.stop"
 KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
 
@@ -633,9 +642,11 @@ try: d = json.load(sys.stdin)
 except Exception: sys.exit(0)
 if isinstance(d, dict): d = d.get("instances", []) or []
 for i in d:
-    if (i.get("label") or "") == sys.argv[1]:
+    lab = i.get("label") or ""
+    if (lab.startswith(sys.argv[1]) if len(sys.argv) > 2 and sys.argv[2] == "prefix"
+        else lab == sys.argv[1]):
         print(i.get("id"), i.get("gpu_name"))
-' "$SWEEP_LABEL" 2>/dev/null)"
+' "$SWEEP_LABEL" "${RECONCILE_PREFIX:+prefix}" 2>/dev/null)"
     [ -z "$ids" ] && return 0
     while read -r id gpu; do
         [ -z "$id" ] && continue
@@ -2084,7 +2095,14 @@ command -v python3 >/dev/null || die "python3 not found (used for JSON and for t
     || die "no vast.ai api key (~/.config/vastai/vast_api_key)"
 
 if [ "$RECONCILE" = 1 ]; then
-    info "reconcile-only: destroying anything labelled '$SWEEP_LABEL'. Spends nothing."
+    # Labels are per-run now, so a reconcile scoped to THIS run's label would
+    # find nothing. Reconcile is the cross-run cleanup tool, so it matches the
+    # prefix on purpose -- and says so, because that reaches other runs' boxes.
+    SWEEP_LABEL="$SWEEP_LABEL_PREFIX"
+    RECONCILE_PREFIX=1
+    info "reconcile-only: destroying anything whose label starts '$SWEEP_LABEL_PREFIX'."
+    info "  This is CROSS-RUN by design: it will destroy boxes belonging to other"
+    info "  sweeps that are still running. Spends nothing."
     REGISTRY="$(mktemp)"; CLEANED=1
     reap_strays
     say "still live:"
@@ -2132,6 +2150,24 @@ Commit it, stash it, or pass --allow-dirty to ship it knowingly." 3
     fi
 fi
 
+# ---- run identity ---------------------------------------------------------
+# Settle the run directory and the label BEFORE the plan prints, because the
+# plan reports both. Deriving the label after the plan left it blank there --
+# and a blank label in the plan is exactly how the shared-label reaping bug
+# stays invisible until it destroys someone's box.
+if [ -n "$RESUME_DIR" ]; then
+    OUT_DIR="$RESUME_DIR"
+else
+    OUT_DIR="${OUT_DIR:-$REPO/sweep-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)}"
+fi
+if [ -z "$SWEEP_LABEL" ]; then
+    # Unique by construction: two concurrent runs cannot share an --out, since
+    # the registry, journal and log all live in it. vast labels are short, so
+    # keep it recognisable and bounded.
+    _run_tag="$(basename "$OUT_DIR" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/-$//' | tail -c 40)"
+    SWEEP_LABEL="$SWEEP_LABEL_PREFIX-$_run_tag"
+fi
+
 # ---- plan -----------------------------------------------------------------
 say ""
 say "nvkvm sweep plan"
@@ -2142,6 +2178,9 @@ say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_
 say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
+say "  vast label    : $SWEEP_LABEL"
+say "                  (per-run: reap_strays destroys BY LABEL, so a shared one lets"
+say "                   concurrent runs reap each other -- OBSERVED 2026-08-29)"
 say "  caps          : \$$MAX_DPH/hr per box, \$$MAX_SPEND total, ${BUDGET_HOURS}h auto-destroy"
 say "                  storage <= \$$MAX_STORAGE_PER_GB_MONTH/GB/mo, network <= \$$MAX_INET_DOWN_PER_TB/TB in"
 say "                  (outlier guards at the observed market maxima; network is NOT in dph_total."
@@ -2196,6 +2235,7 @@ if [ -n "$RESUME_DIR" ]; then
     info "resuming into $OUT_DIR (units with a terminal status are not paid for again)"
 else
     OUT_DIR="${OUT_DIR:-$REPO/sweep-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)}"
+
     mkdir -p "$OUT_DIR"
 fi
 mkdir -p "$OUT_DIR/logs"
