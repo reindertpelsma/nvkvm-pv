@@ -192,12 +192,20 @@ check "blacklisting twice does not duplicate" "$(wc -l <"$KNOWN_BAD_FILE")" "$be
 
 echo
 echo "=== 6. offer selection: arch, price cap, known-bad, already-tried ==="
+# storage_cost / internet_{down,up}_cost_per_tb below are the median values
+# vast.ai actually reports (see the 2026-08-29 "set the cost caps from the
+# measured market" commit: storage_cost median 0.200 $/GB/month, network
+# median 4.00 $/TB) -- real offers ALWAYS carry these fields, so a fixture
+# that omits them isn't modelling the market, it's modelling a card that
+# doesn't exist. pick_offer() treats a missing network price as unpriced ->
+# too expensive to risk on an unattended run, so leaving these out made every
+# offer here fail that guard and return nothing, regardless of arch/price.
 cat >"$STATE/offers.json" <<'OFF'
-[{"id":1,"machine_id":42636,"gpu_name":"RTX 3090","dph_total":0.05,"geolocation":"X","inet_down":1,"driver_version":"575.51.03"},
- {"id":2,"machine_id":50000,"gpu_name":"RTX 3060","dph_total":0.10,"geolocation":"Y","inet_down":1,"driver_version":"575.51.03"},
- {"id":3,"machine_id":50001,"gpu_name":"RTX 4090","dph_total":0.20,"geolocation":"Z","inet_down":1,"driver_version":"575.51.03"},
- {"id":4,"machine_id":50002,"gpu_name":"Quadro P4000","dph_total":0.01,"geolocation":"W","inet_down":1,"driver_version":"575.51.03"},
- {"id":5,"machine_id":50003,"gpu_name":"RTX 5090","dph_total":9.99,"geolocation":"V","inet_down":1,"driver_version":"575.51.03"}]
+[{"id":1,"machine_id":42636,"gpu_name":"RTX 3090","dph_total":0.05,"dph_base":0.05,"storage_cost":0.20,"internet_down_cost_per_tb":4.00,"internet_up_cost_per_tb":4.00,"geolocation":"X","inet_down":1,"driver_version":"575.51.03"},
+ {"id":2,"machine_id":50000,"gpu_name":"RTX 3060","dph_total":0.10,"dph_base":0.10,"storage_cost":0.20,"internet_down_cost_per_tb":4.00,"internet_up_cost_per_tb":4.00,"geolocation":"Y","inet_down":1,"driver_version":"575.51.03"},
+ {"id":3,"machine_id":50001,"gpu_name":"RTX 4090","dph_total":0.20,"dph_base":0.20,"storage_cost":0.20,"internet_down_cost_per_tb":4.00,"internet_up_cost_per_tb":4.00,"geolocation":"Z","inet_down":1,"driver_version":"575.51.03"},
+ {"id":4,"machine_id":50002,"gpu_name":"Quadro P4000","dph_total":0.01,"dph_base":0.01,"storage_cost":0.20,"internet_down_cost_per_tb":4.00,"internet_up_cost_per_tb":4.00,"geolocation":"W","inet_down":1,"driver_version":"575.51.03"},
+ {"id":5,"machine_id":50003,"gpu_name":"RTX 5090","dph_total":9.99,"dph_base":9.99,"storage_cost":0.20,"internet_down_cost_per_tb":4.00,"internet_up_cost_per_tb":4.00,"geolocation":"V","inet_down":1,"driver_version":"575.51.03"}]
 OFF
 TRIED_MACHINES=""
 check "ampere skips the known-bad machine and takes the next" \
@@ -276,6 +284,15 @@ check "  ...and is still alive" "$(live_instance_ids | grep -cx 99999999)" "1"
 
 echo
 echo "=== 11. stray reaping only ever touches our own label ==="
+# SWEEP_LABEL is derived per-run from OUT_DIR inside main() (the "two
+# concurrent sweeps reaped each other's boxes" fix) -- but library mode
+# returns before main() ever runs, so nothing assigns it here. A real run
+# always has SWEEP_LABEL set to its own per-run value before reap_strays()
+# is ever reachable, so simulate that by assigning it ourselves; leaving it
+# at its unset default of "" would make reap_strays() match every instance
+# whose label is null (`lab = i.get("label") or ""` -> "" == "") -- which is
+# exactly backwards from "only ever touches our own label".
+SWEEP_LABEL="nvkvm-sweep"
 set_instances '[{"id":301,"actual_status":"running","label":"nvkvm-sweep","gpu_name":"RTX 3060"},
                 {"id":302,"actual_status":"running","label":"uvm-fi","gpu_name":"RTX 5090"},
                 {"id":303,"actual_status":"running","label":null,"gpu_name":"RTX 3090"}]'
