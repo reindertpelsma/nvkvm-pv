@@ -2513,11 +2513,26 @@ else
     OUT_DIR="${OUT_DIR:-$REPO/sweep-runs/$(date -u +%Y-%m-%dT%H-%M-%SZ)}"
 fi
 if [ -z "$SWEEP_LABEL" ]; then
-    # Unique by construction: two concurrent runs cannot share an --out, since
-    # the registry, journal and log all live in it. vast labels are short, so
-    # keep it recognisable and bounded.
-    _run_tag="$(basename "$OUT_DIR" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/-$//' | tail -c 40)"
-    SWEEP_LABEL="$SWEEP_LABEL_PREFIX-$_run_tag"
+    # Unique by construction -- and it has to be the WHOLE PATH, not the
+    # basename.
+    #
+    # This previously used `basename "$OUT_DIR"`, reasoning that two concurrent
+    # runs cannot share an --out. That is true of the PATH and false of the
+    # LABEL derived from it. OBSERVED 2026-08-30: two runs with --out
+    # .../fullsweep2/run and .../n3/run -- different directories, separate
+    # registries, no way to collide on disk -- both produced the label
+    # `nvkvm-sweep-run`, because both basenames are "run". reap_strays()
+    # destroys BY LABEL, so the first to finish would have destroyed the
+    # other's box and called it a stray. That is precisely the failure the
+    # per-run label was introduced to stop, reintroduced by taking the last
+    # path component of a name whose last component is almost always generic.
+    #
+    # So: keep the readable tail for humans, and append a hash of the ABSOLUTE
+    # path so two runs can only collide if they really are the same directory.
+    _run_abs="$(cd "$(dirname "$OUT_DIR")" 2>/dev/null && pwd)/$(basename "$OUT_DIR")"
+    _run_hash="$(printf '%s' "$_run_abs" | sha256sum | cut -c1-8)"
+    _run_tag="$(basename "$OUT_DIR" | tr -c 'A-Za-z0-9._-' '-' | tr -s '-' | sed 's/-$//' | tail -c 24)"
+    SWEEP_LABEL="$SWEEP_LABEL_PREFIX-$_run_tag-$_run_hash"
 fi
 
 # ---- plan -----------------------------------------------------------------
