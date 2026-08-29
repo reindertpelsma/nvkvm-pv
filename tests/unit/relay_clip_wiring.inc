@@ -18,7 +18,7 @@ static void relay_clip_flush(NvkvmRelay *r)
     if (r->clip_out_next >= r->clip_out_count) {
         r->clip_out_count = 0;
         r->clip_out_next = 0;
-        relay_set_fd_handlers(r, false);
+        relay_set_fd_handlers(r, relay_want_writable(r));
         return;
     }
     rc = relay_clip_batch_flush(r->clip_out, r->clip_out_count,
@@ -26,7 +26,7 @@ static void relay_clip_flush(NvkvmRelay *r)
     if (rc == 0) {
         r->clip_out_count = 0;
         r->clip_out_next = 0;
-        relay_set_fd_handlers(r, false);
+        relay_set_fd_handlers(r, relay_want_writable(r));
     } else if (rc == -EAGAIN || rc == -EWOULDBLOCK) {
         relay_set_fd_handlers(r, true);
     } else {

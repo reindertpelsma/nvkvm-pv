@@ -74,7 +74,7 @@ in one does not block another. Nothing is merged to `main`.
 | `fix/kata-supply-chain` | nvkvm-kata: the HTTP modprobe critical | done, **verified live** |
 | `fix/steamos-warn` | nvkvm-steamos: the undefined `warn()` | done, `make check` 17/17 |
 
-### Critical status: 8 of 9 closed, 1 half-closed
+### Critical status: 8 of 9 closed — and two were OVER-RATED, see the correction below
 
 | # | critical | state |
 |---|---|---|
@@ -231,3 +231,67 @@ measured against a real VMM. Whether a legitimate client ever imports more than
 four new buffers in one wakeup is unmeasured; the cost if it does is dropped
 frames recovered within the 100 ms pacing watchdog, not a stall. Worth
 confirming on hardware before this is treated as tuned.
+
+
+## CORRECTION 2026-08-29 — two isolate findings were over-rated
+
+Challenged by the owner and checked in the code. **The audit was wrong about
+reachability on two of its five isolate criticals**, and an inflated critical
+gating a release costs more than a missed minor.
+
+### What the audit assumed, and why it was wrong
+
+It rated `KILL_ISOLATE` and `CLOSE_HANDLE_ON_ISOLATE` as *guest*-reachable
+because their handlers take an id straight off the wire. That is true of the
+handler and irrelevant to the threat, because **guest userspace never composes
+those messages**:
+
+- `nvkvm_virtio_kill_isolate()` has exactly one caller,
+  `nvkvm_session.c:136`, on the session-teardown path. The id comes from
+  `session->isolate_id` of the session being destroyed — reached only via
+  `nvkvm_session_put(ctx->session)` (`nvkvm_main.c:744`, `:805`), i.e. the fd's
+  *own* context, and only when the refcount hits zero on last close.
+- `nvkvm_virtio_close_handle_on_isolate()` is called with `ctx->handle_id`
+  (`nvkvm_main.c:759`) — again the fd's own handle.
+
+An unprivileged guest process therefore cannot name another isolate. It can only
+cause its own session's isolate to be torn down, by closing its own fd.
+
+And the blast radius is one VM: **cross-VM is always cross-process here**, so
+another VM is another VMM process with its own `t->isolates` table. The
+"VM-global id space" the audit flagged is global *within one VM*, which is the
+VM's own property.
+
+**Re-rated: `KILL_ISOLATE` critical → low.** It needs a compromised guest
+*kernel*, and what it can then destroy is its own VM's isolates — self-DoS.
+`CLOSE_HANDLE_ON_ISOLATE` likewise, kept slightly higher only because it moves
+host-side refcounts.
+
+The fixes on `fix/isolate-boundary` stay: they are correct defence-in-depth and
+cost nothing. But **the `KILL_ISOLATE` protocol decision is no longer urgent**
+and should not gate the release.
+
+### What this does NOT rescue
+
+The ring `_IOC_SIZE` stack smash **remains critical**, and the same check is why:
+`nvkvm_session_ring_try(ctx, cmd, ...)` is called from the ioctl path
+(`nvkvm_main.c:2849`) with the **userspace-supplied ioctl command number**. So an
+unprivileged guest process picks `cmd`, `_IOC_SIZE(cmd)` rides it into the ring,
+and the stub reads up to 16 KB into a 256-byte stack buffer **in a host
+process**. Userspace-reachable, guest→host, unchanged.
+
+### Still to re-rate by the same test
+
+`POLL`/`UNPOLL_ON_ISOLATE`, the sparse-GPA leak and the reader-wake bug were all
+rated on handler reachability. Each needs the same question asked — *can guest
+userspace compose this message, or only the guest kernel?* — before its severity
+is trusted. The reader-wake bug likely stands regardless: it wedges QEMU's shared
+aio pool, which is host state.
+
+### The lesson for the next audit round
+
+Every auditor was told the guest is hostile, and each correctly traced its
+component's handler. None traced **backwards into the guest module** to ask who
+can actually compose the request. That is the question that separates
+"unprivileged guest process" from "compromised guest kernel", and the two
+deserve different severities. Put it in the next audit brief.

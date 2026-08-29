@@ -29,6 +29,8 @@ static void relay_writable(void *opaque)
         return;
     }
     if (r->conn_state == RELAY_CONN_ACTIVE) {
+        /* The frame first: it is on a deadline and the clipboard is not. */
+        relay_frame_flush(r);
         relay_clip_flush(r);
     }
 }
