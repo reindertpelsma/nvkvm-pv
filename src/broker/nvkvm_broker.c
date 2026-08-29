@@ -1622,9 +1622,22 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         return;
 
     case NVKVM_BROKER_CMD_CLIPBOARD: {
-        const struct nvkvm_broker_clip_cmd *cc =
-            (const struct nvkvm_broker_clip_cmd *)c;
+        /*
+         * A COPY, NOT A CAST.  The record was read into a `struct
+         * nvkvm_broker_cmd`, and reading that object back through a
+         * `clip_cmd *` is a strict-aliasing violation however identical the two
+         * layouts are — the compiler is entitled to assume the two types never
+         * name the same storage and to reorder the loads accordingly.  Both are
+         * exactly NVKVM_BROKER_CMD_SIZE (asserted in the protocol header), so
+         * the memcpy is the same bytes with the aliasing question removed, and
+         * at -O2 it is a register shuffle.  Not a theoretical worry worth
+         * carrying in the one parser that runs on the privileged side.
+         */
+        struct nvkvm_broker_clip_cmd ccbuf;
+        const struct nvkvm_broker_clip_cmd *cc = &ccbuf;
         unsigned n;
+
+        memcpy(&ccbuf, c, sizeof ccbuf);
 
         if (fd >= 0) {
             close(fd);
