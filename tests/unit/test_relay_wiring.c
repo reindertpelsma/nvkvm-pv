@@ -49,6 +49,19 @@ typedef struct Error {
 
 #define QEMU_CLOCK_REALTIME 0
 
+/*
+ * Frame-retention state. Added with the EAGAIN-redelivery work and mirrored here
+ * because relay_state_helpers.inc carries those transitions; without it this
+ * suite does not build, which is how it went dark from 2026-08-28.
+ */
+typedef enum {
+    RELAY_PEND_NONE = 0,
+    RELAY_PEND_ATTACH,
+    RELAY_PEND_COMMIT,
+} RelayPend;
+
+#define RELAY_PEND_DEADLINE_MS 50
+
 typedef struct NvkvmRelay {
     int sock;
     RelayConnState conn_state;
@@ -68,7 +81,22 @@ typedef struct NvkvmRelay {
     uint32_t last_bw, last_bh, last_stride, last_fourcc;
     uint64_t last_modifier;
     QEMUTimer *handshake_deadline;
+    /* frame retention */
+    RelayPend pend;
+    QEMUTimer *pend_timer;
+    bool      pend_counted;
+    bool      last_shm;
+    uint64_t  n_sent;
+    uint64_t  n_recovered;
 } NvkvmRelay;
+
+/* Lives below the extraction markers in the relay (it drives the socket), so
+ * only the declaration is visible to the extracted helpers. */
+static void relay_frame_flush(NvkvmRelay *r);
+
+/* Defined by relay_fd_ownership.inc, which is included AFTER the state helpers
+ * that call it -- same order as the relay itself, so declare it up front. */
+static void relay_set_fd_handlers(NvkvmRelay *r, bool writable);
 
 typedef void IOHandler(void *opaque);
 
@@ -139,6 +167,10 @@ static void error_setg_errno(Error **errp, int error_no, const char *fmt, ...)
 }
 
 #include "relay_state_helpers.inc"
+
+/* Counted, not performed: this suite asserts wiring, not bytes. */
+static int mock_frame_flushes;
+static void relay_frame_flush(NvkvmRelay *r) { (void)r; mock_frame_flushes++; }
 #include "relay_clip_batch.inc"
 #include "relay_fd_ownership.inc"
 #include "relay_clip_wiring.inc"

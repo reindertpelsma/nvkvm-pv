@@ -387,6 +387,10 @@ static void relay_sync_flush(NvkvmRelay *r);
 static int  relay_send_caps(NvkvmRelay *r);
 static void relay_clip_recv(NvkvmRelay *r, const struct nvkvm_broker_pkt *p);
 
+/* Defined below the extraction markers: it drives the socket, so it is not a
+ * state helper.  relay_pend_deadline() above calls it, hence the declaration. */
+static void relay_frame_flush(NvkvmRelay *r);
+
 /* NVKVM_RELAY_STATE_HELPERS_BEGIN -- extracted by test_relay_state. */
 /*
  * Everything below is knowledge held about ONE broker connection.  A stream
@@ -457,6 +461,39 @@ static void relay_pend_clear(NvkvmRelay *r)
         timer_del(r->pend_timer);
     }
 }
+
+/*
+ * The frame has been undeliverable for RELAY_PEND_DEADLINE_MS.  Try again and,
+ * if it still will not go, keep trying on the same period rather than giving
+ * up: an abandoned frame is the bug this exists to prevent.
+ */
+static void relay_pend_deadline(void *opaque)
+{
+    NvkvmRelay *r = opaque;
+
+    assert(bql_locked());
+    relay_frame_flush(r);
+    if (r->pend != RELAY_PEND_NONE && r->sock >= 0) {
+        timer_mod(r->pend_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      RELAY_PEND_DEADLINE_MS);
+    }
+}
+
+/* Note a frame the socket refused, and make sure something comes back for it. */
+static void relay_pend_arm(NvkvmRelay *r, RelayPend what)
+{
+    r->pend = what;
+    r->pend_counted = (what == RELAY_PEND_COMMIT);
+    relay_set_fd_handlers(r, true);
+    if (r->pend_timer) {
+        timer_mod(r->pend_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      RELAY_PEND_DEADLINE_MS);
+    }
+}
+/* NVKVM_RELAY_STATE_HELPERS_END */
+
 
 /*
  * Re-send as much of the retained frame as the socket will now take.  Mirrors
@@ -539,38 +576,6 @@ static void relay_frame_flush(NvkvmRelay *r)
     }
     relay_set_fd_handlers(r, relay_want_writable(r));
 }
-
-/*
- * The frame has been undeliverable for RELAY_PEND_DEADLINE_MS.  Try again and,
- * if it still will not go, keep trying on the same period rather than giving
- * up: an abandoned frame is the bug this exists to prevent.
- */
-static void relay_pend_deadline(void *opaque)
-{
-    NvkvmRelay *r = opaque;
-
-    assert(bql_locked());
-    relay_frame_flush(r);
-    if (r->pend != RELAY_PEND_NONE && r->sock >= 0) {
-        timer_mod(r->pend_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                      RELAY_PEND_DEADLINE_MS);
-    }
-}
-
-/* Note a frame the socket refused, and make sure something comes back for it. */
-static void relay_pend_arm(NvkvmRelay *r, RelayPend what)
-{
-    r->pend = what;
-    r->pend_counted = (what == RELAY_PEND_COMMIT);
-    relay_set_fd_handlers(r, true);
-    if (r->pend_timer) {
-        timer_mod(r->pend_timer,
-                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
-                      RELAY_PEND_DEADLINE_MS);
-    }
-}
-/* NVKVM_RELAY_STATE_HELPERS_END */
 
 /* NVKVM_RELAY_FD_OWNERSHIP_BEGIN -- extracted by test_relay_wiring. */
 static void relay_set_fd_handlers(NvkvmRelay *r, bool writable)

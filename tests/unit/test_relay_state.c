@@ -14,6 +14,32 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <assert.h>
+#include <stdint.h>
+
+/*
+ * The relay's frame-retention state, mirrored for the extracted helpers.
+ *
+ * These fields arrived with the EAGAIN-redelivery work (2026-08-28) and were
+ * never added here, so this suite STOPPED BUILDING FROM CLEAN and nobody saw it:
+ * relay_state_helpers.inc is a tracked, generated file, so `make` refreshed it on
+ * disk while a stale object satisfied the link. A suite that does not build is
+ * not a smaller test run, it is a hole -- which is what the Makefile says, and
+ * what happened anyway.
+ */
+typedef enum {
+    RELAY_PEND_NONE = 0,
+    RELAY_PEND_ATTACH,
+    RELAY_PEND_COMMIT,
+} RelayPend;
+
+/* QEMU's timer API, reduced to what the extracted helpers touch. The tests do
+ * not exercise firing; they exercise that arm/clear happen on the right edges. */
+typedef struct { bool armed; int64_t at; } QEMUTimer;
+static void timer_del(QEMUTimer *t) { if (t) t->armed = false; }
+static void timer_mod(QEMUTimer *t, int64_t when) { if (t) { t->armed = true; t->at = when; } }
+
+
 
 typedef struct NvkvmRelay {
     int sock;
@@ -31,9 +57,49 @@ typedef struct NvkvmRelay {
     int last_fd;
     uint32_t last_bw, last_bh, last_stride, last_fourcc;
     uint64_t last_modifier;
+    /* frame retention (EAGAIN redelivery) */
+    RelayPend pend;
+    QEMUTimer *pend_timer;
+    bool     pend_counted;
+    bool     last_shm;
+    int      conn_state;
+    uint64_t n_sent;
+    uint64_t n_recovered;
 } NvkvmRelay;
 
+/*
+ * What the retention state machine reaches for, and nothing more.
+ *
+ * relay_frame_flush() drives the socket, so it was moved BELOW the extraction
+ * markers -- it is not a state helper, and sweeping it in is what grew this
+ * region from 47 lines to 183 and broke the suite. Only its declaration is
+ * needed here, because relay_pend_deadline() calls it.
+ */
+static void relay_frame_flush(NvkvmRelay *r);
+
+/* The BQL is held by every real caller; the assert exists to keep it that way. */
+static bool bql_locked(void) { return true; }
+
+/* Deadline arithmetic only: the tests assert WHEN the timer is armed and
+ * cleared, never that it fires. */
+#define QEMU_CLOCK_REALTIME 0
+static int64_t mock_now_ms = 1000;
+static int64_t qemu_clock_get_ms(int clock) { (void)clock; return mock_now_ms; }
+
+/* Mirrors the constant in the relay. Kept in sync by test_relay_wiring, which
+ * greps the source for it -- a copy that drifts fails there, not silently here. */
+#define RELAY_PEND_DEADLINE_MS 50
+
+/* Toggling POLLOUT is a state transition, so the suite counts it. */
+static int mock_fd_handler_updates;
+static void relay_set_fd_handlers(NvkvmRelay *r, bool want_write)
+{ (void)r; (void)want_write; mock_fd_handler_updates++; }
+
 #include "relay_state_helpers.inc"
+
+/* Satisfies the declaration above; the suite counts transitions, not bytes. */
+static int mock_flushes;
+static void relay_frame_flush(NvkvmRelay *r) { (void)r; mock_flushes++; }
 
 static int run, passed;
 

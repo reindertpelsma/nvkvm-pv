@@ -17,6 +17,10 @@ static void relay_connection_state_reset(NvkvmRelay *r)
     r->clip_in_bad = false;
     r->clip_out_count = 0;
     r->clip_out_next = 0;
+    r->pend = RELAY_PEND_NONE;
+    if (r->pend_timer) {
+        timer_del(r->pend_timer);
+    }
 }
 
 /*
@@ -44,5 +48,55 @@ static bool relay_frame_retain(NvkvmRelay *r, int dmabuf_fd,
     r->last_fourcc   = fourcc;
     r->last_modifier = modifier;
     return true;
+}
+
+/*
+ * POLLOUT is shared between the frame retry and the clipboard, so neither may
+ * disarm it while the other still has something to send.  Both call this
+ * instead of passing a literal.
+ */
+static bool relay_want_writable(const NvkvmRelay *r)
+{
+    return r->pend != RELAY_PEND_NONE ||
+           r->clip_out_next < r->clip_out_count;
+}
+
+static void relay_pend_clear(NvkvmRelay *r)
+{
+    r->pend = RELAY_PEND_NONE;
+    if (r->pend_timer) {
+        timer_del(r->pend_timer);
+    }
+}
+
+/*
+ * The frame has been undeliverable for RELAY_PEND_DEADLINE_MS.  Try again and,
+ * if it still will not go, keep trying on the same period rather than giving
+ * up: an abandoned frame is the bug this exists to prevent.
+ */
+static void relay_pend_deadline(void *opaque)
+{
+    NvkvmRelay *r = opaque;
+
+    assert(bql_locked());
+    relay_frame_flush(r);
+    if (r->pend != RELAY_PEND_NONE && r->sock >= 0) {
+        timer_mod(r->pend_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      RELAY_PEND_DEADLINE_MS);
+    }
+}
+
+/* Note a frame the socket refused, and make sure something comes back for it. */
+static void relay_pend_arm(NvkvmRelay *r, RelayPend what)
+{
+    r->pend = what;
+    r->pend_counted = (what == RELAY_PEND_COMMIT);
+    relay_set_fd_handlers(r, true);
+    if (r->pend_timer) {
+        timer_mod(r->pend_timer,
+                  qemu_clock_get_ms(QEMU_CLOCK_REALTIME) +
+                      RELAY_PEND_DEADLINE_MS);
+    }
 }
 /* NVKVM_RELAY_STATE_HELPERS_END */
