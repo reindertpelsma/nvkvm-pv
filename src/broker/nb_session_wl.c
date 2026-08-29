@@ -1745,6 +1745,20 @@ static void wl_client_detach(struct nb_session *s, uint64_t generation)
         w->fetch_len = 0;
         w->fetch_generation = 0;
     }
+    /*
+     * DROP THE TEXT WE ARE HOLDING FOR A VM THAT HAS GONE (audit 2026-08-29).
+     *
+     * nb_client_state_reset() exists so a later VMM cannot inherit paste state,
+     * and this copy is exactly that — a guest's clipboard content, accepted but
+     * never applied because the window was not focused.  Kept here it survives
+     * the disconnect, and the next focus-in puts a departed VM's text on the
+     * user's clipboard, attributed by the notice to whatever VM is on screen
+     * now.  Already-applied text (src_text, and the wl_data_source that serves
+     * it) is NOT dropped: that is the user's clipboard now.
+     */
+    free(w->clip_pending);
+    w->clip_pending = NULL;
+    w->clip_pending_len = 0;
     /* The warning/title state described the departed VM, not the persistent
      * host window. */
     w->clip_notice_until = 0;

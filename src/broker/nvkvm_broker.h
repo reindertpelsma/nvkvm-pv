@@ -206,6 +206,25 @@ struct nb_sink {
     uint64_t rate_ms;           /* start of the current 1s window          */
     unsigned rate_count;
     /*
+     * PER-WAKEUP WORK BUDGET (audit 2026-08-29 S-1, S-2).
+     *
+     * B-1's budget counts COMMANDS, which is only a bound if every command
+     * costs about the same.  Two do not: an X11 shm COMMIT copies the whole
+     * frame (up to 8192*8192*4 = 256 MB) and an X11 ATTACH of a buffer the
+     * cache missed makes a BLOCKING round trip to the X server.  Sixty-four of
+     * either is not a bounded amount of work on the thread that also has to
+     * dispatch focus-loss and CTRL+ALT+G while the keyboard is grabbed.
+     *
+     * So the backends say what a command actually cost.  Bytes stop the DRAIN
+     * LOOP -- the work has already happened, so the charge bounds what follows
+     * it; round trips are refused by the BACKEND before it makes one, because
+     * a trip already begun cannot be cut short.  Both are reset at the top of
+     * every nb_sink_readable(): a wakeup that ends early loses nothing, since
+     * poll() reports POLLIN again immediately and the next call resumes.
+     */
+    uint64_t work_bytes;        /* copied/pushed so far this wakeup        */
+    unsigned work_trips;        /* blocking display round trips this wakeup*/
+    /*
      * Rejection-log throttle (audit 2026-08-27 S-4).  A rejected frame is
      * deliberately NOT a disconnect, so the reject path is the one thing a
      * hostile client can drive forever — and every line through nb_err() is a
@@ -283,6 +302,24 @@ int  nb_sink_flush(struct nb_sink *s);
 bool nb_sink_want_write(const struct nb_sink *s);
 /* Drain and act on whatever the client sent.  Disconnects on any violation. */
 void nb_sink_readable(struct nb_sink *s);
+
+/*
+ * WHAT THAT COMMAND COST, reported by the backend that paid it.  Both of these
+ * exist because the drain loop cannot see inside ->attach()/->commit(), and
+ * one command there can be worth thousands of ordinary ones.
+ *
+ * nb_sink_charge_work(): `bytes` the backend copied or pushed through the
+ * display connection for this command.  Purely additive — the work has already
+ * happened; the charge is what makes the loop yield before the NEXT one.
+ *
+ * nb_sink_take_roundtrip(): ask permission for one BLOCKING round trip to the
+ * display server.  False means the wakeup's allowance is gone and the backend
+ * must fail the command instead (a dropped frame, not a stalled loop).  Only a
+ * backend that has no non-blocking way to hear "the server refused this" needs
+ * this; the Wayland backend deliberately has none to ask about.
+ */
+void nb_sink_charge_work(struct nb_sink *s, uint64_t bytes);
+bool nb_sink_take_roundtrip(struct nb_sink *s);
 
 /* Called by session backends.  `code` values are Linux evdev codes on every
  * backend — that is what makes the wire format backend-independent. */
