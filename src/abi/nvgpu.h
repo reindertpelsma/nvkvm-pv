@@ -789,17 +789,17 @@ struct nv2081_alloc_parameters {
  *    symptom on that host is cuInit() succeeding while cuDeviceGetCount()
  *    returns 0 devices, so CUDA is unusable.
  *
- *    VERIFIED ACROSS TAGS, 2026-08-30. class/clcb33.h read at eleven OGKM
- *    tags spanning every ABI profile boundary:
+ *    VERIFIED ACROSS EVERY SUPPORTED TAG, 2026-08-30. class/clcb33.h read at
+ *    all 216 tags in ogkm-supported-tags.txt, from the local OGKM clone:
  *
- *      515.43.04, 525.60.13                       class ABSENT (does not exist)
- *      535.104.05, 545.23.06, 550.54.14,          NvHandle hClient;  -- identical
- *      570.124.06, 575.51.03, 580.159.04,
- *      590.48.01, 595.91.07, 610.43.02
+ *      49 tags   class ABSENT -- it does not exist before 535
+ *      167 tags  NvHandle hClient;   535.43.02 .. 610.57.04
+ *      ONE distinct layout. It does not diverge anywhere it exists.
  *
- *    So the layout does not diverge anywhere it exists, and a guest on a
- *    pre-535 driver can never allocate this class at all. No profile-specific
- *    handling is needed.
+ *    So no profile-specific handling is needed, and a guest on a pre-535
+ *    driver can never allocate this class at all. This supersedes an earlier
+ *    single-tag read and an eleven-tag sample; the whole set was cheap to
+ *    check because every tag is already on this machine.
  *
  *    WHAT THIS ROW STILL DOES NOT CLAIM: that it FIXES the zero-devices
  *    symptom. It closes a real,
