@@ -2135,8 +2135,18 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					regsurf_nfd++;
 					{
 						__s32 hid = guest_fd_to_handle_id(gfd);
-						if (hid < 0)   /* fail closed */
+						if (hid < 0) {  /* fail closed */
+							/* Unwind like every other
+							 * error exit: both buffers
+							 * are ours until the tail
+							 * frees them, and a guest
+							 * that loops on this
+							 * rejection would otherwise
+							 * leak them until OOM. */
+							kfree(aux_buf);
+							kfree(params_buf);
 							return -EBADF;
+						}
 						memcpy((char *)aux_buf + off,
 						       &hid, sizeof(hid));
 					}
@@ -2183,8 +2193,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				have_export_fd = true;
 				if (gfd >= 0) {
 					__s32 hid = guest_fd_to_handle_id(gfd);
-					if (hid < 0)   /* fail closed -- see 0x3d06 below */
+					if (hid < 0) {  /* fail closed -- see 0x3d06 below */
+						kfree(aux_buf);
+						kfree(params_buf);
 						return -EBADF;
+					}
 					memcpy((char *)aux_buf + 16, &hid,
 					       sizeof(hid));
 				}
@@ -2229,8 +2242,11 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					 * never reaches this branch: a real
 					 * SCM_RIGHTS-received nvkvm fd always
 					 * translates. */
-					if (hid < 0)
+					if (hid < 0) {
+						kfree(aux_buf);
+						kfree(params_buf);
 						return -EBADF;
+					}
 					memcpy(aux_buf, &hid, sizeof(hid));
 				}
 			}
