@@ -304,6 +304,17 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# The SteamOS stage changes the shape of a box: a 3.2 GB recovery image that
+# decompresses to ~10 GB, a qcow2 with two 8 GiB rootfs slots, a locally built
+# QEMU image, and a multi-GB OTA on top.  64 GB is comfortable for the driver
+# loop and NOT enough for that -- and a box that runs out mid-install produces
+# exactly the SIGBUS-truncated NVIDIA tree this stage exists to catch, which
+# would then be read as a product bug rather than a harness one.
+if [ "$RUN_STEAMOS" = 1 ]; then
+    [ "$DISK" -ge 128 ] 2>/dev/null || DISK=128
+    EST_DOWN_GB_PER_BOX=$(( EST_DOWN_GB_PER_BOX + 14 ))
+fi
+
 # ---------------------------------------------------------------------------
 # small utilities
 # ---------------------------------------------------------------------------
@@ -2020,7 +2031,7 @@ run_steamos_stage() {
 
     # Detached: a single `rsh_t 10800` ties the whole stage to one TCP
     # connection, and these boxes drop ssh under load.  Poll for a sentinel.
-    rsh_t 120 "rm -rf /root/steamos-stage; mkdir -p /root/steamos-stage; cd /root/nvkvm && STEAMOS_REF='$STEAMOS_REF' NVKVM_REF='$STEAMOS_REF' nohup setsid bash scripts/sweep_stage_steamos.sh >/root/steamos-stage/run.log 2>&1 </dev/null; echo done >/root/steamos-stage/DONE" >/dev/null 2>&1 &
+    rsh_t 120 "rm -rf /root/steamos-stage; mkdir -p /root/steamos-stage; cd /root/nvkvm && STEAMOS_REF='$STEAMOS_REF' nohup setsid bash scripts/sweep_stage_steamos.sh >/root/steamos-stage/run.log 2>&1 </dev/null; echo done >/root/steamos-stage/DONE" >/dev/null 2>&1 &
     launcher=$!
 
     while [ "$waited" -lt 10800 ]; do
@@ -2327,7 +2338,18 @@ say "  architectures : $ARCHES"
 say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_REQ)}"
 say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
+say "  disk          : ${DISK} GB per box"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
+if [ "$RUN_STEAMOS" = 1 ]; then
+    say "  steamos stage : ON (ref $STEAMOS_REF) -- installs SteamOS on each box and"
+    say "                  drives it to a desktop: install, provision, boot,"
+    say "                  display, ota, slotb. ~2.5h and ~14 GB extra per box."
+fi
+if [ "$DESTROY_ON_ERROR" = 1 ]; then
+    say "  on failure    : DESTROY (--destroy-on-error) -- nothing left to inspect"
+else
+    say "  on failure    : KEEP the box for inspection, bounded by the ${BUDGET_HOURS}h auto-destroy"
+fi
 say "  vast label    : $SWEEP_LABEL"
 say "                  (per-run: reap_strays destroys BY LABEL, so a shared one lets"
 say "                   concurrent runs reap each other -- OBSERVED 2026-08-29)"
@@ -2361,7 +2383,11 @@ if [ "$GO" != 1 ]; then
         line="$(pick_offer "$a")" || { printf '    %-10s NO RENTABLE KVM OFFER under $%s/hr\n' "$a" "$MAX_DPH"; continue; }
         IFS=$'\t' read -r _ mid gname odph ogeo _ _ ostor odowntb onet <<<"$line"
         n="$(drivers_for_arch "$a" | wc -l)"
-        hours="$(python3 -c "print(round(1.2 + 0.25 * $n, 2))")"
+        # The SteamOS stage is ~2.5h of box time on top of the driver loop
+        # (a 3.2 GB image, Valve's installer, a multi-GB OTA and two boots) and
+        # roughly 8 GB more transfer.  Leaving it out of the estimate is how a
+        # --steamos run silently costs 3x its printed price.
+        hours="$(python3 -c "print(round(1.2 + 0.25 * $n + (2.5 if $RUN_STEAMOS else 0), 2))")"
         # Network scales with the DRIVER COUNT, not with time: one .run per
         # driver is the bulk of it, so a long cheap box is not a cheap box.
         c="$(python3 -c "print(round($odph * $hours + $onet * max(1,$n) / max(1,$n), 2))")"

@@ -82,9 +82,20 @@ say "cloning nvkvm-steamos@$STEAMOS_REF and nvkvm-pv@$NVKVM_REF"
 rm -rf "$WORK/nvkvm-steamos" "$WORK/nvkvm-pv"
 git clone -q --depth 50 "$STEAMOS_REPO" "$WORK/nvkvm-steamos" || die_stage clone "steamos clone failed"
 git -C "$WORK/nvkvm-steamos" checkout -q "$STEAMOS_REF" || die_stage clone "steamos ref $STEAMOS_REF"
-git clone -q --depth 50 "$NVKVM_REPO" "$WORK/nvkvm-pv" || die_stage clone "nvkvm-pv clone failed"
-git -C "$WORK/nvkvm-pv" checkout -q "$NVKVM_REF" || die_stage clone "nvkvm-pv ref $NVKVM_REF"
-verdict clone pass "steamos=$(git -C "$WORK/nvkvm-steamos" rev-parse --short HEAD) pv=$(git -C "$WORK/nvkvm-pv" rev-parse --short HEAD)"
+# nvkvm-pv is the code UNDER TEST, so it comes from the tree the sweep shipped
+# to this box, not from GitHub.  Cloning main here would quietly test a
+# different commit than the driver stage just validated, and a release gate that
+# tests the wrong tree is worse than no gate.  Outside a sweep (run by hand),
+# fall back to a clone so the script still works standalone.
+if [ -f /root/nvkvm/src/common/nvkvm_abi.h ]; then
+    PV_SRC="under-test tree shipped by the sweep"
+    cp -a /root/nvkvm "$WORK/nvkvm-pv"
+else
+    PV_SRC="clone of $NVKVM_REPO@$NVKVM_REF"
+    git clone -q --depth 50 "$NVKVM_REPO" "$WORK/nvkvm-pv" || die_stage clone "nvkvm-pv clone failed"
+    git -C "$WORK/nvkvm-pv" checkout -q "$NVKVM_REF" || die_stage clone "nvkvm-pv ref $NVKVM_REF"
+fi
+verdict clone pass "steamos=$(git -C "$WORK/nvkvm-steamos" rev-parse --short HEAD) pv=$(git -C "$WORK/nvkvm-pv" rev-parse --short HEAD 2>/dev/null || echo local) [$PV_SRC]"
 
 # ------------------------------------------------------------ recovery img --
 cd "$WORK" || die_stage image "cannot enter $WORK"
