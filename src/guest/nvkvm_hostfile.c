@@ -39,6 +39,24 @@
  * whose first GPU happens to also be at 00:07.0.)
  */
 
+/*
+ * How many bytes a host-file read may legally land in a shm slot.
+ *
+ * NVKVM_HFILE_MAX_SIZE is 8192, but slot_size is host-negotiated and may
+ * legally be as small as NVKVM_SHM_SLOT_MIN_SIZE (4096).  Asking QEMU for 8192
+ * and then trusting the nbytes it returns meant a 4 KiB over-read of the
+ * ADJACENT slot -- another process's in-flight ioctl parameters -- straight
+ * into the /proc/driver/nvidia files, which are mode 0444 and world-readable.
+ * Bound both the request and the returned count by the slot we actually own.
+ */
+static inline __u32 nvkvm_hfile_cap(void)
+{
+	size_t slot = nvkvm.slot_size;
+
+	return (slot < NVKVM_HFILE_MAX_SIZE) ? (__u32)slot
+					     : (__u32)NVKVM_HFILE_MAX_SIZE;
+}
+
 /* ── proc-entry helpers ───────────────────────────────────────────────────── */
 
 struct nvkvm_hostfile_entry {
@@ -70,8 +88,8 @@ static int hostfile_show(struct seq_file *m, void *v)
 
 	ret = nvkvm_virtio_read_host_file(e->file_id, e->gpu_index,
 					  (__u32)shm_slot,
-					  NVKVM_HFILE_MAX_SIZE, &nbytes);
-	if (ret == 0 && nbytes > 0 && nbytes <= NVKVM_HFILE_MAX_SIZE)
+					  nvkvm_hfile_cap(), &nbytes);
+	if (ret == 0 && nbytes > 0 && nbytes <= nvkvm_hfile_cap())
 		seq_write(m, slot_ptr, nbytes);
 
 	nvkvm_slot_free(&nvkvm, shm_slot);
@@ -122,8 +140,9 @@ static ssize_t initstate_show(struct kobject *kobj, struct kobj_attribute *a,
 
 	/* Host-wide file: QEMU ignores gpu_index for these. */
 	ret = nvkvm_virtio_read_host_file(file_id, 0, (__u32)shm_slot,
-					  NVKVM_HFILE_MAX_SIZE, &nbytes);
-	if (ret == 0 && nbytes > 0 && nbytes <= PAGE_SIZE - 1) {
+					  nvkvm_hfile_cap(), &nbytes);
+	if (ret == 0 && nbytes > 0 && nbytes <= PAGE_SIZE - 1 &&
+	    nbytes <= nvkvm_hfile_cap()) {
 		memcpy(buf, p, nbytes);
 	} else {
 		nbytes = 0;
@@ -293,13 +312,13 @@ int nvkvm_hostfile_discover_gpus(void)
 		__u32 nbytes = 0;
 		int ret = nvkvm_virtio_read_host_file(
 				NVKVM_HFILE_NVIDIA_INFORMATION, (__u32)i,
-				(__u32)shm_slot, NVKVM_HFILE_MAX_SIZE, &nbytes);
+				(__u32)shm_slot, nvkvm_hfile_cap(), &nbytes);
 
 		/* EINVAL here is the end of QEMU's BDF list, not a failure. */
 		if (ret || nbytes == 0)
 			break;
-		if (nbytes > NVKVM_HFILE_MAX_SIZE)
-			nbytes = NVKVM_HFILE_MAX_SIZE;
+		if (nbytes > nvkvm_hfile_cap())
+			nbytes = nvkvm_hfile_cap();
 		memcpy(tmp, slot_ptr, nbytes);
 		if (!nvkvm_parse_bus_location(tmp, nbytes, nvkvm.gpu_bdf[count])) {
 			pr_warn("nvkvm: host GPU %d has no parsable Bus Location; stopping discovery\n",

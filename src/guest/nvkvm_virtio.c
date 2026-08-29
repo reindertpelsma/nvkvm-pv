@@ -99,7 +99,7 @@ void *nvkvm_slot_addr(struct nvkvm_state *state, int slot)
  * Returns the txn_id on success, or 0 if every slot is currently in use
  * (caller should error out — this means NVKVM_MAX_INFLIGHT is too small).
  */
-static __u32 nvkvm_txn_id_alloc(struct nvkvm_state *state)
+__u32 nvkvm_txn_id_alloc(struct nvkvm_state *state)
 {
 	unsigned long flags;
 	__u32 seed = (__u32)atomic_inc_return(&state->next_txn_id);
@@ -121,7 +121,7 @@ static __u32 nvkvm_txn_id_alloc(struct nvkvm_state *state)
 	return 0;
 }
 
-static void nvkvm_txn_id_free(struct nvkvm_state *state, __u32 txn_id)
+void nvkvm_txn_id_free(struct nvkvm_state *state, __u32 txn_id)
 {
 	unsigned long flags;
 	unsigned slot = txn_id & 0xFFF;
@@ -797,6 +797,23 @@ int nvkvm_negotiate_version(struct nvkvm_state *state)
 	    !is_power_of_2(state->slot_size)) {
 		pr_err("nvkvm: invalid slot_size %zu from host\n",
 		       state->slot_size);
+		return -EINVAL;
+	}
+	/*
+	 * The shape check above says nothing about whether the slots FIT.
+	 * nvkvm_slot_addr() computes shm_base + slot * slot_size for any slot up
+	 * to NVKVM_SHM_NSLOTS-1, so a VMM advertising, say, a 1 GiB slot_size
+	 * against the 16 MiB region we actually ioremap()ed would turn every
+	 * slot memcpy into a write past the end of the mapping -- into whatever
+	 * kernel address follows it.  shm_size is the size we mapped in
+	 * nvkvm_virtio_init(); the whole slot array has to live inside it.  u64
+	 * math because slot_size is host-supplied and the product would
+	 * otherwise wrap a 32-bit size_t.
+	 */
+	if ((__u64)state->slot_size * NVKVM_SHM_NSLOTS > (__u64)state->shm_size) {
+		pr_err("nvkvm: host slot_size %zu x %u slots exceeds the %zu-byte shared region\n",
+		       state->slot_size, (unsigned)NVKVM_SHM_NSLOTS,
+		       state->shm_size);
 		return -EINVAL;
 	}
 

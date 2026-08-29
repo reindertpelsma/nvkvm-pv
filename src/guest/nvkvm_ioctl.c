@@ -21,6 +21,7 @@
 
 #include <linux/errno.h>
 #include <linux/fdtable.h>
+#include <linux/limits.h>
 #include <linux/file.h>
 #include <linux/ioctl.h>
 #include "nvkvm.h"
@@ -434,7 +435,22 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		 * sees the same VA the stub has mapped.
 		 */
 		if (p->h_class == 0x71 && p->p_memory && p->limit > 0) {
-			int mret = nvkvm_cpu_pages_migrate_range(
+			int mret;
+			/*
+			 * limit is inclusive, so the length is limit+1 -- and at
+			 * limit == U64_MAX that addition wraps to 0.  Zero passes
+			 * the > 0 guard above, makes the migrate call below return
+			 * immediately, and then skips the else branch that zeroes
+			 * p_memory -- so the raw guest VA would be forwarded to
+			 * the host, defeating the one invariant this sanitizer
+			 * exists to enforce.  No real OS_DESCRIPTOR spans the
+			 * whole address space; refuse it.
+			 */
+			if (p->limit == U64_MAX) {
+				pr_warn_ratelimited("nvkvm: OS_DESCRIPTOR limit=U64_MAX overflows the length computation — refusing\n");
+				return -EINVAL;
+			}
+			mret = nvkvm_cpu_pages_migrate_range(
 				ctx,
 				(__u64)p->p_memory,
 				(__u64)p->limit + 1,

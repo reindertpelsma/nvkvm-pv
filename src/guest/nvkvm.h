@@ -703,4 +703,13 @@ int   nvkvm_send_sync(struct nvkvm_state *state,
 		      void *req_buf, size_t req_len,
 		      struct nvkvm_inflight *inf);
 
+/* txn_id allocator (nvkvm_virtio.c).  Any caller that builds its own inflight
+ * record instead of going through inflight_alloc() must still take its txn_id
+ * from here: a raw atomic_inc_return() on the seed can hand out an id whose
+ * bitmap slot is still outstanding, and the response would then be matched to
+ * the wrong waiter.  Returns 0 if every slot is in use; free with
+ * nvkvm_txn_id_free() once the response has been consumed. */
+__u32 nvkvm_txn_id_alloc(struct nvkvm_state *state);
+void  nvkvm_txn_id_free(struct nvkvm_state *state, __u32 txn_id);
+
 #endif /* NVKVM_H */

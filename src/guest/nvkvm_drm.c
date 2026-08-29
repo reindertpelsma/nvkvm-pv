@@ -292,6 +292,16 @@ static __u32 nvkvm_gem_to_stub(struct drm_file *file, __u32 guest_handle)
  * outside the evicted importer's own fd; a deeper or per-use-refcounted cache
  * is the real answer if a two-compositor workload ever matters.
  *
+ * OWNERSHIP: on success *fwd_ctx_out comes back with a reference TAKEN, and the
+ * caller must nvkvm_fd_ctx_put() it on every exit path.  It used to be borrowed,
+ * returned after the GEM reference that was the only thing keeping the ctx alive
+ * had already been dropped -- a concurrent GEM_CLOSE of the last handle then ran
+ * nvkvm_gem_free() and freed the ctx while this thread was still inside the
+ * blocking nvkvm_virtio_ioctl_on_isolate() round-trip reading
+ * ctx->session->isolate_id.  Note the contrast with nvkvm_fb_stub_handle()
+ * below, which returns a BORROWED ctx: that one is safe only because the KMS
+ * present path holds a framebuffer reference across the whole call.
+ *
  * Returns 0 and fills *stub_h_out / *fwd_ctx_out on success; -errno on a failed
  * cross-isolate broker; -ENOENT if the handle is not one of our proxies. */
 static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
@@ -324,6 +334,9 @@ static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
 		 * is valid), exactly as the multi-open single-process path. */
 		*stub_h_out  = ng->stub_handle;
 		*fwd_ctx_out = owner_ctx ? owner_ctx : caller_ctx;
+		/* Before the GEM put below: that reference is what has been
+		 * holding owner_ctx up to this point. */
+		nvkvm_fd_ctx_get(*fwd_ctx_out);
 		drm_gem_object_put(obj);
 		return 0;
 	}
@@ -342,6 +355,10 @@ static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
 		 * the handle on. */
 		*stub_h_out  = ng->xiso_gem;
 		*fwd_ctx_out = ng->xiso_ctx ? ng->xiso_ctx : caller_ctx;
+		/* Under xiso_lock: an eviction detaches ng->xiso_ctx (and drops
+		 * its reference) with this same lock held, so taking the ref
+		 * here is what stops the evictor freeing it under us. */
+		nvkvm_fd_ctx_get(*fwd_ctx_out);
 		mutex_unlock(&ng->xiso_lock);
 		drm_gem_object_put(obj);
 		return 0;
@@ -367,6 +384,10 @@ static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
 			ng->xiso_gem          = gem;
 			*stub_h_out  = gem;
 			*fwd_ctx_out = caller_ctx;
+			/* Second reference: one for the cache entry above, one
+			 * for the pointer we hand back.  The caller's put must
+			 * not be able to tear down the cache entry. */
+			nvkvm_fd_ctx_get(caller_ctx);
 		} else if (ret == 0) {
 			ret = -EIO;
 		}
@@ -381,7 +402,13 @@ static int nvkvm_gem_resolve_fwd(struct drm_file *file, __u32 guest_handle,
 /* Present path (#102): map a scanout framebuffer back to the host/stub buffer
  * behind it. A compositor's scanout buffer is an NVIDIA bo allocated via the
  * render node, so its guest GEM is one of our proxy objects carrying the stub
- * handle + owning isolate. (A plain shmem dumb fb is NOT a proxy → false.) */
+ * handle + owning isolate. (A plain shmem dumb fb is NOT a proxy → false.)
+ *
+ * OWNERSHIP: *ctx is BORROWED -- valid only while the caller holds a reference
+ * on @fb, which is what keeps the proxy GEM and therefore the ctx alive.  The
+ * one caller (nvkvm_present_send) does; do not copy this pattern anywhere the
+ * fb reference is not held across the entire use.  Contrast
+ * nvkvm_gem_resolve_fwd() above, which returns an owned reference. */
 bool nvkvm_fb_stub_handle(struct drm_framebuffer *fb, __u32 *stub_handle,
 			  struct nvkvm_fd_ctx **ctx)
 {
@@ -776,6 +803,9 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 {
 	struct drm_nvidia_gem_export_nvkms_memory_params *p = data;
 	struct nvkvm_fd_ctx *ctx = file->driver_priv;
+	/* Non-NULL once nvkvm_gem_resolve_fwd() has handed us an owned ctx
+	 * reference; every exit below must drop it. */
+	struct nvkvm_fd_ctx *fwd_ctx = NULL;
 	unsigned int cmd = DRM_IOWR(NVKVM_DRM_COMMAND_BASE + 0x09,
 				    struct drm_nvidia_gem_export_nvkms_memory_params);
 	__u32 guest_h = p->handle, stub_h;
@@ -796,11 +826,17 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 	 * caller's stub (see nvkvm_gem_resolve_fwd).  On a non-proxy handle, fall
 	 * back to forwarding as-is on the caller's ctx. */
 	{
-		int rret = nvkvm_gem_resolve_fwd(file, guest_h, &stub_h, &ctx);
-		if (rret == 0 && stub_h)
-			p->handle = stub_h;
-		else if (rret < 0 && rret != -ENOENT)
+		int rret = nvkvm_gem_resolve_fwd(file, guest_h, &stub_h, &fwd_ctx);
+		if (rret == 0) {
+			/* Owned reference — held for the whole round-trip below,
+			 * because the forwarding ctx is no longer kept alive by
+			 * anything else once resolve_fwd dropped the GEM ref. */
+			ctx = fwd_ctx;
+			if (stub_h)
+				p->handle = stub_h;
+		} else if (rret != -ENOENT) {
 			return rret;
+		}
 	}
 
 	orig_ptr = p->nvkms_params_ptr;
@@ -810,12 +846,16 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 		aux = kzalloc(aux_sz, GFP_KERNEL);
 		if (!aux) {
 			p->handle = guest_h;
+			if (fwd_ctx)
+				nvkvm_fd_ctx_put(fwd_ctx);
 			return -ENOMEM;
 		}
 		if (copy_from_user(aux, (void __user *)(uintptr_t)orig_ptr,
 				   aux_sz)) {
 			kfree(aux);
 			p->handle = guest_h;
+			if (fwd_ctx)
+				nvkvm_fd_ctx_put(fwd_ctx);
 			return -EFAULT;
 		}
 		/* { int memFd } at offset 0 → swap for our handle_id. */
@@ -826,8 +866,19 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 			/* FAIL CLOSED: an untranslated value would be forwarded
 			 * as a VM-global handle_id, which QEMU's cross-isolate
 			 * relay treats as an entitlement.  See nvkvm_main.c. */
-			if (hid < 0)
+			if (hid < 0) {
+				/* Same unwind as every other exit: aux is ours,
+				 * and p->handle still holds the STUB handle we
+				 * substituted above -- drm_ioctl() copies the
+				 * params struct back to userspace on the error
+				 * return, so leaving it there would hand the
+				 * caller an internal host-side handle. */
+				kfree(aux);
+				p->handle = guest_h;
+				if (fwd_ctx)
+					nvkvm_fd_ctx_put(fwd_ctx);
 				return -EBADF;
+			}
 			memcpy(aux, &hid, sizeof(hid));
 		}
 		p->nvkms_params_ptr = 0;   /* stub fills host VA at offset 8 */
@@ -846,6 +897,8 @@ static int nvkvm_drm_fwd_gem_export_nvkms_memory(struct drm_device *dev,
 	p->nvkms_params_ptr = orig_ptr;
 	p->handle = guest_h;
 	kfree(aux);
+	if (fwd_ctx)
+		nvkvm_fd_ctx_put(fwd_ctx);
 	return (r < 0) ? (int)r : 0;
 }
 
@@ -902,8 +955,13 @@ static int nvkvm_drm_fwd_gem_import_nvkms_memory(struct drm_device *dev,
 			/* FAIL CLOSED: an untranslated value would be forwarded
 			 * as a VM-global handle_id, which QEMU's cross-isolate
 			 * relay treats as an entitlement.  See nvkvm_main.c. */
-			if (hid < 0)
+			if (hid < 0) {
+				/* aux is ours; the two exits above free it and
+				 * so must this one, or a guest loop leaks up to
+				 * a slot's worth of kernel memory per call. */
+				kfree(aux);
 				return -EBADF;
+			}
 			memcpy(aux, &hid, sizeof(hid));
 		}
 		p->nvkms_params_ptr = 0;   /* stub fills a host VA at offset 8 */
