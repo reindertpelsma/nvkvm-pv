@@ -69,7 +69,7 @@ in one does not block another. Nothing is merged to `main`.
 | `fix/guest-lifetime` | guest: the critical UAF + 5 serious | **builds**, reviewed, ready |
 | `fix/isolate-boundary` | 6 isolate findings incl. 4 criticals | compiles + unit tests, reviewed — **one critical only half-closed** |
 | `fix/vmm-lifetime` | 5 VMM findings | front-end compiles, reviewed, ready |
-| `fix/broker-work-bounds` | broker serious | in progress |
+| `fix/broker-work-bounds` | all 5 broker findings | done — builds, **ASan+UBSan clean**, 79 selftests pass |
 | `fix/packaging-supply-chain` | nvkvm-pv: dockerignore, action pinning, workflow injection, 9p | done, reviewed |
 | `fix/kata-supply-chain` | nvkvm-kata: the HTTP modprobe critical | done, **verified live** |
 | `fix/steamos-warn` | nvkvm-steamos: the undefined `warn()` | done, `make check` 17/17 |
@@ -185,3 +185,49 @@ dies with a bare exit 141. Reproduced here exactly: the same construct under the
 same shell options exits 141. This is a plain functional bug, unrelated to
 security, that the audit did not look for and that no test covered — the guest
 rootfs build was broken for anyone whose mirror served a full index.
+
+
+## All five components remediated — 2026-08-29
+
+| repo | branch | build evidence |
+|---|---|---|
+| nvkvm-pv | `fix/guest-lifetime` | real `.ko`, warnings identical to `main` |
+| nvkvm-pv | `fix/isolate-boundary` | real `.o` with production flags, stub links, unit suites pass |
+| nvkvm-pv | `fix/vmm-lifetime` | front-end compile only (installed QEMU tree is stale 9.2.0) |
+| nvkvm-pv | `fix/broker-work-bounds` | builds all backends, `make check` + ASan/UBSan clean |
+| nvkvm-pv | `fix/packaging-supply-chain` | CI tests + shellcheck + YAML parse |
+| nvkvm-kata | `fix/kata-supply-chain` | **verified live** — real fetch, digest match, forced mismatch dies |
+| nvkvm-steamos | `fix/steamos-warn` | `make check` 17/17 |
+
+**Nothing merged. Nothing runtime-tested against a VM or GPU.**
+
+### What is genuinely still open
+
+1. **`KILL_ISOLATE` is unauthenticated** until the guest fills `reserved` and
+   QEMU fails closed on zero. Protocol change across two components; needs a
+   decision, not more code.
+2. **BAR1 VA leak** — the original release blocker. Untouched: not root-caused,
+   no fix on any branch.
+3. Guest lock-ordering: the `ext_lock`/`mmap_lock` AB-BA deadlock and the false
+   "no caller holds mmap_lock" invariant. Design changes, deliberately skipped.
+4. VMM: `p->mode` un-latched on broker reconnect, letting both present paths run.
+   State-machine change, deliberately skipped.
+5. Broker: detach-inside-dispatch never reaching the exit check. Control-flow
+   restructuring, deliberately skipped.
+
+### A third correction to the audit, from the broker work
+
+Finding 4 said a refused X11 grab leaves the title reading "GRABBED" **and the
+cursor hidden**. Only the title half is real: `x11_show_cursor()` ignores its
+argument and re-runs `x11_cursor_policy()`, which keys off whether a guest frame
+is up, not off the grab state. The fix restores both anyway, for symmetry with
+the ungrab path.
+
+### The bound values are reasoned, not measured
+
+The broker's new limits — 4 X round trips and 64 MB of copy per wakeup — are
+derived from the 8192-dimension cap and documented honest-client rates, **not**
+measured against a real VMM. Whether a legitimate client ever imports more than
+four new buffers in one wakeup is unmeasured; the cost if it does is dropped
+frames recovered within the 100 ms pacing watchdog, not a stall. Worth
+confirming on hardware before this is treated as tuned.
