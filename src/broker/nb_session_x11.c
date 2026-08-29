@@ -1575,6 +1575,18 @@ static int x11_set_grab(struct nb_session *s, bool on)
             nb_err("GrabKeyboard refused (status %d) — another client holds "
                    "the keyboard", kr ? kr->status : -1);
             free(kr);
+            /*
+             * TAKE THE ANNOUNCEMENT BACK.  The title and the pointer policy are
+             * set BEFORE the grab is asked for, because they have to be up by
+             * the time it succeeds; on the refusal path that leaves the window
+             * saying "GRABBED - CTRL+ALT+G TO RELEASE" over a keyboard someone
+             * else holds.  That is the inversion the protocol header calls
+             * unacceptable — the user hunts for a release for a grab that was
+             * never taken, and learns to distrust the one signal that says
+             * whether their keyboard is captured.
+             */
+            x11_set_status(x, NULL);
+            x11_show_cursor(x, true);
             return -EBUSY;
         }
         free(kr);
@@ -1591,6 +1603,10 @@ static int x11_set_grab(struct nb_session *s, bool on)
             nb_err("GrabPointer refused (status %d)", pr ? pr->status : -1);
             free(pr);
             xcb_ungrab_keyboard(x->c, XCB_CURRENT_TIME);
+            /* Same as above: the keyboard grab has just been given back, so
+             * the window must stop claiming to hold it. */
+            x11_set_status(x, NULL);
+            x11_show_cursor(x, true);
             xcb_flush(x->c);
             return -EBUSY;
         }
