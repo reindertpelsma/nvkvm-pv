@@ -1,3 +1,78 @@
+# Every non-comment rule in .gitignore is repeated here VERBATIM, in order, and
+# tests/dockerignore_superset_test.sh fails the build if one goes missing.
+#
+# This is not tidiness.  .gitignore is where the secrets live: *.key, .env and
+# data/authorized_keys are kept out of the repo precisely because they are
+# secret -- and the runtime stage of the Dockerfile does `COPY . /opt/nvkvm`
+# into an image published under the ghcr name.  Anything Git hides and Docker
+# does not therefore gets baked into a public image layer, where `docker
+# history` reads it back out.  Order matters: the `!` negations below only work
+# if they still follow the rule they re-include, exactly as in .gitignore.
+#
+# ── mirrored from .gitignore ────────────────────────────────────────────────
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+!go.mod
+!go.sum
+*.symvers
+*.order
+.tmp_versions/
+Module.symvers
+modules.builtin
+modules.order
+*.so
+src/stub/nvkvm_stub
+src/stub/nvkvm_stub_bin.h
+.vscode/
+.idea/
+*.key
+.env
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+tests/unit/test_objects
+tests/unit/test_handle
+tests/unit/test_isolate
+tests/unit/test_tables
+tests/unit/test_open_scm
+tests/unit/test_ctrl_gate
+tests/unit/mock_stub
+tests/unit/test_nvkms_allowlist
+tests/unit/test_stub_ptr_sanitize
+tests/unit/test_kvm_slot
+tests/unit/test_r1_type_dev
+tests/unit/test_transport_ready
+tests/unit/stub_sanitize.inc
+tests/unit/kvm_slot_pool.inc
+tests/unit/test_stub_window
+tests/unit/stub_window.inc
+tests/unit/win_alloc.inc
+tests/unit/test_drm_devinfo
+tests/unit/drm_param_structs.inc
+tests/unit/r1_type_dev.inc
+tests/unit/r1_stub_type_dev.inc
+sweep-runs/
+tests/unit/transport_ready.inc
+data/authorized_keys
+data/root_authorized_keys
+tests/unit/test_*
+!tests/unit/test_*.c
+!tests/unit/test_*.py
+!tests/unit/test_*.sh
+src/guest/.*.cmd
+src/guest/*.o
+src/guest/*.ko
+src/guest/*.mod*
+src/guest/Module.symvers
+src/guest/modules.order
+
+# ── Docker-only exclusions ─────────────────────────────────────────────────
+# Repository metadata, large media and disk images: never a build input, and
+# each one invalidates the build cache for free.
 .git
 docs/img/*.gif
 *.qcow2

@@ -116,10 +116,23 @@ if [ -n "${NVKVM_HOSTLIBS_DIR:-}" ] && [ -d "${NVKVM_HOSTLIBS_DIR}" ]; then
 fi
 SHARE_ARG=""
 if [ -n "${NVKVM_SHARE_DIR:-}" ] && [ -d "${NVKVM_SHARE_DIR}" ]; then
-    # passthrough, not mapped: a shared folder is only useful if files the
-    # guest writes are readable on the host as themselves.  mapped stores the
-    # ownership in xattrs and the guest cannot write as its own uid at all.
-    SHARE_ARG="-virtfs local,path=${NVKVM_SHARE_DIR},mount_tag=nvkvm_data,security_model=passthrough"
+    # mapped-xattr, NOT passthrough.  passthrough writes the guest's uid, gid
+    # AND MODE straight through to the host, and this QEMU commonly runs as
+    # root (uid 0 in the container; often root on a bare host too).  So guest
+    # root dropping a `-rwsr-xr-x root` binary in this directory leaves a real
+    # host escalation sitting in a host path, waiting for whoever runs it --
+    # and setting a setuid bit on a file you already own needs no capability,
+    # so no cap_drop stops it.  mapped-xattr keeps guest ownership and mode in
+    # user.virtfs.* xattrs, so nothing host-visible is really setuid.
+    # This is the decision nvkvm-steamos already made for the same share; see
+    # its scripts/steamos-container-entrypoint.sh.
+    #
+    # THE COST IS REAL, and it is not a bug: files the guest writes are owned
+    # by the QEMU uid on the host with mode 0600, not by "the same user" the
+    # guest saw.  Move data with `sudo`, tar, or scp over the forwarded port.
+    # It also needs a host filesystem with user xattrs -- every ext4/xfs/btrfs
+    # has them; a share on a filesystem without them fails at first write.
+    SHARE_ARG="-virtfs local,path=${NVKVM_SHARE_DIR},mount_tag=nvkvm_data,security_model=mapped-xattr"
 fi
 
 # ── P-7: the repo export is READ-ONLY unless explicitly opted in ─────────

@@ -55,7 +55,7 @@ jobs:
     # letting a hung ninja burn a full 6-hour job slot.
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Installed here rather than via `build_qemu.sh --install-deps` so that a
       # dependency problem fails in an obviously-labelled step instead of inside

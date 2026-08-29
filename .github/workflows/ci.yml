@@ -42,6 +42,12 @@
 # so tests/validate.sh cannot run here and is not attempted; hardware coverage
 # comes from scripts/sweep_matrix.py against rented boxes.  Kernel-module
 # builds live in kernel-matrix.yml, the QEMU build in qemu-build.yml.
+#
+# Actions are pinned by commit SHA, version in the trailing comment.  A `@v4`
+# tag is a mutable pointer owned by someone else, and an action that runs here
+# reads the tree and the runner token.  release.yml's header carries the full
+# reasoning and the bump procedure; this file follows the same rule so there is
+# only one rule.
 name: ci
 
 on:
@@ -63,7 +69,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: guest UVM and KMS ordering wiring
         run: python3 tests/guest_wiring_test.py
@@ -73,6 +79,14 @@ jobs:
 
       - name: guest cloud-image cache interruption safety
         run: bash tests/setup_guest_image_offline_test.sh
+
+      # The Dockerfile's runtime stage does `COPY . /opt/nvkvm` into an image
+      # published under the ghcr name.  .gitignore is where *.key, .env and
+      # data/authorized_keys are kept out of a PUBLIC repo; a rule that lives
+      # there and not in .dockerignore protects nothing, because the file goes
+      # straight into a published layer instead.
+      - name: .dockerignore covers every .gitignore rule
+        run: bash tests/dockerignore_superset_test.sh
 
       # run_tests.sh, not `make run`.  `make run` exits non-zero by design --
       # test_isolate fails 5 of its 7 cases at runtime on pre-existing API
@@ -108,7 +122,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: install display protocol build dependencies
         run: |
@@ -133,7 +147,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Twice, on purpose.  The bug this exists for was invisible on the
       # toolchain the author had and fatal on a newer one, so checking a single
@@ -153,7 +167,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Pinned to an exact shellcheck, not the runner image's, because a newer
       # shellcheck ships new checks and would turn this red on a day nobody
@@ -192,8 +206,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.23'
           cache: false

@@ -41,7 +41,13 @@ fi
 BUNDLE="$(ls -d /opt/nvkvm/host-libs-* 2>/dev/null | head -1)"
 [ -n "$BUNDLE" ] && export NVKVM_HOSTLIBS_DIR="$BUNDLE"
 mkdir -p /data
-chmod 0777 /data 2>/dev/null || true   # the guest writes as its own uid
+# 0700, not 0777.  The 0777 was there because the share used 9p
+# security_model=passthrough and the guest wrote as its own uid; the share is
+# mapped-xattr now (see run_test_vm.sh), so QEMU itself does every write and
+# nothing needs world-write.  A world-writable directory on a host bind mount
+# was the other half of the same hazard: anyone on the host could drop a file
+# the guest would then read as trusted.
+chmod 0700 /data 2>/dev/null || true
 export NVKVM_SHARE_DIR=/data
 
 exec bash /opt/nvkvm/scripts/run_test_vm.sh "$@"
