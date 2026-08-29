@@ -686,11 +686,23 @@ int nvkvm_req_open_nvidia_handle(VirtIONvgpu *nv,
 	 * authoritative enforcement — the stub only ever opens devices QEMU
 	 * grants a handle for, so a guest that ignores the cleared config bit
 	 * still cannot reach them.
+	 *
+	 * Audit 2026-08-29 (minor): the range test used to run on `(int)`
+	 * casts of a guest __le32, so any dev_id with bit 31 set went negative,
+	 * compared below NVKVM_DEV_DRM_RD(0), and skipped the gate the sentence
+	 * above calls authoritative.  A skipped gate did not open anything —
+	 * nvidia_dev_path() turns a negative dev_id into a path that does not
+	 * exist — but "the check is bypassed and something else happens to
+	 * catch it" is not what that sentence promises.  Compare unsigned;
+	 * every NVKVM_DEV_* is a small positive constant, so the in-range
+	 * verdicts are unchanged.  (Not guest-userspace reachable either way:
+	 * the guest module derives dev_id from imajor()/iminor() of the node
+	 * userspace opened, it never copies it from an ioctl argument.)
 	 */
 	if (!nv->graphics &&
-	    ((int)req->dev_id == NVKVM_DEV_MODESET ||
-	     ((int)req->dev_id >= NVKVM_DEV_DRM_RD(0) &&
-	      (int)req->dev_id < NVKVM_DEV_DRM_RD(16)))) {
+	    (req->dev_id == (uint32_t)NVKVM_DEV_MODESET ||
+	     (req->dev_id >= (uint32_t)NVKVM_DEV_DRM_RD(0) &&
+	      req->dev_id < (uint32_t)NVKVM_DEV_DRM_RD(16)))) {
 		resp->handle_id = 0;
 		resp->status    = EPERM;
 		return 0;
@@ -809,10 +821,26 @@ int nvkvm_req_close_handle(VirtIONvgpu *nv,
 			    struct nvkvm_req_close_handle *req,
 			    struct nvkvm_resp_close_handle *resp)
 {
-	/* U-6: the va_space dies with the fd — drop its VA-range ownership
-	 * records so a recycled handle_id cannot inherit them. */
-	nvkvm_uvm_va_purge_handle(req->handle_id);
+	/*
+	 * U-6: the va_space dies with the fd — drop its VA-range ownership
+	 * records so a recycled handle_id cannot inherit them.
+	 *
+	 * Audit 2026-08-29 (serious): this ran BEFORE the close, and the close
+	 * legitimately returns -EBUSY while an isolate still holds the handle
+	 * (nvkvm_handle_close's isolate_refcount guard).  On that path the fd
+	 * survives, the va_space survives, and its ownership records were gone
+	 * — so every later range-USING UVM ioctl on that still-live handle
+	 * failed the U-6 containment check and the guest's UVM context was
+	 * bricked with no way back.  Not an attack (guest_fd_to_handle_id
+	 * proves the id is the caller's own fd, so the only context it can
+	 * brick is its own), but a correctness bug a legitimate guest hits by
+	 * closing an fd an isolate still references.  Purge only once the fd is
+	 * actually gone; the records the purge exists to stop leaking into a
+	 * recycled id cannot be inherited while the id is still in use.
+	 */
 	int ret = nvkvm_handle_close(&nv->handles, req->handle_id);
+	if (ret == 0)
+		nvkvm_uvm_va_purge_handle(req->handle_id);
 	resp->status = (ret < 0) ? (uint32_t)-ret : 0;
 	return 0;
 }
@@ -2673,11 +2701,66 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				 * recycled onto an unrelated file.  Dup under
 				 * the lock and give the driver the dup, which
 				 * we own for the whole call. */
+				/*
+				 * Audit 2026-08-29 (serious): the only two rows
+				 * that set fd_off — REGISTER_GPU.rmCtrlFd@24 and
+				 * REGISTER_GPU_VASPACE.rmCtrlFd@16 — name an
+				 * /dev/nvidiactl fd, and the REALIZE path checks
+				 * the IDENTICAL field three ways before the stub
+				 * resolves it (session, TYPE_NVIDIA, DEV_CTL —
+				 * see nvkvm_req_realize_uvm_mapping).  Here it
+				 * was resolved with no check at all, so ANY live
+				 * handle id resolved.  The guest sanitizer does
+				 * not close this: guest_fd_to_handle_id() proves
+				 * only that the id belongs to one of the
+				 * caller's OWN open nvkvm fds (fget +
+				 * nvkvm_file_is_ours), not that it is an
+				 * nvidiactl fd — so guest userspace could name
+				 * its own memfd or UVM handle in the rmCtrlFd
+				 * slot and hand the host UVM driver an fd of
+				 * entirely the wrong kind to dereference.
+				 *
+				 * Check type and device, NOT session: the
+				 * session half is deliberately unenforced on
+				 * this path (see the access-rights note at the
+				 * top of this function — it would wrongly reject
+				 * a legitimately shared handle).  Type comes
+				 * from nvkvm_handle_get(), which drops the lock,
+				 * so pair it with the generation the atomic
+				 * acquire reports: equal generations prove the
+				 * slot was not recycled between the two reads,
+				 * and therefore that the type describes the same
+				 * handle the dup came from.
+				 */
+				struct nvkvm_handle *eh =
+					nvkvm_handle_get(&nv->handles, hid);
+				if (!eh)
+					continue;
+				int      etype = eh->type;
+				uint64_t egen0 = eh->generation;
+				int      edev  = -1;
+				uint64_t egen  = 0;
 				int efd = nvkvm_handle_acquire_fd(&nv->handles,
-								  hid, NULL,
-								  NULL);
+								  hid, &edev,
+								  &egen);
 				if (efd < 0)
 					continue;
+				if (etype != NVKVM_HANDLE_TYPE_NVIDIA ||
+				    edev != NVKVM_DEV_CTL || egen != egen0) {
+					NVKVM_DBG("nvkvm: DENY UVM cmd=0x%x "
+						  "embedded fd handle %u is not "
+						  "a live nvidiactl handle "
+						  "(type=%d dev=%d)\n",
+						  req->cmd, hid, etype, edev);
+					close(efd);
+					for (int j = 0; j < nsaved; j++)
+						close(emb_fd[j]);
+					resp->retval     = (uint64_t)(int64_t)(-EBADF);
+					resp->status     = 0;
+					resp->nvstatus   = 0x1f; /* INVALID_ARGUMENT */
+					resp->fault_addr = 0;
+					return 0;
+				}
 				saved_val[nsaved] = hid;
 				saved_off[nsaved] = (int)off;
 				emb_fd[nsaved]    = efd;
@@ -4103,8 +4186,25 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	 * NVKVM_REALIZE_PROT_MASK) and reject absurd lengths before we touch the
 	 * device fd or the sparse window.  (Window allocation also rejects
 	 * oversize, but bound here so we never hand a wild len to mmap().)
+	 *
+	 * Audit 2026-08-29 (serious): prot was masked here and map_flags was
+	 * not, even though both are guest fields and the sibling REALIZE path
+	 * masks both (NVKVM_REALIZE_PROT_MASK / NVKVM_REALIZE_FLAGS_MASK).
+	 * map_flags is forwarded verbatim into the stub's mmap(), which ORs in
+	 * MAP_FIXED and calls it — so MAP_ANONYMOUS would have given the guest
+	 * anonymous zeroes at a window VA it believes is device memory (the fd
+	 * is ignored for an anonymous mapping, silently, with no error), and
+	 * MAP_LOCKED / MAP_POPULATE / MAP_HUGETLB are unbounded work the guest
+	 * gets to request inside another process.  Mask to the same two bits
+	 * REALIZE allows.  Today's guest module hardcodes MAP_SHARED
+	 * (nvkvm_mmap.c), so nothing legitimate loses a flag — which also means
+	 * this needs a compromised guest KERNEL to reach, not merely hostile
+	 * guest userspace.
 	 */
-	req->prot &= (uint32_t)(PROT_READ | PROT_WRITE);
+	req->prot      &= (uint32_t)(PROT_READ | PROT_WRITE);
+	req->map_flags &= (uint32_t)(MAP_SHARED | MAP_PRIVATE);
+	if ((req->map_flags & (MAP_SHARED | MAP_PRIVATE)) == 0)
+		req->map_flags |= MAP_SHARED;
 	if (len == 0 || len > nv->sparse_size) {
 		resp->status = EINVAL;
 		return 0;
@@ -4273,6 +4373,18 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 				"nvkvm: mmap_on_isolate(uvm): sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);
+			/* Audit 2026-08-29 #5, fourth site: the finding named
+			 * three, and this is the same shape as the in-window
+			 * !target return above — nvkvm_sparse_gpa_alloc()
+			 * transferred the extent to us and nothing has recorded
+			 * it in iso_mmap_tbl yet, so returning without freeing
+			 * puts it beyond the reach of every reclaim path,
+			 * isolate death included.  Reachable: the guest's mmap(2)
+			 * length rides straight through to req->length
+			 * (nvkvm_mmap.c caps it at 1 GiB), so repeated UVM
+			 * mmaps eat the 128 GiB window a gigabyte at a time. */
+			if (gpa)
+				nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 			resp->status = ENOMEM;
 			return 0;
 		}
@@ -4333,6 +4445,36 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 						 (int)req->prot,
 						 (int)req->map_flags,
 						 &stub_va);
+			/*
+			 * Audit 2026-08-29 (serious): stub_va is a value the
+			 * STUB reported, and it was recorded verbatim — despite
+			 * nvkvm_isolate_proto.h asserting that every response
+			 * value is range-checked.  We asked for MAP_FIXED at
+			 * `place`, so on success the kernel's answer IS `place`;
+			 * anything else is a stub that is lying or broken.  It
+			 * matters because stub_va is what teardown later feeds
+			 * to nvkvm_win_unplace(), which is QEMU-side
+			 * bookkeeping: a wrong address releases a window range
+			 * that was never held, and the allocator then hands the
+			 * same window VA out twice.  Contained to the lying
+			 * isolate's own window (win_place/win_unplace are keyed
+			 * by isolate_id), so this is hardening, not a
+			 * cross-isolate hole.  Treat a mismatch as a failed
+			 * mmap and unwind exactly as ret < 0 does.
+			 */
+			if (ret == 0 && stub_va != 0 && stub_va != place) {
+				fprintf(stderr,
+					"nvkvm: mmap_on_isolate: isolate %u "
+					"reported host_va 0x%llx for a MAP_FIXED "
+					"at 0x%llx — refusing\n",
+					req->isolate_id,
+					(unsigned long long)stub_va,
+					(unsigned long long)place);
+				nvkvm_isolate_munmap(&nv->isolates,
+						     req->isolate_id, place,
+						     (uint64_t)len);
+				ret = -EPROTO;
+			}
 			if (ret < 0)
 				nvkvm_win_unplace(req->isolate_id, place, len);
 			else if (!stub_va)
@@ -4360,9 +4502,11 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 		 * as the two sites above — the extent is not in iso_mmap_tbl
 		 * yet, so leaving it allocated leaks window space that nothing
 		 * can ever reclaim.  Ordered after the anon restore, exactly
-		 * like the token == 0 unwind below.  (Only the in-window case
-		 * holds an extent; the UVM path takes a KVM slot and gpa
-		 * stays 0.) */
+		 * like the token == 0 unwind below.  BOTH branches hold an
+		 * extent — the parenthetical here used to claim the UVM path
+		 * takes a KVM slot and leaves gpa at 0, which stopped being
+		 * true when that branch moved onto the sparse window; the
+		 * `if (gpa)` was already right, the comment was not. */
 		if (gpa)
 			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 		resp->status = (uint32_t)-ret;
@@ -5023,6 +5167,48 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 		return 0;
 	}
 
+	/*
+	 * Audit P2-2, second half.  The IOCTL path got a worker-private
+	 * snapshot of its shm slots (nvkvm_ioctl_work_fn) and this path did
+	 * not, even though it is the one with more to check: everything below
+	 * validates state_buf and intent_buf IN PLACE and then ships those same
+	 * pages to the stub.  The slots are guest-shared memory, and although
+	 * this handler runs on the main loop under the BQL, vCPU threads
+	 * execute guest code WITHOUT the BQL — so a second vCPU can flip
+	 * n_gpus, an rm_ctrl_fd_handle_id or the intent's base/length after the
+	 * check reads it and before the stub reads it, which is exactly the
+	 * double-fetch that defeats the per-handle proof two blocks down.
+	 * Copy once, validate the copy, forward the copy.
+	 *
+	 * Copy state_size (not the whole slot): every read below is through
+	 * `struct nvkvm_uvm_state_snapshot *`, so that is the extent this
+	 * handler has ever touched.  Nothing is copied back — the dispatcher
+	 * returns only the response struct to the guest, and the one write into
+	 * intent (`p->rm_status = 0`) normalises what we send to the stub, not
+	 * anything the guest reads.
+	 *
+	 * Both copies are stack locals of a fixed size — no allocation, so no
+	 * free to get wrong on any of this function's twelve exits.  The state
+	 * snapshot is a fixed 1176-byte struct; the intent buffer is sized to
+	 * the largest intent any mode accepts, which is SEM_POOL's 9248-byte
+	 * UVM_ALLOC_SEMAPHORE_POOL_PARAMS (the only mode there is).  That makes
+	 * the bound below strictly tighter than NVKVM_REALIZE_INTENT_MAX and
+	 * changes no verdict: a larger intent_size reached the switch and was
+	 * rejected there; now it is rejected here, one step earlier.
+	 */
+	struct nvkvm_uvm_state_snapshot        state_priv;
+	struct uvm_alloc_semaphore_pool_params intent_priv;
+
+	if (req->intent_size > sizeof(intent_priv)) {
+		resp->status = (uint32_t)-EINVAL;
+		return 0;
+	}
+	memcpy(&state_priv, state_buf, state_size);
+	memset(&intent_priv, 0, sizeof(intent_priv));
+	memcpy(&intent_priv, intent_buf, req->intent_size);
+	state_buf  = &state_priv;
+	intent_buf = &intent_priv;
+
 	/* §8a.5 — validate per-mode intent shape. */
 	struct nvkvm_uvm_state_snapshot *snap = state_buf;
 	uint32_t n_gpus = le32_to_cpu(snap->n_gpus);
@@ -5132,7 +5318,17 @@ int nvkvm_req_realize_uvm_mapping(VirtIONvgpu *nv,
 		/* FF-3 (security_audit_2026_06_01): free the window extent on the
 		 * error path — otherwise every failed realize leaks GPA space. */
 		nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
-		resp->status    = (uint32_t)-ret;
+		/*
+		 * Audit 2026-08-29 (minor): the host_va == 0 half of this test
+		 * reported SUCCESS.  `-ret` is 0 when ret is 0, so a stub that
+		 * returned 0 with no address gave the guest status 0 alongside
+		 * gpa_base 0 and length 0 — a mapping the guest is told it has
+		 * and does not.  The extent was already freed, so it would then
+		 * be handed to somebody else.  Name the failure, using the same
+		 * -EIO the rm_status branch just below uses for "the stub came
+		 * back without the mapping it was asked for".
+		 */
+		resp->status    = ret < 0 ? (uint32_t)-ret : (uint32_t)-EIO;
 		resp->rm_status = rm_status;
 		return 0;
 	}
