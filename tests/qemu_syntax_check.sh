@@ -48,6 +48,7 @@ CFLAGS="-fsyntax-only -Wall -Wextra -D_GNU_SOURCE
 
 rc=0
 checked=0
+vacuous=""
 for f in ../../src/qemu/*.c; do
     base="$(basename "$f")"
     case " $SKIP " in *" $base "*)
@@ -56,6 +57,31 @@ for f in ../../src/qemu/*.c; do
     # -Werror only for the implicit-declaration family: that is the specific
     # bug this gate is for, and the tree has pre-existing -Wsign-compare and
     # -Wunused-parameter warnings that are not worth failing a build over.
+    # A FILE WHOSE BODY IS #if'd OUT PASSES THIS GATE TRIVIALLY, and used to be
+    # reported as "ok" beside files that were really compiled.  MEASURED
+    # 2026-08-29: nvkvm_present_egl.c wraps all 2035 lines in
+    # `#if defined(CONFIG_OPENGL) && NVKVM_QEMU_GRAPHICS`, this script never
+    # defines CONFIG_OPENGL, and so the entire display path -- the most
+    # intricate code in the tree -- contributed a green line to every run while
+    # nothing of it was parsed.  "8 files parsed clean" was not false so much as
+    # meaningless, which is worse, because it was cited as evidence in review.
+    #
+    # Detect the cause rather than measuring the symptom: a file-level guard on
+    # a macro this gate does not define.  Counting surviving preprocessor lines
+    # was tried first and is not trustworthy -- for most files here `gcc -E`
+    # fails outright on the stub headers, so "0 lines survived" is indistinguishable
+    # from "conditioned out" and would have flagged everything.
+    guard=""
+    for m in CONFIG_OPENGL NVKVM_QEMU_GRAPHICS; do
+        if grep -qE "^#if.*(defined\\($m\\)|[^_]$m)" "$f" 2>/dev/null; then
+            case "$CFLAGS" in *"-D$m"*) ;; *) guard="$guard $m" ;; esac
+        fi
+    done
+    if [ -n "$guard" ]; then
+        printf '  %-28s NOT COVERED (body is behind%s, undefined here)\n' "$base" "$guard"
+        vacuous="$vacuous $base"
+        continue
+    fi
     if out="$($CC $CFLAGS -Werror=implicit-function-declaration \
                           -Werror=implicit-int \
                           -Werror=int-conversion "$f" 2>&1)"; then
@@ -71,6 +97,13 @@ done
 echo
 if [ "$rc" -eq 0 ]; then
     echo "QEMU SYNTAX CHECK OK — $checked file(s) parsed clean under $($CC -dumpversion 2>/dev/null || echo "$CC")."
+    if [ -n "$vacuous" ]; then
+        echo
+        echo "  NOT COVERED, and not counted above --$vacuous"
+        echo "  Their bodies are conditioned out (CONFIG_OPENGL / NVKVM_QEMU_GRAPHICS),"
+        echo "  so this gate says NOTHING about them. Compile them against a configured"
+        echo "  QEMU tree before treating the display path as reviewed."
+    fi
 else
     echo "QEMU SYNTAX CHECK FAILED — this tree will not build under GCC 14+."
 fi
