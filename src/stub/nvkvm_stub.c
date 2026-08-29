@@ -2349,9 +2349,25 @@ static void handle_xiso_import(struct isolate_cmd_xiso_import *cmd,
 
 static void handle_close_fd(uint32_t handle_id)
 {
+	/*
+	 * Audit 2026-08-29 #3: this used to send_ok() even when this stub held
+	 * no fd under handle_id, so QEMU saw ret == 0 for EVERY close and
+	 * unref'd nvkvm_handle's isolate_refcount unconditionally.  Repeating
+	 * the call on a handle_id we never held therefore walked that count
+	 * down to 0 and defeated the -EBUSY guard that stops a handle from
+	 * being closed while an isolate still holds it.  Report the truth:
+	 * -EBADF for a handle this isolate does not hold, so the refcount only
+	 * moves for a close that actually released something.
+	 */
 	fs_mutex_lock(&fd_mutex);
-	handle_remove(handle_id);
+	int held = handle_lookup(handle_id) >= 0;
+	if (held)
+		handle_remove(handle_id);
 	fs_mutex_unlock(&fd_mutex);
+	if (!held) {
+		send_error(-EBADF);
+		return;
+	}
 	send_ok();
 }
 
@@ -2954,6 +2970,46 @@ static void ring_exec_one(const uint8_t *pay, uint32_t len)
 		__builtin_memcpy(param, pay + sizeof(rq), rq.param_size);
 	if (rq.aux_size)
 		__builtin_memcpy(aux, pay + sizeof(rq) + rq.param_size, rq.aux_size);
+
+	/*
+	 * Audit G-8 on the ring path — the clamp handle_ioctl_cmd() applies to
+	 * the socket path, ported to the one place it was missing.  The driver
+	 * copies _IOC_SIZE(cmd) bytes in and back out regardless of
+	 * param_size, and `cmd` here is authored by the GUEST: the ring memfd
+	 * is mapped into guest physical memory, and ring_ctrl_must_punt()
+	 * constrains only bits 0-15 (type 'F', nr 0x2a), leaving the 14-bit
+	 * size field free.  So a record could name _IOC_SIZE up to 16383 with
+	 * `param` being a 256-byte array ON THIS THREAD'S STACK — a
+	 * guest-driven stack overflow, not the "DoS, never OOB" this file
+	 * claims for a malformed ring.
+	 *
+	 * The socket path widens its heap allocation; a fixed stack array
+	 * cannot be widened, so an oversize _IOC_SIZE is PUNTED instead — not
+	 * executed here, re-issued by the guest on the virtqueue, where the
+	 * worker path's widened (and zero-filled) blob is what the driver
+	 * writes into.  Legitimate flat NV_ESC_RM_CONTROL is _IOC_SIZE 32, so
+	 * nothing real takes this exit.
+	 *
+	 * Below the cap, the driver may still read [param_size, _IOC_SIZE) —
+	 * bytes we never wrote.  Zero that tail for the same reason blob_alloc
+	 * zeroes its own: the driver must not act on this thread's stack
+	 * residue.  (It cannot leak back to the guest — ring_write_resp copies
+	 * only param_size bytes — but it must not be READ either.)
+	 */
+	{
+		unsigned ioc_sz = (rq.cmd >> 16) & 0x3fffu;
+		if (ioc_sz > sizeof(param)) {
+			ring_write_resp(rq.txn_id, 0, 0, NVKVM_RING_RESP_PUNT,
+					NULL, 0, NULL, 0);
+			return;
+		}
+		/* Byte loop, not __builtin_memset: this is a freestanding
+		 * -fno-builtin binary with no libc, and a non-constant size
+		 * lowers to a call to memset() that does not exist here (it
+		 * fails at link, not at run time). */
+		for (unsigned i = rq.param_size; i < ioc_sz; i++)
+			param[i] = 0;
+	}
 
 	if (ring_ctrl_must_punt(rq.cmd, param, rq.param_size, rq.aux_size)) {
 		ring_write_resp(rq.txn_id, 0, 0, NVKVM_RING_RESP_PUNT,

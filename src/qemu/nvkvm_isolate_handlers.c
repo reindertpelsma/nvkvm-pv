@@ -859,6 +859,52 @@ int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 			    struct nvkvm_req_kill_isolate *req,
 			    struct nvkvm_resp_kill_isolate *resp)
 {
+	/*
+	 * S-2 (cross-isolate), audit 2026-08-29 #4: this used to act on a bare
+	 * guest isolate_id with no ownership test of any kind — strictly worse
+	 * than the documented MUNMAP gap below, because it needs no mmap_token
+	 * and the id space is only 4096 slot indices.  What follows the kill is
+	 * not recoverable for the victim: nvkvm_iso_mmap_reap_isolate() restores
+	 * anonymous backing over its live GPU mappings, its window and its
+	 * session are forgotten, and every host fd it owned is force-closed.
+	 *
+	 * Reject id 0 outright (it is never a live isolate; nvkvm_isolate_kill
+	 * would answer -ENOENT, but say so here so the fast path never enters
+	 * the table at all).
+	 */
+	if (req->isolate_id == 0) {
+		resp->status = EINVAL;
+		return 0;
+	}
+
+	/*
+	 * The session→isolate half of the proof the siblings carry
+	 * (PRESENT :2206, XISO_IMPORT :1995, REALIZE :4822 — each takes a
+	 * session_id from QEMU's own handle table and checks the pairing).
+	 *
+	 * KNOWN GAP, and it is the same one MUNMAP_ON_ISOLATE documents below:
+	 * struct nvkvm_req_kill_isolate is { isolate_id, reserved } and carries
+	 * NO caller identity, and there is no handle here to anchor a session to
+	 * the way the siblings do.  Closing it properly needs a caller session_id
+	 * ON THE WIRE.  Rather than bodge one in, we read the (guest-zeroed,
+	 * protocol-reserved) second word as an OPTIONAL caller session_id: when
+	 * the guest supplies one we hold it to the same pairing test the siblings
+	 * apply, and when it is 0 we behave exactly as before.  So this is inert
+	 * against today's guest module (which sends 0) and becomes real the
+	 * moment that field is filled — no flag day, no broken kills in between.
+	 * As with every session_has_isolate() check here, it would bound a
+	 * malicious guest USERSPACE process only: the guest kernel module fills
+	 * the field and is itself untrusted.  Defence in depth, same weight.
+	 */
+	if (req->reserved != 0 &&
+	    !session_has_isolate(nv, req->reserved, req->isolate_id)) {
+		NVKVM_DBG("nvkvm kill_isolate: isolate %u not owned by "
+			  "session %u — refused\n",
+			  req->isolate_id, req->reserved);
+		resp->status = EPERM;
+		return 0;
+	}
+
 	int ret = nvkvm_isolate_kill(&nv->isolates, req->isolate_id);
 
 	/*
@@ -1006,6 +1052,42 @@ int nvkvm_req_close_handle_on_isolate(VirtIONvgpu *nv,
 				       struct nvkvm_req_close_handle_on_isolate *req,
 				       struct nvkvm_resp_close_handle_on_isolate *resp)
 {
+	/*
+	 * S-2 (cross-isolate), audit 2026-08-29 #3: this carried NEITHER half of
+	 * the pairing proof its siblings carry, and handle ids and isolate ids
+	 * are one VM-global sequential space — so naming a neighbour's
+	 * isolate_id ran nvkvm_iso_mmap_reap_handle() against it, restoring
+	 * anonymous backing over that isolate's live device mappings WHILE IT IS
+	 * STILL WRITING THROUGH THEM, and purged UVM VA-ownership records that
+	 * belong to another session.  Both happen before the close is even
+	 * attempted, so a request that ultimately fails still did the damage.
+	 *
+	 * Half one, handle→session: the handle must exist and must still have a
+	 * live fd (a closed slot has nothing to close on an isolate).
+	 * Half two, session→isolate: the isolate named must belong to that
+	 * handle's session — the same test PRESENT (:2206) and XISO_IMPORT
+	 * (:1995) apply to their (isolate, handle) pairs.  A stub would answer
+	 * -EBADF for a handle it does not hold, but that is the stub catching
+	 * what the boundary should have — and it does not undo the reap above.
+	 *
+	 * It also closes the refcount walk in the same finding: with the stub
+	 * now reporting failure for a handle it never held (nvkvm_stub.c
+	 * handle_close_fd), repeated calls naming a FOREIGN handle_id can no
+	 * longer drive isolate_refcount to 0 and defeat close-handle's -EBUSY.
+	 */
+	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, req->handle_id);
+	if (!h || h->fd < 0) {
+		resp->status = EBADF;
+		return 0;
+	}
+	if (!session_has_isolate(nv, h->session_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm close_handle_on_isolate: handle %u (sess=%u) "
+			  "does not belong to isolate %u — refused\n",
+			  req->handle_id, h->session_id, req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
+
 	/* U-6: see nvkvm_req_close_handle. */
 	nvkvm_uvm_va_purge_handle(req->handle_id);
 	/* Drop any window extent this handle still owns before the fd goes, so
@@ -4026,6 +4108,15 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 				"nvkvm: mmap_on_isolate: sparse window full "
 				"(handle=%u len=%lu)\n",
 				req->handle_id, (unsigned long)len);
+			/* Audit 2026-08-29 #5: the alloc above TRANSFERRED
+			 * ownership of the extent to us, and nothing records it
+			 * until iso_mmap_alloc() far below — so returning here
+			 * without freeing loses it permanently: no reclaim path,
+			 * not munmap, not isolate death, can find an extent that
+			 * is in no table.  Free it the way the token == 0 path
+			 * already does. */
+			if (gpa)
+				nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 			resp->status = ENOMEM;
 			return 0;
 		}
@@ -4062,6 +4153,14 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			/* Restore the anonymous backing we just clobbered so the
 			 * window stays fully mapped for KVM. */
 			nvkvm_window_restore_anon(target, len);
+			/* …and give the GPA extent back (audit 2026-08-29 #5).
+			 * This is the reachable half of that finding:
+			 * TYPE_NVIDIA handles skip the S-1 extent check above,
+			 * so a bogus offset makes this mmap() fail
+			 * deterministically AFTER the allocation — one request
+			 * with length == sparse_size permanently consumed the
+			 * whole 128 GiB window. */
+			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 			resp->status = (uint32_t)se;
 			return 0;
 		}
@@ -4225,6 +4324,16 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 			}
 			munmap(qva, len);
 		}
+		/* Audit 2026-08-29 #5: the stub-mirror rollback unwound the
+		 * mapping but not the GPA reservation behind it.  Same reason
+		 * as the two sites above — the extent is not in iso_mmap_tbl
+		 * yet, so leaving it allocated leaks window space that nothing
+		 * can ever reclaim.  Ordered after the anon restore, exactly
+		 * like the token == 0 unwind below.  (Only the in-window case
+		 * holds an extent; the UVM path takes a KVM slot and gpa
+		 * stays 0.) */
+		if (gpa)
+			nvkvm_sparse_gpa_free(nv, gpa, (size_t)len);
 		resp->status = (uint32_t)-ret;
 		return 0;
 	}
@@ -4475,10 +4584,41 @@ static int nvkvm_iso_mmap_reap_isolate(VirtIONvgpu *nv, uint32_t isolate_id)
 
 /* ── Poll on isolate ─────────────────────────────────────────────────────── */
 
+/*
+ * Audit 2026-08-29 (minor): both POLL handlers validated NEITHER id half —
+ * they were two of the eight isolate_id-taking handlers with no ownership
+ * check at all (the MUNMAP comment's "three of the five" undercounts).  The
+ * effect is smaller than the kill/close pair, but it is the same shape:
+ * arm or disarm a poll registration inside a NEIGHBOUR's stub on a
+ * guest-chosen (isolate, handle) pair, and — for UNPOLL — silence the
+ * os-event wakeups another session's process is blocked on.
+ *
+ * Same pairing proof as CLOSE_HANDLE_ON_ISOLATE: the handle must exist with a
+ * live fd (handle→session), and its session must own the isolate named
+ * (session→isolate).  Defence in depth, the same weight as every other
+ * session_has_isolate() check here: the guest kernel module fills session_id
+ * and is itself untrusted, so this bounds a malicious guest USERSPACE process.
+ */
+static bool poll_pair_ok(VirtIONvgpu *nv, uint32_t handle_id,
+			 uint32_t isolate_id)
+{
+	struct nvkvm_handle *h = nvkvm_handle_get(&nv->handles, handle_id);
+	if (!h || h->fd < 0)
+		return false;
+	return session_has_isolate(nv, h->session_id, isolate_id);
+}
+
 int nvkvm_req_poll_on_isolate(VirtIONvgpu *nv,
 			       struct nvkvm_req_poll_on_isolate *req,
 			       struct nvkvm_resp_poll_on_isolate *resp)
 {
+	if (!poll_pair_ok(nv, req->handle_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm poll_on_isolate: handle %u does not belong to "
+			  "isolate %u — refused\n",
+			  req->handle_id, req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
 	int ret = nvkvm_isolate_poll(&nv->isolates,
 				     req->isolate_id,
 				     req->handle_id,
@@ -4491,6 +4631,13 @@ int nvkvm_req_unpoll_on_isolate(VirtIONvgpu *nv,
 				 struct nvkvm_req_unpoll_on_isolate *req,
 				 struct nvkvm_resp_unpoll_on_isolate *resp)
 {
+	if (!poll_pair_ok(nv, req->handle_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm unpoll_on_isolate: handle %u does not belong "
+			  "to isolate %u — refused\n",
+			  req->handle_id, req->isolate_id);
+		resp->status = EPERM;
+		return 0;
+	}
 	int ret = nvkvm_isolate_unpoll(&nv->isolates,
 				       req->isolate_id,
 				       req->handle_id);

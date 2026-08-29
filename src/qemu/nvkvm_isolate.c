@@ -794,6 +794,39 @@ static void drain_message(int fd)
 	recv(fd, buf, sizeof(buf), 0);
 }
 
+/*
+ * Wake a pending IOCTL entry the reader has already CLAIMED (unlinked from
+ * pending_head) but cannot complete.
+ *
+ * F2-1 audit follow-up (2026-08-29 #2): the claim at ISOLATE_RESP_IOCTL is
+ * what makes a duplicate txn_id harmless (R2-H2), but it also means the entry
+ * is reachable from nobody but this thread between the unlink and p->done.
+ * The two payload recv()s in between can fail — that is exactly what the 5 s
+ * SO_RCVTIMEO is FOR, a stub that announces a size and then stalls — and
+ * `goto reader_exit` then walked a pending_head this entry was no longer on.
+ * The caller (nvkvm_isolate_ioctl) waits on p->cond with NO deadline, by
+ * design, so it parked forever holding a QEMU thread-pool worker and its
+ * VirtQueueElement; repeating it exhausts the shared 64-thread aio pool and
+ * wedges block I/O for the whole VM.  The liveness argument for that untimed
+ * wait is "the reader wakes every pending caller with -ECONNRESET", so this
+ * is the one path that must not be able to skip it.
+ *
+ * Waking a claimed entry is safe: the caller cannot touch its stack-allocated
+ * `pending` until p->done is set under iso->lock, and its own cleanup unlinks
+ * by pointer search, so finding itself already off the list is a no-op.
+ */
+static void reader_fail_claimed(struct nvkvm_isolate *iso,
+				struct nvkvm_pending_ioctl *p)
+{
+	if (!p)
+		return;
+	pthread_mutex_lock(&iso->lock);
+	p->error = -ECONNRESET;
+	p->done  = true;
+	pthread_cond_signal(&p->cond);
+	pthread_mutex_unlock(&iso->lock);
+}
+
 static void reader_signal_sync(struct nvkvm_isolate *iso, int err,
 				int mmap_retval)
 {
@@ -1046,8 +1079,13 @@ static void *isolate_reader_fn(void *arg)
 				    param_size <= (uint32_t)p->param_cap) {
 					n = recv(iso->sock_fd, p->param_buf,
 						 p->param_cap, 0);
-					if (n <= 0)
+					if (n <= 0) {
+						/* We own `p` — it is off the
+						 * list, so reader_exit's wake
+						 * loop cannot see it. */
+						reader_fail_claimed(iso, p);
 						goto reader_exit;
+					}
 				} else {
 					drain_message(iso->sock_fd);
 					if (p)
@@ -1061,8 +1099,12 @@ static void *isolate_reader_fn(void *arg)
 				    aux_size <= (uint32_t)p->aux_cap) {
 					n = recv(iso->sock_fd, p->aux_buf,
 						 p->aux_cap, 0);
-					if (n <= 0)
+					if (n <= 0) {
+						/* Same as above: claimed, so
+						 * only we can wake it. */
+						reader_fail_claimed(iso, p);
 						goto reader_exit;
+					}
 				} else {
 					drain_message(iso->sock_fd);
 					if (p)
