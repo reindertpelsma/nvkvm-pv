@@ -3507,9 +3507,46 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		bool cc_readable = param_buf && req->param_size >= 12;
 		if (cc_readable)
 			memcpy(&cc, (char *)param_buf + 8, 4);
+		/*
+		 * Answered here, never forwarded: the gamescope scheduling
+		 * controls.  These are privileged in OGKM on all 216 supported
+		 * tags (accessRight = RS_ACCESS_NICE => capable(CAP_SYS_NICE)),
+		 * so they can never be allowlisted -- but they only set
+		 * scheduling PRIORITY, so returning NV_OK without doing
+		 * anything preserves correctness and costs only compositing
+		 * latency.  The guest is deliberately being told a change took
+		 * effect that did not.  The reasoning, the per-tag evidence and
+		 * the cost are in nvkvm_ctrl_allowlist.h next to the table and
+		 * in docs/reference/gamescope-scheduling-controls.md.
+		 *
+		 * This must come BEFORE the allowlist test below, because these
+		 * commands are deliberately absent from the allowlist and would
+		 * otherwise take the DENY branch.  Their params are input-only,
+		 * so -- exactly like the DENY branch -- nothing is written back
+		 * to the guest; only the status differs.  The oversize test is
+		 * repeated here so a no-op cannot be used to smuggle an
+		 * unbounded aux blob past the 1 MiB cap.
+		 *
+		 * S-5: `cc_readable` gates this too.  A control whose command
+		 * word we could not even read must not be answered NV_OK any
+		 * more than it may be forwarded -- `cc` is the 0xffffffff
+		 * sentinel there, and a sentinel must never select a success
+		 * path.  (No real no-op command is lost: NVOS54 carries the
+		 * command at offset 8, so a block shorter than 12 bytes does
+		 * not contain one.)
+		 */
+		if (cc_readable && nvkvm_ctrl_cmd_noop(cc) &&
+		    req->aux_size <= (1u << 20)) {
+			NVKVM_DBG("nvkvm: NO-OP ctrl cmd 0x%08x "
+				  "(scheduling priority; not forwarded)\n", cc);
+			resp->retval     = 0;
+			resp->status     = 0;
+			resp->nvstatus   = 0;   /* NV_OK */
+			resp->fault_addr = 0;
+			return 0;
+		}
 		int cc_how = cc_readable ? nvkvm_ctrl_cmd_allowed(cc) : 0;
-		if (!cc_readable || !cc_how ||
-		    req->aux_size > (1u << 20)) {
+		if (!cc_readable || !cc_how || req->aux_size > (1u << 20)) {
 			nvkvm_ctrl_deny_log(cc);
 			/* As above: RM answers an unsupported control with a
 			 * successful ioctl carrying NV_ERR_NOT_SUPPORTED, not
