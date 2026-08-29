@@ -72,7 +72,13 @@ done
 [ -e /dev/kvm ] || die_stage preflight "no /dev/kvm"
 # The guest's DRM node is a PROXY for the host's. Without these the guest gets
 # ENOENT on every open and no compositor starts -- diagnosed the hard way.
-[ -e /dev/dri/renderD128 ] || die_stage preflight "host has no /dev/dri/renderD128"
+# nvidia-drm is loaded WITHOUT modeset by many distro setups, and then there is
+# no render node at all.  Ask for it before declaring the box unusable.
+if [ ! -e /dev/dri/renderD128 ]; then
+    modprobe nvidia-drm modeset=1 2>/dev/null || modprobe nvidia-drm 2>/dev/null || true
+    sleep 2
+fi
+[ -e /dev/dri/renderD128 ] || die_stage preflight "no /dev/dri/renderD128 even after modprobe nvidia-drm modeset=1"
 verdict preflight pass "kvm + dri present"
 
 # ------------------------------------------------------------------- clone --
