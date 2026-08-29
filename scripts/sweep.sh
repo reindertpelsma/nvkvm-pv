@@ -150,8 +150,18 @@ DRIVERS_REQ=""
 DRIVER_CACHE_DIR="${NVKVM_SWEEP_DRIVER_CACHE:-}"
 GUEST_IMAGE_CACHE="${NVKVM_SWEEP_GUEST_IMAGE_CACHE:-}"
 GUEST_IMAGE_CACHE_SHA256=""
-GUEST_IMAGE_NAME="noble-server-cloudimg-amd64.img"
-GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/$GUEST_IMAGE_NAME"
+# RULE 4: the GUEST kernel is a swept axis, not a constant.
+#
+# nvkvm-guest.ko is compiled against whatever kernel the guest runs, on every
+# boot, and until now every box ran the same noble image -- so one kernel was
+# ever tested. The cheapest real lever is the cloud image series: each Ubuntu
+# release ships a different kernel, and swapping the series costs nothing but a
+# different URL. --guest-image picks one.
+#
+# VERIFIED 2026-08-30 that each of these resolves; oracular and plucky 404.
+GUEST_IMAGE_SERIES="${NVKVM_SWEEP_GUEST_SERIES:-noble}"
+GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
+GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
 PRESET="boundary"
 MIN_DRIVERS=5
 # The SteamOS product stage: off by default because it costs ~2h of box time and
@@ -279,6 +289,14 @@ while [ $# -gt 0 ]; do
         --drivers)      DRIVERS_REQ="$2"; shift 2 ;;
         --driver-cache) DRIVER_CACHE_DIR="$2"; shift 2 ;;
         --guest-image-cache) GUEST_IMAGE_CACHE="$2"; shift 2 ;;
+        --guest-image)  GUEST_IMAGE_SERIES="$2"
+                        case "$GUEST_IMAGE_SERIES" in
+                            jammy|noble|questing|resolute) ;;
+                            *) echo "$SELF: --guest-image wants jammy|noble|questing|resolute (each verified to resolve); got '$GUEST_IMAGE_SERIES'" >&2; exit 3 ;;
+                        esac
+                        GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
+                        GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
+                        shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
         --steamos)      RUN_STEAMOS=1; shift ;;
@@ -2512,6 +2530,7 @@ say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_
 say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  disk          : ${DISK} GB per box"
+say "  guest series  : $GUEST_IMAGE_SERIES (the guest KERNEL axis -- sweep rule 4)"
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
 if [ "$RUN_STEAMOS" = 1 ]; then
     say "  steamos stage : ON (ref $STEAMOS_REF) -- installs SteamOS on each box and"
