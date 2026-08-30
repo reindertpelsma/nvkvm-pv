@@ -469,3 +469,36 @@ application's own shared memfd is not. In the first case nvkvm creates the
 backing object and every future mapping resolves to its pages by construction;
 in the second the object belongs to the application and its page cache belongs
 to shmem.
+
+## fork still works — the constraint is ordering, not fork itself
+
+**Measured 2026-08-31**, `tests/repro/register_then_fork.c`.
+
+    cuMemHostRegister (single view) rc=0   (allowed -- relocated to the window)
+    parent: wrote B; own view has B in 65536/65536
+    child:  before=65536/65536 saw A; after parent wrote B -> B=65536 A=0
+    VERDICT: PASS -- register-then-fork stays coherent
+
+| order | result |
+|---|---|
+| **register, then fork** | **works**, fully coherent |
+| fork, then register | refused (`page_mapcount() > 1`) |
+
+Why the good order works: by fork time the buffer has already moved into the
+window and the VMA is a window mapping, so `fork()` copies that mapping and
+both processes are on the same physical pages. There is no relocation left to
+perform and nothing to leave behind.
+
+Why the bad order cannot: two shmem views already exist when the registration
+arrives, and only the registering VMA can be relocated.
+
+**This substantially narrows the compatibility gap.** Register-then-fork is the
+ordinary pattern -- set up pinned buffers, then fork workers -- and it is
+unaffected. What is refused is fork-first followed by registering memory
+already shared with another process, which is a deliberate IPC construction
+rather than something a normal CUDA program does by accident.
+
+*Note on the transcript:* the `cuMemHostRegister` line appears twice in the
+output. That is stdio, not a second registration -- the parent's `printf` was
+still buffered at `fork()`, so the child inherited a copy and flushed it on
+exit.
