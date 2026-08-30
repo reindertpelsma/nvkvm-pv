@@ -2315,24 +2315,6 @@ while [ $i -lt ${#RESULT_NAMES[@]} ]; do
 done
 
 TOTAL=${#RESULT_NAMES[@]}
-printf '\n %sTOTAL %d   PASS %d   FAIL %d   SKIP %d   UNTESTED %d%s\n' \
-       "$C_BOLD" "$TOTAL" "$N_PASS" "$N_FAIL" "$N_SKIP" "$N_UNTESTED" "$C_RESET"
-
-if [ -n "$UNEXPECTED_SKIPS" ]; then
-    printf ' %sUNEXPECTED SKIPS:%s%s\n' "$C_SKIP" "$C_RESET" "$UNEXPECTED_SKIPS"
-    printf '   (a skipped check is NOT a pass. Declare it with --allow-skip <name> only\n'
-    printf '    if you have decided it is out of scope for this run.)\n'
-fi
-if [ "$N_UNTESTED" -gt 0 ]; then
-    printf '\n %s%d of %d checks were never attempted.%s\n' "$C_UNT" "$N_UNTESTED" "$TOTAL" "$C_RESET"
-    printf '   This run says NOTHING about them -- not that they work, not that they do\n'
-    printf '   not. There was no compiler and no prebuilt probe, so no CUDA, Vulkan, EGL\n'
-    printf '   or GL code ran at all. --allow-skip does not apply and cannot silence this.\n'
-    printf '   Fix it by building the probes where a toolchain exists and shipping them:\n'
-    printf '     bash %s --build-probes /usr/local/lib/nvkvm/probes\n' "$0"
-fi
-
-# --- optional JSON -----------------------------------------------------------
 # ---------------------------------------------------------------------------
 # host-memory registration invariants
 # ---------------------------------------------------------------------------
@@ -2391,6 +2373,24 @@ reg_invariant host_register_then_fork register_then_fork.c \
 reg_invariant host_register_cow_fork cow_after_fork.c \
     "child registered inherited COW heap; parent's copy intact"
 
+printf '\n %sTOTAL %d   PASS %d   FAIL %d   SKIP %d   UNTESTED %d%s\n' \
+       "$C_BOLD" "$TOTAL" "$N_PASS" "$N_FAIL" "$N_SKIP" "$N_UNTESTED" "$C_RESET"
+
+if [ -n "$UNEXPECTED_SKIPS" ]; then
+    printf ' %sUNEXPECTED SKIPS:%s%s\n' "$C_SKIP" "$C_RESET" "$UNEXPECTED_SKIPS"
+    printf '   (a skipped check is NOT a pass. Declare it with --allow-skip <name> only\n'
+    printf '    if you have decided it is out of scope for this run.)\n'
+fi
+if [ "$N_UNTESTED" -gt 0 ]; then
+    printf '\n %s%d of %d checks were never attempted.%s\n' "$C_UNT" "$N_UNTESTED" "$TOTAL" "$C_RESET"
+    printf '   This run says NOTHING about them -- not that they work, not that they do\n'
+    printf '   not. There was no compiler and no prebuilt probe, so no CUDA, Vulkan, EGL\n'
+    printf '   or GL code ran at all. --allow-skip does not apply and cannot silence this.\n'
+    printf '   Fix it by building the probes where a toolchain exists and shipping them:\n'
+    printf '     bash %s --build-probes /usr/local/lib/nvkvm/probes\n' "$0"
+fi
+
+# --- optional JSON -----------------------------------------------------------
 if [ -n "$JSON_OUT" ]; then
     {
         printf '{\n'
