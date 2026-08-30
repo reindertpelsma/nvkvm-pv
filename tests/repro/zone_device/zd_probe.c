@@ -30,6 +30,14 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/fs.h>
+#include <linux/uaccess.h>
+
+/* ioctl: ask the kernel to GUP/pin a user address that maps window pages.
+ * This is the property the whole design rests on -- nvkvm GUPs the buffer and
+ * the host driver pins it, so if PageReserved or ZONE_DEVICE blocks GUP the
+ * approach is dead regardless of how good the rmap accounting is. */
+#define ZD_IOC_GUP  _IOW('Z', 1, unsigned long)
+#define ZD_IOC_PIN  _IOW('Z', 2, unsigned long)
 
 static unsigned long base = 0x6000000000UL;
 static unsigned long size = 128UL << 20;
@@ -117,9 +125,50 @@ static int zd_mmap(struct file *f, struct vm_area_struct *vma)
 	return 0;
 }
 
+static long zd_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+	unsigned long uaddr;
+	struct page *pg = NULL;
+	long n;
+
+	if (copy_from_user(&uaddr, (void __user *)arg, sizeof(uaddr)))
+		return -EFAULT;
+
+	switch (cmd) {
+	case ZD_IOC_GUP:
+		n = get_user_pages_fast(uaddr, 1, FOLL_WRITE, &pg);
+		pr_info("zd_probe: get_user_pages_fast(0x%lx) -> %ld%s\n", uaddr, n,
+			n == 1 ? "" : "  <-- FAILED");
+		if (n == 1) {
+			pr_info("zd_probe:   page=%px pfn=0x%lx zone_device=%d "
+				"mapcount=%d refcount=%d reserved=%d\n",
+				pg, page_to_pfn(pg), is_zone_device_page(pg),
+				page_mapcount(pg), page_ref_count(pg), PageReserved(pg));
+			put_page(pg);
+		}
+		return n == 1 ? 0 : (n < 0 ? n : -EFAULT);
+
+	case ZD_IOC_PIN:
+		/* FOLL_PIN is what a driver doing DMA uses, and it is stricter
+		 * than a plain GUP reference -- notably it refuses some page
+		 * types outright. This is the call the NVIDIA driver makes. */
+		n = pin_user_pages_fast(uaddr, 1, FOLL_WRITE, &pg);
+		pr_info("zd_probe: pin_user_pages_fast(0x%lx) -> %ld%s\n", uaddr, n,
+			n == 1 ? "" : "  <-- FAILED");
+		if (n == 1) {
+			pr_info("zd_probe:   pinned page=%px pfn=0x%lx zone_device=%d\n",
+				pg, page_to_pfn(pg), is_zone_device_page(pg));
+			unpin_user_page(pg);
+		}
+		return n == 1 ? 0 : (n < 0 ? n : -EFAULT);
+	}
+	return -ENOTTY;
+}
+
 static const struct file_operations zd_fops = {
-	.owner = THIS_MODULE,
-	.mmap  = zd_mmap,
+	.owner          = THIS_MODULE,
+	.mmap           = zd_mmap,
+	.unlocked_ioctl = zd_ioctl,
 };
 static struct miscdevice zd_misc = {
 	.minor = MISC_DYNAMIC_MINOR, .name = "zd_probe", .fops = &zd_fops, .mode = 0666,

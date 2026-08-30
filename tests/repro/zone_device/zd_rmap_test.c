@@ -18,6 +18,11 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
+#include <errno.h>
+
+#define ZD_IOC_GUP  _IOW('Z', 1, unsigned long)
+#define ZD_IOC_PIN  _IOW('Z', 2, unsigned long)
 
 #define LEN (64u * 1024u)
 
@@ -81,6 +86,27 @@ int main(void)
     int two = mapcount();
     if (write(to_child[1], "g", 1) != 1) return 2;
     waitpid(pid, NULL, 0);
+
+    /* ---- Q3/Q4: can the kernel GUP and PIN these pages, and can the CPU
+     * actually touch them? GUP is what nvkvm does to the buffer and PIN is
+     * what a DMA driver does; either failing sinks the design. ---- */
+    unsigned long ua = (unsigned long)m;
+    printf("\n--- GUP / PIN on the mapped window page ---\n");
+    printf("  get_user_pages_fast: %s\n",
+           ioctl(fd, ZD_IOC_GUP, &ua) == 0 ? "OK" : strerror(errno));
+    printf("  pin_user_pages_fast: %s\n",
+           ioctl(fd, ZD_IOC_PIN, &ua) == 0 ? "OK" : strerror(errno));
+
+    printf("\n--- CPU access through the mapping ---\n");
+    printf("  (this window sub-range may be unbacked; a read that returns all\n"
+           "   ones means the mapping works and the GPA has no backing)\n");
+    volatile unsigned int *w = (volatile unsigned int *)m;
+    unsigned int r0 = w[0];
+    printf("  initial read       = 0x%08x\n", r0);
+    w[0] = 0x5A5A5A5A;
+    unsigned int r1 = w[0];
+    printf("  write 0x5A5A5A5A -> readback = 0x%08x  %s\n", r1,
+           r1 == 0x5A5A5A5A ? "PERSISTS (backed)" : "does not persist (unbacked GPA)");
 
     printf("\nmapcount: before=%d  after mmap=%d  after fork=%d\n", before, one, two);
     if (one > before && two > one) {
