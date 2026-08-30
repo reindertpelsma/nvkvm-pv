@@ -1631,6 +1631,49 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	}
 
 	/*
+	 * THE PAGES MUST NOT ALREADY BE MAPPED BY ANYONE ELSE.
+	 *
+	 * Everything below relocates this range: the data is copied into a host
+	 * memfd and the VMA is repointed at a GPA window.  That rewrites THIS
+	 * mm's view and nothing else.  Any second view keeps the original pages
+	 * and silently stops sharing with this one -- measured total divergence,
+	 * with every ioctl returning success, in
+	 * docs/investigations/shared-mapping-desync/.
+	 *
+	 * Ways in, all ordinary rather than exotic:
+	 *   - MAP_SHARED|MAP_ANONYMOUS inherited across fork()
+	 *   - a memfd deliberately shared between cooperating processes
+	 *   - a VMM's guest-RAM memfd aliased into a KVM memslot (nesting)
+	 *
+	 * The earlier vm_file/s_magic/S_PRIVATE tests all ask who CREATED the
+	 * object.  That is the wrong question and missed the fork case entirely
+	 * (shmem_zero_setup() sets S_PRIVATE, so MAP_SHARED|MAP_ANONYMOUS
+	 * passed).  The question is how many mappings the pages already have,
+	 * and page_mapcount() answers it directly for every case above.
+	 *
+	 * We hold a pin on each page here, which does not itself raise mapcount
+	 * -- so 1 means "this VMA only" and >1 means someone else is mapping it.
+	 *
+	 * This REFUSES rather than repairing.  Repairing would mean migrating
+	 * every other view onto the new pages, which needs an i_mmap walk plus
+	 * mmap_write_lock on foreign mms -- the kernel's lock order is
+	 * mmap_lock outer, i_mmap_rwsem inner, so doing it in that direction is
+	 * an ABBA inversion, and rmap_walk() is not exported to modules.  Until
+	 * that is solved, an honest -EINVAL beats silent corruption.
+	 */
+	for (i = 0; i < (unsigned long)got; i++) {
+		int mc = page_mapcount(pages[i]);
+
+		if (mc > 1) {
+			pr_warn_ratelimited(
+				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
+				start, end, i, mc);
+			ret = -EINVAL;
+			goto err_unpin;
+		}
+	}
+
+	/*
 	 * ONE VMA conversion for the whole range, up front.  It moves no data,
 	 * and it does not split the VMA: vm_flags_set()/vm_flags_clear() take
 	 * no address range — they OR/AND bits on the vm_area_struct itself.
