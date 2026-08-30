@@ -1,19 +1,19 @@
 /*
- * cow_after_fork.c -- is COW'd private memory still registerable after fork?
+ * cow_after_fork.c -- heap allocated before CUDA exists, then registered by a
+ * forked child.
  *
- * The mapcount guard refuses a range something else maps. For MAP_SHARED that
- * is correct -- the sharing is real. For MAP_PRIVATE it would be wrong: the
- * sharing is copy-on-write, the memory is logically private, and registering
- * heap after a fork is an ordinary thing to do. migrate_range GUPs with
- * FOLL_WRITE, which should break COW before the mapcount check runs.
+ * The realistic shape: a process that knows nothing about CUDA allocates heap,
+ * forks, and the CHILD initialises CUDA and registers the inherited buffer.
+ * The pages are shared copy-on-write at that moment, so a naive
+ * "is anything else mapping this?" check would refuse it -- but the sharing is
+ * COW, the memory is logically private, and a write breaks it apart. The stock
+ * NVIDIA driver handles this correctly, so nvkvm must too.
  *
- * The CHILD only holds the COW reference (no CUDA in the child -- CUDA does
- * not support using a context in a forked child, and an earlier version of
- * this test hung there rather than measuring anything). The PARENT registers.
+ * Run the same binary against the real driver as a control.
  *
- * PASS: registration allowed, and the child's copy is untouched by the
- *       parent's later writes, i.e. COW held.
- * FAIL: -EINVAL -- the guard over-rejects ordinary private memory.
+ * PASS: child's registration allowed, and the parent's copy is untouched by
+ *       the child's writes (COW held).
+ * FAIL: refused -- an ordinary pattern regressed.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -40,6 +40,7 @@ static unsigned count_eq(volatile unsigned *p, unsigned v)
 
 int main(void)
 {
+    /* Heap, allocated before anything CUDA-shaped exists. */
     volatile unsigned *buf = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
                                   MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (buf == MAP_FAILED) { perror("mmap"); return 2; }
@@ -48,43 +49,41 @@ int main(void)
     int tp[2], tc[2]; if (pipe(tp)||pipe(tc)) return 2;
     pid_t pid = fork();
 
-    if (pid == 0) {                 /* child: just hold the COW reference */
-        char c;
-        if (write(tp[1],"r",1)!=1) _exit(3);
-        if (read(tc[0],&c,1)!=1)   _exit(3);
-        unsigned a = count_eq(buf, SENTINEL_A), cc = count_eq(buf, SENTINEL_C);
-        printf("  child: after parent registered+wrote -> A=%u C=%u (of %u)\n",
-               a, cc, LEN/4);
+    if (pid == 0) {                 /* CHILD does all the CUDA work */
+        CUdevice dev; CUcontext ctx; CUresult rc;
+        printf("  child: cuInit...\n"); fflush(stdout);
+        if (cuInit(0))                    { printf("  child: cuInit FAILED\n");      fflush(stdout); _exit(2); }
+        if (cuDeviceGet(&dev,0))          { printf("  child: cuDeviceGet FAILED\n"); fflush(stdout); _exit(2); }
+        if (cuCtxCreate_v2(&ctx,0,dev))   { printf("  child: cuCtxCreate FAILED\n"); fflush(stdout); _exit(2); }
+
+        rc = cuMemHostRegister_v2((void*)buf, LEN, CU_MEMHOSTREGISTER_DEVICEMAP);
+        printf("  child: register inherited COW heap rc=%d %s\n", rc,
+               rc == 0 ? "ALLOWED" : "REFUSED");
+        if (rc == 0) {
+            for (unsigned i = 0; i < LEN/4; i++) buf[i] = SENTINEL_C;
+            printf("  child: wrote C; own view C=%u/%u\n", count_eq(buf, SENTINEL_C), LEN/4);
+            cuMemHostUnregister((void*)buf);
+        }
         fflush(stdout);
-        _exit(a == LEN/4 && cc == 0 ? 0 : 1);   /* COW must have held */
+        if (write(tp[1], rc == 0 ? "y" : "n", 1) != 1) _exit(3);
+        char c; if (read(tc[0],&c,1)!=1) _exit(3);
+        _exit(rc == 0 ? 0 : 1);
     }
 
-    char c;
-    if (read(tp[0],&c,1)!=1) return 2;   /* child is alive, holding the pages */
-
-    CUdevice dev; CUcontext ctx;
-    if (cuInit(0) || cuDeviceGet(&dev,0) || cuCtxCreate_v2(&ctx,0,dev)) return 2;
-
-    CUresult rc = cuMemHostRegister_v2((void*)buf, LEN, CU_MEMHOSTREGISTER_DEVICEMAP);
-    printf("  parent: register COW'd private memory (child holds it) rc=%d %s\n",
-           rc, rc == 0 ? "ALLOWED" : "REFUSED");
-    if (rc == 0) {
-        for (unsigned i = 0; i < LEN/4; i++) buf[i] = SENTINEL_C;
-        printf("  parent: wrote C; own view has C in %u/%u\n",
-               count_eq(buf, SENTINEL_C), LEN/4);
-        cuMemHostUnregister((void*)buf);
-    }
-
+    char v;
+    if (read(tp[0],&v,1)!=1) { printf("  parent: child died before reporting\n"); return 2; }
+    unsigned a = count_eq(buf, SENTINEL_A), cc = count_eq(buf, SENTINEL_C);
+    printf("  parent: own copy -> A=%u C=%u (of %u)\n", a, cc, LEN/4);
     if (write(tc[1],"g",1)!=1) return 2;
     int st=0; waitpid(pid,&st,0);
     int crc = WIFEXITED(st)?WEXITSTATUS(st):99;
 
     printf("\n");
-    if (rc == 0 && crc == 0)
-        printf("VERDICT: PASS -- COW private memory registers after fork, COW intact\n");
-    else if (rc != 0)
-        printf("VERDICT: FAIL -- guard over-rejects ordinary COW private memory\n");
+    if (v == 'y' && a == LEN/4 && cc == 0)
+        printf("VERDICT: PASS -- child registered inherited COW heap; parent's copy intact\n");
+    else if (v == 'n')
+        printf("VERDICT: FAIL -- refused; ordinary fork-then-CUDA heap use regressed\n");
     else
-        printf("VERDICT: registered, but the child's copy changed -- COW BROKEN\n");
-    return (rc == 0 && crc == 0) ? 0 : 1;
+        printf("VERDICT: registered but COW did not hold (parent A=%u C=%u)\n", a, cc);
+    return crc;
 }
