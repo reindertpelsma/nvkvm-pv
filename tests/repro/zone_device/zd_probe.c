@@ -160,11 +160,16 @@ static int zd_mmap(struct file *f, struct vm_area_struct *vma)
 
 static long zd_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
-	unsigned long uaddr;
+	unsigned long uaddr = 0;
 	struct page *pg = NULL;
 	long n;
 
-	if (copy_from_user(&uaddr, (void __user *)arg, sizeof(uaddr)))
+	/* Only the address-taking commands have an argument. Copying for all of
+	 * them made ZD_IOC_DROP (an _IO with no arg) fail with -EFAULT before
+	 * the switch, which read as "unpin does not work" -- a test bug that
+	 * looked exactly like a kernel limitation. */
+	if (cmd != ZD_IOC_DROP &&
+	    copy_from_user(&uaddr, (void __user *)arg, sizeof(uaddr)))
 		return -EFAULT;
 
 	switch (cmd) {

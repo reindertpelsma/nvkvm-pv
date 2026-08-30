@@ -56,7 +56,7 @@ int main(void)
     int after_unmap = refcount();
     printf("after munmap, pin still held        refcount=%d  <-- the gate\n", after_unmap);
 
-    ioctl(fd, ZD_IOC_DROP);
+    if (ioctl(fd, ZD_IOC_DROP)) { perror("DROP"); return 2; }   /* check it! */
     int after_drop = refcount();
     printf("after the pin is dropped            refcount=%d\n", after_drop);
 
