@@ -38,6 +38,8 @@
  * approach is dead regardless of how good the rmap accounting is. */
 #define ZD_IOC_GUP  _IOW('Z', 1, unsigned long)
 #define ZD_IOC_PIN  _IOW('Z', 2, unsigned long)
+#define ZD_IOC_HOLD _IOW('Z', 3, unsigned long)   /* pin and KEEP it */
+#define ZD_IOC_DROP _IO('Z', 4)                   /* release the held pin */
 
 static unsigned long base = 0x6000000000UL;
 static unsigned long size = 128UL << 20;
@@ -72,6 +74,10 @@ static void zd_page_free(struct page *page)
 static const struct dev_pagemap_ops zd_pgmap_ops = {
 	.page_free = zd_page_free,
 };
+
+/* A deliberately leaked pin, to model a guest process that pins a window page
+ * and outlives the registration -- the case the lifetime rule must catch. */
+static struct page *held_page;
 
 static struct dev_pagemap pgmap;
 static void *vaddr;
@@ -175,6 +181,22 @@ static long zd_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 		}
 		return n == 1 ? 0 : (n < 0 ? n : -EFAULT);
 
+	case ZD_IOC_HOLD:
+		if (held_page) return -EBUSY;
+		n = pin_user_pages_fast(uaddr, 1, FOLL_WRITE, &held_page);
+		if (n != 1) { held_page = NULL; return -EFAULT; }
+		pr_info("zd_probe: HELD pin on pfn=0x%lx refcount now %d\n",
+			page_to_pfn(held_page), page_ref_count(held_page));
+		return 0;
+
+	case ZD_IOC_DROP:
+		if (!held_page) return -ENOENT;
+		pr_info("zd_probe: dropping held pin on pfn=0x%lx (refcount %d)\n",
+			page_to_pfn(held_page), page_ref_count(held_page));
+		unpin_user_page(held_page);
+		held_page = NULL;
+		return 0;
+
 	case ZD_IOC_PIN:
 		/* FOLL_PIN is what a driver doing DMA uses, and it is stricter
 		 * than a plain GUP reference -- notably it refuses some page
@@ -249,6 +271,7 @@ static int __init zd_init(void)
 
 static void __exit zd_exit(void)
 {
+	if (held_page) { unpin_user_page(held_page); held_page = NULL; }
 	misc_deregister(&zd_misc);
 	remove_proc_entry("zd_probe", NULL);
 	if (vaddr) { memunmap_pages(&pgmap); pr_info("zd_probe: memunmap_pages done\n"); }
