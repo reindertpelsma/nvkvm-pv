@@ -66,3 +66,54 @@ is clean and repeatable.
 
 (2) is the one to test next, and it is cheap: insert a page into a VMA, fork,
 and check whether the kernel reports both mappings.
+
+# Stage 2 result: the pages ARE rmap-tracked
+
+**Measured 2026-08-31**, same guest. `zd_probe.ko` inserts window pages into a
+user VMA; `zd_rmap_test` reads the kernel's own accounting across mmap and
+fork.
+
+    insert_path   vm_insert_page (err=0)
+    mapcount      before=0   after mmap=1   after fork=2
+    refcount      1 -> 2 -> 3
+    PageLRU 0   PageReserved 1   page_mapping NULL   zonenum 4
+    RESULT: PASS -- the kernel tracks these mappings (rmap works)
+
+Against the four open points:
+
+**1. Insertable into a user VMA -- YES, via `vm_insert_page()`.** The normal
+page path accepted a ZONE_DEVICE page. The `vmf_insert_mixed()`/`VM_MIXEDMAP`
+fallback was never needed, which matters: that path installs a `pte_special`
+the kernel does not account, and would have bought nothing.
+
+**2. rmap-tracked -- YES.** `page_mapcount()` rises with each mapping,
+including across `fork()`. This is the property `VM_PFNMAP` lacks and the whole
+reason relocation could only ever rewrite one VMA.
+
+**3. `migrate_pages()` destination -- NO.** `PageLRU=0`, `PageReserved=1`:
+standard migration isolates LRU folios and these are not on the LRU. Less
+important than it looks -- see below.
+
+**4. CPU access -- still untested.** The probe maps an unbacked part of the
+sparse window and deliberately does not touch it. Low risk rather than unknown:
+the window is demonstrably CPU-accessible when backed (every CUDA check reads
+its results back through it) and ZONE_DEVICE changes page metadata, not memory.
+Not claimed until run.
+
+## What this changes
+
+If the window were populated with `vm_insert_page()` over ZONE_DEVICE pages
+instead of `remap_pfn_range()` under `VM_PFNMAP`, the kernel would track every
+mapping itself. The `page_mapcount() > 1` guard added to refuse shared
+relocation becomes the *natural* accounting rather than a special case, and the
+"find and convert every other view" problem -- foreign `mmap_write_lock`,
+shmem `vm_ops` refaulting, views created after registration -- does not arise,
+because nothing is being relocated.
+
+That is the argument for allocate-in-window, arrived at independently: with
+rmap present, (3) stops mattering, since migration is only needed to move pages
+*into* the window, and a buffer allocated there never has to move.
+
+**Unquantified:** `PageReserved=1` is worth understanding before relying on
+this -- several mm paths skip reserved pages, and it may constrain what else
+these mappings can participate in.
