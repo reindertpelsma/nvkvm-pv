@@ -45,3 +45,22 @@ should not be written up as a root cause.
 
 `tests/repro/nested_vidmem_zeros.c`, `nested_pinned_sysmem.c`,
 `nested_pinned_vma.c` on branch `fix/nested-l2-htod-zeros`.
+
+## Possible offline shortcut (added after poweroff)
+
+`dmesg` is a RAM ring buffer, so the oops died with the poweroff. But if the
+L2 guest runs persistent journald, the same oops was written into the guest
+image and survives on disk. Try this before re-running the whole nested
+stack -- it needs no boot:
+
+    # find the L2 guest image, then:
+    modprobe nbd max_part=8
+    qemu-nbd -r -c /dev/nbd0 <l2-guest>.qcow2     # -r: read-only, do not mutate
+    mkdir -p /mnt/l2 && mount -o ro /dev/nbd0p2 /mnt/l2
+    journalctl -D /mnt/l2/var/log/journal -k --no-pager \
+      | grep -iE 'nvkvm|BUG:|Oops|Call Trace|RIP:|migrat' | tail -80
+    umount /mnt/l2 && qemu-nbd -d /dev/nbd0
+
+If `/mnt/l2/var/log/journal` is absent or empty, persistent logging was off
+and the trace is genuinely gone -- fall back to re-running the stack and the
+`l1.sh`/`l2.sh` capture above.
