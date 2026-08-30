@@ -22,6 +22,25 @@ Mode up, gamescope compositing. 60–90 seconds in, the guest stops:
 One CPU spinning while the rest halt is the shape of a spinlock whose holder
 never releases — on KVM, contended spinlock waiters halt until kicked.
 
+## It also reproduces at SHUTDOWN, with no OTA involved
+
+Measured 2026-08-30, second reproduction, triggered by a plain `systemctl
+reboot` while Game Mode was running:
+
+| observation | value |
+|---|---|
+| `/proc/<qemu>/io` | 145072128 read / 2846859264 written, **identical 5 s apart** |
+| QEMU CPU | 1.0% |
+| vCPUs | **all 8 at RIP `ffffffffb9ed7aef`**, identical across two samples 5 s apart |
+| QMP | `running` |
+
+So the trigger is not the OTA and not sustained disk writes -- a reboot with the
+GPU active is enough. What the OTA and a shutdown share is **GPU teardown /
+activity**, which is the common factor.
+
+(The RIP differs from the OTA capture only because KASLR relocates the kernel
+each boot; compare symbols, never raw addresses, across boots.)
+
 ## The discriminating control
 
 **The same OTA on the same guest with the GPU path dead completes normally**
