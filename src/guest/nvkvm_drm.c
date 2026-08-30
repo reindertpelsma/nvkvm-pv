@@ -1070,7 +1070,24 @@ static const struct drm_driver nvkvm_drm_driver = {
 	/* DRIVER_MODESET|ATOMIC: the guest-emulated virtual KMS head (#102,
 	 * nvkvm_kms.c) lives on this same device so render + scanout share one DRM
 	 * device (no cross-device PRIME). */
-	.driver_features = DRIVER_RENDER | DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+	/* DRIVER_SYNCOBJ|_TIMELINE: gamescope's DRM backend refuses to drive a
+	 * connector without DRM_CAP_SYNCOBJ and falls back to its headless
+	 * backend -- after having already selected our real connector, which is
+	 * why the failure looked like a modesetting problem and not a missing
+	 * capability (see docs/investigations/gamescope-oobe/).  drm_getcap
+	 * answers that cap straight from drm_core_check_feature(), and syncobjs
+	 * are implemented ENTIRELY in DRM core (drm_syncobj.c): a driver only
+	 * declares support, the core supplies the ioctls and needs no callbacks
+	 * from us.  So this is a genuine capability we always had and never
+	 * advertised, not a claim we cannot honour.
+	 *
+	 * NOT added here: DRM_CAP_ASYNC_PAGE_FLIP.  That one is
+	 * mode_config.async_page_flip, and setting it would tell userspace we
+	 * honour DRM_MODE_PAGE_FLIP_ASYNC in atomic commit, which is a claim
+	 * about our KMS path rather than a core-provided primitive.  Measure
+	 * whether it is actually required before asserting it. */
+	.driver_features = DRIVER_RENDER | DRIVER_GEM | DRIVER_MODESET |
+			   DRIVER_ATOMIC | DRIVER_SYNCOBJ | DRIVER_SYNCOBJ_TIMELINE,
 	.open            = nvkvm_drm_open,
 	.postclose       = nvkvm_drm_postclose,
 	.ioctls          = nvkvm_drm_ioctls,
