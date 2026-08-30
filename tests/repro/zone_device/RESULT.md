@@ -117,3 +117,63 @@ rmap present, (3) stops mattering, since migration is only needed to move pages
 **Unquantified:** `PageReserved=1` is worth understanding before relying on
 this -- several mm paths skip reserved pages, and it may constrain what else
 these mappings can participate in.
+
+# Stage 3: GUP, PIN, CPU access — all four questions closed
+
+**Measured 2026-08-31**, same guest and window.
+
+    get_user_pages_fast:  OK
+    pin_user_pages_fast:  OK
+    CPU access:  initial read 0x00000000, write 0x5A5A5A5A, readback 0x5a5a5a5a
+    mapcount:    0 -> 1 (mmap) -> 2 (fork)
+
+**`PageReserved=1` constrains nothing that matters here.** It does not block
+GUP or `pin_user_pages`, and the paths it does exclude (swap, reclaim) are ones
+this memory must be excluded from anyway.
+
+**GUP and PIN both work**, which was the real question behind
+`PageReserved`: nvkvm GUPs the registered buffer and the host driver pins it
+for DMA. Either failing would have ended the approach regardless of how good
+the rmap accounting is.
+
+**CPU access caveat.** The mapping is write-back cached, so a write followed
+immediately by a read can be served from cache without reaching the device.
+The result proves the mapping is *usable*; it does not prove that particular
+GPA is backed. Distinguishing them needs a flush, or a read through a second
+independent mapping.
+
+## Status of the four
+
+| # | question | result |
+|---|---|---|
+| 1 | insertable into a user VMA | **YES**, via `vm_insert_page` (normal path) |
+| 2 | rmap-tracked | **YES**, mapcount rises per mapping |
+| 3 | `migrate_pages()` destination | **NO** (`PageLRU=0`) — and not needed |
+| 4 | GUP / PIN / CPU access | **YES** / **YES** / usable (see caveat) |
+
+## The security-critical design point this exposes
+
+Refcounting is not free. Today the window is `VM_PFNMAP`: no `struct page`, so
+no reference can be taken, and teardown is unconditional. Give the pages a
+`struct page` and a guest process can `pin_user_pages()` one — directly, or via
+O_DIRECT, or by handing it to another driver for DMA — and that pin can
+**outlive the registration**.
+
+That turns revocation into a correctness *and* security question:
+
+- If QEMU unmaps the memfd from that GPA while a guest pin is live, the guest
+  holds a pin on a PFN that may later back **a different isolate's memory**.
+  That is a cross-isolate read/write primitive, reachable from ordinary guest
+  userspace.
+- Refusing to revoke while pinned is the safe direction, but then a guest can
+  pin window pages and never release them, holding host memfd pages
+  indefinitely.
+
+So the rule has to be explicit: **a window GPA may not be re-pointed at
+different backing while any reference to its pages exists.** Either revocation
+blocks on the refcount, or a GPA range is retired rather than reused. Getting
+this wrong is worse than the bug this whole line of work started from, because
+it crosses an isolate boundary rather than corrupting one process's own data.
+
+Nothing measured here blocks the approach. This is the piece that has to be
+designed rather than discovered.
