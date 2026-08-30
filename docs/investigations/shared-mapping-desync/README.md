@@ -423,3 +423,49 @@ Together with the four targeted cases:
 | fork-shared | refused, both views stay coherent |
 | nested L2 (memslot alias) | refused, no silent corruption |
 | single-view memfd | works (the S_PRIVATE over-rejection is gone) |
+
+## Why not hook the mechanism swap already uses?
+
+Swap has exactly the property this bug lacks: a shmem page can move and every
+mapping still resolves correctly, including mappings created afterwards. Worth
+recording why that mechanism is not directly reusable, because it is the
+obvious question and the obvious answer ("you cannot control future mappings")
+is wrong -- the kernel controls them constantly.
+
+The coherence does not live in the VMAs. It lives in the inode's
+**`address_space`**: a swapped-out shmem folio leaves a swap entry in the
+inode's xarray, and any later fault in any mapping goes
+`shmem_fault -> shmem_get_folio ->` finds the entry -> swaps in -> installs the
+new page. The address_space is the hook point.
+
+Two things stop us using it, and only one is fundamental.
+
+1. **The window has no `struct page`.** The page cache, rmap and
+   `migrate_pages()` all work on folios. The GPA window is installed with
+   `remap_pfn_range()` under `VM_PFNMAP|VM_IO` over a region the code itself
+   describes as non-System-RAM. There is nothing to insert. This is a property
+   of the current design, not a law: `memremap_pages()`/ZONE_DEVICE exists
+   precisely to give non-RAM a `struct page`, and is how GPU drivers make
+   device memory a `migrate_vma_*` target. nvkvm uses none of it today
+   (verified: no `memremap_pages`, `pgmap` or `ZONE_DEVICE` in `src/guest/`).
+   **Unverified:** whether a CPU-accessible ZONE_DEVICE page can be
+   page-cache-resident at all -- device-*private* pages explicitly cannot be
+   CPU-mapped, which is the opposite of what is needed here.
+
+2. **shmem owns the inode's page cache, and we do not.** Even given struct
+   pages, substituting foreign folios into another file's mapping is not a
+   sanctioned operation: shmem allocates, reclaims and swaps those folios on
+   its own schedule, so anything installed there can be reclaimed out from
+   under the GPU.
+
+(2) is the fundamental one, and it states the real boundary more precisely than
+"future mappings cannot be controlled":
+
+> **The address_space can be hooked for a file we own, not for a file we are
+> handed.**
+
+Which is why `cuMemHostAlloc` is tractable and `cuMemHostRegister` on an
+application's own shared memfd is not. In the first case nvkvm creates the
+backing object and every future mapping resolves to its pages by construction;
+in the second the object belongs to the application and its page cache belongs
+to shmem.
