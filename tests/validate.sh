@@ -2300,20 +2300,6 @@ while [ $i -lt ${#RESULT_NAMES[@]} ]; do
     i=$((i+1))
 done
 
-# --- classify skips ----------------------------------------------------------
-UNEXPECTED_SKIPS=""
-i=0
-while [ $i -lt ${#RESULT_NAMES[@]} ]; do
-    if [ "${RESULT_STATUS[$i]}" = SKIP ]; then
-        n="${RESULT_NAMES[$i]}"
-        case ",$ALLOW_SKIP," in
-            *,"$n",*) : ;;                          # declared via --allow-skip
-            *) UNEXPECTED_SKIPS="$UNEXPECTED_SKIPS $n" ;;
-        esac
-    fi
-    i=$((i+1))
-done
-
 # ---------------------------------------------------------------------------
 # host-memory registration invariants
 # ---------------------------------------------------------------------------
@@ -2367,6 +2353,20 @@ reg_invariant host_register_then_fork register_then_fork.c \
     "child sees the parent's writes after register-then-fork"
 reg_invariant host_register_cow_fork cow_after_fork.c \
     "child registered inherited COW heap; parent's copy intact"
+
+# --- classify skips ----------------------------------------------------------
+UNEXPECTED_SKIPS=""
+i=0
+while [ $i -lt ${#RESULT_NAMES[@]} ]; do
+    if [ "${RESULT_STATUS[$i]}" = SKIP ]; then
+        n="${RESULT_NAMES[$i]}"
+        case ",$ALLOW_SKIP," in
+            *,"$n",*) : ;;                          # declared via --allow-skip
+            *) UNEXPECTED_SKIPS="$UNEXPECTED_SKIPS $n" ;;
+        esac
+    fi
+    i=$((i+1))
+done
 
 TOTAL=${#RESULT_NAMES[@]}
 printf '\n %sTOTAL %d   PASS %d   FAIL %d   SKIP %d   UNTESTED %d%s\n' \
