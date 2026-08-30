@@ -1805,7 +1805,21 @@ boot_kernel_series() {
                linux-image-generic linux-headers-generic" >/dev/null 2>&1 \
         || { warn "  apt could not install the GA kernel"; return 1; }
 
-    have="$(rsh_t 120 "ls -1 /boot/vmlinuz-${want}* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1" 2>/dev/null | tr -d '\r')"
+    # PREFER THE -generic FLAVOUR.  MEASURED 2026-08-30: picking merely "the
+    # newest 5.15" lands on 5.15.0-1079-kvm, because sort -V ranks 1079 above
+    # 190 -- and the -kvm flavour cannot build these drivers at all:
+    #   modpost: "backlight_device_register" [nvidia-modeset.ko] undefined!
+    #   modpost: GPL-incompatible module nvidia.ko uses GPL-only symbol
+    #            'rcu_read_unlock_strict'
+    # Both are properties of that flavour's config, not of 5.15, and headers
+    # were present -- so this looked like "the old driver still will not build"
+    # when it was the wrong kernel flavour.  Fall back to any match only if no
+    # -generic exists, and say so.
+    have="$(rsh_t 120 "ls -1 /boot/vmlinuz-${want}*-generic 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1" 2>/dev/null | tr -d '\r')"
+    if [ -z "$have" ]; then
+        have="$(rsh_t 120 "ls -1 /boot/vmlinuz-${want}* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1" 2>/dev/null | tr -d '\r')"
+        [ -n "$have" ] && warn "  no ${want}-generic kernel; falling back to ${have}, which may not build these drivers"
+    fi
     [ -n "$have" ] || { warn "  no /boot/vmlinuz-${want}* after apt install"; return 1; }
     info "  installed ${have}; removing the HWE kernel so GRUB has one choice"
 
