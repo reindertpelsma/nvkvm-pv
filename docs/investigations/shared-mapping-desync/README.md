@@ -398,3 +398,28 @@ identity is not the same as relaxing what an isolate may present.
 - Handles outliving sessions makes `NVKVM_HANDLE_MAX` the backstop against a
   guest that never closes them. That bounds it to a guest self-DoS rather than
   a host problem, but the cap has to actually be the limit.
+
+## Release verification: full suite, no regression
+
+**2026-08-30**, RTX 3050 Laptop GPU, driver 580.173.02, tree `a95dd61`, L1
+(single-level nvkvm), QEMU rebuilt from the same tree.
+
+    TOTAL 30   PASS 30   FAIL 0   SKIP 0   UNTESTED 0
+    VERDICT: PASS (all 30 checks passed)
+
+The `page_mapcount() > 1` guard rejects only genuinely shared ranges, so the
+whole suite -- CUDA bring-up, HtoD/DtoH, memset, PTX JIT, kernel launch,
+matmul, managed alloc and coherence, Vulkan compute, EGL, OpenGL -- is
+unaffected. Worth stating explicitly because the guard sits on the pinned-host
+path that most of the CUDA checks traverse, and "my targeted probes pass" is
+not the same claim as "nothing else broke".
+
+Together with the four targeted cases:
+
+| case | result |
+|---|---|
+| full suite, L1 | **30/30 PASS** |
+| L1 single-view pinned sysmem | 16384/16384 both directions |
+| fork-shared | refused, both views stay coherent |
+| nested L2 (memslot alias) | refused, no silent corruption |
+| single-view memfd | works (the S_PRIVATE over-rejection is gone) |
