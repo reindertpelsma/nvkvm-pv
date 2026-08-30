@@ -38,6 +38,27 @@ static unsigned long dstbase = 0x6800000000UL;   /* window base + 32 GiB */
 static unsigned long dstsize = 2UL << 20;
 module_param(dstbase, ulong, 0444);
 module_param(dstsize, ulong, 0444);
+static int dsttype;   /* 0 = GENERIC, 1 = DEVICE_PRIVATE */
+module_param(dsttype, int, 0444);
+MODULE_PARM_DESC(dsttype, "destination pgmap type: 0=GENERIC, 1=DEVICE_PRIVATE");
+
+/* DEVICE_PRIVATE requires both a page_free op and an owner, or memremap_pages
+ * refuses. It also demands a migrate_to_ram op: a CPU touch of such a page
+ * faults and the kernel calls this to bring it back. That requirement is the
+ * whole reason DEVICE_PRIVATE is a poor fit for a buffer the guest CPU reads
+ * -- but it is exactly what makes it an accepted migration destination. */
+static void mv_page_free(struct page *p) { }
+static vm_fault_t mv_migrate_to_ram(struct vm_fault *vmf)
+{
+	pr_info_ratelimited("mv_probe: CPU touched a DEVICE_PRIVATE page -- "
+			    "kernel is asking us to migrate it back\n");
+	return VM_FAULT_SIGBUS;
+}
+static const struct dev_pagemap_ops mv_pgmap_ops = {
+	.page_free      = mv_page_free,
+	.migrate_to_ram = mv_migrate_to_ram,
+};
+
 static struct dev_pagemap dpg;
 static void *dvaddr;
 static int dst_ready;
@@ -133,18 +154,21 @@ static struct miscdevice mv_misc = {
 static int __init mv_init(void)
 {
 	memset(&dpg, 0, sizeof(dpg));
-	dpg.type        = MEMORY_DEVICE_GENERIC;
+	dpg.type        = dsttype ? MEMORY_DEVICE_PRIVATE : MEMORY_DEVICE_GENERIC;
+	dpg.ops         = &mv_pgmap_ops;
+	dpg.owner       = &dpg;
 	dpg.range.start = dstbase;
 	dpg.range.end   = dstbase + dstsize - 1;
 	dpg.nr_range    = 1;
 	dvaddr = memremap_pages(&dpg, NUMA_NO_NODE);
 	if (IS_ERR(dvaddr)) {
-		pr_warn("mv_probe: dst pgmap unavailable (%ld); TRY still works\n",
-			PTR_ERR(dvaddr));
+		pr_warn("mv_probe: dst pgmap type=%s unavailable (%ld); TRY still works\n",
+			dsttype ? "DEVICE_PRIVATE" : "GENERIC", PTR_ERR(dvaddr));
 		dvaddr = NULL;
 	} else {
 		dst_ready = 1;
-		pr_info("mv_probe: dst pgmap at 0x%lx ready\n", dstbase);
+		pr_info("mv_probe: dst pgmap at 0x%lx ready, type=%s\n", dstbase,
+			dsttype ? "DEVICE_PRIVATE" : "GENERIC");
 	}
 	return misc_register(&mv_misc);
 }
