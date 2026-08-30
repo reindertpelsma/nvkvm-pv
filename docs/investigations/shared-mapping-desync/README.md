@@ -72,3 +72,54 @@ is a normal pattern, not an exotic one. Every ioctl returns success. A workload
 would see stale data with no diagnostic. This is a correctness bug in the
 single-level path, i.e. in what ships, and it should be triaged before the
 release rather than filed with the nested experiment.
+
+## Why this cannot be fixed with the kernel's page migration
+
+The obvious proposal -- "move the physical page the way swap does, so every
+mapping follows via rmap" -- identifies the right *property* but cannot use the
+kernel's mechanism, and it is worth writing down why so it is not re-proposed.
+
+Swap and `migrate_pages()` move a folio between **kernel-managed pages** while
+preserving its `address_space`; rmap then rewrites every PTE. Both halves fail
+here:
+
+- **The destination has no `struct page` in the guest.** It is a host-side
+  memfd, filled over virtio through bounce slots
+  (`nvkvm_virtio_open_memory_handle` / `_write_memory_handle`), exposed to the
+  guest as a sparse GPA window that the code itself describes as "a PCI-BAR
+  (non-RAM) region" and installs with `remap_pfn_range` under
+  `VM_PFNMAP|VM_IO`. `migrate_pages()` has nothing to migrate *to*.
+- **It re-homes into a different object.** Swap never moves a page from one
+  `address_space` into another; this moves guest anon/shmem pages into a host
+  memfd. Migration preserves object identity by design.
+
+Hand-rolling the rmap walk instead does not rescue it: the other view is an
+ordinary shmem VMA, so PFN PTEs would contradict its `vm_flags`, and the next
+fault there would go through shmem's fault handler and repopulate the original
+page regardless.
+
+## The direction that does work: do not relocate
+
+The guest's pages are already host memory, inside the VMM's memslot. The host
+does not need a *copy* in a second memfd -- it needs to reach the pages where
+they already are. One physical home means every view stays valid by
+construction, and memfd vs fork-shared vs private becomes irrelevant rather
+than something to detect.
+
+That is the same conclusion as "allocate the backing once from a DMA-able
+window at the bottom level", reached from the opposite direction, and it also
+removes the per-chunk copy that currently costs a full bounce of every
+registered byte.
+
+Open questions before this is a plan, none yet measured: whether the guest can
+describe a scattered GPA set to the host cheaply enough (the current design
+buys contiguity with the copy), and whether the stub's pin can be held stable
+against guest-side reclaim of those pages.
+
+## Interim
+
+Detection is cheap and makes the failure honest; a sharing test
+(`page_mapcount() > 1` over the pinned range, or an `i_mmap` walk) would turn
+silent divergence into `-EINVAL` for fork-shared and shared-memfd cases alike,
+the same way `8f5d104` did for the memslot case. It is a stopgap: it refuses
+work rather than performing it correctly.
