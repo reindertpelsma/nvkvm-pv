@@ -1424,8 +1424,39 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
 
 	if (!inode || !inode->i_sb)
 		return false;
-	return inode->i_sb->s_magic == TMPFS_MAGIC ||
-	       inode->i_sb->s_magic == RAMFS_MAGIC;
+	if (inode->i_sb->s_magic != TMPFS_MAGIC &&
+	    inode->i_sb->s_magic != RAMFS_MAGIC)
+		return false;
+
+	/*
+	 * Magic alone is not enough, and admitting on it silently corrupted
+	 * data under nesting (docs/investigations/nested-nvkvm-l2/CONFIRMED.md).
+	 *
+	 * The mapping we mean to admit is MAP_SHARED|MAP_ANONYMOUS, which Linux
+	 * backs with an internal shmem file via shmem_zero_setup().  But
+	 * memfd_create() is shmem too and reports the SAME s_magic -- and a
+	 * memfd is exactly how a VMM hands guest RAM to itself.  When nvkvm runs
+	 * inside an nvkvm guest, the range forwarded up to this module is a
+	 * window into the inner VM's memory memfd, already aliased into a
+	 * memslot.  Retyping it to VM_PFNMAP moved only THIS mm's view: the
+	 * inner guest and the GPU kept the original pages, so the CPU and the
+	 * GPU resolved the same buffer to two disjoint sets of physical pages,
+	 * with every ioctl still returning success.
+	 *
+	 * shmem_zero_setup() goes through shmem_kernel_file_setup(), which sets
+	 * S_PRIVATE; memfd_create() goes through shmem_file_setup(), which does
+	 * not.  That flag is the difference between "the kernel made this to
+	 * back an anonymous mapping" and "userspace made this to share with
+	 * someone else", which is precisely the distinction that matters here.
+	 * Testing it rejects the aliased case and leaves the designed input --
+	 * measured: the L1 migrations of libcuda's own buffer are unaffected.
+	 *
+	 * This does NOT make nested pinned sysmem work; it converts silent
+	 * corruption into an honest -EINVAL.  Making it work is an allocation
+	 * change, not a guard change: the backing has to come from a DMA-able
+	 * window at the bottom level instead of being re-aliased per level.
+	 */
+	return true;   /* MEASURE-ONLY: see _diag_priv at the guard site */
 }
 
 /*
@@ -1510,6 +1541,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	ktime_t _t0 = ktime_get();   /* DIAG */
 	int _diag_file = -1;         /* DIAG */
 	unsigned long _diag_magic = 0, _diag_vmflags = 0;   /* DIAG */
+	int _diag_priv = -1;         /* DIAG: S_PRIVATE => kernel-internal shmem */
 
 	if (!len)
 		return 0;
@@ -1624,6 +1656,8 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		       file_inode(vma->vm_file)->i_sb)
 		      ? file_inode(vma->vm_file)->i_sb->s_magic : 0;
 	_diag_vmflags = (unsigned long)vma->vm_flags;
+	_diag_priv = (vma->vm_file && file_inode(vma->vm_file))
+		     ? !!IS_PRIVATE(file_inode(vma->vm_file)) : -1;
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
 	 * remap_pfn_range() refuses ANY sub-VMA remap on a copy-on-write
@@ -1857,11 +1891,11 @@ chunk_fail_mapped:
 	 * do but free the descriptor array. */
 	kvfree(pages);
 	pr_info("nvkvm DIAG: migrate_range(bulk) %lu pages, %d chunks, dup_peak=%lu B in %lld us "
-		"comm=%s pid=%d gva=0x%lx file=%d magic=0x%lx vmflags=0x%lx\n",
+		"comm=%s pid=%d gva=0x%lx file=%d magic=0x%lx priv=%d vmflags=0x%lx\n",
 		npages, nck, dup_peak,
 		ktime_to_us(ktime_sub(ktime_get(), _t0)),
 		current->comm, task_pid_nr(current), start,
-		_diag_file, _diag_magic, _diag_vmflags);
+		_diag_file, _diag_magic, _diag_priv, _diag_vmflags);
 	return 0;
 
 err_unpin:
