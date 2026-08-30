@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #define MV_IOC_TRY _IOW('M', 1, unsigned long)
+#define MV_IOC_DST _IOW('M', 2, unsigned long)
 #define LEN (64u*1024u)
 
 static void try_one(int fd, const char *label, int flags)
@@ -29,6 +30,17 @@ int main(void)
     if (fd < 0) { perror("open /dev/mv_probe"); return 2; }
     try_one(fd, "MAP_PRIVATE|MAP_ANONYMOUS",  MAP_PRIVATE|MAP_ANONYMOUS);
     try_one(fd, "MAP_SHARED|MAP_ANONYMOUS",   MAP_SHARED|MAP_ANONYMOUS);
-    printf("\n(the second is what cuMemHostAlloc returns)\n");
+    printf("\n(the second is what cuMemHostAlloc returns)\n\n");
+
+    /* Now the destination question, on the shmem shape that matters. */
+    void *m = mmap(NULL, LEN, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if (m != MAP_FAILED) {
+        memset(m, 0xCD, LEN);
+        unsigned long ua = (unsigned long)m;
+        int rc = ioctl(fd, MV_IOC_DST, &ua);
+        printf("%-34s ZONE_DEVICE destination -> %s\n",
+               "MAP_SHARED|MAP_ANONYMOUS", rc == 0 ? "setup ok (see dmesg)" : strerror(errno));
+        munmap(m, LEN);
+    }
     return 0;
 }

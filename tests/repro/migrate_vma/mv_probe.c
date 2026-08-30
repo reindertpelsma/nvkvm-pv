@@ -26,8 +26,24 @@
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/sched/mm.h>
+#include <linux/memremap.h>
 
-#define MV_IOC_TRY _IOW('M', 1, unsigned long)
+/*
+ * A private pgmap for the destination test, deliberately high in the 64 GiB
+ * window: nvkvm allocates its GPAs from the base upward, and claiming a range
+ * it is using breaks CUDA outright (measured -- cuCtxCreate failed until the
+ * probe was unloaded).
+ */
+static unsigned long dstbase = 0x6800000000UL;   /* window base + 32 GiB */
+static unsigned long dstsize = 2UL << 20;
+module_param(dstbase, ulong, 0444);
+module_param(dstsize, ulong, 0444);
+static struct dev_pagemap dpg;
+static void *dvaddr;
+static int dst_ready;
+
+#define MV_IOC_TRY  _IOW('M', 1, unsigned long)
+#define MV_IOC_DST  _IOW('M', 2, unsigned long)   /* try a ZONE_DEVICE destination */
 
 static long mv_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
@@ -38,7 +54,7 @@ static long mv_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	struct migrate_vma mig;
 	int ret;
 
-	if (cmd != MV_IOC_TRY) return -ENOTTY;
+	if (cmd != MV_IOC_TRY && cmd != MV_IOC_DST) return -ENOTTY;
 	if (copy_from_user(&uaddr, (void __user *)arg, sizeof(uaddr))) return -EFAULT;
 
 	start = uaddr & PAGE_MASK;
@@ -76,11 +92,30 @@ static long mv_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 	} else {
 		pr_info("mv_probe: migrate_vma_setup -> 0  ACCEPTED  cpages=%lu npages=%lu src[0]=0x%lx\n",
 			mig.cpages, mig.npages, src[0]);
-		/* Abort cleanly: no dst entries filled means nothing migrates and
-		 * finalize restores the original PTEs. */
-		migrate_vma_pages(&mig);
-		migrate_vma_finalize(&mig);
-		pr_info("mv_probe: aborted and finalized (no pages moved)\n");
+
+		if (cmd == MV_IOC_DST && dst_ready && mig.cpages == 1 &&
+		    (src[0] & MIGRATE_PFN_MIGRATE)) {
+			/* The real question: can a window ZONE_DEVICE page be the
+			 * destination? If migrate_vma_pages() takes it, the rmap
+			 * walk in remove_migration_ptes() updates EVERY mapping
+			 * and all-views coherence needs no hand-tracking. */
+			struct page *dpage = pfn_to_page(dstbase >> PAGE_SHIFT);
+
+			get_page(dpage);
+			lock_page(dpage);
+			dst[0] = migrate_pfn(page_to_pfn(dpage));
+			pr_info("mv_probe: offering ZONE_DEVICE dst pfn=0x%lx\n",
+				page_to_pfn(dpage));
+			migrate_vma_pages(&mig);
+			pr_info("mv_probe: after pages(): src[0]=0x%lx migrated=%s\n",
+				src[0],
+				(src[0] & MIGRATE_PFN_MIGRATE) ? "YES" : "NO -- refused");
+			migrate_vma_finalize(&mig);
+		} else {
+			migrate_vma_pages(&mig);
+			migrate_vma_finalize(&mig);
+			pr_info("mv_probe: aborted and finalized (no pages moved)\n");
+		}
 	}
 	mmap_write_unlock(mm);
 
@@ -95,8 +130,29 @@ static const struct file_operations mv_fops = {
 static struct miscdevice mv_misc = {
 	.minor = MISC_DYNAMIC_MINOR, .name = "mv_probe", .fops = &mv_fops, .mode = 0666,
 };
-static int __init mv_init(void) { return misc_register(&mv_misc); }
-static void __exit mv_exit(void) { misc_deregister(&mv_misc); }
+static int __init mv_init(void)
+{
+	memset(&dpg, 0, sizeof(dpg));
+	dpg.type        = MEMORY_DEVICE_GENERIC;
+	dpg.range.start = dstbase;
+	dpg.range.end   = dstbase + dstsize - 1;
+	dpg.nr_range    = 1;
+	dvaddr = memremap_pages(&dpg, NUMA_NO_NODE);
+	if (IS_ERR(dvaddr)) {
+		pr_warn("mv_probe: dst pgmap unavailable (%ld); TRY still works\n",
+			PTR_ERR(dvaddr));
+		dvaddr = NULL;
+	} else {
+		dst_ready = 1;
+		pr_info("mv_probe: dst pgmap at 0x%lx ready\n", dstbase);
+	}
+	return misc_register(&mv_misc);
+}
+static void __exit mv_exit(void)
+{
+	misc_deregister(&mv_misc);
+	if (dvaddr) memunmap_pages(&dpg);
+}
 module_init(mv_init);
 module_exit(mv_exit);
 MODULE_LICENSE("GPL");
