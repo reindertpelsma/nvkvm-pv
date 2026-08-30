@@ -112,3 +112,54 @@ A successful migration into `MEMORY_DEVICE_PRIVATE` left the module unremovable
 the probe implements `migrate_to_ram` as `VM_FAULT_SIGBUS` rather than
 migrating back. A real implementation must implement `migrate_to_ram`
 faithfully, or teardown hangs the guest. Recovering needs a guest reboot.
+
+# Verdict: not implementable as driver work
+
+The join this needs is behind a symbol the kernel does not export.
+
+    migrate_pages            NOT EXPORTED
+    folio_isolate_lru        NOT EXPORTED
+    isolate_lru_page         NOT EXPORTED
+    putback_movable_pages    NOT EXPORTED
+    migrate_vma_setup        EXPORT_SYMBOL       <- the only path a module gets
+    memremap_pages           EXPORT_SYMBOL_GPL
+
+So:
+
+- **Sparse is not the problem.** `memremap_pages()` gives sparse, driver-owned
+  pages with `struct page`, rmap tracking, GUP and PIN -- all measured green.
+- The only migration path exported to a module is `migrate_vma_*`, the device
+  path, and it **refuses shmem sources** (measured: private-anon moves, shmem
+  refused, same destination).
+- The path that accepts shmem sources, `migrate_pages()`, is kernel-internal,
+  as is every helper needed to drive it.
+
+**A pool would not have helped**, and the earlier reasoning for it was wrong on
+its own terms: the pool existed to supply a *normal folio* destination, and the
+API that would consume it is unreachable. Its real costs (fully-backed
+allocation, weakened per-isolate confinement over shared backing) never even
+come into play.
+
+**No destination type rescues it either.** The refusal is on the source side,
+so `CONFIG_DEVICE_COHERENT` -- treated earlier as a possible escape -- does not
+help.
+
+## Four routes, one fact
+
+Every approach tried failed at the same place: **a shmem page's identity lives
+in the inode's `address_space`, and no third party may re-home it.**
+
+1. Hook the address_space directly -- shmem owns it, and foreign folios
+   installed there are subject to its reclaim.
+2. Convert every mapping's VMA -- foreign `mmap_write_lock` ordering, and
+   shmem's `vm_ops` reinstates the original page on the next fault.
+3. `migrate_vma` into device memory -- refuses shmem sources.
+4. `migrate_pages` into a driver-owned normal folio -- not exported.
+
+## What this does not change
+
+The corruption is fixed and shipping: `page_mapcount() > 1` refuses to relocate
+a shared range, 30/30 on the full suite, verified across single-view,
+fork-shared, nested and single-view-memfd. Making shared registration *work*
+requires kernel changes -- exporting the LRU migration path, or teaching
+`migrate_vma` to accept shmem sources -- and is upstream work, not driver work.
