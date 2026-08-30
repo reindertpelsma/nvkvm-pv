@@ -114,3 +114,28 @@ judgement is wrong.
 The way to get 26/30 *and* correctness is the allocation change, not the guard:
 back the registration from a DMA-able window allocated once at the bottom
 level, instead of re-aliasing a memfd per level.
+
+### What this is NOT, and where the guard over-rejects
+
+**This is not "NVIDIA DMA does not work on memfd-backed memory."** It does --
+on the stock driver and here. The driver pins whatever backs the VMA and does
+not care which filesystem it came from.
+
+The fault is in nvkvm's **relocation**, a step that only exists because the
+guest's pages have to become visible to the host stub. `migrate_range` copies
+the pages into a shared memfd and repoints the guest VMA at it with
+`VM_PFNMAP`. That is sound only for a VMA with **exactly one view**. A VMM's
+guest-RAM memfd has two -- the stub's mapping and the KVM memslot backing the
+inner guest -- so moving one desynchronises the other. `TMPFS_MAGIC` was a
+proxy for "ordinary process memory", and memfd breaks the proxy by being shmem
+*and* shared.
+
+**Known over-rejection.** `S_PRIVATE` rejects every memfd, not only aliased
+ones. A single-view case -- `memfd_create` + `mmap` + `cuMemHostRegister`
+inside an ordinary (non-nested) guest -- was safe before and now returns
+`-EINVAL`. The property that actually matters, "is this already aliased into a
+memslot", is not observable from the guest module, so `S_PRIVATE` stands in for
+it. That is a deliberate trade: refuse a narrow working case rather than keep
+silently corrupting the nested one. It is untested whether any real workload
+hits it; if one does, the fix is not to widen the magic check again but to make
+aliasing itself detectable.
