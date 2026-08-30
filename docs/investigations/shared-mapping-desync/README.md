@@ -282,3 +282,42 @@ i_mmap_rwsem-inner order) and replacing shmem's `vm_ops` on a VMA its owner
 never asked to have converted -- otherwise the next fault there repopulates the
 original page. That is the piece to prototype before calling this easy; the
 sharing primitive it depends on is already present.
+
+## Correction: the case that matters IS cross-session, so the VMM does change
+
+The section above confirmed handles are session-scoped rather than
+isolate-scoped and concluded "no VMM change". That is right for threads and
+wrong for the case this document is about, because it did not check what a
+session *is*. From `struct nvkvm_session`:
+
+> Sessions are keyed by `mm` (address-space identity), not by tgid. [...]
+> threads share an mm so they share a session (correct); **fork creates a new
+> mm so the child gets a new session (correct).**
+
+Parent and child sharing a buffer are therefore in *different* sessions, always.
+Two consequences:
+
+1. **`MMAP_ON_ISOLATE` refuses it.** The gate requires
+   `h->session_id == req->session_id`, so granting the buffer's memfd to the
+   other process's isolate returns `EPERM`.
+2. **Teardown is owner-keyed, not refcounted.** `nvkvm_handle_close_session()`
+   closes every handle whose `session_id` matches the dying session, so a
+   shared handle dies with its creator even while another session maps it.
+
+### Size of the change
+
+Small in code, substantial in review. Two focused edits: an explicit
+cross-session *grant* (not merely relaxing the equality test), and
+refcount-based teardown instead of owner-identity teardown.
+
+Both sit on the boundary this code is most careful about. Session keying is
+`mm`-based specifically because tgid reuse was "a cross-uid info-leak path
+inside one VM", and `isolate_refcount` today guards a weaker property. A
+cross-session grant lets process A make pages mappable by process B's isolate,
+so it needs the guest kernel to vouch that B really maps those pages, and
+revocation that holds when A exits first. That is a security design task.
+
+**Summary of scope:** nothing for threads (same session); small,
+security-sensitive VMM work for the fork/multi-process case that actually
+matters; and the guest-side repointing of foreign VMAs remains the larger
+piece either way.
