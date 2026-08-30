@@ -98,7 +98,52 @@ ordinary shmem VMA, so PFN PTEs would contradict its `vm_flags`, and the next
 fault there would go through shmem's fault handler and repopulate the original
 page regardless.
 
-## The direction that does work: do not relocate
+## Correction: "do not relocate" breaks the isolation model
+
+The paragraph below was written before accounting for what the copy BUYS, and
+is left in place with this correction rather than deleted, because the idea is
+the obvious one and will be proposed again.
+
+**Mapping the guest-RAM object into the isolate would hand a GPU-facing
+sandboxed process the entire guest.** The per-registration memfd is not an
+implementation detail: because it contains only the registered bytes, it is
+the boundary that keeps the isolate from reading all of guest memory. nvkvm
+spends real effort on that confinement (per-VM uid, chroot, seccomp), and this
+would undo it.
+
+The idea survives only in range-limited form -- the isolate may map *only* the
+ranges it has been granted. That is architecturally consistent with what
+already exists: QEMU brokers every isolate mapping through `iso_mmap_tbl`
+(`NVKVM_ISO_MMAP_MAX` 8192), `iso_mmap_translate()` validates
+`(isolate_id, base, len)` against recorded entries, and `iso_mmap_free()`
+invalidates before the isolate-side munmap. Granting and revoking ranges is
+the existing model.
+
+But three constraints stand in the way, and together they are why the copy is
+defensible rather than merely convenient:
+
+1. **Guest RAM is not a shareable object today.** `scripts/run_test_vm.sh`
+   boots with a plain `-m "$VM_MEM"`: anonymous private memory in QEMU's
+   address space. There is nothing to range-map, and anonymous memory cannot
+   be shared with a separate process at all. This would require
+   `memory-backend-memfd,share=on`, which makes *all* guest RAM a shareable
+   object -- acceptable only because exposure stays gated by what QEMU maps,
+   but a real change in blast radius.
+2. **Scatter versus the token table.** The copy buys contiguity: 2 GiB in
+   2 MiB chunks is 1024 tokens, 1/8 of the table. Without it the design
+   inherits whatever physical scatter the guest allocator produced -- worst
+   case 4 KiB runs, 524288 tokens for the same 2 GiB against a table of 8192.
+3. **Lifetime.** With a copy, the isolate's memfd is independent of what the
+   guest later does with its pages. Without one, the isolate maps live guest
+   pages: the pins must be held for the whole registration and revoked exactly
+   on unregister, or the isolate later reads unrelated guest data through a
+   stale mapping. The copy provides that property for free.
+
+So the near-term sharing check below is not obviously just a stopgap. Given
+(1)-(3) it may be the right permanent answer for shared mappings, with a
+no-copy path reserved for a design that solves all three.
+
+## Superseded: do not relocate
 
 The guest's pages are already host memory, inside the VMM's memslot. The host
 does not need a *copy* in a second memfd -- it needs to reach the pages where
