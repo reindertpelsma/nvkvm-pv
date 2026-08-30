@@ -32,14 +32,19 @@ int main(void)
     try_one(fd, "MAP_SHARED|MAP_ANONYMOUS",   MAP_SHARED|MAP_ANONYMOUS);
     printf("\n(the second is what cuMemHostAlloc returns)\n\n");
 
-    /* Now the destination question, on the shmem shape that matters. */
-    void *m = mmap(NULL, LEN, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
-    if (m != MAP_FAILED) {
+    /* The discriminator: does an actual MOVE succeed for private-anon but not
+     * for shmem? If so the blocker is the source's address_space, not the
+     * destination page type. */
+    int shapes[2] = { MAP_PRIVATE|MAP_ANONYMOUS, MAP_SHARED|MAP_ANONYMOUS };
+    const char *names[2] = { "MAP_PRIVATE|MAP_ANONYMOUS", "MAP_SHARED|MAP_ANONYMOUS" };
+    for (int i = 0; i < 2; i++) {
+        void *m = mmap(NULL, LEN, PROT_READ|PROT_WRITE, shapes[i], -1, 0);
+        if (m == MAP_FAILED) continue;
         memset(m, 0xCD, LEN);
         unsigned long ua = (unsigned long)m;
         int rc = ioctl(fd, MV_IOC_DST, &ua);
-        printf("%-34s ZONE_DEVICE destination -> %s\n",
-               "MAP_SHARED|MAP_ANONYMOUS", rc == 0 ? "setup ok (see dmesg)" : strerror(errno));
+        printf("%-34s actual move -> %s\n", names[i],
+               rc == 0 ? "ran (see dmesg for migrated=YES/NO)" : strerror(errno));
         munmap(m, LEN);
     }
     return 0;
