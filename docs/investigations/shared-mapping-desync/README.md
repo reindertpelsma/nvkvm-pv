@@ -345,3 +345,56 @@ construction*, never incidentally. The `h->session_id == req->session_id` gate
 in `MMAP_ON_ISOLATE` therefore always blocks it, and the cross-session grant is
 unavoidable for the fork/memfd case rather than being an edge case to design
 around.
+
+## Revised: the session gate is guest policy, and the code half-agrees
+
+Earlier sections treated the `session_id` gate as a security boundary and
+scoped a "cross-session grant" around it. That framing was wrong about whose
+policy it is.
+
+**Correct scoping.** Permission gating *between guest processes* belongs to the
+guest kernel. The VMM's purpose is preventing guest→host/GPU escape, which the
+guest must not be able to influence. `session_id` is filled in by the guest
+kernel module, so the gate cannot bind a compromised guest kernel at all -- and
+the codebase says so, in the `KILL_ISOLATE` handler:
+
+> As with every `session_has_isolate()` check here, it would bound a malicious
+> guest **USERSPACE** process only: the guest kernel module fills the field and
+> is itself untrusted. Defence in depth, same weight.
+
+**The handle model already matches the target design.** `nvkvm_handle_close()`
+refuses with `-EBUSY` while `isolate_refcount > 0`: handles live in a global
+per-device table, are refcounted by isolate, and are closed explicitly. That is
+"handles are disconnected from sessions" already implemented -- a handle can
+outlive the isolate that created it, which is what makes an RM object or a
+memfd shareable at all.
+
+**`nvkvm_handle_close_session()` is the inconsistent one.** It walks the table
+and force-closes every handle whose `session_id` matches, ignoring
+`isolate_refcount` entirely -- the one place that still treats a handle as
+owned by a session rather than referenced by isolates.
+
+### Resulting delta
+
+1. Drop `h->session_id != req->session_id` in `MMAP_ON_ISOLATE`.
+2. Make session teardown respect `isolate_refcount`, or drop it in favour of
+   explicit close.
+
+(2) removes an existing inconsistency rather than adding semantics. Both are
+small.
+
+### What must not move
+
+`iso_mmap_translate()`'s token validation is the **isolate→VMM** surface, and
+that is the real guest→host containment. It is a different check from the
+session gate and stays exactly as it is. Relaxing guest-supplied session
+identity is not the same as relaxing what an isolate may present.
+
+### Caveats
+
+- Losing the gate costs defence-in-depth against a guest-kernel bug that let
+  userspace influence the field. The comment above rates that "same weight",
+  i.e. minor, and guest userspace does not fill it.
+- Handles outliving sessions makes `NVKVM_HANDLE_MAX` the backstop against a
+  guest that never closes them. That bounds it to a guest self-DoS rather than
+  a host problem, but the cap has to actually be the limit.
