@@ -2333,6 +2333,64 @@ if [ "$N_UNTESTED" -gt 0 ]; then
 fi
 
 # --- optional JSON -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# host-memory registration invariants
+# ---------------------------------------------------------------------------
+# These are regressions that the CUDA checks above cannot see, because every
+# one of them registers cuMemHostAlloc memory -- which is MAP_SHARED. The bugs
+# live on the MAP_PRIVATE and genuinely-shared paths:
+#
+#   * MAP_PRIVATE (ordinary malloc'd heap) registered fine and then SIGSEGV'd
+#     on the first write, for over a year, because migrate_range cleared
+#     VM_MAYWRITE and vm_get_page_prot() then yielded a read-only protection.
+#   * A range something else already maps must be REFUSED, not relocated --
+#     relocating rewrites one VMA and silently desynchronises every other view.
+#   * Registering and then forking must stay coherent.
+#
+# Each runs a standalone repro from tests/repro/. Missing sources or no
+# compiler is SKIP, not FAIL: this file must stay runnable on a bare guest.
+section "host-memory registration invariants"
+
+REPRO_DIR="${NVKVM_REPRO_DIR:-$(cd "$(dirname "$0")/repro" 2>/dev/null && pwd)}"
+
+reg_invariant() {
+    # reg_invariant <check-name> <source.c> <detail-on-pass>
+    local name="$1" src="$2" okdetail="$3"
+    if ! command -v gcc >/dev/null 2>&1; then
+        record "$name" SKIP "no compiler on this guest"; return
+    fi
+    if [ -z "$REPRO_DIR" ] || [ ! -f "$REPRO_DIR/$src" ]; then
+        record "$name" SKIP "tests/repro/$src not present"; return
+    fi
+    if ! gcc -O1 -o "$WORK/${name}" "$REPRO_DIR/$src" -lcuda >"$WORK/${name}.cc" 2>&1; then
+        record "$name" SKIP "will not build (no libcuda?): $(tail -1 "$WORK/${name}.cc" | cut -c1-60)"
+        return
+    fi
+    local out rc
+    out="$(timeout 120 "$WORK/${name}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        record "$name" PASS "$okdetail"
+    else
+        record "$name" FAIL "rc=$rc: $(printf '%s' "$out" | grep -iE 'VERDICT|SEGV|REFUSED' | head -1 | cut -c1-72)"
+    fi
+}
+
+# 1. ordinary heap must survive registration and stay writable
+reg_invariant host_register_private_rw private_register_write.c \
+    "MAP_PRIVATE and MAP_SHARED both writable after cuMemHostRegister"
+
+# 2. a shared range must be refused rather than silently desynchronised
+reg_invariant host_register_shared_refused shared_view_desync.c \
+    "registering a range another process maps is refused; both views stay coherent"
+
+# 3. register, then fork -- the ordinary worker-pool shape
+reg_invariant host_register_then_fork register_then_fork.c \
+    "child sees the parent's writes after register-then-fork"
+
+# 4. COW heap inherited across fork, registered by the child
+reg_invariant host_register_cow_fork cow_after_fork.c \
+    "child registered inherited COW heap; parent's copy intact"
+
 if [ -n "$JSON_OUT" ]; then
     {
         printf '{\n'
