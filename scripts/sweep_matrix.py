@@ -348,8 +348,20 @@ def purge_distro_driver(S):
     # driver-install-failed and reads like "these drivers will not install on
     # Ampere".  They would; the box simply had a driver we had not removed.
     # The installer ships its own uninstaller for precisely this, so use it.
+    # The 900 below is a LOCAL timeout: when the uninstaller hangs remotely, it
+    # fires as an exception that fails the whole box, and the operator sees
+    # "install_driver raised: Command ... timed out" with no idea what hung.
+    # MEASURED 2026-08-30 on two independent Blackwell boxes (RTX 5070 and
+    # RTX 5060): /usr/bin/nvidia-uninstall never returns, both boxes burned
+    # their run, and blackwell produced zero verdicts twice.
+    #
+    # So bound it REMOTELY too, and let the step continue. `; true` keeps a
+    # killed uninstaller from failing the command, and the leftover-library
+    # check immediately below is what actually decides whether the purge
+    # worked -- which turns a silent hang into a specific, reportable state.
+    # Remote bound stays under the local one so the remote timer always wins.
     sh(rsh(S, "test -x /usr/bin/nvidia-uninstall && "
-              "/usr/bin/nvidia-uninstall --silent --no-questions "
+              "timeout -k 30 600 /usr/bin/nvidia-uninstall --silent --no-questions "
               ">> /root/purge.log 2>&1; true"), timeout=900)
     left, _ = sh(rsh(S, "ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.* "
                        "/usr/lib/x86_64-linux-gnu/libcuda.so.* 2>/dev/null | wc -l"),
