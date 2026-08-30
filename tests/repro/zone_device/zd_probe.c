@@ -1,111 +1,176 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * zd_probe.c -- can the nvkvm GPA window carry `struct page`?
+ * zd_probe.c -- can the nvkvm GPA window carry `struct page`, and does that
+ * buy us rmap?
  *
- * The window is installed today with remap_pfn_range() over a non-System-RAM
- * BAR, so it has no struct page. That is why it cannot be a target for
- * migrate_pages()/rmap -- the machinery that makes swap coherent across every
- * mapping of a file, including ones created later. memremap_pages() exists to
- * give non-RAM a struct page; this asks whether it works here, and at what
- * cost, WITHOUT touching nvkvm's own paths.
+ * Stage 1 (already answered, kept as the precondition): memremap_pages() over
+ * the window BAR gives valid ZONE_DEVICE struct pages.
  *
- * Deliberately does not read or write the range by default. The window is
- * sparse: only sub-ranges nvkvm has mapped a memfd into are backed, and a
- * load/store to an unbacked GPA leaves the guest for QEMU as MMIO. Pass
- * touch=1 only for a range you know is backed.
+ * Stage 2 (the point): a struct page is only useful here if the kernel then
+ * TRACKS the mappings. VM_PFNMAP has no rmap, which is why relocating a range
+ * today can only rewrite the VMA in front of it. So: insert a window page into
+ * a user VMA, and ask the kernel how many mappings it thinks exist.
  *
- *   insmod zd_probe.ko base=0x6000000000 size=0x8000000     # 128 MiB
- *   insmod zd_probe.ko base=... size=... touch=1            # only if backed
+ *   /dev/zd_probe   mmap  -> inserts window pages into the caller's VMA
+ *   /proc/zd_probe  read  -> the kernel's own view: mapcount, refcount, flags
+ *
+ * The insertion is tried two ways because they have different rmap semantics
+ * and it is not obvious which (if either) accepts a ZONE_DEVICE page:
+ *   vm_insert_page()   normal-page path, rmap-tracked, may reject non-normal
+ *   vmf_insert_mixed() VM_MIXEDMAP path, may install a pte_special with no rmap
  */
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/memremap.h>
 #include <linux/mm.h>
 #include <linux/io.h>
+#include <linux/miscdevice.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/fs.h>
 
 static unsigned long base = 0x6000000000UL;
 static unsigned long size = 128UL << 20;
 static int touch;
+static int mode = 0;   /* 0 = try vm_insert_page then vmf_insert_mixed */
 module_param(base, ulong, 0444);
 module_param(size, ulong, 0444);
 module_param(touch, int, 0444);
-MODULE_PARM_DESC(base,  "guest-physical base of the region (nvkvm window BAR2)");
-MODULE_PARM_DESC(size,  "bytes to map; memmap costs size/4096*64 bytes of RAM");
-MODULE_PARM_DESC(touch, "1 = read/write the range (ONLY if it is backed)");
+module_param(mode, int, 0644);
+MODULE_PARM_DESC(mode, "0=auto, 1=vm_insert_page only, 2=vmf_insert_mixed only");
 
 static struct dev_pagemap pgmap;
 static void *vaddr;
+static unsigned long base_pfn;
+
+/* what the last mmap actually managed to do, for the /proc report */
+static const char *last_path = "(no mmap yet)";
+static int         last_err;
+
+/* ── /proc/zd_probe: the kernel's own view of the first window page ─────── */
+static int zd_show(struct seq_file *m, void *v)
+{
+	struct page *p;
+
+	if (!vaddr) { seq_puts(m, "not mapped\n"); return 0; }
+	p = pfn_to_page(base_pfn);
+
+	seq_printf(m, "insert_path      %s (err=%d)\n", last_path, last_err);
+	seq_printf(m, "is_zone_device   %d\n", is_zone_device_page(p));
+	seq_printf(m, "page_mapcount    %d\n", page_mapcount(p));
+	seq_printf(m, "page_ref_count   %d\n", page_ref_count(p));
+	seq_printf(m, "PageLRU          %d\n", PageLRU(p));
+	seq_printf(m, "PageReserved     %d\n", PageReserved(p));
+	seq_printf(m, "PageAnon         %d\n", PageAnon(p));
+	seq_printf(m, "page_mapping     %px\n", page_mapping(p));
+	seq_printf(m, "zonenum          %u\n", page_zonenum(p));
+	return 0;
+}
+static int zd_open(struct inode *i, struct file *f) { return single_open(f, zd_show, NULL); }
+static const struct proc_ops zd_proc_ops = {
+	.proc_open = zd_open, .proc_read = seq_read,
+	.proc_lseek = seq_lseek, .proc_release = single_release,
+};
+
+/* ── /dev/zd_probe: put window pages into a user VMA ────────────────────── */
+static int zd_mmap(struct file *f, struct vm_area_struct *vma)
+{
+	unsigned long len = vma->vm_end - vma->vm_start;
+	unsigned long i, npages = len >> PAGE_SHIFT;
+	struct page *p;
+	int ret = -EINVAL;
+
+	if (!vaddr) return -ENODEV;
+	if (npages > (size >> PAGE_SHIFT)) return -EINVAL;
+
+	/* (1) vm_insert_page: the normal-page path. If this works the mapping
+	 *     is an ordinary file-backed-ish mapping and rmap applies. */
+	if (mode == 0 || mode == 1) {
+		vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
+		for (i = 0; i < npages; i++) {
+			p = pfn_to_page(base_pfn + i);
+			ret = vm_insert_page(vma, vma->vm_start + (i << PAGE_SHIFT), p);
+			if (ret) break;
+		}
+		if (!ret) { last_path = "vm_insert_page"; last_err = 0; return 0; }
+		pr_info("zd_probe: vm_insert_page rejected at page %lu: %d\n", i, ret);
+		if (mode == 1) { last_path = "vm_insert_page"; last_err = ret; return ret; }
+		zap_vma_ptes(vma, vma->vm_start, len);
+	}
+
+	/* (2) vmf_insert_mixed: the VM_MIXEDMAP path devices normally use.
+	 *     Expected to succeed -- the open question is whether the result is
+	 *     rmap-tracked or a pte_special the kernel does not account. */
+	vm_flags_set(vma, VM_MIXEDMAP | VM_DONTEXPAND | VM_DONTDUMP);
+	for (i = 0; i < npages; i++) {
+		vm_fault_t vf = vmf_insert_mixed(vma, vma->vm_start + (i << PAGE_SHIFT),
+						 __pfn_to_pfn_t(base_pfn + i, PFN_DEV | PFN_MAP));
+		if (vf & VM_FAULT_ERROR) {
+			pr_info("zd_probe: vmf_insert_mixed failed at %lu (vf=0x%x)\n", i, vf);
+			last_path = "vmf_insert_mixed"; last_err = -EFAULT;
+			return -EFAULT;
+		}
+	}
+	last_path = "vmf_insert_mixed"; last_err = 0;
+	return 0;
+}
+
+static const struct file_operations zd_fops = {
+	.owner = THIS_MODULE,
+	.mmap  = zd_mmap,
+};
+static struct miscdevice zd_misc = {
+	.minor = MISC_DYNAMIC_MINOR, .name = "zd_probe", .fops = &zd_fops, .mode = 0666,
+};
 
 static int __init zd_init(void)
 {
-	unsigned long pfn, npages = size >> PAGE_SHIFT;
-	struct page *p0, *pn;
+	unsigned long npages = size >> PAGE_SHIFT;
+	struct page *p0;
 	u64 t0, t1;
 
 	pr_info("zd_probe: base=0x%lx size=0x%lx (%lu pages, memmap ~%lu KiB)\n",
 		base, size, npages, (npages * sizeof(struct page)) >> 10);
 
-	/* MEMORY_DEVICE_GENERIC: CPU-accessible device memory. NOT
-	 * MEMORY_DEVICE_PRIVATE, whose pages are deliberately not CPU-mappable
-	 * (a fault migrates them back), which is the opposite of what a shared
-	 * host window needs. */
 	memset(&pgmap, 0, sizeof(pgmap));
-	pgmap.type              = MEMORY_DEVICE_GENERIC;
-	pgmap.range.start       = base;
-	pgmap.range.end         = base + size - 1;
-	pgmap.nr_range          = 1;
-	pgmap.ops               = NULL;
+	pgmap.type        = MEMORY_DEVICE_GENERIC;
+	pgmap.range.start = base;
+	pgmap.range.end   = base + size - 1;
+	pgmap.nr_range    = 1;
 
 	t0 = ktime_get_ns();
 	vaddr = memremap_pages(&pgmap, NUMA_NO_NODE);
 	t1 = ktime_get_ns();
-
 	if (IS_ERR(vaddr)) {
 		pr_err("zd_probe: memremap_pages FAILED: %ld\n", PTR_ERR(vaddr));
-		pr_err("zd_probe:   (-EINVAL usually means alignment: needs "
-		       "sub-section (2MiB) granularity)\n");
 		vaddr = NULL;
-		return PTR_ERR(vaddr ?: ERR_PTR(-EINVAL));
+		return -EINVAL;
 	}
-	pr_info("zd_probe: memremap_pages OK in %llu us, vaddr=%px\n",
-		(t1 - t0) / 1000, vaddr);
-
-	/* The point of the exercise: do these PFNs have struct pages, and do
-	 * they round-trip? That is what rmap and migrate_pages() require. */
-	pfn = base >> PAGE_SHIFT;
-	p0  = pfn_to_page(pfn);
-	pn  = pfn_to_page(pfn + npages - 1);
-	pr_info("zd_probe: pfn_to_page(first)=%px last=%px\n", p0, pn);
-	pr_info("zd_probe: round-trip first: pfn=0x%lx -> page -> pfn=0x%lx %s\n",
-		pfn, page_to_pfn(p0), page_to_pfn(p0) == pfn ? "OK" : "MISMATCH");
-	pr_info("zd_probe: is_zone_device_page(first)=%d refcount=%d\n",
-		is_zone_device_page(p0), page_ref_count(p0));
-	pr_info("zd_probe: page_zonenum=%u  pgmap=%px (ours=%px) %s\n",
-		page_zonenum(p0), p0->pgmap, &pgmap,
-		p0->pgmap == &pgmap ? "OK" : "UNEXPECTED");
+	base_pfn = base >> PAGE_SHIFT;
+	p0 = pfn_to_page(base_pfn);
+	pr_info("zd_probe: memremap_pages OK in %llu us, vaddr=%px\n", (t1-t0)/1000, vaddr);
+	pr_info("zd_probe: zone_device=%d refcount=%d LRU=%d zonenum=%u\n",
+		is_zone_device_page(p0), page_ref_count(p0), PageLRU(p0), page_zonenum(p0));
 
 	if (touch) {
 		u32 *q = (u32 *)vaddr;
-		pr_info("zd_probe: touch=1, writing/reading first word\n");
 		WRITE_ONCE(q[0], 0xA5A5A5A5);
-		pr_info("zd_probe: readback=0x%08x %s\n", READ_ONCE(q[0]),
+		pr_info("zd_probe: kernel vaddr readback=0x%08x %s\n", READ_ONCE(q[0]),
 			READ_ONCE(q[0]) == 0xA5A5A5A5 ? "OK" : "MISMATCH");
-	} else {
-		pr_info("zd_probe: touch=0, not accessing the range "
-			"(sparse window: unbacked GPAs exit to the VMM)\n");
 	}
+
+	proc_create("zd_probe", 0444, NULL, &zd_proc_ops);
+	if (misc_register(&zd_misc)) pr_warn("zd_probe: misc_register failed\n");
 	return 0;
 }
 
 static void __exit zd_exit(void)
 {
-	if (vaddr) {
-		memunmap_pages(&pgmap);
-		pr_info("zd_probe: memunmap_pages done\n");
-	}
+	misc_deregister(&zd_misc);
+	remove_proc_entry("zd_probe", NULL);
+	if (vaddr) { memunmap_pages(&pgmap); pr_info("zd_probe: memunmap_pages done\n"); }
 }
-
 module_init(zd_init);
 module_exit(zd_exit);
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Probe whether the nvkvm GPA window can carry struct page");
+MODULE_DESCRIPTION("Does the nvkvm window support struct page, and does that buy rmap?");
