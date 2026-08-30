@@ -68,7 +68,10 @@ int main(void)
         rc = cuMemHostRegister_v2((void*)buf, LEN, CU_MEMHOSTREGISTER_DEVICEMAP);
         printf("  child: register inherited COW heap rc=%d %s\n", rc,
                rc == 0 ? "ALLOWED" : "REFUSED");
+        fflush(stdout);   /* the write below may fault; do not lose this line */
         if (rc == 0) {
+            printf("  child: writing through the registered buffer ...\n");
+            fflush(stdout);
             for (unsigned i = 0; i < LEN/4; i++) buf[i] = SENTINEL_C;
             printf("  child: wrote C; own view C=%u/%u\n", count_eq(buf, SENTINEL_C), LEN/4);
             cuMemHostUnregister((void*)buf);
