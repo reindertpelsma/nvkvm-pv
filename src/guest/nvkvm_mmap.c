@@ -1528,10 +1528,6 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	long got = 0;
 	unsigned long i;
 	int ret = 0, nck = 0;
-	ktime_t _t0 = ktime_get();   /* DIAG */
-	int _diag_file = -1;         /* DIAG */
-	unsigned long _diag_magic = 0, _diag_vmflags = 0;   /* DIAG */
-	int _diag_priv = -1;         /* DIAG: S_PRIVATE => kernel-internal shmem */
 
 	if (!len)
 		return 0;
@@ -1680,17 +1676,6 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			!!vma->vm_file);
 		ret = -EINVAL; goto err_unpin;
 	}
-	/* DIAG: what KIND of memory are we about to retype?  A plain anonymous
-	 * VMA is the designed input (libcuda's own buffer in the guest).  A
-	 * shmem/memfd VMA means the caller is mapping an object that is ALREADY
-	 * shared with a VMM -- see the diagnostic print at the end. */
-	_diag_file  = !!vma->vm_file;
-	_diag_magic = (vma->vm_file && file_inode(vma->vm_file) &&
-		       file_inode(vma->vm_file)->i_sb)
-		      ? file_inode(vma->vm_file)->i_sb->s_magic : 0;
-	_diag_vmflags = (unsigned long)vma->vm_flags;
-	_diag_priv = (vma->vm_file && file_inode(vma->vm_file))
-		     ? !!IS_PRIVATE(file_inode(vma->vm_file)) : -1;
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
 	 * remap_pfn_range() refuses ANY sub-VMA remap on a copy-on-write
@@ -1923,12 +1908,6 @@ chunk_fail_mapped:
 	/* Every chunk is migrated, recorded and unpinned.  Nothing is left to
 	 * do but free the descriptor array. */
 	kvfree(pages);
-	pr_info("nvkvm DIAG: migrate_range(bulk) %lu pages, %d chunks, dup_peak=%lu B in %lld us "
-		"comm=%s pid=%d gva=0x%lx file=%d magic=0x%lx priv=%d vmflags=0x%lx\n",
-		npages, nck, dup_peak,
-		ktime_to_us(ktime_sub(ktime_get(), _t0)),
-		current->comm, task_pid_nr(current), start,
-		_diag_file, _diag_magic, _diag_priv, _diag_vmflags);
 	return 0;
 
 err_unpin:
