@@ -108,12 +108,28 @@ L2. The two views separate, silently, with every step returning success.
 shared at all (P1/P2); VIDMEM, managed memory and HtoD are all correct; the
 zeros are a read from the other page set. The original lead is disproven.
 
-**Not yet measured:** which of the two sysmem-aliasing mechanisms breaks first,
-and the mechanism above for the migration path. `cuMemHostAlloc` produced **no**
-`migrate_range` line at L2 (the only 64 KiB migration in the L2 log is the
-`cuMemHostRegister` buffer of probe step P3), so that buffer travels the
-RM-alloc + `mmap_on_isolate` path, not the OS_DESCRIPTOR path — and it is broken
-too. Both mechanisms are implicated; only the general property is proven.
+**Not yet measured:** which sysmem-aliasing mechanism breaks, and the mechanism
+above for the migration path.
+
+Be careful with the log evidence here. No `migrate_range` line appears at L2 for
+either probe's `cuMemHostAlloc` buffer — the only 64 KiB migration in the L2 log
+is probe step P3's `cuMemHostRegister` buffer, and no 64-page line appears for
+the 256 KiB one. That is **not** proof the OS_DESCRIPTOR path was skipped:
+`nvkvm_cpu_pages_migrate_range()` returns 0 *silently* when the start gva is
+already migrated, so a `cuMemHostAlloc` that libcuda suballocated out of a pinned
+pool it had already registered would migrate nothing and log nothing. Both
+readings are live:
+
+- libcuda suballocates the pinned buffer from one of the five 2 MiB
+  OS_DESCRIPTOR regions it registers at context create, in which case P1/P2 and
+  the DtoH staging failure are the *same* object and the migration mechanism
+  above explains all of it; or
+- `cuMemHostAlloc` travels the RM-alloc + `mmap_on_isolate` path instead, in
+  which case two mechanisms are broken for the same structural reason.
+
+Only the general property — sysmem shared with the GPU is not shared at L2 — is
+proven. The DIAG instrument distinguishes these: it prints the gva, so a
+suballocation shows up as a migrated 2 MiB range containing the buffer.
 
 The instrument for the next measurement is committed: the DIAG commit on this
 branch prints `comm`, `pid`, `file` and the superblock magic for every
