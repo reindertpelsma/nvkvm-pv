@@ -183,13 +183,32 @@ across `fork()` and a shared memfd are *ordinary guest RAM*. They are refused
 today for a different reason -- relocation desynchronises the other views --
 and scoping out I/O does nothing for them. They are exactly what should work.
 
+### Correction: range-granting an fd is not a thing
+
+An earlier revision of this section claimed the `iso_mmap_tbl` broker could
+grant the isolate "only the GPA runs covering the buffer", giving zero-copy
+without weakening isolation. **That was wrong.** `iso_mmap_tbl` brokers
+mappings *QEMU itself makes*; it is not a range restriction on an fd the
+isolate holds. A file descriptor carries no range attribute -- an existing
+memfd cannot be split, and arbitrary pages cannot be aliased into a fresh one,
+which is precisely why the copy exists in the first place.
+
+So zero-copy on arbitrary registered memory requires handing the isolate the
+guest-RAM object and mediating **every** `mmap` and `munmap` on it --
+`SECCOMP_RET_USER_NOTIF`, dealloc accounting, and killing isolates that do not
+comply. That is a supervised boundary rather than a hard one, and it is the
+same design as "solution 1" with the same fragilities. It is not a way around
+them.
+
 ### Why the scope decision matters anyway
 
 It reduces the no-relocate design to a single case, ordinary RAM, which makes
 it tractable. With that plus one launch change the pieces already exist:
 
 1. Boot guest RAM as `memory-backend-memfd,share=on` so it is a shareable host
-   object. Today `scripts/run_test_vm.sh` uses a plain `-m`, so there is
+   object -- **and accept that the isolate then holds that object**, with
+   range control enforced only by mediating every mmap/munmap (see the
+   correction above). Today `scripts/run_test_vm.sh` uses a plain `-m`, so there is
    nothing to grant -- this is the precondition, and it is a config change
    rather than a redesign. **Unverified:** that this composes with nvkvm's
    sparse window and memslot handling.
@@ -212,7 +231,12 @@ Two measurable obstacles remain:
   revoked exactly on unregister, or the isolate later reads unrelated guest
   data through a stale grant. The copy gets this property for free.
 
-### Tractable subset, worth doing first
+### Tractable subset, worth doing first -- and it escapes the argument above
+
+Note what makes this different: it needs **no** access to guest RAM. The
+isolate already maps a per-registration host memfd today, and this keeps that
+exposure exactly as it is -- no shared guest RAM, no seccomp mediation, no new
+boundary.
 
 `cuMemHostAlloc` *chooses* its memory, unlike `cuMemHostRegister`. Satisfying
 it directly from the already-shared window means no relocation ever happens,
