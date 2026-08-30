@@ -139,3 +139,79 @@ both userspace), the retained state is inside NVIDIA'"'"'s driver.
 KWin/Plasma does reach the display on this same build (connector enabled, flips
 counted), so the DRM path itself works — this is specific to the gamescope
 session.
+
+---
+
+## CORRECTION (2026-08-30): "falls back to headless" was a misread log line
+
+Everything above that describes gamescope *falling back* to the headless backend
+is **wrong**, and the error it was chasing does not exist.
+
+From gamescope's own source (`src/wlserver.cpp`, `wlserver_init`):
+
+```c
+wlserver.wlr.headless_backend = wlr_headless_backend_create( wlserver.event_loop );
+```
+
+That call is **unconditional**. gamescope always creates a headless *wlroots*
+backend for the nested compositor games connect to, and drives the display
+separately through its own DRM backend. The line
+
+```
+[Info] wlserver: [backend/headless/backend.c:17] Starting headless backend
+```
+
+is prefixed `wlserver:` and comes from wlroots — it appears in **every**
+gamescope run, working ones included. It is not a fallback, not an error, and
+not evidence of anything.
+
+The two `[Error]` lines we chased are likewise non-fatal, confirmed from source
+(`src/Backends/DRMBackend.cpp`):
+
+- `Immediate flips are not supported by the KMS driver` — sets
+  `g_bSupportsAsyncFlips = false`, logs, and continues. No `return false`.
+  **Do not implement `DRM_CAP_ASYNC_PAGE_FLIP` to "fix" this**; it would mean
+  claiming we honour `DRM_MODE_PAGE_FLIP_ASYNC` while our virtual head
+  deliberately paces flips off a software vblank with backpressure (the
+  mechanism that stops the guest lapping the host's scanout ring), i.e. trading
+  a real safety property for nothing.
+- `Syncobjs are not supported by the KMS driver` — the `else` branch only logs.
+
+### What the evidence actually says
+
+On the failing run, gamescope gets **further than anyone credited**:
+
+```
+drm: opening DRM node '/dev/dri/card0'
+drm: Connectors:
+drm:   Virtual-1 (connected)
+drm: selecting connector Virtual-1
+drm: selecting mode 1920x1080@60Hz
+```
+
+and **none of `init_drm`'s seven `return false` strings appear anywhere in the
+log** — no ATOMIC cap failure, no dummy-syncobj failure, no `get_resources()`
+failure, no missing primary plane, no "doesn't support any formats >= 8888", no
+page-flip pipe failure. The primary plane advertises `XR24 AR24` (both ≥8888)
+and `DRM_CAP_ADDFB2_MODIFIERS` is set.
+
+So the DRM backend appears to initialise and select our connector and mode.
+**The failure is somewhere after mode selection**, not in backend choice.
+
+### Where to look next
+
+The older evidence in this file — connector `enabled=disabled`, zero flips, zero
+xwm clients — is still valid and is now the *only* live symptom. Two candidate
+readings, neither yet tested:
+
+1. gamescope commits and the atomic commit fails or never flips (look at the
+   commit path and our KMS `atomic_check`/flush, and at host-side
+   `nvkvm present: flip` counters).
+2. gamescope is up and healthy, and nothing ever connects to it — "zero xwm
+   clients" would then mean the OOBE/Steam client failed to launch inside the
+   session, which is not an nvkvm problem at all.
+
+Distinguish those before writing any more code. The one real gap this
+investigation did close is `DRIVER_SYNCOBJ` (see the commit that added it):
+that cap was genuinely missing, and gamescope now exercises its syncobj path
+successfully — but it was never the reason for the symptom.
