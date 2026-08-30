@@ -148,6 +148,7 @@ ALL_ARCHES=0
 GPU_FILTER=""
 DRIVERS_REQ=""
 DRIVER_CACHE_DIR="${NVKVM_SWEEP_DRIVER_CACHE:-}"
+BOOT_KERNEL="${NVKVM_SWEEP_BOOT_KERNEL:-}"
 GUEST_IMAGE_CACHE="${NVKVM_SWEEP_GUEST_IMAGE_CACHE:-}"
 GUEST_IMAGE_CACHE_SHA256=""
 # RULE 4: the GUEST kernel is a swept axis, not a constant.
@@ -288,6 +289,7 @@ while [ $# -gt 0 ]; do
         --gpu)          GPU_FILTER="$2"; shift 2 ;;
         --drivers)      DRIVERS_REQ="$2"; shift 2 ;;
         --driver-cache) DRIVER_CACHE_DIR="$2"; shift 2 ;;
+        --boot-kernel)  BOOT_KERNEL="$2"; shift 2 ;;
         --guest-image-cache) GUEST_IMAGE_CACHE="$2"; shift 2 ;;
         --guest-image)  GUEST_IMAGE_SERIES="$2"
                         case "$GUEST_IMAGE_SERIES" in
@@ -1776,6 +1778,70 @@ print(out)
 }
 
 # ---------------------------------------------------------------------------
+# boot the box on a DIFFERENT host kernel, then prove it took
+# ---------------------------------------------------------------------------
+# ABI profiles 515/525/535 cannot be swept on the stock vast image: those
+# drivers predate kernel API changes (get_user_pages_remote's signature, among
+# others) and their modules simply will not compile against the 6.8 HWE kernel
+# the image runs.  MEASURED 2026-08-30: 515.43.04 dies in nv-mm.h with "too many
+# arguments to function 'get_user_pages_remote'".  88 of 216 published tags sit
+# behind those three profiles.
+#
+# Ubuntu 22.04's GA kernel is 5.15, and the image carries HWE on top of it, so
+# the old kernel is one apt away.  Install it, point GRUB at it, reboot, and --
+# this is the load-bearing part -- VERIFY the box came back on the kernel we
+# asked for.  Continuing on the wrong kernel would silently produce
+# "driver-install-failed" rows that look like driver verdicts and are not.
+boot_kernel_series() {
+    local want="$1" cur got have
+    cur="$(rsh_t 60 'uname -r' 2>/dev/null | tr -d '\r')"
+    case "$cur" in
+        "$want"*) info "  host kernel already $cur -- no reboot needed"; return 0 ;;
+    esac
+    info "  switching host kernel: $cur -> ${want}.x (needed for pre-550 drivers)"
+
+    rsh_t 900 "DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
+               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+               linux-image-generic linux-headers-generic" >/dev/null 2>&1 \
+        || { warn "  apt could not install the GA kernel"; return 1; }
+
+    have="$(rsh_t 120 "ls -1 /boot/vmlinuz-${want}* 2>/dev/null | sed 's|.*/vmlinuz-||' | sort -V | tail -1" 2>/dev/null | tr -d '\r')"
+    [ -n "$have" ] || { warn "  no /boot/vmlinuz-${want}* after apt install"; return 1; }
+    info "  installed ${have}; removing the HWE kernel so GRUB has one choice"
+
+    # Deliberately blunt: rather than construct a GRUB menuentry id (nested
+    # grub-probe inside sed inside ssh -- fragile quoting that fails in the
+    # field, not in testing), remove the OTHER kernels so the default is the
+    # only one left.  Purging the running kernel is safe here: the files stay
+    # mapped until reboot, and the box is disposable.
+    rsh_t 900 "DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq \
+               'linux-image-*-generic' 'linux-headers-*-generic' \
+               'linux-image-generic-hwe-*' 'linux-headers-generic-hwe-*' \
+               --allow-remove-essential 2>/dev/null; \
+               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+               linux-image-${have} linux-headers-${have} && update-grub" >/dev/null 2>&1 \
+        || { warn "  could not isolate ${have} as the only installed kernel"; return 1; }
+
+    got="$(rsh_t 120 "ls -1 /boot/vmlinuz-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r')"
+    info "  kernels present after cleanup: ${got:-?}"
+
+    info "  rebooting onto ${have}"
+    rsh_t 60 'nohup sh -c "sleep 1; reboot" >/dev/null 2>&1 &' >/dev/null 2>&1 || true
+    sleep 25
+    local n=0
+    until rsh_t 30 'true' >/dev/null 2>&1; do
+        n=$((n+1)); [ "$n" -ge 60 ] && { warn "  box never came back after reboot"; return 1; }
+        sleep 10
+    done
+    got="$(rsh_t 60 'uname -r' 2>/dev/null | tr -d '\r')"
+    case "$got" in
+        "$want"*) info "  host kernel is now $got"; return 0 ;;
+        *) warn "  reboot landed on $got, not ${want}.x -- refusing to sweep on the wrong kernel"
+           return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # which NVIDIA kernel-module flavour is loaded RIGHT NOW
 # ---------------------------------------------------------------------------
 # A sweep that cannot say whether it tested the proprietary module or the open
@@ -1928,6 +1994,14 @@ sweep_one_box() {
                 detail "systemd-detect-virt=${BOX_VIRT:-?} /dev/kvm=${BOX_KVM:-?} -- this is a container, not a KVM VM, so the NVIDIA module belongs to the physical host and no driver could be replaced" \
                 ts "$(date -u +%FT%TZ)")"
         box_status="notvm"
+    fi
+
+    if [ "$box_status" = "ok" ] && [ -n "$BOOT_KERNEL" ] && ! boot_kernel_series "$BOOT_KERNEL"; then
+        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "kernel-switch-failed" \
+                instance "$iid" machine "$machine" \
+                detail "could not bring the box up on kernel ${BOOT_KERNEL}.x; sweeping on the wrong kernel would turn 'this driver cannot build here' into rows that read like driver verdicts" \
+                ts "$(date -u +%FT%TZ)")"
+        box_status="kernelswitch"
     fi
 
     if [ "$box_status" = "ok" ]; then
