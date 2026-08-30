@@ -1,0 +1,12 @@
+[  145.018961] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 2034 us comm=nps pid=4803 gva=0x7c712c600000 file=1 magic=0x1021994 vmflags=0x80000fb
+[  145.024691] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1850 us comm=nps pid=4803 gva=0x7c712c800000 file=1 magic=0x1021994 vmflags=0x80000fb
+[  145.027345] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1870 us comm=nps pid=4803 gva=0x7c71343de000 file=1 magic=0x1021994 vmflags=0x80000fb
+[  145.064476] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1519 us comm=nps pid=4803 gva=0x7c712d400000 file=1 magic=0x1021994 vmflags=0x80000fb
+[  145.248241] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1620 us comm=nps pid=4803 gva=0x7c7128600000 file=1 magic=0x1021994 vmflags=0x80000fb
+[  145.254832] nvkvm DIAG: migrate_range(bulk) 16 pages, 1 chunks, dup_peak=65536 B in 172 us comm=nps pid=4803 gva=0x62b4af458000 file=0 magic=0x0 vmflags=0x8100073
+[ 1222.212828] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1296 us comm=memfd:nvkvm_stu pid=7630 gva=0x7c1a03021000 file=1 magic=0x1021994 vmflags=0x80000fb
+[ 1222.392583] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1205 us comm=memfd:nvkvm_stu pid=7636 gva=0x7c1a03221000 file=1 magic=0x1021994 vmflags=0x80000fb
+[ 1222.400586] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1291 us comm=memfd:nvkvm_stu pid=7640 gva=0x7c1a83021000 file=1 magic=0x1021994 vmflags=0x80000fb
+[ 1223.875346] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1354 us comm=memfd:nvkvm_stu pid=7634 gva=0x7c1b03221000 file=1 magic=0x1021994 vmflags=0x80000fb
+[ 1225.307667] nvkvm DIAG: migrate_range(bulk) 512 pages, 1 chunks, dup_peak=2097152 B in 1110 us comm=memfd:nvkvm_stu pid=7629 gva=0x7c1b83954000 file=1 magic=0x1021994 vmflags=0x80000fb
+[ 1225.322498] nvkvm DIAG: migrate_range(bulk) 16 pages, 1 chunks, dup_peak=65536 B in 233 us comm=memfd:nvkvm_stu pid=7633 gva=0x7c1c03954000 file=1 magic=0x1021994 vmflags=0x80000fb
