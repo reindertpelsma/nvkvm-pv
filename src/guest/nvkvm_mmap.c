@@ -1456,7 +1456,40 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
 	 * change, not a guard change: the backing has to come from a DMA-able
 	 * window at the bottom level instead of being re-aliased per level.
 	 */
-	return true;   /* MEASURE-ONLY: see _diag_priv at the guard site */
+	/*
+	 * Magic alone is not enough, and admitting on it alone silently
+	 * corrupted data under nesting (docs/investigations/nested-nvkvm-l2/).
+	 *
+	 * The mapping we mean to admit is MAP_SHARED|MAP_ANONYMOUS, which Linux
+	 * backs with an internal shmem file via shmem_zero_setup().  But
+	 * memfd_create() is shmem too and reports the SAME s_magic -- and a
+	 * memfd is exactly how a VMM hands itself guest RAM.  With nvkvm running
+	 * inside an nvkvm guest, the range forwarded up to this module is a
+	 * window into the INNER VM's memory memfd, already aliased into a
+	 * memslot.  Retyping it to VM_PFNMAP moved only this mm's view: the
+	 * inner guest and the GPU kept the original pages, so one buffer
+	 * resolved to two disjoint sets of physical pages while every ioctl
+	 * still returned success.  It also panicked the outer guest
+	 * ("Host injected async #PF in kernel mode", Comm: worker).
+	 *
+	 * shmem_zero_setup() goes through shmem_kernel_file_setup(), which sets
+	 * S_PRIVATE.  memfd_create() goes through shmem_file_setup(), which does
+	 * not.  That is the difference between "the kernel made this to back an
+	 * anonymous mapping" and "userspace made this to share with someone
+	 * else" -- exactly the distinction that matters.
+	 *
+	 * MEASURED, both levels on one machine, one boot (RTX 3050, 39-bit):
+	 *   L1 libcuda's own pinned buffer  file=1 magic=0x1021994 priv=1  (x5)
+	 *   L2 stub's aliased guest memfd   file=1 magic=0x1021994 priv=0  (x6)
+	 * Perfect separation, so this rejects the aliased case and leaves the
+	 * designed input untouched.
+	 *
+	 * This does NOT make nested pinned sysmem work -- it converts silent
+	 * corruption into an honest -EINVAL.  Making it work is an allocation
+	 * change, not a guard change: the backing must come from a DMA-able
+	 * window at the bottom level rather than being re-aliased per level.
+	 */
+	return IS_PRIVATE(inode);
 }
 
 /*
