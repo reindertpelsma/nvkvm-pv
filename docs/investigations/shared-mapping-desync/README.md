@@ -168,3 +168,55 @@ Detection is cheap and makes the failure honest; a sharing test
 silent divergence into `-EINVAL` for fork-shared and shared-memfd cases alike,
 the same way `8f5d104` did for the memslot case. It is a stopgap: it refuses
 work rather than performing it correctly.
+
+## Scope decision: I/O memory stays unsupported, ordinary RAM must work
+
+Registering **PCI BAR or other I/O memory** with `cuMemHostRegister` stays
+refused (`VM_PFNMAP|VM_IO|VM_MIXEDMAP|VM_HUGETLB`). In a guest without device
+passthrough an application's pointers come from `malloc`/`mmap`, CUDA device
+memory, or managed memory; the apparent exceptions (V4L2 buffers, dma-buf,
+RDMA regions) are virtio-backed and therefore ordinary guest RAM. This is
+rarer in a VM than on bare metal, and costs little to leave out.
+
+**Do not confuse that with the shared-mapping cases.** `MAP_SHARED|MAP_ANONYMOUS`
+across `fork()` and a shared memfd are *ordinary guest RAM*. They are refused
+today for a different reason -- relocation desynchronises the other views --
+and scoping out I/O does nothing for them. They are exactly what should work.
+
+### Why the scope decision matters anyway
+
+It reduces the no-relocate design to a single case, ordinary RAM, which makes
+it tractable. With that plus one launch change the pieces already exist:
+
+1. Boot guest RAM as `memory-backend-memfd,share=on` so it is a shareable host
+   object. Today `scripts/run_test_vm.sh` uses a plain `-m`, so there is
+   nothing to grant -- this is the precondition, and it is a config change
+   rather than a redesign. **Unverified:** that this composes with nvkvm's
+   sparse window and memslot handling.
+2. Grant the isolate only the GPA runs covering the registered buffer, via the
+   existing `iso_mmap_tbl` broker (`iso_mmap_translate()` validates
+   `(isolate_id, base, len)`; `iso_mmap_free()` revokes before munmap). The
+   isolate never receives the whole guest-RAM object, which is what made the
+   naive version an isolation break.
+3. No copy, therefore one physical home, therefore every view stays coherent
+   by construction -- fork-shared, memfd and private alike, with no test to
+   get wrong. It also removes the per-registration bounce copy of every byte.
+
+Two measurable obstacles remain:
+
+- **Scatter.** A guest-virtual buffer is physically fragmented, so a
+  registration costs one token per contiguous GPA run against a table of 8192.
+  64 KiB is fine; 2 GiB may not be. The current copy buys contiguity, which is
+  what the token budget was sized against.
+- **Pin lifetime.** Pins must be held for the whole registration and grants
+  revoked exactly on unregister, or the isolate later reads unrelated guest
+  data through a stale grant. The copy gets this property for free.
+
+### Tractable subset, worth doing first
+
+`cuMemHostAlloc` *chooses* its memory, unlike `cuMemHostRegister`. Satisfying
+it directly from the already-shared window means no relocation ever happens,
+so a child inheriting the mapping across `fork()` inherits something already
+host-visible and it simply works. That is a bounded guest-module change and it
+covers the common pattern of allocating pinned staging buffers, without
+needing (1)-(3) above.
