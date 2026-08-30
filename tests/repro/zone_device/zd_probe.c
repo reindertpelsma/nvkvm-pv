@@ -24,6 +24,8 @@
 #include <linux/memremap.h>
 #include <linux/mm.h>
 #include <linux/io.h>
+#include <linux/pfn_t.h>
+#include <linux/pagemap.h>
 #include <linux/miscdevice.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
