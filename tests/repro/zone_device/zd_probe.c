@@ -43,11 +43,35 @@ static unsigned long base = 0x6000000000UL;
 static unsigned long size = 128UL << 20;
 static int touch;
 static int mode = 0;   /* 0 = try vm_insert_page then vmf_insert_mixed */
+static int devtype = 0;  /* 0 = MEMORY_DEVICE_GENERIC, 1 = MEMORY_DEVICE_COHERENT */
+module_param(devtype, int, 0444);
+MODULE_PARM_DESC(devtype, "0=GENERIC, 1=COHERENT (COHERENT is the type whose "
+			  "refcount the driver owns, so page_free can fire)");
+static atomic_t free_calls = ATOMIC_INIT(0);
 module_param(base, ulong, 0444);
 module_param(size, ulong, 0444);
 module_param(touch, int, 0444);
 module_param(mode, int, 0644);
 MODULE_PARM_DESC(mode, "0=auto, 1=vm_insert_page only, 2=vmf_insert_mixed only");
+
+/*
+ * The whole question for lifetime: does the kernel tell us when the last
+ * reference to a window page goes away? If it does, a handle can be released
+ * exactly when nothing can reach its pages any more -- no polling, and no
+ * check-then-close race. If it does not, releasing safely needs something
+ * else entirely.
+ */
+static void zd_page_free(struct page *page)
+{
+	int n = atomic_inc_return(&free_calls);
+	if (n <= 4)
+		pr_info("zd_probe: page_free() called for pfn=0x%lx (call #%d)\n",
+			page_to_pfn(page), n);
+}
+
+static const struct dev_pagemap_ops zd_pgmap_ops = {
+	.page_free = zd_page_free,
+};
 
 static struct dev_pagemap pgmap;
 static void *vaddr;
@@ -74,6 +98,9 @@ static int zd_show(struct seq_file *m, void *v)
 	seq_printf(m, "PageAnon         %d\n", PageAnon(p));
 	seq_printf(m, "page_mapping     %px\n", page_mapping(p));
 	seq_printf(m, "zonenum          %u\n", page_zonenum(p));
+	seq_printf(m, "pgmap_type       %s\n",
+		   pgmap.type == MEMORY_DEVICE_COHERENT ? "COHERENT" : "GENERIC");
+	seq_printf(m, "page_free_calls  %d\n", atomic_read(&free_calls));
 	return 0;
 }
 static int zd_open(struct inode *i, struct file *f) { return single_open(f, zd_show, NULL); }
@@ -184,10 +211,11 @@ static int __init zd_init(void)
 		base, size, npages, (npages * sizeof(struct page)) >> 10);
 
 	memset(&pgmap, 0, sizeof(pgmap));
-	pgmap.type        = MEMORY_DEVICE_GENERIC;
+	pgmap.type        = devtype ? MEMORY_DEVICE_COHERENT : MEMORY_DEVICE_GENERIC;
 	pgmap.range.start = base;
 	pgmap.range.end   = base + size - 1;
 	pgmap.nr_range    = 1;
+	pgmap.ops         = &zd_pgmap_ops;
 
 	t0 = ktime_get_ns();
 	vaddr = memremap_pages(&pgmap, NUMA_NO_NODE);
@@ -200,8 +228,12 @@ static int __init zd_init(void)
 	base_pfn = base >> PAGE_SHIFT;
 	p0 = pfn_to_page(base_pfn);
 	pr_info("zd_probe: memremap_pages OK in %llu us, vaddr=%px\n", (t1-t0)/1000, vaddr);
-	pr_info("zd_probe: zone_device=%d refcount=%d LRU=%d zonenum=%u\n",
+	pr_info("zd_probe: type=%s zone_device=%d refcount=%d LRU=%d zonenum=%u\n",
+		devtype ? "COHERENT" : "GENERIC",
 		is_zone_device_page(p0), page_ref_count(p0), PageLRU(p0), page_zonenum(p0));
+	pr_info("zd_probe: initial refcount is the thing that decides lifetime: "
+		"if the pgmap holds one permanently it never reaches 0 and "
+		"page_free() can never fire\n");
 
 	if (touch) {
 		u32 *q = (u32 *)vaddr;
