@@ -200,10 +200,19 @@ static void inflight_dequeue(struct nvkvm_state *state,
 
 static bool nvkvm_request_type_known(__u32 type)
 {
-	/* The protocol deliberately has one legacy block and one current block. */
+	/*
+	 * The protocol deliberately has one legacy block and one current block.
+	 *
+	 * KEEP THE UPPER BOUND ON THE LAST ID.  -Wswitch below forces a new
+	 * request to declare its completion shape, but it does NOT catch this
+	 * range test -- a new id simply falls outside, gets EINVAL here, and
+	 * never reaches the switch at all.  Measured the hard way: RESET landed
+	 * with the switch arm present and the bound stale, so the VMM executed
+	 * the request correctly and the guest still reported it unsupported.
+	 */
 	return (type >= NVKVM_REQ_OPEN && type <= NVKVM_REQ_MUNMAP) ||
 	       (type >= NVKVM_REQ_LIST_NVIDIA_DEVICES &&
-		type <= NVKVM_REQ_XISO_IMPORT);
+		type <= NVKVM_REQ_RESET);
 }
 
 /* ── VQ_TX completion callback — called from softirq context ─────────────── */
