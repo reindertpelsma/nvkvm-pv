@@ -1097,6 +1097,29 @@ int nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
 	return ret;
 }
 
+/*
+ * Tell the VMM to drop everything a previous guest module left behind.
+ *
+ * Handles are closed explicitly and outlive their session, so a module that
+ * dies without unwinding (force-unload, oops, guest reboot) strands isolates
+ * and memfds in the VMM that no later request can name.  Sending this before
+ * we serve anything makes the VMM's state match ours, which is empty.
+ *
+ * Best-effort by design: a VMM predating this request replies with an error,
+ * and that must not stop the module loading -- it only means the older VMM
+ * still reclaims on session teardown, which is what it always did.
+ */
+int nvkvm_virtio_reset(void)
+{
+	struct {
+		struct nvkvm_hdr       hdr;
+		struct nvkvm_req_reset req;
+	} msg = {};
+	__u64 retval = 0;
+
+	return simple_req(NVKVM_REQ_RESET, &msg, sizeof(msg), &retval);
+}
+
 int nvkvm_virtio_create_isolate(unsigned int session_id, __u32 *isolate_id_out)
 {
 	struct {

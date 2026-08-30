@@ -3473,6 +3473,30 @@ static int __init nvkvm_init(void)
 		return ret;
 	}
 
+	/*
+	 * Reclaim whatever a previous module instance stranded in the VMM,
+	 * BEFORE register_devices() publishes /dev nodes anything can open.
+	 *
+	 * Handles outlive their session by design (explicit close, refused
+	 * while an isolate holds one), so a module that went away without
+	 * unwinding -- force-unload, oops, guest reboot -- leaves isolates and
+	 * memfds no request of ours will ever name. This is the only point at
+	 * which the guest can assert "the VMM's state should match mine, and
+	 * mine is empty".
+	 *
+	 * After register_virtio_driver() because it needs the transport, and
+	 * before register_devices() because after that a racing open() could
+	 * create a session we would then reset out from under.
+	 *
+	 * Deliberately non-fatal: an older VMM rejects the request, which only
+	 * means it still reclaims on session teardown as it always did. Failing
+	 * the module load over that would be a regression, not a safety gain.
+	 */
+	ret = nvkvm_virtio_reset();
+	if (ret)
+		pr_info("nvkvm: VMM reset unavailable (%d) — continuing; a VMM "
+			"without it reclaims on session teardown instead\n", ret);
+
 	ret = register_devices();
 	if (ret) {
 		unregister_virtio_driver(&nvkvm_virtio_driver);

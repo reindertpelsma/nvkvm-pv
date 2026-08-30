@@ -1023,6 +1023,10 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			    nvkvm_req_create_isolate,
 			    nvkvm_resp_create_isolate,
 			    nvkvm_req_create_isolate)
+		ISOLATE_REQ(NVKVM_REQ_RESET,
+			    nvkvm_req_reset,
+			    nvkvm_resp_reset,
+			    nvkvm_req_reset)
 		ISOLATE_REQ(NVKVM_REQ_KILL_ISOLATE,
 			    nvkvm_req_kill_isolate,
 			    nvkvm_resp_kill_isolate,

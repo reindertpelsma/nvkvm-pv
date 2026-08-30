@@ -125,6 +125,10 @@ int nvkvm_handle_unref_isolate_generation(struct nvkvm_handle_table *t,
 int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id);
 
 /* Close all handles belonging to a session (called on session teardown). */
+/* Force every handle shut regardless of isolate_refcount.  RESET only:
+ * kill all isolates first.  Returns how many were closed. */
+uint32_t nvkvm_handle_close_all(struct nvkvm_handle_table *t);
+
 void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_id);
 
 #endif /* NVKVM_HANDLE_H */

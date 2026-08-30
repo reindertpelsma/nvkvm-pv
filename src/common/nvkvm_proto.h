@@ -179,6 +179,7 @@ enum nvkvm_request_type {
 	NVKVM_REQ_XISO_IMPORT             = 31, /* #110 cross-isolate dma-buf: broker a bo from
 	                                           * the owner isolate into the caller's; returns
 	                                           * the caller-local stub GEM handle            */
+	NVKVM_REQ_RESET                   = 32, /* drop all guest-owned VMM state */
 };
 
 /* ── Generic header ──────────────────────────────────────────────────────── */
@@ -328,6 +329,37 @@ struct nvkvm_resp_create_isolate {
 };
 
 /* ── KILL_ISOLATE ────────────────────────────────────────────────────────── */
+
+/* ── RESET ───────────────────────────────────────────────────────────────────
+ * Sent by the guest module at init, before it serves anything.
+ *
+ * Handles deliberately outlive the session that created them (they are closed
+ * explicitly, and refused while an isolate still holds one), so nothing in the
+ * steady state reclaims a handle whose guest-side owner is gone.  That is
+ * correct while a guest kernel is alive to close them, and wrong across a
+ * module reload: a force-unload, an oops, or a guest reboot leaves the VMM
+ * holding isolates and memfds no future guest request will ever name again.
+ *
+ * So the incoming module declares a fresh start: kill every isolate, close
+ * every handle, drop every session.  This is the reclaim path for state the
+ * guest can no longer address, which is the job session teardown used to do
+ * implicitly (see nvkvm_handle_close_session and audit H-2/H-3).
+ *
+ * Scope is the device, structurally -- the handle table and session list are
+ * members of VirtIONvgpu, so this cannot reach state belonging to anything
+ * else even if another device existed.
+ */
+struct nvkvm_req_reset {
+	__le32 reserved;      /* MBZ */
+	__le32 reserved2;     /* MBZ */
+};
+
+struct nvkvm_resp_reset {
+	__le32 status;
+	__le32 isolates_killed;   /* diagnostics: what the previous life left */
+	__le32 handles_closed;
+	__le32 sessions_dropped;
+};
 
 struct nvkvm_req_kill_isolate {
 	__le32 isolate_id;

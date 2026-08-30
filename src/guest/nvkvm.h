@@ -550,6 +550,7 @@ int  nvkvm_negotiate_version(struct nvkvm_state *state);
 int  nvkvm_virtio_open_nvidia_handle(int dev_id, unsigned int flags,
 				     unsigned int session_id,
 				     __u32 *handle_id_out);
+int  nvkvm_virtio_reset(void);
 int  nvkvm_virtio_create_isolate(unsigned int session_id,
 				 __u32 *isolate_id_out);
 /* #127: ask the host to relay an os-event fd's readiness (POLLIN) over VQ_EVT.

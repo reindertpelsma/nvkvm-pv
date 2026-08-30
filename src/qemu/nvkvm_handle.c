@@ -504,6 +504,42 @@ int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id)
 	return 0;
 }
 
+/*
+ * Force every handle shut, ignoring isolate_refcount.
+ *
+ * The refcount guard in nvkvm_handle_close() exists so a guest cannot destroy
+ * an object another isolate is still using.  That reasoning does not apply
+ * here: the only caller is NVKVM_REQ_RESET, issued by an incoming guest module
+ * that has already killed every isolate, so there is no holder left to protect
+ * -- and any refcount still standing is precisely the stale state reset exists
+ * to clear.  Kill isolates BEFORE calling this, or the fds close underneath a
+ * live stub.
+ *
+ * Returns the number of handles it closed, which is the previous life's leak
+ * count and worth reporting rather than discarding.
+ */
+uint32_t nvkvm_handle_close_all(struct nvkvm_handle_table *t)
+{
+	uint32_t n = 0;
+
+	pthread_mutex_lock(&t->lock);
+	for (int i = 1; i < NVKVM_HANDLE_MAX; i++) {
+		struct nvkvm_handle *h = &t->handles[i];
+
+		if (!h->in_use)
+			continue;
+		if (h->fd >= 0) {
+			close(h->fd);
+			h->fd = -1;
+		}
+		h->in_use          = false;
+		h->isolate_refcount = 0;
+		n++;
+	}
+	pthread_mutex_unlock(&t->lock);
+	return n;
+}
+
 void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_id)
 {
 	pthread_mutex_lock(&t->lock);

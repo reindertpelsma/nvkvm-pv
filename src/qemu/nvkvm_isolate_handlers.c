@@ -894,6 +894,85 @@ out:
 	return 0;
 }
 
+/*
+ * NVKVM_REQ_RESET — an incoming guest module declares a fresh start.
+ *
+ * Handles outlive the session that created them by design: they are closed
+ * explicitly, and refused while an isolate holds one.  That is right while a
+ * guest kernel is alive to close them, and leaves nothing to reclaim state
+ * across a module reload -- a force-unload, an oops or a guest reboot strands
+ * isolates and memfds that no future guest request can name.  Reset is that
+ * reclaim path.
+ *
+ * Order matters and is the whole content of this function:
+ *   1. kill every isolate  -- so nothing is executing against the fds
+ *   2. destroy every session -- reclaims its RM object graph and fd lists
+ *   3. force every remaining handle shut -- the parked ones, which by
+ *      construction belong to no session and would otherwise survive
+ *
+ * Doing (3) before (1) would close fds under a live stub.
+ *
+ * Scope is this device: nv->handles and nv->sessions are members of
+ * VirtIONvgpu, so a reset cannot reach state belonging to another device.
+ */
+int nvkvm_req_reset(VirtIONvgpu *nv,
+		    struct nvkvm_req_reset *req,
+		    struct nvkvm_resp_reset *resp)
+{
+	uint32_t isolates = 0, sessions = 0, handles = 0;
+
+	(void)req;
+	memset(resp, 0, sizeof(*resp));
+
+	/*
+	 * Snapshot the session ids first.  nvkvm_session_destroy() unlinks from
+	 * nv->sessions, so walking the list while destroying entries would use
+	 * a freed link; and the kill below drops sessions_lock internally.
+	 */
+	uint32_t ids[256];
+	uint32_t nids = 0;
+
+	pthread_mutex_lock(&nv->sessions_lock);
+	struct nvkvm_session *s;
+	TAILQ_FOREACH(s, &nv->sessions, link) {
+		if (nids < (uint32_t)(sizeof(ids) / sizeof(ids[0])))
+			ids[nids++] = s->id;
+	}
+	pthread_mutex_unlock(&nv->sessions_lock);
+
+	for (uint32_t i = 0; i < nids; i++) {
+		pthread_mutex_lock(&nv->sessions_lock);
+		s = nvkvm_session_find(nv, ids[i]);
+		pthread_mutex_unlock(&nv->sessions_lock);
+		if (!s)
+			continue;                      /* raced away; fine */
+
+		pthread_mutex_lock(&s->lock);
+		isolates += (uint32_t)s->nisolates;
+		pthread_mutex_unlock(&s->lock);
+
+		nvkvm_isolate_kill_session(&nv->isolates, ids[i]);
+		nvkvm_session_destroy(nv, s);
+		sessions++;
+	}
+
+	/* Whatever is left is parked: owned by no live session, reachable only
+	 * by a handle id the incoming guest has no record of. */
+	handles = nvkvm_handle_close_all(&nv->handles);
+
+	resp->isolates_killed  = cpu_to_le32(isolates);
+	resp->sessions_dropped = cpu_to_le32(sessions);
+	resp->handles_closed   = cpu_to_le32(handles);
+	resp->status           = 0;
+
+	if (isolates || sessions || handles)
+		fprintf(stderr,
+			"nvkvm: RESET reclaimed %u isolate(s), %u session(s), "
+			"%u handle(s) left by a previous guest module\n",
+			isolates, sessions, handles);
+	return 0;
+}
+
 int nvkvm_req_open_memory_handle(VirtIONvgpu *nv,
 				  struct nvkvm_req_open_memory_handle *req,
 				  struct nvkvm_resp_open_memory_handle *resp)

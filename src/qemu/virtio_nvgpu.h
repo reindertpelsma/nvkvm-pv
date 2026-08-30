@@ -485,6 +485,9 @@ int nvkvm_req_close_handle(VirtIONvgpu *nv,
 int nvkvm_req_create_isolate(VirtIONvgpu *nv,
 			      struct nvkvm_req_create_isolate *req,
 			      struct nvkvm_resp_create_isolate *resp);
+int nvkvm_req_reset(VirtIONvgpu *nv,
+		    struct nvkvm_req_reset *req,
+		    struct nvkvm_resp_reset *resp);
 int nvkvm_req_kill_isolate(VirtIONvgpu *nv,
 			    struct nvkvm_req_kill_isolate *req,
 			    struct nvkvm_resp_kill_isolate *resp);
