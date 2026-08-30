@@ -571,9 +571,11 @@ void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_i
 	}
 	pthread_mutex_unlock(&t->lock);
 
-	if (nmem || nnv)
-		fprintf(stderr,
-			"nvkvm DIAG: close_session(%u) force-closed %u memfd + "
-			"%u nvidia handle(s), %u still isolate-referenced\n",
-			session_id, nmem, nnv, nref);
+	/* Unconditional on purpose: printing only non-zero counts makes an
+	 * absent line ambiguous between "found nothing" and "never called",
+	 * and that is exactly the distinction this measurement exists to make. */
+	fprintf(stderr,
+		"nvkvm DIAG: close_session(%u) force-closed %u memfd + "
+		"%u nvidia handle(s), %u still isolate-referenced\n",
+		session_id, nmem, nnv, nref);
 }
