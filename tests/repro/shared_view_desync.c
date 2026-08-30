@@ -75,8 +75,8 @@ int main(void)
         char c;
         /* confirm the shared mapping works at all before the interesting part */
         unsigned pre = count_eq(buf, SENTINEL_A);
-        if (write(to_parent[1], "r", 1) != 1) _exit(3);
-        if (read(to_child[0], &c, 1) != 1)    _exit(3);
+        if (write(to_parent[1], "r", 1) != 1) { fflush(stdout); _exit(3); }
+        if (read(to_child[0], &c, 1) != 1)    { fflush(stdout); _exit(3); }
         unsigned post_b = count_eq(buf, SENTINEL_B);
         unsigned post_a = count_eq(buf, SENTINEL_A);
         printf("  child: before register saw A in %u/%u words\n", pre, LEN/4);
@@ -85,6 +85,9 @@ int main(void)
         if (post_b == LEN/4)      printf("  child: PASS -- both views are one buffer\n");
         else if (post_a == LEN/4) printf("  child: FAIL -- STALE: parent's view was relocated, child left behind\n");
         else                      printf("  child: FAIL -- partially diverged\n");
+        /* _exit() skips stdio flush and silently ate these lines the first
+         * time this ran -- the measurement was fine, the reporting was not. */
+        fflush(stdout);
         _exit(post_b == LEN/4 ? 0 : 1);
     }
 
