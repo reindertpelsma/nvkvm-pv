@@ -40,6 +40,7 @@ USAGE
     ./scripts/sweep_matrix.py --render        # re-render the table only
     ./scripts/sweep_matrix.py --check-tree    # does the tree match HEAD? (free)
 """
+import os
 import argparse, json, os, re, shlex, subprocess, sys, time, datetime
 
 KVM_IMAGE = "docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16"
@@ -149,8 +150,39 @@ DRIVER_ALTS = {
 # which each architecture became supported at all; below the floor the install
 # succeeds and `nvidia-smi` reports no devices, which is NOT an nvkvm result and
 # is recorded as `driver-predates-gpu`.
+# blackwell is 580, NOT 570, and the reason is a kernel hang rather than a
+# missing PCI ID.  MEASURED 2026-08-30 on two boxes (RTX 5070/GB205 and
+# RTX 5070 Ti/GB203, different machines), reproduced both times:
+#
+#   BUG: kernel NULL pointer dereference, address: 00000000000000c4
+#   Comm: nv_open_q   RIP: pci_read_config_dword+0x5/0x50
+#    gpuReadPcieConfigCycle_GB202 -> kbifSavePcieConfigRegistersFn1_GB202
+#    -> kbifStateLoad -> gpuStateLoad -> RmInitAdapter -> nvidia_open_deferred
+#
+# Fn1 is PCI FUNCTION 1.  vast's KVM template passes the GPU as 00:08.0 and its
+# HDMI-audio sibling as a SEPARATE SLOT 00:07.0, so 00:08.1 does not exist.
+# 570's open module dereferences that NULL pci_dev, dies HOLDING AN RM SPINLOCK,
+# and every later NVIDIA fd close spins on it with IRQs disabled until the CPU
+# soft-locks.  sshd stays alive throughout (13 consecutive fresh logins during
+# one 180s 'hang'), which is why four earlier sweeps read this as an unexplained
+# box wedge and burned their rentals on it.
+#
+# Control on ONE box, same GPU, minutes apart: 580.95.05 -m=kernel-open ->
+# `nvidia-smi -L` answers instantly; 570.124.06 -> hang.
+#
+# NOT a missing-PCI-ID problem: 570.124.06 binds the device and reaches
+# RmInitAdapter, so the old `driver-predates-gpu` reading of these rows was a
+# MISDIAGNOSIS.  Separately, the image's preinstalled 575 is the PROPRIETARY
+# flavour and cannot init on Blackwell at all ("requires use of the NVIDIA open
+# kernel modules", RmInitAdapter failed 0x22:0x56:884), which is why these boxes
+# look driverless at rent time.
+#
+# Consequence to be honest about: with the floor at 580 only 580.95.05 and the
+# 610 row remain reachable, which is fewer than MIN_DRIVERS.  Blackwell coverage
+# is genuinely narrower here than the arch supports -- 610.43.02 is still
+# UNTESTED on Blackwell (the second box was unrecoverable before it ran).
 ARCH_FLOOR = {
-    "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 570,
+    "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 580,
 }
 
 ARCH_OF = [   # substring -> architecture, FIRST MATCH WINS: specific before generic
@@ -503,6 +535,16 @@ def install_driver(S, ver, arch, log):
     three matrix rows are no longer published and fall back to DRIVER_ALTS.
     """
     kernel_open = arch in OPEN_MODULE_ARCHES
+    # NVKVM_FORCE_MODULE lets a sweep pin the flavour on an architecture that
+    # can run either.  Our ABI table is EXTRACTED FROM OGKM headers, so testing
+    # only the proprietary module means validating open-module-derived struct
+    # layouts against the closed implementation -- they should agree, which is
+    # exactly the kind of assumption a sweep exists to kill.  Never used to
+    # weaken an arch that REQUIRES open (Blackwell/Hopper cannot bind the
+    # proprietary module at all), so the force is ignored there.
+    _force = os.environ.get("NVKVM_FORCE_MODULE", "").strip().lower()
+    if _force in ("open", "proprietary") and arch not in OPEN_MODULE_ARCHES:
+        kernel_open = (_force == "open")
 
     # This must precede even the fast path.  A preinstalled driver does not
     # need replacing, but validating nvkvm while the desktop template's Xorg
@@ -624,11 +666,23 @@ def install_driver(S, ver, arch, log):
     # /root/drvinstall.log, so the log for a failed install was overwritten by
     # the next driver before anyone could read it -- and `log`, the parameter
     # naming the file, was accepted and then ignored.
-    attempts = [
-        f"{ccenv}/root/drv.run {base} {mod}",
-        f"{ccenv}/root/drv.run {base} {other}",
-        f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
-    ]
+    # On an architecture that REQUIRES the open module, never fall back to the
+    # other flavour.  Blackwell/Hopper cannot bind the proprietary module at
+    # all, so "try the opposite" can only install something that loads and then
+    # reports no GPU -- which reads downstream as "this driver predates the
+    # silicon" and hides the real failure (the open build not compiling).
+    # Keep the flavour fixed and let the build error speak instead.
+    if kernel_open:
+        attempts = [
+            f"{ccenv}/root/drv.run {base} {mod}",
+            f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
+        ]
+    else:
+        attempts = [
+            f"{ccenv}/root/drv.run {base} {mod}",
+            f"{ccenv}/root/drv.run {base} {other}",
+            f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
+        ]
     rc = 1
     for i, cmd in enumerate(attempts):
         redir = ">" if i == 0 else ">>"
@@ -654,11 +708,23 @@ def install_driver(S, ver, arch, log):
         return False, (tail[-1100:] + hint), None
 
     sh(f"{S} 'modprobe nvidia; modprobe nvidia_uvm; true'", timeout=180)
+    # Which module flavour actually ended up loaded.  Until now this was only
+    # ever checked for OPEN_MODULE_ARCHES, so a sweep could not tell you whether
+    # its green rows were proprietary or OGKM -- the single most basic fact
+    # about what was tested.  "Dual MIT/GPL" is the open module, "NVIDIA" the
+    # proprietary one.
+    lic, _ = sh(rsh(S, "modinfo nvidia 2>/dev/null | "
+                       "awk '/^license:/{$1=\"\"; print}'"), timeout=90)
+    lic = (lic or "").strip()
+    flavour = ("open" if ("MIT" in lic or "GPL" in lic)
+               else "proprietary" if "NVIDIA" in lic
+               else "unknown")
     got = installed_driver_version(S)
     if got != use_ver:
         raw, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=60)
         return False, f"installed {use_ver} but /proc reports: {raw.strip()[:200]}", None
-    detail = f"{use_ver}" + ("" if use_ver == ver else f" (SUBSTITUTE for unpublished {ver})")
+    detail = (f"{use_ver} [module={flavour}]"
+              + ("" if use_ver == ver else f" (SUBSTITUTE for unpublished {ver})"))
     return True, detail, use_ver
 
 
