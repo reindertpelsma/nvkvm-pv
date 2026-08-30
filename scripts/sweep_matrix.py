@@ -150,8 +150,39 @@ DRIVER_ALTS = {
 # which each architecture became supported at all; below the floor the install
 # succeeds and `nvidia-smi` reports no devices, which is NOT an nvkvm result and
 # is recorded as `driver-predates-gpu`.
+# blackwell is 580, NOT 570, and the reason is a kernel hang rather than a
+# missing PCI ID.  MEASURED 2026-08-30 on two boxes (RTX 5070/GB205 and
+# RTX 5070 Ti/GB203, different machines), reproduced both times:
+#
+#   BUG: kernel NULL pointer dereference, address: 00000000000000c4
+#   Comm: nv_open_q   RIP: pci_read_config_dword+0x5/0x50
+#    gpuReadPcieConfigCycle_GB202 -> kbifSavePcieConfigRegistersFn1_GB202
+#    -> kbifStateLoad -> gpuStateLoad -> RmInitAdapter -> nvidia_open_deferred
+#
+# Fn1 is PCI FUNCTION 1.  vast's KVM template passes the GPU as 00:08.0 and its
+# HDMI-audio sibling as a SEPARATE SLOT 00:07.0, so 00:08.1 does not exist.
+# 570's open module dereferences that NULL pci_dev, dies HOLDING AN RM SPINLOCK,
+# and every later NVIDIA fd close spins on it with IRQs disabled until the CPU
+# soft-locks.  sshd stays alive throughout (13 consecutive fresh logins during
+# one 180s 'hang'), which is why four earlier sweeps read this as an unexplained
+# box wedge and burned their rentals on it.
+#
+# Control on ONE box, same GPU, minutes apart: 580.95.05 -m=kernel-open ->
+# `nvidia-smi -L` answers instantly; 570.124.06 -> hang.
+#
+# NOT a missing-PCI-ID problem: 570.124.06 binds the device and reaches
+# RmInitAdapter, so the old `driver-predates-gpu` reading of these rows was a
+# MISDIAGNOSIS.  Separately, the image's preinstalled 575 is the PROPRIETARY
+# flavour and cannot init on Blackwell at all ("requires use of the NVIDIA open
+# kernel modules", RmInitAdapter failed 0x22:0x56:884), which is why these boxes
+# look driverless at rent time.
+#
+# Consequence to be honest about: with the floor at 580 only 580.95.05 and the
+# 610 row remain reachable, which is fewer than MIN_DRIVERS.  Blackwell coverage
+# is genuinely narrower here than the arch supports -- 610.43.02 is still
+# UNTESTED on Blackwell (the second box was unrecoverable before it ran).
 ARCH_FLOOR = {
-    "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 570,
+    "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 580,
 }
 
 ARCH_OF = [   # substring -> architecture, FIRST MATCH WINS: specific before generic
