@@ -93,7 +93,7 @@ hung once and has not reproduced since.
 
 | | |
 |---|---|
-| Host | Linux with **working KVM** (see below), an NVIDIA GPU, and the proprietary/open NVIDIA driver installed |
+| Host | Linux with **working KVM** (see below), an NVIDIA GPU, and the NVIDIA driver installed — **either module flavour**, proprietary or open (OGKM); see [module flavours](#module-flavours) |
 | Guest | Linux, kernel 5.15 – 7.0 (built on every LTS in range; run-tested on Ubuntu 24.04, kernel 6.8) — see [guest kernels](docs/reference/guest-kernels.md) |
 | GPU | Turing or newer — Pascal enumerates but `cuInit` fails, and the open kernel module will not probe it at all (see [Tested platforms](#tested-platforms)) |
 | Size | ~16 GB RAM and 4 vCPUs free for the guest (the defaults), plus ~40 GB disk for the guest image and QEMU |
@@ -607,6 +607,33 @@ NVIDIA's bugs until the same test was run on bare metal:
 Coverage is a function of what someone happened to rent, so it is uneven by
 construction — reports from hardware not listed are genuinely wanted, and a
 **failure** is worth more than a success. See [contributing](CONTRIBUTING.md).
+
+### Module flavours
+
+nvkvm forwards to whichever NVIDIA kernel module the host has. **Both flavours
+work**, and most desktop installs still ship the proprietary one:
+
+| flavour | `modinfo nvidia` license | evidence |
+|---|---|---|
+| **proprietary** | `NVIDIA` | the bulk of the Turing / Ampere / Ada rows above; re-confirmed 2026-08-30 by a sweep of ampere + turing + ada across five ABI profiles, every row `30P/0F/0S` |
+| **open (OGKM)** | `Dual MIT/GPL` | **every Blackwell and Hopper row above** — those parts cannot bind the proprietary module, so each of them is an OGKM result by construction. Also RTX 4070 on 595.84 open, real kernel launch with checked arithmetic |
+
+Two caveats, because the table above is more confident than the history behind it:
+
+- **The flavour was not recorded when most of those rows were measured.** The
+  proprietary attribution for Turing/Ampere/Ada is inferred from the installer's
+  attempt order (`-m=kernel` first on any architecture not in
+  `OPEN_MODULE_ARCHES`), not read from `modinfo`. The OGKM attribution for
+  Blackwell/Hopper is a hardware argument — those GPUs have no proprietary
+  option — not a logged string either. Both inferences are sound; neither was a
+  measurement.
+- `scripts/sweep.sh` now records `module=open|proprietary|unknown` on **every**
+  row, control included, so future runs state their own flavour instead of
+  leaving it to be reconstructed.
+
+Note the vast.ai KVM image used for sweeps is **not** preloaded with OGKM: the
+only flavour observed on its boxes is `license='NVIDIA '`. An OGKM sweep on
+those boxes therefore has to install the open module explicitly.
 
 ## FAQ
 
