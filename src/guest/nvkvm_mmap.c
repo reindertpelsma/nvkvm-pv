@@ -1695,8 +1695,31 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * VM_MAYWRITE.  VM_WRITE is untouched, so userspace keeps write access
 	 * — only a later mprotect() trying to re-add PROT_WRITE is refused.
 	 */
+	/*
+	 * Make it a SHARED passthrough rather than stripping VM_MAYWRITE.
+	 *
+	 * remap_pfn_range() refuses a sub-VMA remap on a COW mapping, and
+	 * is_cow_mapping() is (VM_SHARED|VM_MAYWRITE) == VM_MAYWRITE. Clearing
+	 * VM_MAYWRITE satisfied that test but left the VMA private-and-
+	 * unwritable: vm_get_page_prot() maps (VM_WRITE, !VM_SHARED) to a
+	 * read-only protection -- that is how COW is expressed -- so the PTEs
+	 * installed below came out read-only, and with VM_MAYWRITE gone the
+	 * resulting write fault had no way to resolve.
+	 *
+	 * MEASURED: a MAP_PRIVATE buffer registered fine and then SIGSEGV'd on
+	 * the first write, while the same binary on the stock driver wrote it
+	 * happily (tests/repro/private_register_write.c). That is ordinary
+	 * malloc'd heap, and the 30-check suite missed it because every CUDA
+	 * check registers cuMemHostAlloc memory, which is MAP_SHARED.
+	 *
+	 * Setting VM_SHARED makes is_cow_mapping() false for the same reason,
+	 * so remap_pfn_range() is satisfied -- and it is the honest description
+	 * of what this VMA now is. After the conversion it is a straight
+	 * passthrough of host window pages: there is no COW left to perform, and
+	 * a fork must share the window rather than try to copy it.
+	 */
 	if (is_cow_mapping(vma->vm_flags))
-		vm_flags_clear(vma, VM_MAYWRITE);
+		vm_flags_set(vma, VM_SHARED);
 	/*
 	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
 	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
