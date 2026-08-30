@@ -1310,6 +1310,36 @@ struct nvkvm_uvm_desc {
  * fd_off lists every frontend fd the trusted path must resolve.  In particular
  * REGISTER_GPU.rmCtrlFd@24 is an input fd, not an output status word.
  */
+/*
+ * Which DEVICE legitimately appears in a UVM command's embedded-fd slot.
+ *
+ * Only three commands carry an embedded fd, and they do NOT all carry the same
+ * kind.  Assuming they did is what broke CUDA: the gate below hardcoded
+ * NVKVM_DEV_CTL, so UVM_MM_INITIALIZE -- whose field is a /dev/nvidia-uvm fd,
+ * not an nvidiactl one -- was denied with -EBADF, and cuInit() returned 999
+ * with no visible reason.  MEASURED by bisect 2026-08-30: 0a5527a is the first
+ * commit where cuInit fails; its parent d8553ee passes.
+ *
+ *   25 UVM_REGISTER_GPU_VASPACE.rmCtrlFd @16  -> /dev/nvidiactl
+ *   37 UVM_REGISTER_GPU.rmCtrlFd        @24  -> /dev/nvidiactl
+ *   75 UVM_MM_INITIALIZE.uvmFd          @0   -> /dev/nvidia-uvm
+ *
+ * Returns -1 for anything else, which the caller treats as DENY: a command that
+ * grows an embedded fd must be added here deliberately, not admitted by default.
+ */
+static int nvkvm_uvm_embedded_fd_dev(uint32_t cmd)
+{
+	switch (cmd) {
+	case 25: /* UVM_REGISTER_GPU_VASPACE */
+	case 37: /* UVM_REGISTER_GPU         */
+		return NVKVM_DEV_CTL;
+	case 75: /* UVM_MM_INITIALIZE        */
+		return NVKVM_DEV_UVM;
+	default:
+		return -1;
+	}
+}
+
 static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
 	/* The full UVM command set (open kernel module / gVisor nvproxy
 	 * uvm.go).  min_size: cmds whose struct is defined in our ABI
@@ -2798,10 +2828,17 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				 * the lock and give the driver the dup, which
 				 * we own for the whole call. */
 				/*
-				 * Audit 2026-08-29 (serious): the only two rows
-				 * that set fd_off — REGISTER_GPU.rmCtrlFd@24 and
-				 * REGISTER_GPU_VASPACE.rmCtrlFd@16 — name an
-				 * /dev/nvidiactl fd, and the REALIZE path checks
+				 * Audit 2026-08-29 (serious): THREE rows set
+				 * fd_off, not two, and they do not all name the
+				 * same device — REGISTER_GPU.rmCtrlFd@24 and
+				 * REGISTER_GPU_VASPACE.rmCtrlFd@16 name an
+				 * /dev/nvidiactl fd, but MM_INITIALIZE.uvmFd@0
+				 * names a /dev/nvidia-uvm one.  The original
+				 * wording said "the only two rows" and the check
+				 * hardcoded DEV_CTL to match; that denied every
+				 * MM_INITIALIZE and broke cuInit.  The expected
+				 * device now comes from
+				 * nvkvm_uvm_embedded_fd_dev().  The REALIZE path checks
 				 * the IDENTICAL field three ways before the stub
 				 * resolves it (session, TYPE_NVIDIA, DEV_CTL —
 				 * see nvkvm_req_realize_uvm_mapping).  Here it
@@ -2841,13 +2878,26 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 								  &egen);
 				if (efd < 0)
 					continue;
+				int want_dev =
+					nvkvm_uvm_embedded_fd_dev(req->cmd);
 				if (etype != NVKVM_HANDLE_TYPE_NVIDIA ||
-				    edev != NVKVM_DEV_CTL || egen != egen0) {
-					NVKVM_DBG("nvkvm: DENY UVM cmd=0x%x "
-						  "embedded fd handle %u is not "
-						  "a live nvidiactl handle "
-						  "(type=%d dev=%d)\n",
-						  req->cmd, hid, etype, edev);
+				    want_dev < 0 || edev != want_dev ||
+				    egen != egen0) {
+					/* Unconditional, not NVKVM_DBG: every
+					 * sibling DENY in this function prints
+					 * to stderr, and nvkvm_log.h says
+					 * security DENY decisions must always be
+					 * visible.  Hiding this one behind
+					 * NVKVM_DEBUG is what made the cuInit
+					 * regression silent for three days. */
+					fprintf(stderr,
+						"nvkvm: DENY UVM cmd=0x%x "
+						"embedded fd handle %u: "
+						"type=%d dev=%d, wanted "
+						"type=%d dev=%d\n",
+						req->cmd, hid, etype, edev,
+						NVKVM_HANDLE_TYPE_NVIDIA,
+						want_dev);
 					close(efd);
 					for (int j = 0; j < nsaved; j++)
 						close(emb_fd[j]);
