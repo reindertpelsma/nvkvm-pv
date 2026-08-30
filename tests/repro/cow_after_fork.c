@@ -46,15 +46,24 @@ int main(void)
     if (buf == MAP_FAILED) { perror("mmap"); return 2; }
     for (unsigned i = 0; i < LEN/4; i++) buf[i] = SENTINEL_A;
 
-    int tp[2], tc[2]; if (pipe(tp)||pipe(tc)) return 2;
+    /*
+     * No pipes. An earlier version used two for handshaking and never closed
+     * the unused ends, so when the child exited early the parent's read()
+     * never saw EOF and blocked forever -- which looked exactly like a hang
+     * inside cuInit. waitpid() is all the synchronisation this needs: the
+     * child does everything and exits, then the parent inspects its own COW
+     * copy, which by then must be untouched.
+     */
     pid_t pid = fork();
 
     if (pid == 0) {                 /* CHILD does all the CUDA work */
         CUdevice dev; CUcontext ctx; CUresult rc;
-        printf("  child: cuInit...\n"); fflush(stdout);
-        if (cuInit(0))                    { printf("  child: cuInit FAILED\n");      fflush(stdout); _exit(2); }
-        if (cuDeviceGet(&dev,0))          { printf("  child: cuDeviceGet FAILED\n"); fflush(stdout); _exit(2); }
-        if (cuCtxCreate_v2(&ctx,0,dev))   { printf("  child: cuCtxCreate FAILED\n"); fflush(stdout); _exit(2); }
+        printf("  child: cuInit ...\n");      fflush(stdout);
+        if (cuInit(0))                  { printf("  child: cuInit FAILED\n");      fflush(stdout); _exit(2); }
+        printf("  child: cuDeviceGet ...\n"); fflush(stdout);
+        if (cuDeviceGet(&dev,0))        { printf("  child: cuDeviceGet FAILED\n"); fflush(stdout); _exit(2); }
+        printf("  child: cuCtxCreate ...\n"); fflush(stdout);
+        if (cuCtxCreate_v2(&ctx,0,dev)) { printf("  child: cuCtxCreate FAILED\n"); fflush(stdout); _exit(2); }
 
         rc = cuMemHostRegister_v2((void*)buf, LEN, CU_MEMHOSTREGISTER_DEVICEMAP);
         printf("  child: register inherited COW heap rc=%d %s\n", rc,
@@ -65,25 +74,24 @@ int main(void)
             cuMemHostUnregister((void*)buf);
         }
         fflush(stdout);
-        if (write(tp[1], rc == 0 ? "y" : "n", 1) != 1) _exit(3);
-        char c; if (read(tc[0],&c,1)!=1) _exit(3);
         _exit(rc == 0 ? 0 : 1);
     }
 
-    char v;
-    if (read(tp[0],&v,1)!=1) { printf("  parent: child died before reporting\n"); return 2; }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    int crc = WIFEXITED(st) ? WEXITSTATUS(st) : 99;
+
     unsigned a = count_eq(buf, SENTINEL_A), cc = count_eq(buf, SENTINEL_C);
     printf("  parent: own copy -> A=%u C=%u (of %u)\n", a, cc, LEN/4);
-    if (write(tc[1],"g",1)!=1) return 2;
-    int st=0; waitpid(pid,&st,0);
-    int crc = WIFEXITED(st)?WEXITSTATUS(st):99;
 
     printf("\n");
-    if (v == 'y' && a == LEN/4 && cc == 0)
+    if (crc == 0 && a == LEN/4 && cc == 0)
         printf("VERDICT: PASS -- child registered inherited COW heap; parent's copy intact\n");
-    else if (v == 'n')
+    else if (crc == 1)
         printf("VERDICT: FAIL -- refused; ordinary fork-then-CUDA heap use regressed\n");
+    else if (crc == 2)
+        printf("VERDICT: child could not bring CUDA up at all\n");
     else
-        printf("VERDICT: registered but COW did not hold (parent A=%u C=%u)\n", a, cc);
+        printf("VERDICT: registered but COW did not hold (A=%u C=%u)\n", a, cc);
     return crc;
 }
