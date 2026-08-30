@@ -177,3 +177,59 @@ it crosses an isolate boundary rather than corrupting one process's own data.
 
 Nothing measured here blocks the approach. This is the piece that has to be
 designed rather than discovered.
+
+# Stage 4: lifetime — can a release gate be built on refcount?
+
+**Measured 2026-08-31.** The proposed rule is: the VMM memfd behind a window
+range is released only when nothing references its pages, so a GPA can never be
+re-pointed at different backing under a live reference.
+
+## No stock-kernel ZONE_DEVICE type gives a free callback
+
+| type | CPU-accessible | `page_free` fires | available on stock Ubuntu |
+|---|---|---|---|
+| `MEMORY_DEVICE_GENERIC` | yes | **no** | yes |
+| `MEMORY_DEVICE_COHERENT` | yes | yes | **no** |
+| `MEMORY_DEVICE_PRIVATE` | **no** | yes | yes |
+
+Measured, not inferred:
+
+- GENERIC: `page_free_calls 0` after a full map/fork/unmap cycle, and the
+  refcount sits at 1 with nothing mapped -- the pgmap holds a permanent
+  reference, so the count never reaches 0 and the callback cannot fire.
+- COHERENT: `memremap_pages` fails, `WARNING at mm/memremap.c:330`.
+  `CONFIG_DEVICE_COHERENT` is **not set** on 6.8.0-138-generic, and requiring a
+  custom guest kernel is not an option.
+- PRIVATE: excluded by design -- its pages are deliberately not CPU-mappable
+  (a CPU fault migrates them back), which is backwards for a window the CPU and
+  GPU both read.
+
+## So the gate is a check, and the check is sound
+
+    baseline (nothing mapped)        refcount=1
+    after mmap                       refcount=2
+    after a pin is taken and HELD    refcount=1026
+    after munmap, pin still held     refcount=1025   <-- the gate
+    after the pin is dropped         refcount=1
+
+A pin that outlives its mapping stays visible, and the count returns exactly to
+the baseline once released. **A release gate on `refcount == 1` is sound.**
+
+Three consequences for the implementation:
+
+1. `FOLL_PIN` adds `GUP_PIN_COUNTING_BIAS` (1024). The gate is `== 1`; a pin
+   appears as +1024, not +1. Code must not assume small increments.
+2. **No notification.** Without `page_free` nothing signals the last reference
+   dropping, so a deferred release needs a retry trigger: `-EBUSY` on close,
+   retried at process exit, session teardown, or the module-load `RESET`.
+3. The GENERIC baseline is exactly 1, which keeps the gate a constant compare.
+
+## A test bug that impersonated a blocker
+
+The first run of this reported `refcount unmap=1025 drop=1025`, i.e. "unpin
+does not work on ZONE_DEVICE pages" -- which would have been a genuine dead
+end. It was the probe: `copy_from_user()` ran for every ioctl including
+`ZD_IOC_DROP`, an `_IO` with no argument, so it returned `-EFAULT` before
+reaching the switch and the unpin never executed. The tell was in the kernel
+log -- a `HELD pin` line with no matching `dropping held pin` line. Check that
+the code under test actually ran before believing a negative result.
