@@ -321,3 +321,27 @@ revocation that holds when A exits first. That is a security design task.
 security-sensitive VMM work for the fork/multi-process case that actually
 matters; and the guest-side repointing of foreign VMAs remains the larger
 piece either way.
+
+### Measured: session : isolate : guest mm are 1:1
+
+Two comments appeared to disagree -- the guest says sessions are keyed by `mm`
+(so fork makes a new one), while the host annotates `isolate_ids[256]` as
+"one per guest mm", which would only make sense if a session spanned several
+mms. Resolved by measurement rather than by re-reading them.
+
+Two concurrent CUDA processes in one guest:
+
+    2 session 1 RING MAPPED
+    2 session 2 RING MAPPED
+    distinct sessions seen: session 1 session 2
+
+Two processes, two sessions. The guest calls
+`nvkvm_session_get_or_create(current->mm, current->tgid)` and creates exactly
+one isolate per session, so session, isolate and guest `mm` are 1:1 in
+practice; the 256-slot array is headroom, not fan-out.
+
+**Consequence:** a buffer shared between two processes is cross-session *by
+construction*, never incidentally. The `h->session_id == req->session_id` gate
+in `MMAP_ON_ISOLATE` therefore always blocks it, and the cross-session grant is
+unavoidable for the fork/memfd case rather than being an edge case to design
+around.
