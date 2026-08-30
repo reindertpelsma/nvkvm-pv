@@ -58,3 +58,57 @@ nvkvm allocates window GPAs from the base upward, so any real implementation
 must own the pgmap and coordinate with its own allocator rather than layering
 on top. The destination test above deliberately sits 32 GiB into the window to
 avoid this.
+
+# The blocker is the SOURCE, measured
+
+Same destination pgmap, same code path, only the source VMA shape changed:
+
+    VMA anonymous=1  (MAP_PRIVATE|MAP_ANONYMOUS)  -> after pages(): migrated=YES
+    VMA anonymous=0  (MAP_SHARED|MAP_ANONYMOUS)   -> after pages(): migrated=NO
+
+So `migrate_vma` *will* move a private anonymous page into device memory. It
+refuses a shmem page. `cuMemHostAlloc` returns `MAP_SHARED|MAP_ANONYMOUS`,
+which is shmem, so the memory that needs moving is exactly the kind it will not
+move.
+
+An earlier explanation here -- "GENERIC is the wrong destination type" -- was
+wrong: `MEMORY_DEVICE_PRIVATE` was refused too, for the same shmem source.
+
+## The two APIs have complementary gaps
+
+| | shmem source | ZONE_DEVICE destination |
+|---|---|---|
+| `migrate_vma_*` | **refused** (measured) | accepted (PRIVATE) |
+| `migrate_pages()` | accepted (NUMA/compaction move page cache this way) | **refused** (`PageLRU=0`, measured) |
+
+Neither pairing works on a stock kernel. And this is the same fact that blocked
+the address_space route and the all-views-VMA route: **shmem owns those pages**,
+so no third party can re-home them.
+
+## The one combination that could work
+
+`migrate_pages()` takes a `new_folio_t` callback -- the caller chooses the
+destination folio. It accepts shmem sources. So a *normal* folio that happens
+to live in host-visible memory would satisfy both sides at once.
+
+That requires the window to be normal System RAM rather than ZONE_DEVICE:
+hotplug it with `add_memory_driver_managed()`, then immediately reserve all of
+it with `alloc_contig_range()` so nothing is ever handed to the general
+allocator, and serve migration destinations from that reserve.
+
+Costs, both real:
+
+- The window must be **fully backed**, not sparse -- System RAM cannot contain
+  GPAs that fault to the VMM.
+- Every page must be carved out at init. Any part left to the general allocator
+  is guest memory that can land in host-visible pages, which inverts the
+  isolation property. Reserving all of it restores the property, but it has to
+  be all.
+
+## Teardown hazard found
+
+A successful migration into `MEMORY_DEVICE_PRIVATE` left the module unremovable
+(refcount -1): `memunmap_pages()` waits for every device page to be freed, and
+the probe implements `migrate_to_ram` as `VM_FAULT_SIGBUS` rather than
+migrating back. A real implementation must implement `migrate_to_ram`
+faithfully, or teardown hangs the guest. Recovering needs a guest reboot.
