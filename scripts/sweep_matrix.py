@@ -624,11 +624,23 @@ def install_driver(S, ver, arch, log):
     # /root/drvinstall.log, so the log for a failed install was overwritten by
     # the next driver before anyone could read it -- and `log`, the parameter
     # naming the file, was accepted and then ignored.
-    attempts = [
-        f"{ccenv}/root/drv.run {base} {mod}",
-        f"{ccenv}/root/drv.run {base} {other}",
-        f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
-    ]
+    # On an architecture that REQUIRES the open module, never fall back to the
+    # other flavour.  Blackwell/Hopper cannot bind the proprietary module at
+    # all, so "try the opposite" can only install something that loads and then
+    # reports no GPU -- which reads downstream as "this driver predates the
+    # silicon" and hides the real failure (the open build not compiling).
+    # Keep the flavour fixed and let the build error speak instead.
+    if kernel_open:
+        attempts = [
+            f"{ccenv}/root/drv.run {base} {mod}",
+            f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
+        ]
+    else:
+        attempts = [
+            f"{ccenv}/root/drv.run {base} {mod}",
+            f"{ccenv}/root/drv.run {base} {other}",
+            f"{ccenv}/root/drv.run {base} --no-cc-version-check {mod}",
+        ]
     rc = 1
     for i, cmd in enumerate(attempts):
         redir = ">" if i == 0 else ">>"
@@ -654,11 +666,23 @@ def install_driver(S, ver, arch, log):
         return False, (tail[-1100:] + hint), None
 
     sh(f"{S} 'modprobe nvidia; modprobe nvidia_uvm; true'", timeout=180)
+    # Which module flavour actually ended up loaded.  Until now this was only
+    # ever checked for OPEN_MODULE_ARCHES, so a sweep could not tell you whether
+    # its green rows were proprietary or OGKM -- the single most basic fact
+    # about what was tested.  "Dual MIT/GPL" is the open module, "NVIDIA" the
+    # proprietary one.
+    lic, _ = sh(rsh(S, "modinfo nvidia 2>/dev/null | "
+                       "awk '/^license:/{$1=\"\"; print}'"), timeout=90)
+    lic = (lic or "").strip()
+    flavour = ("open" if ("MIT" in lic or "GPL" in lic)
+               else "proprietary" if "NVIDIA" in lic
+               else "unknown")
     got = installed_driver_version(S)
     if got != use_ver:
         raw, _ = sh(f"{S} 'cat /proc/driver/nvidia/version 2>/dev/null | head -1'", timeout=60)
         return False, f"installed {use_ver} but /proc reports: {raw.strip()[:200]}", None
-    detail = f"{use_ver}" + ("" if use_ver == ver else f" (SUBSTITUTE for unpublished {ver})")
+    detail = (f"{use_ver} [module={flavour}]"
+              + ("" if use_ver == ver else f" (SUBSTITUTE for unpublished {ver})"))
     return True, detail, use_ver
 
 

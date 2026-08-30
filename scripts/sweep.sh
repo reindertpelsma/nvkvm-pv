@@ -1776,6 +1776,25 @@ print(out)
 }
 
 # ---------------------------------------------------------------------------
+# which NVIDIA kernel-module flavour is loaded RIGHT NOW
+# ---------------------------------------------------------------------------
+# A sweep that cannot say whether it tested the proprietary module or the open
+# one (OGKM) is missing the most basic fact about what it measured.  This was
+# previously queried only for OPEN_MODULE_ARCHES, so ampere/turing/ada rows
+# recorded nothing at all and the flavour had to be INFERRED from the installer
+# attempt order.  Record it instead.
+#   "Dual MIT/GPL" -> open (OGKM)      "NVIDIA" -> proprietary
+module_flavour() {
+    local lic
+    lic="$(rsh_t 90 'modinfo nvidia 2>/dev/null | awk "/^license:/{\$1=\"\"; print}"' 2>/dev/null | tr -d '\r' | tr -s ' ')"
+    case "$lic" in
+        *MIT*|*GPL*) printf 'open' ;;
+        *NVIDIA*)    printf 'proprietary' ;;
+        *)           printf 'unknown' ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
 # raw log collection -- the box is about to be destroyed and takes its logs with
 # it unless they are pulled off first
 # ---------------------------------------------------------------------------
@@ -2032,6 +2051,7 @@ sweep_drivers_on_box() {
         emit "$(jrec arch "$arch" gpu "$gpu" driver "control:$cur0" driver_actual "$cur0" \
                 abi_expected "$(abi_expected "$cur0")" abi_selected "${VR_ABI:-?}" \
                 status "control-$VR_STATUS" summary "${VR_SUMMARY:-}" \
+                module "$(module_flavour)" \
                 failed_checks "${VR_FAILED:0:1000}" \
                 instance "$iid" machine "$machine" role "control" \
                 detail "preinstalled driver, measured before any purge; not a driver-set row and not counted toward --min-drivers" \
@@ -2150,6 +2170,7 @@ sweep_drivers_on_box() {
             driver_substituted "$([ "$actual" = "$drv" ] && echo false || echo true)" \
             abi_expected "$prof" abi_selected "${VR_ABI:-?}" abi_matches_header "$abi_ok" \
             status "$VR_STATUS" summary "${VR_SUMMARY:-}" validate_rc "${VR_RC:-}" \
+            module "$(module_flavour)" \
             failed_checks "${VR_FAILED:0:1000}" \
             instance "$iid" machine "$machine" dph "$CUR_DPH" \
             seconds "$dur" rationale "$why" role "driver-set" \
