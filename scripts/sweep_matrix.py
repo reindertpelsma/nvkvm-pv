@@ -40,6 +40,7 @@ USAGE
     ./scripts/sweep_matrix.py --render        # re-render the table only
     ./scripts/sweep_matrix.py --check-tree    # does the tree match HEAD? (free)
 """
+import os
 import argparse, json, os, re, shlex, subprocess, sys, time, datetime
 
 KVM_IMAGE = "docker.io/vastai/kvm:ubuntu_cli_22.04-2025-05-16"
@@ -503,6 +504,16 @@ def install_driver(S, ver, arch, log):
     three matrix rows are no longer published and fall back to DRIVER_ALTS.
     """
     kernel_open = arch in OPEN_MODULE_ARCHES
+    # NVKVM_FORCE_MODULE lets a sweep pin the flavour on an architecture that
+    # can run either.  Our ABI table is EXTRACTED FROM OGKM headers, so testing
+    # only the proprietary module means validating open-module-derived struct
+    # layouts against the closed implementation -- they should agree, which is
+    # exactly the kind of assumption a sweep exists to kill.  Never used to
+    # weaken an arch that REQUIRES open (Blackwell/Hopper cannot bind the
+    # proprietary module at all), so the force is ignored there.
+    _force = os.environ.get("NVKVM_FORCE_MODULE", "").strip().lower()
+    if _force in ("open", "proprietary") and arch not in OPEN_MODULE_ARCHES:
+        kernel_open = (_force == "open")
 
     # This must precede even the fast path.  A preinstalled driver does not
     # need replacing, but validating nvkvm while the desktop template's Xorg
