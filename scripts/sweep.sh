@@ -1598,7 +1598,7 @@ PY
 # Recomputing that verdict as `fail == 0` would bank a run with skipped checks
 # as a success, which is exactly what this sweep exists to prevent.
 # ---------------------------------------------------------------------------
-VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""
+VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""; VR_FAILED=""
 
 # A transient unit name is reused for every driver on the box.  `journalctl -u`
 # therefore grows monotonically: after N driver boots it contains the DENY/AUDIT
@@ -1614,7 +1614,7 @@ invocation_journal_query() {
 
 boot_and_validate() {
     local drv="$1" gpu="$2" rc bundles G mod out booted=0 vm_inv vm_journal
-    VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""
+    VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""; VR_FAILED=""
 
     # The host-libs bundle is the HOST DRIVER's userspace and MUST be rebuilt
     # after every swap.  Staging a 580 bundle against a 535 kernel module fails
@@ -1753,6 +1753,19 @@ import json,sys
 try: v = json.load(sys.stdin)
 except Exception: sys.exit(0)
 print("%sP/%sF/%sS" % (v.get("pass","?"), v.get("fail","?"), v.get("skip","?")))
+' 2>/dev/null)"
+    # The count alone is not diagnosable. Keep the NAMES of the checks that
+    # failed (and of skips, which is how a failing check cascades into a dozen
+    # "S"), so a red row can be read after the box is gone.
+    VR_FAILED="$(printf '%s' "$VR_JSON" | python3 -c '
+import json,sys
+try: v = json.load(sys.stdin)
+except Exception: sys.exit(0)
+bad = [c.get("name","?") for c in v.get("checks",[]) if c.get("status") == "FAIL"]
+first_skip = [c.get("name","?") for c in v.get("checks",[]) if c.get("status") == "SKIP"][:3]
+out = ",".join(bad)
+if first_skip: out += "  (skipped after: " + ",".join(first_skip) + ")"
+print(out)
 ' 2>/dev/null)"
     case "$VR_RC" in
         0) VR_STATUS="pass" ;;
@@ -2019,6 +2032,7 @@ sweep_drivers_on_box() {
         emit "$(jrec arch "$arch" gpu "$gpu" driver "control:$cur0" driver_actual "$cur0" \
                 abi_expected "$(abi_expected "$cur0")" abi_selected "${VR_ABI:-?}" \
                 status "control-$VR_STATUS" summary "${VR_SUMMARY:-}" \
+                failed_checks "${VR_FAILED:0:1000}" \
                 instance "$iid" machine "$machine" role "control" \
                 detail "preinstalled driver, measured before any purge; not a driver-set row and not counted toward --min-drivers" \
                 warnings "${VR_WARNINGS:0:4000}" ts "$(date -u +%FT%TZ)")"
@@ -2136,6 +2150,7 @@ sweep_drivers_on_box() {
             driver_substituted "$([ "$actual" = "$drv" ] && echo false || echo true)" \
             abi_expected "$prof" abi_selected "${VR_ABI:-?}" abi_matches_header "$abi_ok" \
             status "$VR_STATUS" summary "${VR_SUMMARY:-}" validate_rc "${VR_RC:-}" \
+            failed_checks "${VR_FAILED:0:1000}" \
             instance "$iid" machine "$machine" dph "$CUR_DPH" \
             seconds "$dur" rationale "$why" role "driver-set" \
             warnings "${VR_WARNINGS:0:4000}" detail "${VR_DETAIL:0:3000}" \
