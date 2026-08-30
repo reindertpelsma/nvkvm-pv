@@ -542,11 +542,27 @@ uint32_t nvkvm_handle_close_all(struct nvkvm_handle_table *t)
 
 void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_id)
 {
+	/*
+	 * DIAG(temp): how much does this actually reclaim?
+	 *
+	 * The guest closes handles explicitly on its unmap paths
+	 * (close_handle_on_isolate then close_handle), but
+	 * nvkvm_session_put() does NOT sweep them at teardown -- it kills the
+	 * isolate and comments "QEMU frees the GPA + memfd on isolate kill".
+	 * So this is either a pure backstop that never fires in practice, or
+	 * the actual reclaim path the guest depends on. Removing it in favour
+	 * of explicit close is safe in the first case and leaks on every
+	 * process exit in the second. Count before deciding.
+	 */
+	uint32_t nmem = 0, nnv = 0, nref = 0;
+
 	pthread_mutex_lock(&t->lock);
 	for (int i = 1; i < NVKVM_HANDLE_MAX; i++) {
 		struct nvkvm_handle *h = &t->handles[i];
 		if (!h->in_use || h->session_id != session_id)
 			continue;
+		if (h->type == NVKVM_HANDLE_TYPE_MEMORY) nmem++; else nnv++;
+		if (h->isolate_refcount > 0) nref++;
 		if (h->fd >= 0) {
 			close(h->fd);
 			h->fd = -1;
@@ -554,4 +570,10 @@ void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_i
 		h->in_use = false;
 	}
 	pthread_mutex_unlock(&t->lock);
+
+	if (nmem || nnv)
+		fprintf(stderr,
+			"nvkvm DIAG: close_session(%u) force-closed %u memfd + "
+			"%u nvidia handle(s), %u still isolate-referenced\n",
+			session_id, nmem, nnv, nref);
 }
