@@ -3585,8 +3585,39 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		 * command at offset 8, so a block shorter than 12 bytes does
 		 * not contain one.)
 		 */
-		if (cc_readable && nvkvm_ctrl_cmd_noop(cc) &&
-		    req->aux_size <= (1u << 20)) {
+		/* NO aux_size CONDITION HERE, DELIBERATELY.  The 1 MiB cap below
+		 * bounds what we FORWARD to the host driver; a no-op forwards
+		 * nothing and reads nothing -- it answers NV_OK and returns.
+		 * Gating the no-op on aux_size only meant that an oversized aux
+		 * made an intentionally-answered command fall through to
+		 * nvkvm_ctrl_cmd_allowed(), which does not list it (it is in
+		 * nvkvm_ctrl_noop[], not the allowlist), and so it was DENIED.
+		 *
+		 * MEASURED 2026-08-30 on the SteamOS guest: 193 consecutive
+		 *   nvkvm: DENY ctrl cmd 0xa06f0111
+		 * = NVA06F_CTRL_CMD_RESTART_RUNLIST, the control the driver
+		 * issues to recover a GPU channel after a fault.  The guest
+		 * received NV_ERR_NOT_SUPPORTED where the design intends NV_OK,
+		 * mid-recovery.  Immediately afterwards every vCPU parked at one
+		 * RIP with zero disk I/O -- a guest deadlock -- with no OOM, no
+		 * hung-task and no filesystem error.
+		 *
+		 * CONTROLLED 2026-08-30, and the result narrows this sharply:
+		 * rebuilding the SAME tree with only this patch reverted also
+		 * produced ZERO denials (345 NO-OPs instead).  So these controls
+		 * never exceed the 1 MiB cap in practice -- the 23,568 baseline
+		 * denials came from an OLD build that had no nvkvm_ctrl_noop[]
+		 * table at all, not from this gate.  This change is therefore
+		 * correct in principle and, on the workload measured, changes
+		 * nothing.  It is kept because gating a no-op on the size of a
+		 * buffer it never reads is wrong regardless.
+		 *
+		 * It does NOT fix the guest deadlock, which still reproduces:
+		 * with the GPU active during steamos-update the guest goes
+		 * unreachable in 60-90s, 7/8 vCPUs in HLT and one spinning at a
+		 * fixed RIP, I/O frozen.  The same OTA with the GPU path dead
+		 * completes, so that hang tracks GPU activity, not this gate. */
+		if (cc_readable && nvkvm_ctrl_cmd_noop(cc)) {
 			NVKVM_DBG("nvkvm: NO-OP ctrl cmd 0x%08x "
 				  "(scheduling priority; not forwarded)\n", cc);
 			resp->retval     = 0;
