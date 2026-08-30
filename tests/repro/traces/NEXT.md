@@ -1,66 +1,44 @@
 # Nested L2 pinned-sysmem zeros — what's still missing
 
-Status at 2026-08-30 (PC powered off mid-investigation).
+Status 2026-08-30. Findings are written up in
+`docs/investigations/nested-nvkvm-l2/ZEROS.md`; this file is only the
+still-open measurement.
 
-## Established
+## Corrected: the oops is NOT the suspect
 
-At L2, `cuMemHostAlloc` pinned sysmem is **not shared**: the CPU and the GPU
-resolve it to two disjoint sets of physical pages.
+An earlier revision of this file named a kernel oops in the L2 guest as the
+prime suspect and said the root cause should not be written up until that trace
+existed. **The trace was captured, and it exonerates the oops.** It is:
 
-- P1: CPU writes the buffer, GPU reads zeros.
-- P2: GPU writes 0xEE, CPU still sees the buffer untouched.
+    WARNING: CPU: 1 PID: 2442 at mm/memory.c:5514 handle_mm_fault+0x327/0x380
+    Comm: nvz2   CR2: 00005dd31fb6e000
+    nvz2[2442]: segfault at 5dd31fb6e000 ... error 7
 
-Every previously-reported symptom follows from that one fact, including the
-"cuMemAlloc returns zeros" framing this started as. HtoD is *not* broken --
-it appeared to work because the GPU genuinely received data; the DtoH read
-came back from the other page set. L1 is byte-exact throughout, so this is
-specific to the second nesting level.
+`0x5dd31fb6e000` is the address probe step **P3** (`cuMemHostRegister` + kernel
+dereference) printed for its own buffer, and **the same probe crashes
+identically at L1** — `EXIT=139` at `[P3]` on the control run. So it is a
+pre-existing `cuMemHostRegister` fault, present at both levels, that merely
+happened to log next to the failure. It is not nesting-specific and it is not
+the zeros. Adjacency, not causation.
 
-The guest module logs a **kernel oops immediately after a 16-page migration**
-(64 KiB -- exactly the probe's buffer) in the path that relocates guest anon
-pages into the shared window. That is the prime suspect and is very likely
-the same bug, not a second one.
+(That `cuMemHostRegister` crash is real and worth its own ticket. It is not this
+one.)
 
-## The one thing still uncaptured
+## The one measurement still open
 
-The full oops trace from the **L2 guest's** dmesg. Host dmesg has no matching
-lines; the oops is inside L2. Note `dmesg` is restricted in the guests -- it
-needs `sudo`, which is why the first capture attempt returned only
-"Operation not permitted" and the second returned only an SSH timeout.
+Which of the two sysmem-aliasing mechanisms breaks, and confirmation of the
+proposed mechanism for the OS_DESCRIPTOR path. The instrument is already
+committed on `fix/nested-l2-htod-zeros`: `migrate_range` now prints
+`comm/pid/gva/file/magic/vmflags`.
 
-    /root/nested-l2/l1.sh "./l2.sh \"sudo dmesg | grep -iE 'nvkvm|BUG:|Oops|Call Trace|RIP:|migrat' | tail -80\""
+    # rebuild L1's guest module from this branch, boot L1 and L2, then at L1:
+    sudo dmesg | grep 'DIAG: migrate_range'
 
-Both levels must be booted first, which takes several minutes.
+Confirms the mechanism if, during an **L2** CUDA run, L1 logs migrations whose
+`comm` is the isolate stub and whose VMA is `file=1 magic=0x1021994` (TMPFS) —
+i.e. L1 is relocating a memfd that L1's own QEMU is simultaneously exposing to
+L2 as guest RAM. In the flat case the same line should read `file=0` (plain
+anonymous memory belonging to the CUDA process itself).
 
-## Why the trace decides it
-
-The working hypothesis is that at L2 the "shared window" is itself L1
-guest-physical, so pages already migrated once get migrated a second time,
-and the second relocation is what splits the CPU's view from the GPU's. If
-the trace lands in the migration path, the fix belongs in the **guest
-module**, not QEMU. Until the trace exists this is a strong hypothesis and
-should not be written up as a root cause.
-
-## Repro sources (this box, uncommitted)
-
-`tests/repro/nested_vidmem_zeros.c`, `nested_pinned_sysmem.c`,
-`nested_pinned_vma.c` on branch `fix/nested-l2-htod-zeros`.
-
-## Possible offline shortcut (added after poweroff)
-
-`dmesg` is a RAM ring buffer, so the oops died with the poweroff. But if the
-L2 guest runs persistent journald, the same oops was written into the guest
-image and survives on disk. Try this before re-running the whole nested
-stack -- it needs no boot:
-
-    # find the L2 guest image, then:
-    modprobe nbd max_part=8
-    qemu-nbd -r -c /dev/nbd0 <l2-guest>.qcow2     # -r: read-only, do not mutate
-    mkdir -p /mnt/l2 && mount -o ro /dev/nbd0p2 /mnt/l2
-    journalctl -D /mnt/l2/var/log/journal -k --no-pager \
-      | grep -iE 'nvkvm|BUG:|Oops|Call Trace|RIP:|migrat' | tail -80
-    umount /mnt/l2 && qemu-nbd -d /dev/nbd0
-
-If `/mnt/l2/var/log/journal` is absent or empty, persistent logging was off
-and the trace is genuinely gone -- fall back to re-running the stack and the
-`l1.sh`/`l2.sh` capture above.
+Note `dmesg` needs `sudo` in both guests, and both levels must be booted, which
+takes several minutes.
