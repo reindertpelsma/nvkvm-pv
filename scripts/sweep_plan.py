@@ -70,6 +70,39 @@ def build_abiq():
     return out
 
 
+
+# ---------------------------------------------------------------------------
+# driver branch -> newest Linux kernel its .run can BUILD against
+# ---------------------------------------------------------------------------
+# A driver that cannot compile is not a test result, it is a wasted rental.
+# Measured 2026-08-30 on vast image ubuntu_cli_22.04 (HWE kernel 6.8.0-59):
+# 515.43.04 fails in nv-mm.h with
+#   error: too many arguments to function 'get_user_pages_remote'
+#   error: passing argument 1 ... from incompatible pointer type [-Werror]
+# because the kernel changed that signature after the driver shipped. The same
+# shape kills every pre-550 branch on a 6.8 host.
+#
+# Values are NVIDIA's published "latest supported kernel" per branch, rounded
+# down to the last release the branch is known to build on. They are a FLOOR on
+# caution, not a guarantee: a branch may fail earlier for other reasons.
+KERNEL_MAX = {
+    515: (5, 19), 520: (5, 19), 525: (6, 2),  530: (6, 3),  535: (6, 5),
+    545: (6, 6),  550: (6, 9),  555: (6, 10), 560: (6, 11), 565: (6, 11),
+    570: (6, 13), 575: (6, 14), 580: (6, 16), 590: (6, 17), 595: (6, 17),
+    610: (6, 18),
+}
+
+
+def builds_on(ver, kernel):
+    """Can this driver's kernel module compile on this host kernel?"""
+    if kernel is None:
+        return True
+    branch = int(ver.split(".")[0])
+    cap = KERNEL_MAX.get(branch)
+    if cap is None:
+        return True
+    return kernel <= cap
+
 def profile_of(abiq, ver):
     try:
         return int(subprocess.check_output([abiq, ver], text=True).strip())
@@ -83,6 +116,11 @@ def main():
     ap.add_argument("--arches", default="ampere,turing,ada,blackwell,hopper")
     ap.add_argument("--nodes-per-arch", type=int, default=1,
                     help="how many hosts to plan per architecture")
+    ap.add_argument("--host-kernel", default="6.8",
+                    help="kernel of the rented box (MAJOR.MINOR). Drivers whose "
+                         "modules cannot build on it are excluded -- an "
+                         "uninstallable driver is a wasted rental, not a result. "
+                         "Pass 'any' to disable the check.")
     ap.add_argument("--available",
                     default=os.path.join(REPO, "scripts", "sweep-driver-availability.tsv"),
                     help="TSV of which versions actually ship a .run installer; "
@@ -100,6 +138,7 @@ def main():
     abiq = build_abiq()
 
     tags = [l.strip() for l in open(a.tags) if l.strip()]
+    n_published = len(tags)
 
     # Publishing an OGKM tag and publishing a downloadable driver are different
     # things. Planning a version with no .run sends a box to a guaranteed
@@ -124,6 +163,18 @@ def main():
             sys.exit("every tag is unobtainable per %s -- the map is likely "
                      "stale or was probed from a blocked network (403 != 404)"
                      % a.available)
+
+    hk = None
+    if a.host_kernel and a.host_kernel != "any":
+        try:
+            parts = a.host_kernel.split(".")
+            hk = (int(parts[0]), int(parts[1]) if len(parts) > 1 else 0)
+        except Exception:
+            sys.exit("--host-kernel must look like 6.8, or be 'any'")
+        too_new = [t for t in tags if not builds_on(t, hk)]
+        tags = [t for t in tags if builds_on(t, hk)]
+        if not tags:
+            sys.exit("no driver in the pool can build on kernel %s" % a.host_kernel)
 
     used = set()
     if a.used and os.path.exists(a.used):
@@ -172,10 +223,14 @@ def main():
 
     print(f"sweep plan: {len(plan)} node(s), "
           f"{sum(len(p['drivers']) for p in plan)} driver run(s)")
-    print(f"  {len(tags)} obtainable tags; {len(taken - used)} newly claimed this plan; "
+    print(f"  {len(tags)} plannable tags; {len(taken - used)} newly claimed this plan; "
           f"{len(tags) - len(taken)} still untested after it")
+    if hk is not None and too_new:
+        print(f"  {len(too_new)} obtainable version(s) cannot build on kernel "
+              f"{a.host_kernel} and are NOT planned (older branches need an "
+              f"older-kernel box; see KERNEL_MAX)")
     if unobtainable:
-        print(f"  {len(unobtainable)} of {len(tags) + len(unobtainable)} published OGKM tags "
+        print(f"  {len(unobtainable)} of {n_published} published OGKM tags "
               f"ship no .run installer and are NOT planned (they would fail the box)")
     print()
     for p in plan:
