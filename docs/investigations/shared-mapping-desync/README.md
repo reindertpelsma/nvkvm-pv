@@ -502,3 +502,30 @@ rather than something a normal CUDA program does by accident.
 output. That is stdio, not a second registration -- the parent's `printf` was
 still buffered at `fork()`, so the child inherited a copy and flushed it on
 exit.
+
+## App matrix: CUDA compute suite passes with the fix
+
+**Measured 2026-08-31**, RTX 3050 guest under nvkvm, `tests/perf/matrix_remote.sh`
+(needed `nvidia-cuda-toolkit` installed in the guest first -- no nvcc by default,
+which is why this section had never run there).
+
+    stream_triad    184.6 GB/s      ok      sgemm_cublas   3.47 TFLOP/s  ok
+    reduce           73.0 GB/s      ok      fft_cufft      686.4 GFLOP/s ok
+    nbody          2721.5 GFLOP/s   ok      sha256         462.0 MH/s    ok
+    blackscholes  11537.6 Mopt/s    ok      memcpy2d        8.41 GB/s    ok
+    conv2d          561.0 GFLOP/s   ok
+
+Real nvcc-built applications on the CUDA **runtime** API plus cuBLAS and cuFFT
+-- paths `validate.sh` does not reach, since it is driver-API only. All pass
+with the `VM_SHARED` fix in place.
+
+Note what this also confirms about the bug's reach: the matrix would **not**
+have caught it either. These apps allocate device memory and use ordinary
+`cudaMemcpy`; none registers a `malloc`'d host buffer with
+`cuMemHostRegister`, which is the only path that was broken. Together with the
+30 driver-API checks and the GL/Vulkan app set, that is why a year-old bug in
+ordinary heap registration went unseen.
+
+The PyTorch, gpu-burn and llama.cpp sections did not run -- no venv, no
+gpu-burn source, no model in this guest -- so they are untested here rather
+than passing.
