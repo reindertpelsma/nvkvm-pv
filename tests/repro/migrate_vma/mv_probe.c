@@ -131,6 +131,18 @@ static long mv_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 			pr_info("mv_probe: after pages(): src[0]=0x%lx migrated=%s\n",
 				src[0],
 				(src[0] & MIGRATE_PFN_MIGRATE) ? "YES" : "NO -- refused");
+			/*
+			 * If the migration was refused the destination was never
+			 * consumed, so its lock and reference are still ours. Not
+			 * releasing them wedges the module: memunmap_pages() waits
+			 * for every page to be free, so rmmod hangs and the module
+			 * sticks at refcount -1, unremovable without a reboot.
+			 * Measured the hard way.
+			 */
+			if (!(src[0] & MIGRATE_PFN_MIGRATE)) {
+				unlock_page(dpage);
+				put_page(dpage);
+			}
 			migrate_vma_finalize(&mig);
 		} else {
 			migrate_vma_pages(&mig);
