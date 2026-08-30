@@ -2315,6 +2315,7 @@ while [ $i -lt ${#RESULT_NAMES[@]} ]; do
 done
 
 TOTAL=${#RESULT_NAMES[@]}
+TOTAL=${#RESULT_NAMES[@]}
 # ---------------------------------------------------------------------------
 # host-memory registration invariants
 # ---------------------------------------------------------------------------
