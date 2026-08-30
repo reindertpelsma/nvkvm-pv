@@ -244,3 +244,41 @@ so a child inheriting the mapping across `fork()` inherits something already
 host-visible and it simply works. That is a bounded guest-module change and it
 covers the common pattern of allocating pinned staging buffers, without
 needing (1)-(3) above.
+
+## Confirmed: sharing a memfd between isolates already works
+
+Checked against `nvkvm_req_mmap_on_isolate()`. The permission gate is
+
+    if (h->session_id != req->session_id ||
+        !session_has_isolate(nv, req->session_id, req->isolate_id))
+            resp->status = EPERM;
+
+which binds a handle to a **session**, not to an isolate. Naming a different
+`isolate_id` of the same session passes. Memfds are first-class here --
+`NVKVM_HANDLE_TYPE_MEMORY` lives in the same per-device
+`VirtIONvgpu.handles` table as `TYPE_NVIDIA`, and `isolate_refcount` is
+documented as "# isolates that hold this handle", plural by design. So one
+pinned buffer's memfd can back several isolates **with existing commands and
+no VMM change**, the same way RM objects are shared.
+
+### This also narrows an earlier over-correction
+
+A previous section claimed range-granting an fd "is not a thing". Too broad.
+`MMAP_ON_ISOLATE` *does* bounds-check `(offset, length)` against the object --
+`obj_end` from `h->size`, plus `length <= nv->sparse_size` -- so range-limited
+granting exists **for a bounded object**. The objection only holds when the
+object is all of guest RAM, where a check against `h->size` constrains nothing
+and per-range policy would have to come from somewhere else (seccomp
+user-notify). A design that keeps one memfd per pinned buffer stays in the
+regime that already works; a design that hands over the whole guest-RAM object
+does not.
+
+### What is actually left
+
+Not the VMM. The open problem is guest-side: pointing *every* view at that one
+memfd means repointing the other processes' VMAs, which needs
+`mmap_write_lock` on foreign mms (against the kernel's mmap_lock-outer /
+i_mmap_rwsem-inner order) and replacing shmem's `vm_ops` on a VMA its owner
+never asked to have converted -- otherwise the next fault there repopulates the
+original page. That is the piece to prototype before calling this easy; the
+sharing primitive it depends on is already present.
