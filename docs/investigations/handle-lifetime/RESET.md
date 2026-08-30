@@ -58,3 +58,47 @@ bound on the last id.
 Unload safety (refusing while guest VMAs still point at the window) and the
 handle/session decoupling itself. Reset is the reclaim backstop those depend
 on, and is independently useful without them.
+
+# Is `close_session` load-bearing? Measured: no
+
+Removing `nvkvm_handle_close_session()` in favour of explicit close is safe
+only if the guest already reclaims its handles. `nvkvm_session_put()` does
+*not* sweep them -- it stops the pump, unmaps the ring, kills the isolate, and
+comments "QEMU frees the GPA + memfd on isolate kill" -- which reads as though
+the guest depends on the VMM for reclaim. It does not.
+
+Instrumented `close_session()` to report what it actually force-closes, and ran
+a CUDA workload that terminates **abnormally** (the probe segfaults at P3,
+`rc=139`), so the ungraceful path is the one covered:
+
+    nvkvm DIAG: close_session(1) force-closed 0 memfd + 0 nvidia handle(s),
+                0 still isolate-referenced          (x2)
+
+It runs, and finds nothing, every time. The guest's paired
+`close_handle_on_isolate` / `close_handle` calls have already reclaimed
+everything by the time the session is destroyed, because fd release runs during
+process teardown however the process died.
+
+**So `close_session` is a backstop that never fires in practice**, not the
+reclaim path. Dropping it costs nothing in the steady state, and `RESET` covers
+the case it was really guarding: state stranded when the guest module itself
+goes away without unwinding.
+
+### Print unconditionally when the question is "did this run?"
+
+The first version printed only non-zero counts, so zero lines were ambiguous
+between "found nothing" and "never called" -- the exact distinction being
+measured. Worth remembering: a diagnostic that is silent on the common case
+cannot answer a reachability question.
+
+### Not established
+
+One workload shape, two events. A process killed while holding many handles
+mid-registration was not tested, and neither was a guest kernel that fails
+during release. The claim is "does not fire for a normally-structured workload
+that dies abnormally", not "can never fire".
+
+### Temporary
+
+The `DIAG(temp)` commits on this branch instrument `close_session` and must be
+removed before it merges anywhere.
