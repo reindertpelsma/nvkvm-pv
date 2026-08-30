@@ -1825,15 +1825,21 @@ boot_kernel_series() {
 
     # Deliberately blunt: rather than construct a GRUB menuentry id (nested
     # grub-probe inside sed inside ssh -- fragile quoting that fails in the
-    # field, not in testing), remove the OTHER kernels so the default is the
+    # field, not in testing), remove every OTHER kernel so the default is the
     # only one left.  Purging the running kernel is safe here: the files stay
     # mapped until reboot, and the box is disposable.
+    #
+    # PURGE BY EXCLUSION, NOT BY GLOB.  MEASURED 2026-08-30: globbing
+    # 'linux-image-*-generic' and the hwe metapackages left the -kvm flavour
+    # installed ("kernels present after cleanup: 2"), GRUB booted
+    # 5.15.0-1079-kvm over 5.15.0-190-generic because 1079 sorts higher, and the
+    # drivers failed to build exactly as before -- with the log claiming GRUB had
+    # one choice.  Enumerate what dpkg actually has and drop everything that is
+    # not the kernel we picked.
     rsh_t 900 "DEBIAN_FRONTEND=noninteractive apt-get purge -y -qq \
-               'linux-image-*-generic' 'linux-headers-*-generic' \
-               'linux-image-generic-hwe-*' 'linux-headers-generic-hwe-*' \
-               --allow-remove-essential 2>/dev/null; \
-               DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-               linux-image-${have} linux-headers-${have} && update-grub" >/dev/null 2>&1 \
+               \$(dpkg-query -W -f='\${Package}\n' 'linux-image-*' 'linux-headers-*' 2>/dev/null \
+                  | grep -v -- '${have}' | tr '\n' ' ') 2>/dev/null; \
+               update-grub" >/dev/null 2>&1 \
         || { warn "  could not isolate ${have} as the only installed kernel"; return 1; }
 
     got="$(rsh_t 120 "ls -1 /boot/vmlinuz-* 2>/dev/null | wc -l" 2>/dev/null | tr -d '\r')"
@@ -1849,7 +1855,17 @@ boot_kernel_series() {
     done
     got="$(rsh_t 60 'uname -r' 2>/dev/null | tr -d '\r')"
     case "$got" in
-        "$want"*) info "  host kernel is now $got"; return 0 ;;
+        "$want"*)
+            # Landing on ${want}.x is necessary but NOT sufficient: the -kvm
+            # flavour is a ${want} kernel that still cannot build these drivers
+            # (no backlight class, GPL-only rcu symbol).  Refuse it explicitly
+            # rather than produce driver-install-failed rows that read like
+            # driver verdicts.
+            case "$got" in
+                *-generic) info "  host kernel is now $got"; return 0 ;;
+                *) warn "  landed on $got -- not a -generic flavour, which cannot build pre-550 drivers"
+                   return 1 ;;
+            esac ;;
         *) warn "  reboot landed on $got, not ${want}.x -- refusing to sweep on the wrong kernel"
            return 1 ;;
     esac
