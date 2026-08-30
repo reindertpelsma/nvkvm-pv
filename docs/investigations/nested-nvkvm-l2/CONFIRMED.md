@@ -66,3 +66,51 @@ migrating" from "memfd already aliased into a memslot". The guard needs to test
 aliasing, not filesystem type. The L1 control shows a naive tightening would
 regress the working case, since L1's legitimate migrations carry the same
 magic.
+
+## The guard, and what it costs
+
+`nvkvm_vma_file_is_memory()` now tests `IS_PRIVATE(inode)` as well as the
+superblock magic. Measured at both levels, one machine, one boot:
+
+| population | caller | `priv` | n |
+|---|---|---|---|
+| L1, libcuda's own pinned buffer | `comm=nps` | **1** | 5 |
+| L1, plain anonymous (no vm_file) | `comm=nps` | −1 | 1 |
+| L2, stub's aliased guest memfd | `comm=memfd:nvkvm_stu` | **0** | 6 |
+
+No overlap, so the guard rejects exactly the aliased case.
+
+**Verified after the change.** L1 control unchanged: `16384/16384` both
+directions, HtoD correct at every size. L2 now logs
+
+    nvkvm: refusing to migrate 0x707ebb621000-0x707ebb821000: the VMA is not
+    plain anonymous memory (vm_flags=0x80000fb file=1)
+    nvkvm: migrate_range(bulk) failed ret=-22 at chunk 0
+
+and CUDA fails honestly instead of returning zeros.
+
+### The trade-off is real and is a judgement call
+
+| | L2 score | CUDA at L2 | silent corruption | L1 panic risk |
+|---|---|---|---|---|
+| without the guard | **26P / 4F / 0S** | mostly works | **yes, 4 checks** | yes (async #PF) |
+| with the guard | **22P / 1F / 7S** | `cuCtxCreate` rc=304 | none | none observed |
+
+The guard costs *all* nested CUDA: `cuCtxCreate` needs the OS_DESCRIPTOR
+registration this path serves, so every CUDA check downstream skips. The
+headline nested number goes from 26/30 to 22/30 and that is not cosmetic.
+
+What survives at L2 is more than the number suggests: **Vulkan compute still
+dispatches and verifies on-GPU** (`vk_compute_dispatch`, 4096 elements checked),
+EGL and OpenGL still render and read back correctly. Nested GPU compute is
+therefore still available at L2 -- just not through CUDA's pinned-sysmem path.
+
+**Recommendation: keep the guard.** Silent numerical corruption with every
+ioctl returning success is the worst failure mode available, it also panicked
+the outer guest, and nesting is an experiment rather than a shipped feature --
+so the honest -EINVAL costs nothing real today. Reverting is one line if that
+judgement is wrong.
+
+The way to get 26/30 *and* correctness is the allocation change, not the guard:
+back the registration from a DMA-able window allocated once at the bottom
+level, instead of re-aliasing a memfd per level.
