@@ -289,6 +289,16 @@ static void nvkvm_tx_done_callback(struct virtqueue *vq)
 			inf->retval = le32_to_cpu(resp->handle_id);
 			break;
 		}
+		case NVKVM_REQ_RESET: {
+			/* Status only. The counts the VMM reports (isolates,
+			 * handles, sessions reclaimed) are diagnostics for its
+			 * own log; the guest has no use for them -- it is
+			 * asserting emptiness, not auditing the previous life. */
+			struct nvkvm_resp_reset *resp = (void *)(hdr + 1);
+			inf->status = le32_to_cpu(resp->status);
+			inf->retval = 0;
+			break;
+		}
 		case NVKVM_REQ_XISO_IMPORT: {
 			struct nvkvm_resp_xiso_import *resp = (void *)(hdr + 1);
 			inf->status = le32_to_cpu(resp->status);
