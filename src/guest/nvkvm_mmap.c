@@ -2299,6 +2299,9 @@ retry_mapcount:
 			goto err_unpin;
 		}
 	}
+	if (is_shmem_obj)
+		pr_info("nvkvm: MEASURE mapcount-check pid=%d passed after %u retries mc_allowed=%lu\n",
+			current->pid, mapcount_retries, mc_allowed);
 	}
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
