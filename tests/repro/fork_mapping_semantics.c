@@ -19,6 +19,14 @@
  *
  * PASS: shared behaves shared, private behaves private.
  * FAIL: private leaked (registration converted it), or shared did not share.
+ *
+ * NOT asserted: that the CHILD can drive CUDA. Measured on the stock NVIDIA
+ * driver, a forked child cannot initialise CUDA once the parent holds a
+ * context -- documented NVIDIA behaviour, nothing to do with nvkvm. Requiring
+ * it made this test fail against the reference implementation. The child's
+ * CUDA result is reported for information and does not affect the verdict;
+ * two INDEPENDENT processes sharing an fd (the /dev/nvkvm-mem case) is a
+ * different shape and is not what fork tests.
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -95,9 +103,10 @@ static int run_case(const char *name, int mapflags, int expect_shared)
 
     int shared_observed = (parent_sees_child > 0) || msg[1];
     if (shared_observed == expect_shared) {
-        printf("  => OK: behaves %s, and child CUDA %s\n",
-               expect_shared?"shared":"private", msg[0]?"worked":"FAILED");
-        return msg[0] ? 0 : 1;         /* CUDA must work in the child too */
+        printf("  => OK: behaves %s (child CUDA %s -- informational, the stock\n"
+               "     driver also refuses CUDA in a forked child)\n",
+               expect_shared?"shared":"private", msg[0]?"up":"unavailable");
+        return 0;
     }
     printf("  => WRONG: expected %s, observed %s\n",
            expect_shared?"shared":"private", shared_observed?"shared":"private");

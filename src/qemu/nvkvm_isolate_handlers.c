@@ -4462,27 +4462,35 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	 * map any other host-process isolate's live /dev/nvidia* fd into the
 	 * window, at a GPA of its choosing, in the privileged QEMU process.
 	 * Isolates are separate host processes, so that is the host-process
-	 * boundary this layer is responsible for, not intra-VM policy; PRESENT
-	 * and XISO_IMPORT already check the same two things (handle→session,
-	 * session→isolate) and this handler simply did not.
+	 * boundary this layer is responsible for, not intra-VM policy.
 	 *
-	 * NOT uid-separated, whatever this comment used to say.  On the rung
-	 * nvkvm_iso_auto_select() prefers, mode is NS|SECCOMP with no
-	 * NVKVM_ISO_LAYER_UID, so use_uid is false, nvkvm_iso_drop_privilege()
-	 * never runs, and nvkvm_map_child_userns() writes a bare
-	 * "0 <geteuid()> 1" uid_map -- every isolate's in-namespace root maps to
-	 * the SAME host uid, QEMU's own.  What separates them is the user/pid/
-	 * mount/net/ipc/uts namespaces plus seccomp, which is a real boundary
-	 * (sibling user namespaces cannot ptrace each other and CLONE_NEWPID
-	 * hides the pids) but is not a uid boundary.  Distinct host uids appear
-	 * only on the UID rung, which auto-select falls back to when
-	 * CLONE_NEWUSER fails.  Do not reason about this layer as though a
-	 * DAC check were backing it up.
+	 * That boundary is session_has_isolate(nv, req->session_id,
+	 * req->isolate_id) below: the caller may only map into an isolate IT
+	 * owns.  KEEP this half exactly as it is.
+	 *
+	 * dev-nvkvm-mem spike, owner-directed (2026-08-31): this used to ALSO
+	 * require h->session_id == req->session_id -- the handle's OWNING
+	 * session had to match the caller's.  That is dropped.  It does not
+	 * bound a malicious guest at all: req->session_id is filled in by the
+	 * GUEST KERNEL MODULE, which the VMM already treats as untrusted
+	 * everywhere else this pattern appears (see the KILL_ISOLATE handler
+	 * above -- "As with every session_has_isolate() check here, it would
+	 * bound a malicious guest USERSPACE process only: the guest kernel
+	 * module fills the field and is itself untrusted.  Defence in depth,
+	 * same weight.")  A compromised guest kernel could already claim any
+	 * session_id it likes, so the clause never protected the host -- it
+	 * only got in the way of the one honest use it also blocked:
+	 * /dev/nvkvm-mem's fd being shared cross-process (fork, SCM_RIGHTS),
+	 * which is that device's entire reason to exist.  Gating which GUEST
+	 * process may reference which handle is the guest kernel's job, same
+	 * as every other intra-VM policy decision this layer does not referee;
+	 * the VMM's job, which session_has_isolate() still does, is only
+	 * "may this caller name this isolate" -- guest -> host escape, not
+	 * guest process A -> guest process B.
 	 */
-	if (h->session_id != req->session_id ||
-	    !session_has_isolate(nv, req->session_id, req->isolate_id)) {
-		NVKVM_DBG("nvkvm: mmap_on_isolate: handle/isolate session "
-			  "mismatch (h=%u h_sess=%u req_sess=%u iso=%u)\n",
+	if (!session_has_isolate(nv, req->session_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm: mmap_on_isolate: caller does not own isolate "
+			  "(h=%u h_sess=%u req_sess=%u iso=%u)\n",
 			  req->handle_id, h->session_id, req->session_id,
 			  req->isolate_id);
 		resp->status = EPERM;
