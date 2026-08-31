@@ -69,7 +69,17 @@ int main(void)
 	volatile unsigned *B = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
 				    MAP_SHARED|MAP_ANONYMOUS, -1, 0);
 	if (B == MAP_FAILED) { perror("mmap"); return 2; }
-	for (unsigned i = 0; i < LEN/4; i++) B[i] = 0;
+	/*
+	 * Deliberately NOT touched here. Linux does not eagerly copy PTEs for
+	 * a shared file-backed VMA at fork() (the same fact
+	 * fork_both_register.c's bug hinged on) -- but if THIS process wrote
+	 * to B before forking, its own PTE would already be resident, and the
+	 * helper's otherwise-sole registration below would see mapcount 2
+	 * with nobody (yet) waiting to explain it, refusing for the same
+	 * reason shared_view_desync.c's parent is refused. Untouched, this
+	 * process contributes nothing until it deliberately registers, well
+	 * after the helper is gone -- exactly the shape this test wants.
+	 */
 
 	int pipefd[2];
 	if (pipe(pipefd)) { perror("pipe"); return 2; }
