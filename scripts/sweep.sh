@@ -163,6 +163,13 @@ GUEST_IMAGE_CACHE_SHA256=""
 GUEST_IMAGE_SERIES="${NVKVM_SWEEP_GUEST_SERIES:-noble}"
 GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
 GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
+# The qcow2 setup_guest.sh will produce.  noble keeps the historical name (three
+# other places test for that exact path); every other series is named for itself.
+if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
+    GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+else
+    GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
+fi
 PRESET="boundary"
 MIN_DRIVERS=5
 # The SteamOS product stage: off by default because it costs ~2h of box time and
@@ -298,6 +305,16 @@ while [ $# -gt 0 ]; do
                         esac
                         GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
                         GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
+                        # Recompute here too: the defaults block runs BEFORE
+                        # argument parsing, so without this --guest-image would
+                        # change the download and leave the launcher pointed at
+                        # noble's qcow2 -- the same class of mismatch this whole
+                        # change exists to remove.
+                        if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
+                            GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+                        else
+                            GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
+                        fi
                         shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
@@ -1397,11 +1414,7 @@ provision_box() {
     # run_test_vm.sh defaults to /opt/nvkvm-guest/ubuntu-24.04.qcow2.  Now that
     # the qcow2 is named for its series, point the launcher at the one we built
     # rather than letting it fall back to a name that may not exist.
-    if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
-        ENVP="$ENVP VM_IMG=/opt/nvkvm-guest/ubuntu-24.04.qcow2"
-    else
-        ENVP="$ENVP VM_IMG=/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
-    fi
+    ENVP="$ENVP VM_IMG=$GUEST_QCOW2"
     for step in build guest; do
         if ! quiesce_host_apt; then
             PROVISION_FAIL_DETAIL="$HOST_APT_DETAIL"
@@ -1692,7 +1705,15 @@ boot_and_validate() {
         return
     fi
 
-    rsh_t 200 'systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --working-directory=/root/nvkvm bash scripts/run_test_vm.sh' >/dev/null 2>&1
+    # VM_IMG MUST be passed as --setenv.  systemd-run starts the unit in a fresh
+    # environment, so nothing exported for the provisioning steps reaches it.
+    # The qcow2 is named for its series now, and run_test_vm.sh's built-in
+    # default is ubuntu-24.04.qcow2 -- so on any non-noble series the launcher
+    # looked for a file that does not exist, QEMU never started, and the run
+    # died as `vm-journal-scope-missing`, which reads like a systemd/journal
+    # problem and is really a missing disk image.  MEASURED on the first
+    # questing run, 2026-09-01.
+    rsh_t 200 "systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --setenv=VM_IMG='$GUEST_QCOW2' --working-directory=/root/nvkvm bash scripts/run_test_vm.sh" >/dev/null 2>&1
 
     vm_inv="$(rsh_t 90 'systemctl show nvkvm-vm.service --property=InvocationID --value 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
     if ! vm_journal="$(invocation_journal_query "$vm_inv")"; then
