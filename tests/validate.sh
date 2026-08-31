@@ -2347,12 +2347,14 @@ reg_invariant() {
 
 reg_invariant host_register_private_rw private_register_write.c \
     "MAP_PRIVATE and MAP_SHARED both writable after cuMemHostRegister"
-reg_invariant host_register_shared_refused shared_view_desync.c \
-    "a range another process maps is refused; both views stay coherent"
+reg_invariant host_register_shared_coherent shared_view_desync.c \
+    "two views of one shared buffer stay coherent (now by sharing, not refusal)"
 reg_invariant host_register_then_fork register_then_fork.c \
     "child sees the parent's writes after register-then-fork"
 reg_invariant host_register_cow_fork cow_after_fork.c \
     "child registered inherited COW heap; parent's copy intact"
+reg_invariant host_register_two_process_share fork_both_register.c \
+    "two processes each register the same MAP_SHARED buffer; both see both writes"
 
 # --- classify skips ----------------------------------------------------------
 UNEXPECTED_SKIPS=""
