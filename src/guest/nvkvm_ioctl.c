@@ -24,6 +24,8 @@
 #include <linux/limits.h>
 #include <linux/file.h>
 #include <linux/ioctl.h>
+#include <linux/mm.h>          /* find_vma/mmap_read_lock — devmem pass-through
+				* check in NV_ESC_RM_ALLOC_MEMORY below */
 #include "nvkvm.h"
 #include "abi/uvm.h"
 
@@ -436,6 +438,11 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		 */
 		if (p->h_class == 0x71 && p->p_memory && p->limit > 0) {
 			int mret;
+			__u64 os_start = (__u64)p->p_memory;
+			__u64 os_len   = (__u64)p->limit + 1;
+			bool passthrough = false;
+			__u32 dm_handle = 0, dm_isolate = 0;
+			__u64 dm_gpa = 0;
 			/*
 			 * limit is inclusive, so the length is limit+1 -- and at
 			 * limit == U64_MAX that addition wraps to 0.  Zero passes
@@ -450,15 +457,64 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 				pr_warn_ratelimited("nvkvm: OS_DESCRIPTOR limit=U64_MAX overflows the length computation — refusing\n");
 				return -EINVAL;
 			}
+
+			/*
+			 * PASS-THROUGH (dev-nvkvm-mem spike, TASK 1, per owner
+			 * correction): if [os_start, os_start+os_len) is
+			 * entirely inside one of OUR OWN /dev/nvkvm-mem
+			 * mappings, that memory has been host-visible window
+			 * memory -- already backed by an isolate memfd,
+			 * already mapped by the isolate -- from the moment
+			 * /dev/nvkvm-mem's own mmap() returned. There is
+			 * nothing to migrate: no page to pin, no data to copy,
+			 * no guest VMA to retype, no PTE to touch. Recognise it
+			 * by struct-file identity (nvkvm_devmem_vma_lookup(),
+			 * nvkvm_devmem.c) and skip
+			 * nvkvm_cpu_pages_migrate_range() ENTIRELY for this
+			 * range, rather than teach that function an exception:
+			 * its VM_PFNMAP|VM_IO refusal and its
+			 * page_mapcount() > 1 guard are both left
+			 * byte-for-byte as they are, and this path never
+			 * reaches them.
+			 *
+			 * Restricted to a devmem VMA owned by THIS fd's own
+			 * session/isolate: a /dev/nvkvm-mem fd shared with a
+			 * different process (fork, SCM_RIGHTS) falls straight
+			 * through to the unchanged migrate_range() call below
+			 * and is refused exactly as before.
+			 */
+			{
+				struct mm_struct *mm = current->mm;
+				struct vm_area_struct *vma;
+
+				mmap_read_lock(mm);
+				vma = find_vma(mm, os_start);
+				if (vma && vma->vm_start <= os_start &&
+				    vma->vm_end >= os_start + os_len &&
+				    nvkvm_devmem_vma_lookup(vma, &dm_handle,
+							    &dm_gpa, &dm_isolate) &&
+				    ctx->session &&
+				    dm_isolate == ctx->session->isolate_id)
+					passthrough = true;
+				mmap_read_unlock(mm);
+			}
+
+			if (passthrough) {
+				pr_info("nvkvm: OS_DESCRIPTOR %llx+%llx is a /dev/nvkvm-mem pass-through — reusing handle=%u gpa=0x%llx, no migration\n",
+					(unsigned long long)os_start,
+					(unsigned long long)os_len,
+					dm_handle, (unsigned long long)dm_gpa);
+				/* leave p_memory alone — see note above the switch */
+				break;
+			}
+
 			mret = nvkvm_cpu_pages_migrate_range(
-				ctx,
-				(__u64)p->p_memory,
-				(__u64)p->limit + 1,
+				ctx, os_start, os_len,
 				0x1 | 0x2 /* PROT_READ | PROT_WRITE */);
 			if (mret) {
 				pr_warn("nvkvm: OS_DESCRIPTOR migrate %llx+%llx failed: %d\n",
-					(unsigned long long)p->p_memory,
-					(unsigned long long)p->limit + 1,
+					(unsigned long long)os_start,
+					(unsigned long long)os_len,
 					mret);
 				return mret;
 			}

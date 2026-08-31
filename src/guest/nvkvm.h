@@ -511,6 +511,20 @@ int  nvkvm_ensure_isolate(struct nvkvm_session *session);
  * what this is and is not. */
 int  nvkvm_devmem_init(void);
 void nvkvm_devmem_exit(void);
+/* Pass-through recognition (TASK 1, dev-nvkvm-mem spike): is `vma` a mapping
+ * of OUR /dev/nvkvm-mem, and if so what handle/GPA/isolate backs it? Called
+ * from nvkvm_ioctl.c BEFORE it would call nvkvm_cpu_pages_migrate_range(), so
+ * a devmem-backed range can skip migration entirely instead of teaching
+ * migrate_range() an exception to its VM_PFNMAP/page_mapcount() guards.
+ * Identifies the file by ->f_op pointer identity (nvkvm_devmem_fops is
+ * static to nvkvm_devmem.c, so this is the only way in) rather than a
+ * separate registry -- the struct file IS the registry entry, and its
+ * lifetime already tracks the mapping's. dctx's fields are set once in
+ * open() and never mutated after, so no locking is needed to read them here.
+ * Returns false (nothing written to the out-params) for any VMA that is not
+ * one of ours. */
+bool nvkvm_devmem_vma_lookup(struct vm_area_struct *vma, __u32 *handle_id,
+			     __u64 *gpa, __u32 *isolate_id);
 
 /* #101 async event delivery: registry of poll-capable fd contexts keyed by
  * (isolate_id, handle_id). register on open, unregister on close. deliver() is

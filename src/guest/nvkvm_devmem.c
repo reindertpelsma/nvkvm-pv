@@ -220,6 +220,54 @@ static const struct file_operations nvkvm_devmem_fops = {
 	.mmap    = nvkvm_devmem_mmap,
 };
 
+/*
+ * nvkvm_devmem_vma_lookup — TASK 1 (pass-through registration): recognise a
+ * VMA as one of OUR /dev/nvkvm-mem mappings and hand back the handle/GPA/
+ * isolate that already backs it, so a caller can reuse it instead of
+ * migrating.  Used from nvkvm_sanitize_ioctl_params()'s NV_ESC_RM_ALLOC_MEMORY
+ * handling (nvkvm_ioctl.c) to skip nvkvm_cpu_pages_migrate_range() ENTIRELY
+ * for a devmem-backed OS_DESCRIPTOR registration -- deliberately called from
+ * the caller of migrate_range(), not from inside it, so migrate_range() and
+ * its VM_PFNMAP/page_mapcount() guards stay byte-for-byte unchanged.
+ *
+ * Identification is by struct file ->f_op pointer identity: nvkvm_devmem_fops
+ * is static to this file, so `vma->vm_file->f_op == &nvkvm_devmem_fops` can
+ * only be true for a file opened through THIS device's ->open, i.e. one whose
+ * private_data is genuinely a `struct nvkvm_devmem_ctx *`. This needs no
+ * separate registry (a list/xarray of live devmem fds) because the struct
+ * file already IS that registry entry: vma->vm_file holds a real reference
+ * for as long as the VMA exists (mmap_region() takes it), so dctx cannot be
+ * freed out from under this call, and dctx's handle_id/gpa/session fields are
+ * written exactly once, in open(), before the file is visible to any other
+ * thread -- so reading them here needs no lock.
+ *
+ * Returns false, and writes nothing to the out-params, for every VMA that
+ * is not ours -- an anonymous VMA, a different device's mapping, or a devmem
+ * VMA whose open() failed partway through. Callers must treat false as "not
+ * ours, handle it exactly as before"; this function never overrides another
+ * driver's mapping.
+ */
+bool nvkvm_devmem_vma_lookup(struct vm_area_struct *vma, __u32 *handle_id,
+			     __u64 *gpa, __u32 *isolate_id)
+{
+	struct nvkvm_devmem_ctx *dctx;
+
+	if (!vma || !vma->vm_file || vma->vm_file->f_op != &nvkvm_devmem_fops)
+		return false;
+
+	dctx = vma->vm_file->private_data;
+	if (!dctx || !dctx->ready || !dctx->session)
+		return false;
+
+	if (handle_id)
+		*handle_id = dctx->handle_id;
+	if (gpa)
+		*gpa = dctx->gpa;
+	if (isolate_id)
+		*isolate_id = dctx->session->isolate_id;
+	return true;
+}
+
 static struct miscdevice nvkvm_devmem_misc = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "nvkvm-mem",
