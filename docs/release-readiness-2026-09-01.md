@@ -204,24 +204,24 @@ must be labelled as such, exactly like the 515/525 ABI rows.
 10. `matrix.md`, auto-generated from `sweep.jsonl`, rendering UNTESTED as its
     own state. It is the artifact that makes "here is what we tested, here is
     what we did not" concrete.
-11. **CI's kernel matrix is blind at the top of the range, not red.**
-    Measured locally: `tests/kernel_matrix.sh ubuntu:26.04` returns
-    `SKIP -- no kernel headers in this image`. It never compiles anything, so
-    it could not have caught `page_mapcount`. The job is not failing to notice
-    a break; the row that would have found it does not run.
+11. **UNRESOLVED — do NOT act on my earlier claim here.** An earlier revision
+    of this document asserted that CI's kernel matrix is "blind at the top of
+    the range" because `tests/kernel_matrix.sh ubuntu:26.04` returned
+    `SKIP -- no kernel headers in this image`. **That conclusion was wrong, or
+    at least unsupported.** Containers on the machine I ran it from cannot reach
+    package mirrors — `archlinux` failed with `Resolving timed out after 10002
+    milliseconds`, and an `apt-get update` test exceeded 120s the same way. So
+    every image skips here for want of network, whatever its headers situation.
+    `kernel_matrix.sh` sends all installer output to /dev/null, which makes a
+    network failure and a header-less image produce the identical result line —
+    itself worth fixing.
 
-    `kernel_matrix.sh:100` is `[ "$verdict" = SKIP ] && [ "$STRICT_SKIP" = 1 ]
-    && rc=1`, and `.github/workflows/kernel-matrix.yml` sets `STRICT_SKIP: "1"`
-    -- so on GitHub this should be a hard failure, unless headers resolve there
-    and not here. **Unverified from this machine:** whether GitHub's runners can
-    install `linux-headers` for `ubuntu:26.04`. Check the actual CI run history
-    before concluding which of the two it is.
-
-    The script's own header anticipated this exact failure: "a package gets
-    renamed would quietly degrade to 'passing'". It degraded.
-
-### Not blocking
-
+    What is still true and worth checking: the matrix images top out around 6.14
+    (fedora:42, ubuntu:25.04) and 6.12 (debian:13), so whether ≥6.16 is covered
+    depends entirely on `ubuntu:26.04` behaving on GitHub's runners. **Check the
+    actual CI run history** — that is the only place this can be settled — and
+    if that row does skip there, `STRICT_SKIP: "1"` in the workflow should
+    already be turning it into a failure.
 12. Pre-Turing bring-up (§4).
 13. `--ssh` end-to-end test against a real rented box — the code is committed
     but the full path has never been exercised.
