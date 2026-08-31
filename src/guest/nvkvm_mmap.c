@@ -1515,6 +1515,12 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
  * that justified trusting the inode pointer in the first place: at least
  * one live, unretyped reference to that inode (the surviving process's own
  * vm_file) still exists whenever an entry for it does.
+ *
+ * This registry alone is not sufficient for fork_both_register.c's actual
+ * shape -- two peer processes racing out of fork() with no ordering between
+ * them, not "one finishes, then later another registers." See the pending-
+ * claim mechanism (nvkvm_shared_resolve() and friends) below the registry
+ * helpers for why and how that race is closed.
  */
 struct nvkvm_shared_range {
 	struct list_head list;
@@ -1558,8 +1564,6 @@ static void nvkvm_shared_add(struct inode *inode, unsigned long pgoff,
 	mutex_lock(&nvkvm_shared_lock);
 	list_add_tail(&sr->list, &nvkvm_shared_ranges);
 	mutex_unlock(&nvkvm_shared_lock);
-	pr_info("nvkvm: DEBUG shared_add inode=%p pgoff=%lu len=%lu handle=%u\n",
-		inode, pgoff, len, handle_id);
 }
 
 static void nvkvm_shared_remove_handle(__u32 handle_id)
@@ -1576,64 +1580,217 @@ static void nvkvm_shared_remove_handle(__u32 handle_id)
 	mutex_unlock(&nvkvm_shared_lock);
 }
 
-/*
- * nvkvm_migrate_range_is_shareable — read-only probe: is [start,end) backed
- * by a shmem object every chunk of which is already migrated under some
- * earlier registration?  Takes only mmap_read_lock.  The real work
- * (nvkvm_cpu_pages_share_range() below) re-validates everything it needs
- * under mmap_write_lock, so a benign race here (another thread of the same
- * process mutating the VMA between the probe and the real call) only ever
- * costs a -EAGAIN, never a wrong mapping.
- */
-static bool nvkvm_migrate_range_is_shareable(struct mm_struct *mm,
-					     unsigned long start,
-					     unsigned long end,
-					     struct inode **inode_out,
-					     unsigned long *pgoff_out)
+/* Caller holds nvkvm_shared_lock. */
+static bool nvkvm_shared_fully_covered_locked(struct inode *inode,
+					      unsigned long pgoff_base,
+					      unsigned long range_len)
 {
-	struct vm_area_struct *vma;
-	bool ok = false;
+	unsigned long coff;
 
-	mmap_read_lock(mm);
-	vma = find_vma(mm, start);
-	pr_info("nvkvm: DEBUG is_shareable vma=%p vm_start=%lx vm_end=%lx "
-		"vm_file=%p vm_flags=%lx start=%lx end=%lx\n",
-		vma, vma ? vma->vm_start : 0, vma ? vma->vm_end : 0,
-		vma ? vma->vm_file : NULL, vma ? (unsigned long)vma->vm_flags : 0,
-		start, end);
-	if (vma && vma->vm_start <= start && vma->vm_end >= end &&
-	    vma->vm_file && nvkvm_vma_file_is_memory(vma) &&
-	    !(vma->vm_flags & (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB))) {
-		struct inode *inode = file_inode(vma->vm_file);
-		unsigned long pgoff_base = vma->vm_pgoff +
-			((start - vma->vm_start) >> PAGE_SHIFT);
-		unsigned long coff, range_len = end - start;
+	for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
+		unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
+					 range_len - coff);
+		unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
+		struct nvkvm_shared_range *sr;
+		bool hit = false;
 
-		ok = true;
-		for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
-			unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
-						 range_len - coff);
-			unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
-			__u32 h = nvkvm_shared_find(inode, pgoff, clen);
-
-			pr_info("nvkvm: DEBUG is_shareable chunk inode=%p pgoff=%lu "
-				"clen=%lu -> handle=%u\n", inode, pgoff, clen, h);
-			if (!h) {
-				ok = false;
+		list_for_each_entry(sr, &nvkvm_shared_ranges, list) {
+			if (sr->inode == inode && sr->pgoff == pgoff &&
+			    sr->len == clen) {
+				hit = true;
 				break;
 			}
 		}
-		if (ok) {
+		if (!hit)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * ─── The race the registry alone does not close ────────────────────────────
+ *
+ * fork_both_register.c is not "register, then later someone else registers
+ * the same object" -- it is two ALREADY-RUNNING processes independently
+ * calling migrate_range for the same object at close to the same time, with
+ * no ordering between them.  A plain "check the registry, share if found,
+ * else migrate" has a window: both calls can probe before EITHER has
+ * finished migrating and recorded anything, both see nothing, and both fall
+ * into the ordinary pin-and-relocate path -- reintroducing exactly the
+ * mapcount race this whole mechanism exists to close, just delayed rather
+ * than removed.  Measured: this is not a corner case, it is the common case
+ * for two peer processes racing out of fork() with no synchronisation.
+ *
+ * Fix: a second, lighter-weight PENDING list.  The first caller to reach a
+ * given inode with no completed registry entry does not just start
+ * migrating -- it publishes a pending claim for that inode first.  Every
+ * later caller for the SAME inode, arriving before the claim resolves,
+ * waits on it instead of racing past it, then re-decides once it resolves:
+ * on success the registry now has the answer and it shares; on failure the
+ * claim is gone and it becomes the new claimant and tries the migration
+ * itself.  Either way, no second caller ever begins pinning while a sibling
+ * is mid-migration on the same object.
+ *
+ * Granularity is per INODE, not per (inode, pgoff, len): a second caller for
+ * a genuinely disjoint sub-range of the same large object waits for an
+ * unrelated migration to finish before it can even start its own. That is a
+ * throughput cost, not a correctness one -- disjoint concurrent
+ * sub-registrations of one object are not a shape any current caller
+ * produces (cuMemHostRegister registers one buffer, one object, in full).
+ * Keying finer is a straightforward follow-up if that ever changes.
+ *
+ * Refcounting: `refs` starts at 1 (the claimant's own reference) and is
+ * touched only under nvkvm_shared_lock. A waiter increments it while still
+ * holding the lock (so it can only find `pend` while it is still on the
+ * list) before dropping the lock to sleep; nvkvm_shared_claim_release()
+ * unlinks `pend` from the list and decrements under the SAME lock section,
+ * so no thread can observe (let alone increment-reference) a pending entry
+ * that is no longer reachable from the list -- the classic "list_del and
+ * the recount that retires an object happen in one critical section"
+ * invariant. Whoever's decrement reaches zero frees it; complete_all() runs
+ * strictly before that free can be reached by any waiter still asleep, since
+ * a waiter cannot resume (and therefore cannot free) before complete_all()
+ * wakes it.
+ */
+struct nvkvm_shared_pending {
+	struct list_head list;
+	struct inode    *inode;   /* identity only — never dereferenced */
+	struct completion done;
+	int              refs;
+};
+
+static LIST_HEAD(nvkvm_shared_pending_list);
+
+/* Caller holds nvkvm_shared_lock. */
+static struct nvkvm_shared_pending *
+nvkvm_shared_find_pending_locked(struct inode *inode)
+{
+	struct nvkvm_shared_pending *p;
+
+	list_for_each_entry(p, &nvkvm_shared_pending_list, list)
+		if (p->inode == inode)
+			return p;
+	return NULL;
+}
+
+/*
+ * nvkvm_shared_claim_release — the claimant's migration attempt (success or
+ * failure) is decided.  Unlink the pending marker so it can no longer be
+ * found, wake every waiter so they re-decide, and free it once the last
+ * reference (ours, or a waiter still catching up on the lock) is gone.
+ */
+static void nvkvm_shared_claim_release(struct nvkvm_shared_pending *pend)
+{
+	bool free_it;
+
+	mutex_lock(&nvkvm_shared_lock);
+	list_del(&pend->list);
+	free_it = (--pend->refs == 0);
+	mutex_unlock(&nvkvm_shared_lock);
+
+	complete_all(&pend->done);
+	if (free_it)
+		kfree(pend);
+}
+
+/* A waiter's turn is over (it woke up, or never had to wait) — drop the
+ * reference it took to observe `pend` safely across the sleep. */
+static void nvkvm_shared_pending_put(struct nvkvm_shared_pending *pend)
+{
+	bool free_it;
+
+	mutex_lock(&nvkvm_shared_lock);
+	free_it = (--pend->refs == 0);
+	mutex_unlock(&nvkvm_shared_lock);
+	if (free_it)
+		kfree(pend);
+}
+
+/*
+ * nvkvm_shared_resolve — decide what a possibly-shmem-backed [start,end)
+ * should do, waiting out any concurrent sibling migration of the same
+ * object along the way.  See the race comment above.
+ *
+ * Returns:
+ *   true  -- SHARE.  *inode_out / *pgoff_out set; caller runs
+ *            nvkvm_cpu_pages_share_range() and returns its result.
+ *   false -- MIGRATE the ordinary way.  *claim_out is NULL when the range
+ *            is not shmem-backed at all (nothing to claim or release).
+ *            Otherwise *claim_out is this call's own claim and MUST be
+ *            passed to nvkvm_shared_claim_release() from every exit path of
+ *            the ordinary migrate, exactly once, once success or failure is
+ *            known — that release is what wakes any sibling waiting to
+ *            re-check the registry.
+ */
+static bool nvkvm_shared_resolve(struct mm_struct *mm,
+				 unsigned long start, unsigned long end,
+				 struct inode **inode_out,
+				 unsigned long *pgoff_out,
+				 struct nvkvm_shared_pending **claim_out)
+{
+	*claim_out = NULL;
+
+	for (;;) {
+		struct vm_area_struct *vma;
+		struct inode *inode = NULL;
+		unsigned long pgoff_base = 0;
+		bool is_shmem;
+		struct nvkvm_shared_pending *pend;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, start);
+		is_shmem = vma && vma->vm_start <= start && vma->vm_end >= end &&
+			  vma->vm_file && nvkvm_vma_file_is_memory(vma) &&
+			  !(vma->vm_flags &
+			    (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB));
+		if (is_shmem) {
+			inode = file_inode(vma->vm_file);
+			pgoff_base = vma->vm_pgoff +
+				((start - vma->vm_start) >> PAGE_SHIFT);
+		}
+		mmap_read_unlock(mm);
+
+		if (!is_shmem)
+			return false;   /* ordinary MAP_PRIVATE|ANON: nothing to claim */
+
+		mutex_lock(&nvkvm_shared_lock);
+		if (nvkvm_shared_fully_covered_locked(inode, pgoff_base,
+						      end - start)) {
+			mutex_unlock(&nvkvm_shared_lock);
 			*inode_out = inode;
 			*pgoff_out = pgoff_base;
+			return true;
 		}
-	} else {
-		pr_info("nvkvm: DEBUG is_shareable precondition failed "
-			"(is_memory=%d)\n",
-			vma && vma->vm_file ? nvkvm_vma_file_is_memory(vma) : -1);
+		pend = nvkvm_shared_find_pending_locked(inode);
+		if (pend) {
+			pend->refs++;
+			mutex_unlock(&nvkvm_shared_lock);
+			wait_for_completion(&pend->done);
+			nvkvm_shared_pending_put(pend);
+			continue;   /* re-decide: share, wait again, or claim */
+		}
+
+		pend = kzalloc(sizeof(*pend), GFP_KERNEL);
+		if (!pend) {
+			/* Best-effort: proceed unclaimed rather than fail the
+			 * registration over a bookkeeping allocation. A racing
+			 * sibling in this rare case falls back to the pre-fix
+			 * behaviour (mapcount guard decides) instead of
+			 * waiting -- correct, just not optimal. */
+			mutex_unlock(&nvkvm_shared_lock);
+			return false;
+		}
+		pend->inode = inode;
+		pend->refs  = 1;
+		init_completion(&pend->done);
+		list_add_tail(&pend->list, &nvkvm_shared_pending_list);
+		mutex_unlock(&nvkvm_shared_lock);
+
+		*inode_out  = inode;
+		*pgoff_out  = pgoff_base;
+		*claim_out  = pend;
+		return false;
 	}
-	mmap_read_unlock(mm);
-	return ok;
 }
 
 /*
@@ -1850,6 +2007,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	bool is_shmem_obj = false;         /* object-keyed sharing, see below */
 	struct inode *reg_inode = NULL;
 	unsigned long reg_pgoff_base = 0;
+	struct nvkvm_shared_pending *shared_claim = NULL;
 
 	if (!len)
 		return 0;
@@ -1889,13 +2047,20 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * BEFORE any page is pinned and before the mapcount guard can even be
 	 * reached — the share path is for ranges that are NOT being relocated,
 	 * so it must never be reachable through that guard.
+	 *
+	 * nvkvm_shared_resolve() also closes the race two peer processes
+	 * hit racing straight out of fork() with no synchronisation between
+	 * them (see its comment): it waits out a sibling's in-flight
+	 * migration of the same object rather than letting both fall into
+	 * the relocate path together, and hands this call a claim to release
+	 * once its own attempt (below) is decided.
 	 */
 	{
 		struct inode *sh_inode = NULL;
 		unsigned long sh_pgoff = 0;
 
-		if (nvkvm_migrate_range_is_shareable(mm, start, end,
-						     &sh_inode, &sh_pgoff))
+		if (nvkvm_shared_resolve(mm, start, end, &sh_inode, &sh_pgoff,
+					 &shared_claim))
 			return nvkvm_cpu_pages_share_range(ctx, start, end, prot,
 							   sh_inode, sh_pgoff);
 	}
@@ -1904,8 +2069,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	npages    = range_len >> PAGE_SHIFT;
 
 	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
-	if (!pages)
-		return -ENOMEM;
+	if (!pages) { ret = -ENOMEM; goto err_unpin; }
 
 	/*
 	 * Pin every page up front — BEFORE any VMA mutation, so a later
@@ -1990,10 +2154,6 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		reg_pgoff_base = vma->vm_pgoff +
 			((start - vma->vm_start) >> PAGE_SHIFT);
 	}
-	pr_info("nvkvm: DEBUG migrate_range main-path is_shmem_obj=%d inode=%p "
-		"pgoff_base=%lu start=%lx vm_file=%p\n",
-		is_shmem_obj, reg_inode, reg_pgoff_base, start, vma->vm_file);
-
 	/*
 	 * Under mmap_write_lock, and after the VMA type check, on purpose.
 	 *
@@ -2358,6 +2518,10 @@ chunk_fail_mapped:
 	/* Every chunk is migrated, recorded and unpinned.  Nothing is left to
 	 * do but free the descriptor array. */
 	kvfree(pages);
+	/* Object-keyed sharing: our attempt succeeded — wake anyone waiting
+	 * on this object so they re-check the (now populated) registry. */
+	if (shared_claim)
+		nvkvm_shared_claim_release(shared_claim);
 	return 0;
 
 err_unpin:
@@ -2378,5 +2542,11 @@ err_unpin:
 	kvfree(pages);
 	pr_warn("nvkvm: migrate_range(bulk) failed ret=%d at chunk %d (%d chunk(s) already migrated and left mapped)\n",
 		ret, nck, nck);
+	/* Object-keyed sharing: our attempt failed — release the claim (the
+	 * registry has nothing for this object) so a waiting sibling becomes
+	 * the new claimant and tries the migration itself, rather than
+	 * waiting forever on a claim that will never resolve. */
+	if (shared_claim)
+		nvkvm_shared_claim_release(shared_claim);
 	return ret;
 }
