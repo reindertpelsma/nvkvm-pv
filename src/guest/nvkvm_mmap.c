@@ -2211,16 +2211,61 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * mmap_lock outer, i_mmap_rwsem inner, so doing it in that direction is
 	 * an ABBA inversion, and rmap_walk() is not exported to modules.  Until
 	 * that is solved, an honest -EINVAL beats silent corruption.
+	 *
+	 * The threshold is 1 (exactly this VMA, nothing else) UNLESS we are
+	 * holding an object-keyed claim (shared_claim != NULL) that other
+	 * processes are actively waiting on -- see
+	 * nvkvm_cpu_pages_share_range()'s comment block and
+	 * nvkvm_shared_resolve() for the mechanism.
+	 *
+	 * WHY A WAITER CAN RAISE THE THRESHOLD, MEASURED, NOT ASSUMED:
+	 * fork_both_register.c's two peer processes each independently bring
+	 * a CUDA context up before registering, and CUDA's own bring-up
+	 * (cuInit/cuCtxCreate) was measured to fault in a sibling's PTE for an
+	 * already-shared page BEFORE that sibling ever calls
+	 * cuMemHostRegister on it -- confirmed live: dmesg showed the WAITING
+	 * side's own resolve() call reach nvkvm_shared_resolve() and go to
+	 * sleep on wait_for_completion() BEFORE the claimant's mapcount check
+	 * ran, so the extra mapping was already there before the waiter did
+	 * anything migrate_range-related at all. No amount of serialising the
+	 * two ioctl calls against each other removes this: the fault happens
+	 * in userspace, before the ioctl is even issued, and is not ours to
+	 * order.
+	 *
+	 * A page mapping contributed by a process that is, RIGHT NOW, blocked
+	 * inside OUR OWN kernel-verified wait-for-this-exact-object protocol
+	 * is safe to relocate past: nvkvm_shared_resolve() guarantees that
+	 * waiter will re-decide once we release the claim, and either share
+	 * the memfd we are about to create (repointing its VMA and discarding
+	 * whatever stray PTE it had) or become the new claimant itself -- it
+	 * can never be left stranded on the original pages, which is the only
+	 * thing this guard exists to prevent.
+	 *
+	 * A page mapping NOT explained by a currently-waiting sibling gets
+	 * exactly the pre-existing refusal, unconditionally: pend->refs is
+	 * read fresh (under nvkvm_shared_lock) right before this loop, so a
+	 * process that is not, at this moment, parked in our own wait queue
+	 * for this object -- e.g. shared_view_desync.c's child, which never
+	 * calls migrate_range on the buffer at all -- contributes nothing to
+	 * the threshold and the guard fires exactly as it did before this
+	 * mechanism existed. Confirmed against that test below.
 	 */
+	{
+		unsigned long mc_allowed = 1;
+
+		if (shared_claim) {
+			mutex_lock(&nvkvm_shared_lock);
+			mc_allowed = (unsigned long)shared_claim->refs;
+			mutex_unlock(&nvkvm_shared_lock);
+		}
+
 	for (i = 0; i < (unsigned long)got; i++) {
 		int mc = page_mapcount(pages[i]);
 
-		if (mc > 1) {
+		if ((unsigned long)mc > mc_allowed) {
 			pr_warn_ratelimited(
-				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
-				start, end, i, mc);
-			pr_info("nvkvm: DEBUG mapcount-fail pid=%d is_shmem_obj=%d claim=%p\n",
-				current->pid, is_shmem_obj, shared_claim);
+				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times (allowed %lu) -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
+				start, end, i, mc, mc_allowed);
 			/* Under mmap_write_lock now -- every sibling error
 			 * path in this section unlocks before unwinding, and
 			 * err_unpin does not. */
@@ -2228,6 +2273,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			ret = -EINVAL;
 			goto err_unpin;
 		}
+	}
 	}
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
