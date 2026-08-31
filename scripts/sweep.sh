@@ -145,6 +145,17 @@ KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
 
 ARCHES=""
 ALL_ARCHES=0
+# --ssh: run against a box we did not rent.  Unlocks the axes vast cannot reach
+# (datacenter silicon, an old-kernel host for the 515/525 profiles, your own
+# hardware) and lets a THIRD PARTY run this identical harness and send back a
+# row -- which is the only way the evidence stops being self-recorded.
+MANUAL_SSH=""
+# Driver install is PURGE-AND-REPLACE.  That is correct on a box we rented and
+# will destroy; it is destructive on a machine somebody cares about.  So for a
+# manual host it is OFF unless asked for, and the run measures whatever driver
+# is already installed.  Never make "I pointed it at my workstation" cost
+# somebody their driver stack.
+ALLOW_DRIVER_INSTALL=0
 GPU_FILTER=""
 DRIVERS_REQ=""
 DRIVER_CACHE_DIR="${NVKVM_SWEEP_DRIVER_CACHE:-}"
@@ -285,6 +296,8 @@ usage() { sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --arch)         ARCHES="$2"; shift 2 ;;
+        --ssh)          MANUAL_SSH="$2"; shift 2 ;;
+        --allow-driver-install) ALLOW_DRIVER_INSTALL=1; shift ;;
         --all-arches)   ALL_ARCHES=1; shift ;;
         --gpu)          GPU_FILTER="$2"; shift 2 ;;
         --drivers)      DRIVERS_REQ="$2"; shift 2 ;;
@@ -1231,6 +1244,110 @@ verify_is_vm() {
 }
 
 # ---------------------------------------------------------------------------
+# manual host: a box we did not rent
+#
+# Everything between "ssh works" and "destroy" is identical to the vast path --
+# same provisioning, same validate.sh, same verdict vocabulary -- so a manual
+# host reuses sweep_drivers_on_box() verbatim.  Only the ends differ: no create,
+# no destroy, no billing.
+#
+# The capability check is NOT verify_is_vm().  That one demands
+# systemd-detect-virt in {kvm,qemu} because on vast anything else means we
+# rented a container by mistake, and a container inherits the host's CPU flags
+# and makes every driver install a silent no-op.  A manual host is the opposite
+# case: BARE METAL IS THE BEST INPUT we can be given, and it reports "none".
+# What actually matters either way is a usable /dev/kvm, so that is what we
+# require, and a container is still refused.
+# ---------------------------------------------------------------------------
+MANUAL_HOST_DETAIL=""
+verify_host_capable() {
+    BOX_VIRT="$(rsh_t 60 'systemd-detect-virt 2>/dev/null || echo unknown' 2>/dev/null | tr -d '\r\n ')"
+    BOX_KVM="$(rsh_t 60 'test -w /dev/kvm && echo yes || echo no' 2>/dev/null | tr -d '\r\n ')"
+    info "  systemd-detect-virt=$BOX_VIRT  /dev/kvm(writable)=$BOX_KVM"
+    case "$BOX_VIRT" in
+        docker|podman|lxc|lxc-libvirt|container-other|rkt|systemd-nspawn)
+            MANUAL_HOST_DETAIL="systemd-detect-virt=$BOX_VIRT -- this is a container. The NVIDIA module belongs to the host, so a driver install here is a no-op and every result would be the host's, not ours."
+            return 1 ;;
+    esac
+    if [ "$BOX_KVM" != "yes" ]; then
+        MANUAL_HOST_DETAIL="/dev/kvm is not writable by this user -- the guest cannot be booted, so nothing below this point would be measuring nvkvm."
+        return 1
+    fi
+    return 0
+}
+
+# --ssh accepts  user@host:port  |  host:port  |  host   (user defaults to root,
+# port to 22).  Both fields go through the SAME validators the vast endpoints
+# do: they end up inside commands that run as root here, and "the operator
+# typed it" is not a reason to skip validation -- it may have been pasted from
+# a provider's web UI.
+set_manual_endpoint() {
+    local spec="$1" user host port
+    case "$spec" in
+        *@*) user="${spec%%@*}"; spec="${spec#*@}" ;;
+        *)   user="root" ;;
+    esac
+    case "$spec" in
+        *:*) host="${spec%:*}"; port="${spec##*:}" ;;
+        *)   host="$spec"; port="22" ;;
+    esac
+    sweep_valid_host "$host" || die "--ssh: refusing host '$host' (want an IPv4/IPv6 literal or a DNS name)" 3
+    sweep_valid_port "$port" || die "--ssh: refusing port '$port'" 3
+    case "$user" in
+        ''|*[!a-zA-Z0-9._-]*) die "--ssh: refusing user '$user'" 3 ;;
+    esac
+    # Root, and say so rather than half-working.  provision_box() and the driver
+    # staging write to /root and scp as root@; a sudo-user host would get part
+    # way and fail somewhere less obvious than here.  Every provider this is
+    # aimed at (vast, Spheron, LeaderGPU, Lambda) hands out root.
+    [ "$user" = "root" ] || die "--ssh: this harness needs root on the target (got '$user'). The provisioning path writes to /root and copies as root@; a non-root host would fail later and less clearly than here." 3
+    CUR_HOST="$host"; CUR_PORT="$port"
+    # shellcheck disable=SC2206  # SSH_OPTS is a fixed local literal
+    SSH_ARGV=(ssh $SSH_OPTS -o ConnectTimeout=20 -p "$port" "$user@$host")
+    SSH="ssh $SSH_OPTS -o ConnectTimeout=20 -p $port $user@$host"
+    SCP_HOST="$host"; SCP_PORT="$port"; SCP_USER="$user"
+    info "  manual host: $user@$host:$port"
+}
+
+sweep_manual_box() {
+    local arch="$1" gpu rc logdir
+    set_manual_endpoint "$MANUAL_SSH"
+
+    if ! rsh_t 60 'echo NVKVM_SSH_OK' 2>/dev/null | grep -q NVKVM_SSH_OK; then
+        emit "$(jrec arch "$arch" driver "-" status "no-ssh" host "$CUR_HOST" \
+                detail "could not reach the manual host over ssh" \
+                cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
+        warn "manual host unreachable over ssh"
+        return 2
+    fi
+    if ! verify_host_capable; then
+        emit "$(jrec arch "$arch" driver "-" status "host-not-capable" host "$CUR_HOST" \
+                detail "$MANUAL_HOST_DETAIL" \
+                cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
+        warn "manual host is not usable: $MANUAL_HOST_DETAIL"
+        return 2
+    fi
+
+    gpu="$(rsh_t 90 'nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1' 2>/dev/null | tr -d '\r' | sed 's/^ *//;s/ *$//')"
+    [ -n "$gpu" ] || gpu="unknown"
+    info "  gpu reports: $gpu"
+
+    logdir="$OUT_DIR/logs/manual-$CUR_HOST"
+    mkdir -p "$logdir"
+
+    if ! provision_box; then
+        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "build-failed" host "$CUR_HOST" \
+                detail "${PROVISION_FAIL_DETAIL:0:400}" \
+                cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
+        return 2
+    fi
+    sweep_drivers_on_box "$arch" "$gpu" "manual:$CUR_HOST" "manual" "$logdir"
+    collect_logs "$logdir" 2>/dev/null || true
+    info "  manual host left running and untouched -- nothing was rented, nothing destroyed"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # provisioning (ONCE per box: neither QEMU nor the guest image depends on the
 # host driver, so this cost is amortised across the whole driver set.  That is
 # the entire economic argument for installing drivers rather than shopping for
@@ -2139,6 +2256,28 @@ sweep_drivers_on_box() {
     cur0="$(rsh_t 90 'cat /proc/driver/nvidia/version 2>/dev/null | head -1' 2>/dev/null \
             | parse_nvrm_driver_version)"
 
+    # A manual host keeps the driver it came with unless explicitly told
+    # otherwise.  That is not a limitation to apologise for: it is exactly the
+    # "one host, one driver, the BIG test" shape -- few variables, so spend the
+    # time on depth instead of breadth.  The row still says which driver ran,
+    # so the matrix never implies coverage that was not measured.
+    if [ -n "$MANUAL_SSH" ] && [ "$ALLOW_DRIVER_INSTALL" != 1 ]; then
+        if [ -z "$cur0" ]; then
+            emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "no-driver-present" \
+                    instance "$iid" host "${CUR_HOST:-}" \
+                    detail "no NVIDIA driver is installed on this manual host and --allow-driver-install was not given, so there is nothing to measure" \
+                    cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
+            warn "  manual host has no NVIDIA driver and driver install was not permitted"
+            return
+        fi
+        info "  manual host: measuring the preinstalled $cur0 only"
+        info "  (pass --allow-driver-install to purge and sweep the driver set -- DESTRUCTIVE)"
+        todo="$(drivers_for_arch "$arch" | awk -F'|' -v c="$cur0" '$1==c')"
+        if [ -z "$todo" ]; then
+            CONTROL=1
+        fi
+    fi
+
     # THE CONTROL RUN.  Measure whatever the image already ships BEFORE
     # anything is purged, and label it a control rather than a matrix row.
     #
@@ -2717,9 +2856,22 @@ for a in ${ARCHES//,/ }; do
     done
 done
 say ""
+if [ -n "$MANUAL_SSH" ]; then
+    say "  MANUAL HOST: $MANUAL_SSH"
+    if [ "$ALLOW_DRIVER_INSTALL" = 1 ]; then
+        say "  driver set   : the full list above will be PURGED AND INSTALLED on that host"
+        say "                 (--allow-driver-install was given -- this is destructive)"
+    else
+        say "  driver set   : NOT touched. Only the driver already installed there is measured."
+        say "                 (pass --allow-driver-install to sweep the set -- DESTRUCTIVE)"
+    fi
+    say "  cost         : none. Nothing is rented, nothing is destroyed, nothing is billed."
+    say "                 The spend cap and the offer search do not apply to a host we did not rent."
+else
 say "  $total_units driver run(s) across $nboxes box(es)"
+fi
 
-if [ "$GO" != 1 ]; then
+if [ "$GO" != 1 ] && [ -z "$MANUAL_SSH" ]; then
     # A dry run is not just a printout: it exercises the real offer search, the
     # real architecture mapping, the known-bad filter and the price cap against
     # live vast.ai data.  That is the multi-architecture layer, minus the money.
@@ -2745,6 +2897,9 @@ if [ "$GO" != 1 ]; then
     done
     say ""
     say "  estimated total: ~\$$est   (cap is \$$MAX_SPEND)"
+fi
+
+if [ "$GO" != 1 ]; then
     say ""
     say "DRY RUN — nothing rented, \$0 spent. Re-run with --go to execute."
     CLEANED=1
@@ -2776,6 +2931,16 @@ arm_autodestroy
 
 rm -f "$STOP_FILE"
 say ""
+if [ -n "$MANUAL_SSH" ]; then
+    # One host, given to us.  No renting, no destroying, no billing -- so the
+    # whole offer/spend/reaper machinery is bypassed rather than fed dummy
+    # values that would render as "$0.00" and read like a free run.
+    set -- ${ARCHES//,/ }
+    [ "$#" -eq 1 ] || die "--ssh takes exactly one --arch (got: '${ARCHES:-none}'). The driver floor and the applicable driver set are per-architecture, and we cannot infer them from a machine we did not choose." 3
+    say "=== manual host (arch: $1) ==========================================="
+    sweep_manual_box "$1"; rc=$?
+    MANUAL_RC="$rc"
+else
 for arch in ${ARCHES//,/ }; do
     if stop_requested; then
         warn "STOP requested -- not renting any further boxes"
@@ -2796,6 +2961,7 @@ for arch in ${ARCHES//,/ }; do
             info "retrying $arch on a different machine (attempt $attempt/$BOX_ATTEMPTS)"
     done
 done
+fi
 
 say ""
 say "=== summary ==========================================================="
