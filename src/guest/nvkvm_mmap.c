@@ -2209,19 +2209,37 @@ retry_mapcount:
 	 * nvkvm_cpu_pages_share_range()'s comment block and
 	 * nvkvm_shared_resolve() for the mechanism.
 	 *
-	 * WHY A WAITER CAN RAISE THE THRESHOLD, MEASURED, NOT ASSUMED:
-	 * fork_both_register.c's two peer processes each independently bring
-	 * a CUDA context up before registering, and CUDA's own bring-up
-	 * (cuInit/cuCtxCreate) was measured to fault in a sibling's PTE for an
-	 * already-shared page BEFORE that sibling ever calls
-	 * cuMemHostRegister on it -- confirmed live: dmesg showed the WAITING
-	 * side's own resolve() call reach nvkvm_shared_resolve() and go to
-	 * sleep on wait_for_completion() BEFORE the claimant's mapcount check
-	 * ran, so the extra mapping was already there before the waiter did
-	 * anything migrate_range-related at all. No amount of serialising the
-	 * two ioctl calls against each other removes this: the fault happens
-	 * in userspace, before the ioctl is even issued, and is not ours to
-	 * order.
+	 * WHERE THE EXTRA MAPPING ACTUALLY COMES FROM, MEASURED, NOT ASSUMED:
+	 * an earlier revision of this comment blamed CUDA's own bring-up
+	 * (cuInit/cuCtxCreate) for faulting a sibling's PTE in before it ever
+	 * called cuMemHostRegister. That was wrong -- disproved by a direct
+	 * probe (a helper that checks its own /proc/self/pagemap "present"
+	 * bit after each of cuInit/cuDeviceGet/cuCtxCreate/registerA, on a
+	 * MAP_SHARED page it never touches otherwise): the bit stays 0 the
+	 * entire time. CUDA bring-up does not touch unrelated host memory.
+	 *
+	 * The real mechanism is simpler and entirely inside this function:
+	 * get_user_pages_fast(FOLL_WRITE) in the pin loop above is an
+	 * ordinary write-fault. If the calling process had NO PTE for this
+	 * page yet (true for whichever of the two fork siblings does not
+	 * already hold one -- fork does not eagerly copy PTEs for a
+	 * MAP_SHARED|MAP_ANONYMOUS VMA, confirmed separately via the same
+	 * pagemap technique across a bare fork() with no CUDA involved at
+	 * all), that gup call PERMANENTLY installs one, exactly as an
+	 * ordinary read/write through the pointer would -- and it does so
+	 * whether this call's migrate_range() attempt goes on to SUCCEED or
+	 * FAIL. err_unpin's put_page() only drops the extra pin gup itself
+	 * took; it does not, and cannot, unmap the page-table entry that the
+	 * underlying fault installed. So a sibling that tries and fails once
+	 * leaves a real, ordinary PTE behind, and every later attempt -- by
+	 * anyone, on this object -- sees it. Two consequences fall out of
+	 * this directly: (1) the "race" is not fundamentally about ioctl
+	 * timing, it is about whichever sibling's fault happens second
+	 * relative to the other's still-resident PTE, which includes a
+	 * pre-fork write (fork_both_register.c's parent writes the buffer
+	 * before forking, so it always already holds one); (2) a sibling's
+	 * FAILED attempt does not "cost nothing" -- it leaves the exact
+	 * evidence a later attempt needs to explain itself.
 	 *
 	 * A page mapping contributed by a process that is, RIGHT NOW, blocked
 	 * inside OUR OWN kernel-verified wait-for-this-exact-object protocol
@@ -2232,39 +2250,81 @@ retry_mapcount:
 	 * can never be left stranded on the original pages, which is the only
 	 * thing this guard exists to prevent.
 	 *
-	 * A page mapping NOT explained by a currently-waiting sibling gets
-	 * exactly the pre-existing refusal, unconditionally: pend->refs is
-	 * read fresh (under nvkvm_shared_lock) right before this loop, so a
-	 * process that is not, at this moment, parked in our own wait queue
-	 * for this object -- e.g. shared_view_desync.c's child, which never
-	 * calls migrate_range on the buffer at all -- contributes nothing to
-	 * the threshold and the guard fires exactly as it did before this
-	 * mechanism existed. Confirmed against that test below.
+	 * SAFETY OF THE CREDIT, stated precisely because a wrong credit here
+	 * is the actual danger (a wrong RETRY only costs latency; a wrong
+	 * CREDIT relocates a range out from under a real, uncredited view):
 	 *
-	 * BOUNDED RETRY, and why refs-counting alone still is not enough:
-	 * refs only credits a sibling that is CONCURRENTLY blocked in
-	 * nvkvm_shared_resolve() at the exact instant of this check. Measured
-	 * live: fork_both_register.c's two peer processes frequently reach
-	 * their OWN migrate_range(B) calls with NO temporal overlap at all --
-	 * one claims, fails this very check (mapcount already 2 from the
-	 * sibling's earlier, unrelated CUDA bring-up activity touching the
-	 * page), and fully releases its claim BEFORE the other even starts,
-	 * so refs was 1 (nobody waiting) for both attempts and neither is
-	 * accounted for by the other. Confirmed via dmesg: both processes'
-	 * claim/release pairs were fully sequential, non-overlapping, and
-	 * both hit this refusal.
+	 *   - What is credited: shared_claim->refs, read fresh under
+	 *     nvkvm_shared_lock immediately before this loop (and again on
+	 *     every retry pass below) -- never a stale or cached count.
+	 *   - What proves a credited reference is a genuine co-registrant,
+	 *     not a third party: the ONLY way refs is incremented is
+	 *     nvkvm_shared_find_pending_locked() matching a waiter's OWN
+	 *     `inode` (from ITS OWN live VMA over this exact object, resolved
+	 *     the same way we resolved ours) against our pend. There is no
+	 *     path to being counted that does not go through a real
+	 *     migrate_range() ioctl call on a VMA that genuinely maps this
+	 *     object -- an attacker cannot inflate refs without first having
+	 *     ordinary OS-level access to map the object at all, at which
+	 *     point ordinary POSIX MAP_SHARED semantics already give it
+	 *     read/write access to the same bytes; this guard is about GPU-
+	 *     view coherence, not confidentiality.
+	 *   - Can a credited waiter walk away without reconciling, leaving
+	 *     its counted-but-unaccounted-for view behind? No: after
+	 *     wait_for_completion() returns, nvkvm_shared_resolve()'s `continue`
+	 *     unconditionally re-enters its loop -- there is no return path
+	 *     for a woken waiter except SHARE (repoint) or reclaim-as-new-
+	 *     claimant (subject to this same guard again). The control flow
+	 *     enforces this; it does not rely on the calling process behaving
+	 *     itself.
+	 *   - What if a credited waiter is killed mid-wait? wait_for_completion()
+	 *     (not the _interruptible variant) does not observe signals, so a
+	 *     SIGKILL to a waiter does not take effect until its claim
+	 *     resolves and it runs the re-decide above -- verified live with
+	 *     an adversarial probe (a waiter SIGKILLed while its /proc state
+	 *     read 'D' stayed 'D', alive, for the full duration of the
+	 *     claimant's registration and only exited, WIFSIGNALED, after the
+	 *     claimant finished): see
+	 *     docs/investigations/shared-registration-two-processes/README.md,
+	 *     "Why page_mapcount() > 1 needed a threshold change, and why it
+	 *     is still safe". There is no window where a dying credited
+	 *     waiter's contribution is real but its reconciliation is skipped.
 	 *
-	 * Since we still hold our claim, a genuinely cooperating sibling that
-	 * has not YET reached its own call will do so shortly and become a
-	 * counted waiter -- so retry the check a bounded number of times with
-	 * a short sleep (mmap_write_lock dropped first; nothing here needs it
-	 * held across the sleep) rather than failing on the very first
-	 * sample. For a process that will NEVER call migrate_range on this
-	 * object -- shared_view_desync.c's child -- this changes nothing
-	 * except adding a bounded amount of latency before the SAME correct
-	 * refusal: its mapcount source never goes away and no claim ever
-	 * appears for it to be counted against, so every retry sees the same
-	 * unexplained excess and the loop still gives up and refuses.
+	 *   Net: refs cannot be inflated by anything that is not itself bound
+	 *   to go through this same protocol, so crediting it never lets a
+	 *   GENUINELY uninvolved view (e.g. shared_view_desync.c's child,
+	 *   which never calls migrate_range at all and so is never counted)
+	 *   get relocated past. Confirmed by that test still refusing,
+	 *   unchanged, across repeated runs.
+	 *
+	 * BOUNDED RETRY: refs only credits a sibling that is CONCURRENTLY
+	 * blocked in nvkvm_shared_resolve() at the exact instant of this
+	 * check, and the two siblings' migrate_range(B) calls frequently do
+	 * not overlap in time at all (measured via dmesg: fully sequential,
+	 * non-overlapping claim/release pairs, both hitting this refusal,
+	 * before this retry existed). Since we still hold our claim, a
+	 * genuinely cooperating sibling that has not yet reached its own call
+	 * will do so shortly and become a counted waiter -- so retry a
+	 * bounded number of times with a short sleep (mmap_write_lock dropped
+	 * first) instead of failing on the very first sample.
+	 *
+	 * MEASURED (2026-08-31, 8-vCPU guest, stress-ng --cpu 8 in the
+	 * background): 60 fork_both_register.c runs (30 idle + 30 under full
+	 * 8-way CPU stress), zero hard refusals. Of ~270 mapcount checks per
+	 * batch, ~95-97% needed 0 retries (refs-crediting alone already
+	 * covered them); under stress the remainder needed up to 10 retries
+	 * (worst case observed), comfortably inside the 25-attempt budget.
+	 * On exhaustion this fails CLOSED (-EINVAL, the pr_warn_ratelimited()
+	 * below fires and reports the retry count) -- refusing a legitimate
+	 * registration under extreme load is an acceptable failure mode here;
+	 * relocating past an unaccounted view is not, and nothing above
+	 * trades one for the other.
+	 *
+	 * For a process that will NEVER call migrate_range on this object --
+	 * shared_view_desync.c's child -- retrying changes nothing but
+	 * latency: its mapcount source never goes away and no claim ever
+	 * appears to account for it, so every retry sees the same unexplained
+	 * excess and the loop still gives up and refuses, just later.
 	 */
 #define NVKVM_MAPCOUNT_RETRY_MAX     25   /* ~50ms worst case, see delay below */
 #define NVKVM_MAPCOUNT_RETRY_DELAY_MS 2
@@ -2299,9 +2359,6 @@ retry_mapcount:
 			goto err_unpin;
 		}
 	}
-	if (is_shmem_obj)
-		pr_info("nvkvm: MEASURE mapcount-check pid=%d passed after %u retries mc_allowed=%lu\n",
-			current->pid, mapcount_retries, mc_allowed);
 	}
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
