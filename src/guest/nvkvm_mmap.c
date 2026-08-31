@@ -1688,6 +1688,8 @@ static void nvkvm_shared_claim_release(struct nvkvm_shared_pending *pend)
 	free_it = (--pend->refs == 0);
 	mutex_unlock(&nvkvm_shared_lock);
 
+	pr_info("nvkvm: DEBUG claim_release pid=%d pend=%p free_it=%d\n",
+		current->pid, pend, free_it);
 	complete_all(&pend->done);
 	if (free_it)
 		kfree(pend);
@@ -1757,6 +1759,8 @@ static bool nvkvm_shared_resolve(struct mm_struct *mm,
 		if (nvkvm_shared_fully_covered_locked(inode, pgoff_base,
 						      end - start)) {
 			mutex_unlock(&nvkvm_shared_lock);
+			pr_info("nvkvm: DEBUG resolve pid=%d inode=%p -> SHARE\n",
+				current->pid, inode);
 			*inode_out = inode;
 			*pgoff_out = pgoff_base;
 			return true;
@@ -1765,7 +1769,11 @@ static bool nvkvm_shared_resolve(struct mm_struct *mm,
 		if (pend) {
 			pend->refs++;
 			mutex_unlock(&nvkvm_shared_lock);
+			pr_info("nvkvm: DEBUG resolve pid=%d inode=%p -> WAIT on pend=%p\n",
+				current->pid, inode, pend);
 			wait_for_completion(&pend->done);
+			pr_info("nvkvm: DEBUG resolve pid=%d inode=%p -> WOKE pend=%p, retrying\n",
+				current->pid, inode, pend);
 			nvkvm_shared_pending_put(pend);
 			continue;   /* re-decide: share, wait again, or claim */
 		}
@@ -1778,6 +1786,8 @@ static bool nvkvm_shared_resolve(struct mm_struct *mm,
 			 * behaviour (mapcount guard decides) instead of
 			 * waiting -- correct, just not optimal. */
 			mutex_unlock(&nvkvm_shared_lock);
+			pr_info("nvkvm: DEBUG resolve pid=%d inode=%p -> CLAIM alloc failed, unclaimed\n",
+				current->pid, inode);
 			return false;
 		}
 		pend->inode = inode;
@@ -1786,6 +1796,8 @@ static bool nvkvm_shared_resolve(struct mm_struct *mm,
 		list_add_tail(&pend->list, &nvkvm_shared_pending_list);
 		mutex_unlock(&nvkvm_shared_lock);
 
+		pr_info("nvkvm: DEBUG resolve pid=%d inode=%p -> CLAIM pend=%p\n",
+			current->pid, inode, pend);
 		*inode_out  = inode;
 		*pgoff_out  = pgoff_base;
 		*claim_out  = pend;
@@ -2207,6 +2219,8 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			pr_warn_ratelimited(
 				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
 				start, end, i, mc);
+			pr_info("nvkvm: DEBUG mapcount-fail pid=%d is_shmem_obj=%d claim=%p\n",
+				current->pid, is_shmem_obj, shared_claim);
 			/* Under mmap_write_lock now -- every sibling error
 			 * path in this section unlocks before unwinding, and
 			 * err_unpin does not. */
