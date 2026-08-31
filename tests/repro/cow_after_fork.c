@@ -11,6 +11,18 @@
  *
  * Run the same binary against the real driver as a control.
  *
+ * SCOPE NOTE (2026-08-31): this is the fork-THEN-register shape, and it is
+ * the shape commit 79b6e45 ("guest/mmap: keep registered private memory
+ * PRIVATE as well as writable") actually fixes -- that commit's own message
+ * did not draw this distinction and reads more broadly than its fix reaches.
+ * What it fixes precisely: a MAP_PRIVATE mapping stays private in its VMA
+ * flags (VM_SHARED never gets set) while being made writable again after
+ * migrate_range()'s retype. It does NOT fix the reverse order -- register
+ * FIRST, then fork -- because once the VMA is VM_PFNMAP, fork() copies its
+ * special PTEs verbatim regardless of vm_flags. That failing case is
+ * tests/repro/fork_mapping_semantics.c; see
+ * docs/investigations/register-then-fork-private-not-fixed/README.md.
+ *
  * PASS: child's registration allowed, and the parent's copy is untouched by
  *       the child's writes (COW held).
  * FAIL: refused -- an ordinary pattern regressed.
