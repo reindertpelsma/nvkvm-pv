@@ -478,6 +478,12 @@ Two checks now cover it, and the suite is **30** rather than 28:
 |---|---|
 | `cuda_managed_alloc` | `cuMemAllocManaged` succeeds and returns a usable pointer on a device reporting `MANAGED_MEMORY=1` |
 | `cuda_managed_coherence` | the CPU writes the inputs **through the managed pointer** (no `cuMemcpy` anywhere), a real kernel runs over them, and the CPU reads every output element back — repeated over three CPU↔GPU migration cycles with different inputs each time |
+| RTX 3060 | Ampere GA106 | 565.57.01 / 570.124.06 / 580.95.05 / 590.48.01 / 595.84 / 610.57.04 | 550-610 | `9a98116` | 34/34 |
+| RTX 2060S | Turing TU106 | 565.57.01 / 570.124.06 / 580.95.05 / 590.48.01 / 595.84 / 610.57.04 | 550-610 | `9a98116` | 34/34 |
+| RTX 4070 Ti | Ada AD104 | 565.57.01 / 570.124.06 / 580.95.05 / 590.48.01 / 595.84 / 610.57.04 | 550-610 | `9a98116` | 34/34 |
+| RTX 5070 | Blackwell GB205 | 580.95.05 / 590.48.01 / 595.84 / 610.57.04 (all applicable; floor 580) | 580-610 | `9a98116` | 34/34 |
+| RTX 3050 Laptop | Ampere GA107 | 580.173.02 | 580 | `9a98116` | 34/34 |
+| RTX 4070 | Ada AD104 | 595.84 | 580 | `9a98116` | 34/34 |
 
 The second one is the point. Managed memory is a different code path from
 everything else in the suite, not a variation on one: the range is created by
