@@ -43,6 +43,9 @@
 static void nvkvm_vma_open(struct vm_area_struct *vma);
 static void nvkvm_vma_close(struct vm_area_struct *vma);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
+/* Object-keyed sharing registry (defined ahead of migrate_range, below) —
+ * forward-declared so nvkvm_cpu_page_release() can deregister on release. */
+static void nvkvm_shared_remove_handle(__u32 handle_id);
 
 /*
  * nvkvm_force_range_wb — rewrite the leaf PTEs covering [start,end) to
@@ -825,6 +828,12 @@ static void nvkvm_cpu_page_release(struct nvkvm_cpu_page *cp, __u32 isolate_id)
 {
 	nvkvm_cpu_page_unmap_guest(cp);
 
+	/* Object-keyed sharing: forget this handle the moment ANY cp entry
+	 * referencing it goes away (creator's or a sharer's) — conservative,
+	 * always safe.  See the comment above nvkvm_cpu_pages_share_range(). */
+	if (!cp->page)
+		nvkvm_shared_remove_handle(cp->handle_id);
+
 	if (isolate_id) {
 		nvkvm_virtio_munmap_on_isolate(isolate_id, cp->mmap_token);
 		nvkvm_virtio_close_handle_on_isolate(cp->handle_id, isolate_id);
@@ -1447,6 +1456,302 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
 }
 
 /*
+ * Bulk migration chunk size — moved up from just above
+ * nvkvm_cpu_pages_migrate_range() (its full rationale is there) so the
+ * object-keyed sharing code below can chunk the registry the identical way
+ * the relocate path does.  That identical alignment is what makes a
+ * sharer's per-chunk (inode, pgoff) keys land exactly on the keys the
+ * original registrant recorded: both processes computed cbase from the
+ * same vm_start/vm_pgoff (fork() copies the VMA verbatim) stepped by the
+ * same constant, so chunk N's pgoff is bit-identical on both sides.
+ */
+#define NVKVM_MIG_CHUNK   (2UL << 20)
+
+/*
+ * ─── Object-keyed cross-process sharing (fork_both_register.c) ─────────────
+ *
+ * The mapcount guard below refuses to RELOCATE a range that is mapped more
+ * than once — correctly, since relocating repoints only the caller's own
+ * VMA and strands every other view on the original pages (see the guard's
+ * own comment).  But it is one-sided: it stops a SECOND registrant from
+ * stranding a FIRST, not a first registrant from stranding everyone.  Linux
+ * does not eagerly copy PTEs for a shared file-backed VMA at fork(), so the
+ * FIRST registration on such a range sees mapcount == 1 (the sibling's PTE
+ * does not exist yet) and sails through, relocating the object's pages into
+ * a memfd and repointing only its own VMA.  The sibling's later
+ * registration then hits the guard, refuses, and — before this — left the
+ * two processes on divergent memory with every ioctl reporting success.
+ *
+ * Fix: key the migration by the BACKING OBJECT (inode, pgoff), not by GVA —
+ * a GVA is per-process and useless for recognising "this is the same
+ * buffer" across two different address spaces.  Before a range that is
+ * backed by a shmem object (MAP_SHARED|MAP_ANONYMOUS — the only case that
+ * can legitimately have a second view; see nvkvm_vma_file_is_memory())
+ * would be relocated, check whether its object was already migrated under
+ * an earlier registration.  If every chunk the caller would touch is
+ * already covered, do not relocate again: map the SAME memfds into THIS
+ * process's isolate at THIS process's VA and retype this VMA to point at
+ * the same window GPAs.  Both VMAs then reference one memfd and can never
+ * desync — and the mapcount guard never runs for this call, because
+ * nothing here is being relocated.  Runs in the registrant's own process
+ * context, so no foreign mmap_lock is ever touched.
+ *
+ * The registry only ever answers "was this EXACT (inode, pgoff, len) chunk
+ * already migrated" — no partial-coverage stitching.  A partial match falls
+ * straight through to the ordinary pin-and-relocate path below, mapcount
+ * guard included, unaffected by any of this: the guard still refuses to
+ * relocate any range that turns out to have a second view.  That is enough
+ * for the tested shape (whole-buffer refork registration, the realistic
+ * case for cuMemHostRegister) without teaching the registry to reason about
+ * overlapping sub-ranges nothing here needs.
+ *
+ * Lifetime: `inode` is stored ONLY for pointer-identity comparison and is
+ * NEVER dereferenced through the registry (the same discipline
+ * nvkvm_cpu_page_entry_live() already uses for `cp->mm`).  An entry is
+ * removed the moment ANY nvkvm_cpu_page referencing its handle is released
+ * (nvkvm_cpu_page_release(), below) — conservative (it may drop the entry
+ * while another process is still actively sharing the same handle) but
+ * always safe, and it guarantees the registry never outlives the mapping
+ * that justified trusting the inode pointer in the first place: at least
+ * one live, unretyped reference to that inode (the surviving process's own
+ * vm_file) still exists whenever an entry for it does.
+ */
+struct nvkvm_shared_range {
+	struct list_head list;
+	struct inode    *inode;    /* identity only — never dereferenced */
+	unsigned long    pgoff;    /* first page of this chunk, in PAGE_SIZE units */
+	unsigned long    len;      /* bytes */
+	__u32            handle_id;
+};
+
+static DEFINE_MUTEX(nvkvm_shared_lock);
+static LIST_HEAD(nvkvm_shared_ranges);
+
+static __u32 nvkvm_shared_find(struct inode *inode, unsigned long pgoff,
+			       unsigned long len)
+{
+	struct nvkvm_shared_range *sr;
+	__u32 handle = 0;
+
+	mutex_lock(&nvkvm_shared_lock);
+	list_for_each_entry(sr, &nvkvm_shared_ranges, list) {
+		if (sr->inode == inode && sr->pgoff == pgoff && sr->len == len) {
+			handle = sr->handle_id;
+			break;
+		}
+	}
+	mutex_unlock(&nvkvm_shared_lock);
+	return handle;
+}
+
+static void nvkvm_shared_add(struct inode *inode, unsigned long pgoff,
+			     unsigned long len, __u32 handle_id)
+{
+	struct nvkvm_shared_range *sr = kzalloc(sizeof(*sr), GFP_KERNEL);
+
+	if (!sr)
+		return;   /* best-effort: worst case a later sharer re-migrates */
+	sr->inode     = inode;
+	sr->pgoff     = pgoff;
+	sr->len       = len;
+	sr->handle_id = handle_id;
+	mutex_lock(&nvkvm_shared_lock);
+	list_add_tail(&sr->list, &nvkvm_shared_ranges);
+	mutex_unlock(&nvkvm_shared_lock);
+}
+
+static void nvkvm_shared_remove_handle(__u32 handle_id)
+{
+	struct nvkvm_shared_range *sr, *tmp;
+
+	mutex_lock(&nvkvm_shared_lock);
+	list_for_each_entry_safe(sr, tmp, &nvkvm_shared_ranges, list) {
+		if (sr->handle_id == handle_id) {
+			list_del(&sr->list);
+			kfree(sr);
+		}
+	}
+	mutex_unlock(&nvkvm_shared_lock);
+}
+
+/*
+ * nvkvm_migrate_range_is_shareable — read-only probe: is [start,end) backed
+ * by a shmem object every chunk of which is already migrated under some
+ * earlier registration?  Takes only mmap_read_lock.  The real work
+ * (nvkvm_cpu_pages_share_range() below) re-validates everything it needs
+ * under mmap_write_lock, so a benign race here (another thread of the same
+ * process mutating the VMA between the probe and the real call) only ever
+ * costs a -EAGAIN, never a wrong mapping.
+ */
+static bool nvkvm_migrate_range_is_shareable(struct mm_struct *mm,
+					     unsigned long start,
+					     unsigned long end,
+					     struct inode **inode_out,
+					     unsigned long *pgoff_out)
+{
+	struct vm_area_struct *vma;
+	bool ok = false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, start);
+	if (vma && vma->vm_start <= start && vma->vm_end >= end &&
+	    vma->vm_file && nvkvm_vma_file_is_memory(vma) &&
+	    !(vma->vm_flags & (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB))) {
+		struct inode *inode = file_inode(vma->vm_file);
+		unsigned long pgoff_base = vma->vm_pgoff +
+			((start - vma->vm_start) >> PAGE_SHIFT);
+		unsigned long coff, range_len = end - start;
+
+		ok = true;
+		for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
+			unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
+						 range_len - coff);
+			unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
+
+			if (!nvkvm_shared_find(inode, pgoff, clen)) {
+				ok = false;
+				break;
+			}
+		}
+		if (ok) {
+			*inode_out = inode;
+			*pgoff_out = pgoff_base;
+		}
+	}
+	mmap_read_unlock(mm);
+	return ok;
+}
+
+/*
+ * nvkvm_cpu_pages_share_range — the share path proper.  Caller has already
+ * confirmed every chunk of [start,end) resolves in the registry.  Maps each
+ * existing handle into THIS process's isolate at THIS process's VA and
+ * retypes this VMA to point at the same window GPAs — no pin, no gup, no
+ * mapcount check, because nothing is being relocated.
+ *
+ * On any failure this returns the error directly rather than falling back
+ * to the relocate path: chunks already shared in this call stay mapped
+ * (the same "partial registration is a legal intermediate state" contract
+ * nvkvm_cpu_pages_migrate_range's own err_unpin path documents), and
+ * falling back would try to gup pages that, for the chunks already shared,
+ * no longer back this VMA at all.
+ */
+static int nvkvm_cpu_pages_share_range(struct nvkvm_fd_ctx *ctx,
+				       unsigned long start, unsigned long end,
+				       unsigned long prot,
+				       struct inode *want_inode,
+				       unsigned long pgoff_base)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long coff, range_len = end - start;
+	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
+	bool cow_forced_write = false;
+	int ret;
+
+	if (!isolate_id)
+		return -ENOENT;
+
+	mmap_write_lock(mm);
+	vma = find_vma(mm, start);
+	if (!vma || vma->vm_start > start || vma->vm_end < end) {
+		mmap_write_unlock(mm);
+		return -EFAULT;
+	}
+	/* Re-validate identity under the write lock — see the probe's comment. */
+	if ((vma->vm_flags & (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB)) ||
+	    !vma->vm_file || file_inode(vma->vm_file) != want_inode ||
+	    vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT) != pgoff_base) {
+		mmap_write_unlock(mm);
+		return -EAGAIN;
+	}
+
+	/* Same VMA retype the relocate path performs — see its comments above
+	 * (is_cow_mapping / VM_SHARED / vm_get_page_prot) for why. */
+	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	if (is_cow_mapping(vma->vm_flags)) {
+		vm_flags_clear(vma, VM_MAYWRITE);
+		cow_forced_write = true;
+	}
+	vma->vm_page_prot = vm_get_page_prot(cow_forced_write
+					     ? (vma->vm_flags | VM_SHARED)
+					     : vma->vm_flags);
+	mmap_write_unlock(mm);
+
+	for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
+		unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
+					 range_len - coff);
+		unsigned long cbase = start + coff;
+		unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
+		__u32 handle = nvkvm_shared_find(want_inode, pgoff, clen);
+		__u64 gpa = 0;
+		__u32 token = 0;
+		struct nvkvm_cpu_page *cp;
+
+		if (!handle)
+			return -EAGAIN;   /* raced: entry disappeared mid-loop */
+
+		ret = nvkvm_virtio_copy_handle_to_isolate(handle, isolate_id);
+		if (ret)
+			return ret;
+
+		ret = nvkvm_virtio_mmap_on_isolate(isolate_id, handle,
+						   cbase, 0, clen,
+						   (__u32)prot, MAP_SHARED,
+						   (unsigned int)ctx->session->id,
+						   &gpa, &token);
+		if (ret) {
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return ret;
+		}
+		if (!nvkvm_gpa_in_mmap_window(gpa, clen)) {
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return -EIO;
+		}
+
+		mmap_write_lock(mm);
+		vma = find_vma(mm, cbase);
+		if (!vma || vma->vm_start > cbase || vma->vm_end < cbase + clen ||
+		    !(vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))) {
+			mmap_write_unlock(mm);
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return -EFAULT;
+		}
+		vma_start_write(vma);
+		nvkvm_zap_range(vma, cbase, clen);
+		ret = remap_pfn_range(vma, cbase, (unsigned long)(gpa >> PAGE_SHIFT),
+				      clen, vma->vm_page_prot);
+		if (!ret)
+			nvkvm_force_range_wb(mm, cbase, cbase + clen);
+		mmap_write_unlock(mm);
+		if (ret) {
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return ret;
+		}
+
+		cp = kzalloc(sizeof(*cp), GFP_KERNEL);
+		if (cp) {
+			cp->page       = NULL;
+			cp->mm         = mm;
+			cp->gva        = cbase;
+			cp->gpa        = gpa;
+			cp->length     = clen;
+			cp->handle_id  = handle;
+			cp->mmap_token = token;
+			cp->prot       = (__u32)prot;
+			mmgrab(mm);
+			mutex_lock(&ctx->cpu_pages_lock);
+			list_add_tail(&cp->list, &ctx->cpu_pages);
+			mutex_unlock(&ctx->cpu_pages_lock);
+		}   /* else: mapping is live; accept the tracking leak, as above */
+	}
+	return 0;
+}
+
+/*
  * nvkvm_cpu_pages_migrate_range — migrate every guest page covering
  * [gva, gva+len) onto memfds shared with the isolate.  Pages already
  * migrated are skipped (cpu_page_migrate dedupes by gva).  Used to set
@@ -1487,8 +1792,10 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
  * overhead negligible, so batching chunks on top of it bought nothing.
  * Restoring the per-chunk order removes the array, removes the per-call
  * ceiling, and tightens the duplicate from 16 MiB to 2 MiB.
+ *
+ * (NVKVM_MIG_CHUNK itself is defined above, ahead of the sharing code that
+ * also needs it — see the comment there.)
  */
-#define NVKVM_MIG_CHUNK   (2UL << 20)
 
 /*
  * Largest range a single call will migrate.  This is no longer structural —
@@ -1526,6 +1833,9 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	unsigned long i;
 	int ret = 0, nck = 0;
 	bool cow_forced_write = false;
+	bool is_shmem_obj = false;         /* object-keyed sharing, see below */
+	struct inode *reg_inode = NULL;
+	unsigned long reg_pgoff_base = 0;
 
 	if (!len)
 		return 0;
@@ -1556,6 +1866,25 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	/* A new registration changes the set of valid ranges — drop any cached
 	 * VALIDATE results so a stale "valid" can't survive a free+remap. */
 	nvkvm_session_vcache_clear(ctx->session);
+
+	/*
+	 * Object-keyed sharing (see the comment block above
+	 * nvkvm_cpu_pages_share_range()): if every chunk of this range is
+	 * already migrated under an earlier registration of the same backing
+	 * object, share it instead of relocating a second time.  Decided here,
+	 * BEFORE any page is pinned and before the mapcount guard can even be
+	 * reached — the share path is for ranges that are NOT being relocated,
+	 * so it must never be reachable through that guard.
+	 */
+	{
+		struct inode *sh_inode = NULL;
+		unsigned long sh_pgoff = 0;
+
+		if (nvkvm_migrate_range_is_shareable(mm, start, end,
+						     &sh_inode, &sh_pgoff))
+			return nvkvm_cpu_pages_share_range(ctx, start, end, prot,
+							   sh_inode, sh_pgoff);
+	}
 
 	range_len = end - start;
 	npages    = range_len >> PAGE_SHIFT;
@@ -1631,6 +1960,21 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			start, end, (unsigned long)vma->vm_flags,
 			!!vma->vm_file);
 		ret = -EINVAL; goto err_unpin;
+	}
+
+	/*
+	 * Captured once, under the same write lock that is about to retype
+	 * this VMA, for the registry insert at the end of each chunk below.
+	 * NULL/false when this is an ordinary MAP_PRIVATE|MAP_ANONYMOUS range
+	 * (nothing to key: it can never legitimately have a second view, so
+	 * sharing does not apply and nothing is recorded).  See the
+	 * object-keyed sharing comment above nvkvm_cpu_pages_share_range().
+	 */
+	is_shmem_obj = vma->vm_file && nvkvm_vma_file_is_memory(vma);
+	if (is_shmem_obj) {
+		reg_inode      = file_inode(vma->vm_file);
+		reg_pgoff_base = vma->vm_pgoff +
+			((start - vma->vm_start) >> PAGE_SHIFT);
 	}
 
 	/*
@@ -1964,6 +2308,14 @@ chunk_fail_h:
 			list_add_tail(&cp->list, &ctx->cpu_pages);
 			mutex_unlock(&ctx->cpu_pages_lock);
 		}   /* else: mapping is live; accept the tracking leak */
+
+		/* Object-keyed sharing: make this chunk findable by a sibling
+		 * process registering the same backing object later.  See the
+		 * comment block above nvkvm_cpu_pages_share_range(). */
+		if (is_shmem_obj)
+			nvkvm_shared_add(reg_inode,
+					 reg_pgoff_base + (coff >> PAGE_SHIFT),
+					 clen, handle);
 
 		/*
 		 * Release this chunk's pinned pages.  The data's only home is
