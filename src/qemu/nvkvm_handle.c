@@ -504,6 +504,36 @@ int nvkvm_handle_close(struct nvkvm_handle_table *t, uint32_t handle_id)
 	return 0;
 }
 
+/*
+ * Cross-session sharing (fork_both_register.c) made this reachable for the
+ * first time: a handle created by session A can now be legitimately mapped
+ * into session B's isolate too (nvkvm_req_mmap_on_isolate no longer requires
+ * h->session_id == req->session_id -- that check was guest policy, not a
+ * host boundary; see the comment there). So a handle's isolate_refcount can
+ * be held by an isolate OUTSIDE the session this loop is tearing down.
+ *
+ * Before that, force-closing every fd here regardless of isolate_refcount
+ * was safe: this function only runs once nisolates == 0 for THIS session
+ * (nvkvm_session_destroy's comment), and no other session could ever hold a
+ * reference on one of this session's handles, so "the isolates are gone"
+ * really did mean isolate_refcount was moot. Measured before this feature
+ * existed: zero handles were ever force-closed here across a full workload,
+ * including abnormal termination, because the guest already closes its own
+ * handles on every ordinary path.
+ *
+ * Now it is a live use-after-free: close the fd here while a live sibling
+ * isolate still has it mapped, and every access that isolate makes through
+ * it is a read/write on a closed (and possibly already-reused) fd number in
+ * QEMU's own process -- host memory corruption, not merely a guest-visible
+ * error. nvkvm_handle_close() already refuses with -EBUSY while
+ * isolate_refcount > 0 for exactly this reason; make session teardown
+ * consistent with it instead of bypassing it. A handle skipped here is not
+ * leaked: it stays in_use under the dead session's id, and whichever side
+ * -- the surviving sharer, ordinarily -- drops the last isolate reference
+ * and then asks to close it will succeed via the normal nvkvm_handle_close()
+ * path once isolate_refcount reaches 0 (nvkvm_handle_close does not check
+ * session ownership, only handle validity and isolate_refcount).
+ */
 void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_id)
 {
 	pthread_mutex_lock(&t->lock);
@@ -511,6 +541,8 @@ void nvkvm_handle_close_session(struct nvkvm_handle_table *t, uint32_t session_i
 		struct nvkvm_handle *h = &t->handles[i];
 		if (!h->in_use || h->session_id != session_id)
 			continue;
+		if (h->isolate_refcount > 0)
+			continue;   /* still referenced by a live sibling isolate */
 		if (h->fd >= 0) {
 			close(h->fd);
 			h->fd = -1;

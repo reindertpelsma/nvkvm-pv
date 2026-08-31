@@ -33,6 +33,7 @@
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
 #include <linux/pgtable.h>
+#include <linux/delay.h>       /* msleep() — mapcount retry, see below */
 #include <linux/fs.h>          /* file_inode() — VMA type check below */
 #include <uapi/linux/magic.h>  /* TMPFS_MAGIC  — VMA type check below */
 #include <asm/pgtable_types.h>
@@ -43,6 +44,9 @@
 static void nvkvm_vma_open(struct vm_area_struct *vma);
 static void nvkvm_vma_close(struct vm_area_struct *vma);
 bool nvkvm_gpa_in_mmap_window(unsigned long gpa_base, unsigned long len);
+/* Object-keyed sharing registry (defined ahead of migrate_range, below) —
+ * forward-declared so nvkvm_cpu_page_release() can deregister on release. */
+static void nvkvm_shared_remove_handle(__u32 handle_id);
 
 /*
  * nvkvm_force_range_wb — rewrite the leaf PTEs covering [start,end) to
@@ -825,6 +829,12 @@ static void nvkvm_cpu_page_release(struct nvkvm_cpu_page *cp, __u32 isolate_id)
 {
 	nvkvm_cpu_page_unmap_guest(cp);
 
+	/* Object-keyed sharing: forget this handle the moment ANY cp entry
+	 * referencing it goes away (creator's or a sharer's) — conservative,
+	 * always safe.  See the comment above nvkvm_cpu_pages_share_range(). */
+	if (!cp->page)
+		nvkvm_shared_remove_handle(cp->handle_id);
+
 	if (isolate_id) {
 		nvkvm_virtio_munmap_on_isolate(isolate_id, cp->mmap_token);
 		nvkvm_virtio_close_handle_on_isolate(cp->handle_id, isolate_id);
@@ -1447,6 +1457,473 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
 }
 
 /*
+ * Bulk migration chunk size — moved up from just above
+ * nvkvm_cpu_pages_migrate_range() (its full rationale is there) so the
+ * object-keyed sharing code below can chunk the registry the identical way
+ * the relocate path does.  That identical alignment is what makes a
+ * sharer's per-chunk (inode, pgoff) keys land exactly on the keys the
+ * original registrant recorded: both processes computed cbase from the
+ * same vm_start/vm_pgoff (fork() copies the VMA verbatim) stepped by the
+ * same constant, so chunk N's pgoff is bit-identical on both sides.
+ */
+#define NVKVM_MIG_CHUNK   (2UL << 20)
+
+/*
+ * ─── Object-keyed cross-process sharing (fork_both_register.c) ─────────────
+ *
+ * The mapcount guard below refuses to RELOCATE a range that is mapped more
+ * than once — correctly, since relocating repoints only the caller's own
+ * VMA and strands every other view on the original pages (see the guard's
+ * own comment).  But it is one-sided: it stops a SECOND registrant from
+ * stranding a FIRST, not a first registrant from stranding everyone.  Linux
+ * does not eagerly copy PTEs for a shared file-backed VMA at fork(), so the
+ * FIRST registration on such a range sees mapcount == 1 (the sibling's PTE
+ * does not exist yet) and sails through, relocating the object's pages into
+ * a memfd and repointing only its own VMA.  The sibling's later
+ * registration then hits the guard, refuses, and — before this — left the
+ * two processes on divergent memory with every ioctl reporting success.
+ *
+ * Fix: key the migration by the BACKING OBJECT (inode, pgoff), not by GVA —
+ * a GVA is per-process and useless for recognising "this is the same
+ * buffer" across two different address spaces.  Before a range that is
+ * backed by a shmem object (MAP_SHARED|MAP_ANONYMOUS — the only case that
+ * can legitimately have a second view; see nvkvm_vma_file_is_memory())
+ * would be relocated, check whether its object was already migrated under
+ * an earlier registration.  If every chunk the caller would touch is
+ * already covered, do not relocate again: map the SAME memfds into THIS
+ * process's isolate at THIS process's VA and retype this VMA to point at
+ * the same window GPAs.  Both VMAs then reference one memfd and can never
+ * desync — and the mapcount guard never runs for this call, because
+ * nothing here is being relocated.  Runs in the registrant's own process
+ * context, so no foreign mmap_lock is ever touched.
+ *
+ * The registry only ever answers "was this EXACT (inode, pgoff, len) chunk
+ * already migrated" — no partial-coverage stitching.  A partial match falls
+ * straight through to the ordinary pin-and-relocate path below, mapcount
+ * guard included, unaffected by any of this: the guard still refuses to
+ * relocate any range that turns out to have a second view.  That is enough
+ * for the tested shape (whole-buffer refork registration, the realistic
+ * case for cuMemHostRegister) without teaching the registry to reason about
+ * overlapping sub-ranges nothing here needs.
+ *
+ * Lifetime: `inode` is stored ONLY for pointer-identity comparison and is
+ * NEVER dereferenced through the registry (the same discipline
+ * nvkvm_cpu_page_entry_live() already uses for `cp->mm`).  An entry is
+ * removed the moment ANY nvkvm_cpu_page referencing its handle is released
+ * (nvkvm_cpu_page_release(), below) — conservative (it may drop the entry
+ * while another process is still actively sharing the same handle) but
+ * always safe, and it guarantees the registry never outlives the mapping
+ * that justified trusting the inode pointer in the first place: at least
+ * one live, unretyped reference to that inode (the surviving process's own
+ * vm_file) still exists whenever an entry for it does.
+ *
+ * This registry alone is not sufficient for fork_both_register.c's actual
+ * shape -- two peer processes racing out of fork() with no ordering between
+ * them, not "one finishes, then later another registers." See the pending-
+ * claim mechanism (nvkvm_shared_resolve() and friends) below the registry
+ * helpers for why and how that race is closed.
+ */
+struct nvkvm_shared_range {
+	struct list_head list;
+	struct inode    *inode;    /* identity only — never dereferenced */
+	unsigned long    pgoff;    /* first page of this chunk, in PAGE_SIZE units */
+	unsigned long    len;      /* bytes */
+	__u32            handle_id;
+};
+
+static DEFINE_MUTEX(nvkvm_shared_lock);
+static LIST_HEAD(nvkvm_shared_ranges);
+
+static __u32 nvkvm_shared_find(struct inode *inode, unsigned long pgoff,
+			       unsigned long len)
+{
+	struct nvkvm_shared_range *sr;
+	__u32 handle = 0;
+
+	mutex_lock(&nvkvm_shared_lock);
+	list_for_each_entry(sr, &nvkvm_shared_ranges, list) {
+		if (sr->inode == inode && sr->pgoff == pgoff && sr->len == len) {
+			handle = sr->handle_id;
+			break;
+		}
+	}
+	mutex_unlock(&nvkvm_shared_lock);
+	return handle;
+}
+
+static void nvkvm_shared_add(struct inode *inode, unsigned long pgoff,
+			     unsigned long len, __u32 handle_id)
+{
+	struct nvkvm_shared_range *sr = kzalloc(sizeof(*sr), GFP_KERNEL);
+
+	if (!sr)
+		return;   /* best-effort: worst case a later sharer re-migrates */
+	sr->inode     = inode;
+	sr->pgoff     = pgoff;
+	sr->len       = len;
+	sr->handle_id = handle_id;
+	mutex_lock(&nvkvm_shared_lock);
+	list_add_tail(&sr->list, &nvkvm_shared_ranges);
+	mutex_unlock(&nvkvm_shared_lock);
+}
+
+static void nvkvm_shared_remove_handle(__u32 handle_id)
+{
+	struct nvkvm_shared_range *sr, *tmp;
+
+	mutex_lock(&nvkvm_shared_lock);
+	list_for_each_entry_safe(sr, tmp, &nvkvm_shared_ranges, list) {
+		if (sr->handle_id == handle_id) {
+			list_del(&sr->list);
+			kfree(sr);
+		}
+	}
+	mutex_unlock(&nvkvm_shared_lock);
+}
+
+/* Caller holds nvkvm_shared_lock. */
+static bool nvkvm_shared_fully_covered_locked(struct inode *inode,
+					      unsigned long pgoff_base,
+					      unsigned long range_len)
+{
+	unsigned long coff;
+
+	for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
+		unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
+					 range_len - coff);
+		unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
+		struct nvkvm_shared_range *sr;
+		bool hit = false;
+
+		list_for_each_entry(sr, &nvkvm_shared_ranges, list) {
+			if (sr->inode == inode && sr->pgoff == pgoff &&
+			    sr->len == clen) {
+				hit = true;
+				break;
+			}
+		}
+		if (!hit)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * ─── The race the registry alone does not close ────────────────────────────
+ *
+ * fork_both_register.c is not "register, then later someone else registers
+ * the same object" -- it is two ALREADY-RUNNING processes independently
+ * calling migrate_range for the same object at close to the same time, with
+ * no ordering between them.  A plain "check the registry, share if found,
+ * else migrate" has a window: both calls can probe before EITHER has
+ * finished migrating and recorded anything, both see nothing, and both fall
+ * into the ordinary pin-and-relocate path -- reintroducing exactly the
+ * mapcount race this whole mechanism exists to close, just delayed rather
+ * than removed.  Measured: this is not a corner case, it is the common case
+ * for two peer processes racing out of fork() with no synchronisation.
+ *
+ * Fix: a second, lighter-weight PENDING list.  The first caller to reach a
+ * given inode with no completed registry entry does not just start
+ * migrating -- it publishes a pending claim for that inode first.  Every
+ * later caller for the SAME inode, arriving before the claim resolves,
+ * waits on it instead of racing past it, then re-decides once it resolves:
+ * on success the registry now has the answer and it shares; on failure the
+ * claim is gone and it becomes the new claimant and tries the migration
+ * itself.  Either way, no second caller ever begins pinning while a sibling
+ * is mid-migration on the same object.
+ *
+ * Granularity is per INODE, not per (inode, pgoff, len): a second caller for
+ * a genuinely disjoint sub-range of the same large object waits for an
+ * unrelated migration to finish before it can even start its own. That is a
+ * throughput cost, not a correctness one -- disjoint concurrent
+ * sub-registrations of one object are not a shape any current caller
+ * produces (cuMemHostRegister registers one buffer, one object, in full).
+ * Keying finer is a straightforward follow-up if that ever changes.
+ *
+ * Refcounting: `refs` starts at 1 (the claimant's own reference) and is
+ * touched only under nvkvm_shared_lock. A waiter increments it while still
+ * holding the lock (so it can only find `pend` while it is still on the
+ * list) before dropping the lock to sleep; nvkvm_shared_claim_release()
+ * unlinks `pend` from the list and decrements under the SAME lock section,
+ * so no thread can observe (let alone increment-reference) a pending entry
+ * that is no longer reachable from the list -- the classic "list_del and
+ * the recount that retires an object happen in one critical section"
+ * invariant. Whoever's decrement reaches zero frees it; complete_all() runs
+ * strictly before that free can be reached by any waiter still asleep, since
+ * a waiter cannot resume (and therefore cannot free) before complete_all()
+ * wakes it.
+ */
+struct nvkvm_shared_pending {
+	struct list_head list;
+	struct inode    *inode;   /* identity only — never dereferenced */
+	struct completion done;
+	int              refs;
+};
+
+static LIST_HEAD(nvkvm_shared_pending_list);
+
+/* Caller holds nvkvm_shared_lock. */
+static struct nvkvm_shared_pending *
+nvkvm_shared_find_pending_locked(struct inode *inode)
+{
+	struct nvkvm_shared_pending *p;
+
+	list_for_each_entry(p, &nvkvm_shared_pending_list, list)
+		if (p->inode == inode)
+			return p;
+	return NULL;
+}
+
+/*
+ * nvkvm_shared_claim_release — the claimant's migration attempt (success or
+ * failure) is decided.  Unlink the pending marker so it can no longer be
+ * found, wake every waiter so they re-decide, and free it once the last
+ * reference (ours, or a waiter still catching up on the lock) is gone.
+ */
+static void nvkvm_shared_claim_release(struct nvkvm_shared_pending *pend)
+{
+	bool free_it;
+
+	mutex_lock(&nvkvm_shared_lock);
+	list_del(&pend->list);
+	free_it = (--pend->refs == 0);
+	mutex_unlock(&nvkvm_shared_lock);
+
+	complete_all(&pend->done);
+	if (free_it)
+		kfree(pend);
+}
+
+/* A waiter's turn is over (it woke up, or never had to wait) — drop the
+ * reference it took to observe `pend` safely across the sleep. */
+static void nvkvm_shared_pending_put(struct nvkvm_shared_pending *pend)
+{
+	bool free_it;
+
+	mutex_lock(&nvkvm_shared_lock);
+	free_it = (--pend->refs == 0);
+	mutex_unlock(&nvkvm_shared_lock);
+	if (free_it)
+		kfree(pend);
+}
+
+/*
+ * nvkvm_shared_resolve — decide what a possibly-shmem-backed [start,end)
+ * should do, waiting out any concurrent sibling migration of the same
+ * object along the way.  See the race comment above.
+ *
+ * Returns:
+ *   true  -- SHARE.  *inode_out / *pgoff_out set; caller runs
+ *            nvkvm_cpu_pages_share_range() and returns its result.
+ *   false -- MIGRATE the ordinary way.  *claim_out is NULL when the range
+ *            is not shmem-backed at all (nothing to claim or release).
+ *            Otherwise *claim_out is this call's own claim and MUST be
+ *            passed to nvkvm_shared_claim_release() from every exit path of
+ *            the ordinary migrate, exactly once, once success or failure is
+ *            known — that release is what wakes any sibling waiting to
+ *            re-check the registry.
+ */
+static bool nvkvm_shared_resolve(struct mm_struct *mm,
+				 unsigned long start, unsigned long end,
+				 struct inode **inode_out,
+				 unsigned long *pgoff_out,
+				 struct nvkvm_shared_pending **claim_out)
+{
+	*claim_out = NULL;
+
+	for (;;) {
+		struct vm_area_struct *vma;
+		struct inode *inode = NULL;
+		unsigned long pgoff_base = 0;
+		bool is_shmem;
+		struct nvkvm_shared_pending *pend;
+
+		mmap_read_lock(mm);
+		vma = find_vma(mm, start);
+		is_shmem = vma && vma->vm_start <= start && vma->vm_end >= end &&
+			  vma->vm_file && nvkvm_vma_file_is_memory(vma) &&
+			  !(vma->vm_flags &
+			    (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB));
+		if (is_shmem) {
+			inode = file_inode(vma->vm_file);
+			pgoff_base = vma->vm_pgoff +
+				((start - vma->vm_start) >> PAGE_SHIFT);
+		}
+		mmap_read_unlock(mm);
+
+		if (!is_shmem)
+			return false;   /* ordinary MAP_PRIVATE|ANON: nothing to claim */
+
+		mutex_lock(&nvkvm_shared_lock);
+		if (nvkvm_shared_fully_covered_locked(inode, pgoff_base,
+						      end - start)) {
+			mutex_unlock(&nvkvm_shared_lock);
+			*inode_out = inode;
+			*pgoff_out = pgoff_base;
+			return true;
+		}
+		pend = nvkvm_shared_find_pending_locked(inode);
+		if (pend) {
+			pend->refs++;
+			mutex_unlock(&nvkvm_shared_lock);
+			wait_for_completion(&pend->done);
+			nvkvm_shared_pending_put(pend);
+			continue;   /* re-decide: share, wait again, or claim */
+		}
+
+		pend = kzalloc(sizeof(*pend), GFP_KERNEL);
+		if (!pend) {
+			/* Best-effort: proceed unclaimed rather than fail the
+			 * registration over a bookkeeping allocation. A racing
+			 * sibling in this rare case falls back to the pre-fix
+			 * behaviour (mapcount guard decides) instead of
+			 * waiting -- correct, just not optimal. */
+			mutex_unlock(&nvkvm_shared_lock);
+			return false;
+		}
+		pend->inode = inode;
+		pend->refs  = 1;
+		init_completion(&pend->done);
+		list_add_tail(&pend->list, &nvkvm_shared_pending_list);
+		mutex_unlock(&nvkvm_shared_lock);
+
+		*inode_out  = inode;
+		*pgoff_out  = pgoff_base;
+		*claim_out  = pend;
+		return false;
+	}
+}
+
+/*
+ * nvkvm_cpu_pages_share_range — the share path proper.  Caller has already
+ * confirmed every chunk of [start,end) resolves in the registry.  Maps each
+ * existing handle into THIS process's isolate at THIS process's VA and
+ * retypes this VMA to point at the same window GPAs — no pin, no gup, no
+ * mapcount check, because nothing is being relocated.
+ *
+ * On any failure this returns the error directly rather than falling back
+ * to the relocate path: chunks already shared in this call stay mapped
+ * (the same "partial registration is a legal intermediate state" contract
+ * nvkvm_cpu_pages_migrate_range's own err_unpin path documents), and
+ * falling back would try to gup pages that, for the chunks already shared,
+ * no longer back this VMA at all.
+ */
+static int nvkvm_cpu_pages_share_range(struct nvkvm_fd_ctx *ctx,
+				       unsigned long start, unsigned long end,
+				       unsigned long prot,
+				       struct inode *want_inode,
+				       unsigned long pgoff_base)
+{
+	struct mm_struct *mm = current->mm;
+	struct vm_area_struct *vma;
+	unsigned long coff, range_len = end - start;
+	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
+	bool cow_forced_write = false;
+	int ret;
+
+	if (!isolate_id)
+		return -ENOENT;
+
+	mmap_write_lock(mm);
+	vma = find_vma(mm, start);
+	if (!vma || vma->vm_start > start || vma->vm_end < end) {
+		mmap_write_unlock(mm);
+		return -EFAULT;
+	}
+	/* Re-validate identity under the write lock — see the probe's comment. */
+	if ((vma->vm_flags & (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB)) ||
+	    !vma->vm_file || file_inode(vma->vm_file) != want_inode ||
+	    vma->vm_pgoff + ((start - vma->vm_start) >> PAGE_SHIFT) != pgoff_base) {
+		mmap_write_unlock(mm);
+		return -EAGAIN;
+	}
+
+	/* Same VMA retype the relocate path performs — see its comments above
+	 * (is_cow_mapping / VM_SHARED / vm_get_page_prot) for why. */
+	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
+	if (is_cow_mapping(vma->vm_flags)) {
+		vm_flags_clear(vma, VM_MAYWRITE);
+		cow_forced_write = true;
+	}
+	vma->vm_page_prot = vm_get_page_prot(cow_forced_write
+					     ? (vma->vm_flags | VM_SHARED)
+					     : vma->vm_flags);
+	mmap_write_unlock(mm);
+
+	for (coff = 0; coff < range_len; coff += NVKVM_MIG_CHUNK) {
+		unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
+					 range_len - coff);
+		unsigned long cbase = start + coff;
+		unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
+		__u32 handle = nvkvm_shared_find(want_inode, pgoff, clen);
+		__u64 gpa = 0;
+		__u32 token = 0;
+		struct nvkvm_cpu_page *cp;
+
+		if (!handle)
+			return -EAGAIN;   /* raced: entry disappeared mid-loop */
+
+		ret = nvkvm_virtio_copy_handle_to_isolate(handle, isolate_id);
+		if (ret)
+			return ret;
+
+		ret = nvkvm_virtio_mmap_on_isolate(isolate_id, handle,
+						   cbase, 0, clen,
+						   (__u32)prot, MAP_SHARED,
+						   (unsigned int)ctx->session->id,
+						   &gpa, &token);
+		if (ret) {
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return ret;
+		}
+		if (!nvkvm_gpa_in_mmap_window(gpa, clen)) {
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return -EIO;
+		}
+
+		mmap_write_lock(mm);
+		vma = find_vma(mm, cbase);
+		if (!vma || vma->vm_start > cbase || vma->vm_end < cbase + clen ||
+		    !(vma->vm_flags & (VM_PFNMAP | VM_MIXEDMAP))) {
+			mmap_write_unlock(mm);
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return -EFAULT;
+		}
+		vma_start_write(vma);
+		nvkvm_zap_range(vma, cbase, clen);
+		ret = remap_pfn_range(vma, cbase, (unsigned long)(gpa >> PAGE_SHIFT),
+				      clen, vma->vm_page_prot);
+		if (!ret)
+			nvkvm_force_range_wb(mm, cbase, cbase + clen);
+		mmap_write_unlock(mm);
+		if (ret) {
+			nvkvm_virtio_munmap_on_isolate(isolate_id, token);
+			nvkvm_virtio_close_handle_on_isolate(handle, isolate_id);
+			return ret;
+		}
+
+		cp = kzalloc(sizeof(*cp), GFP_KERNEL);
+		if (cp) {
+			cp->page       = NULL;
+			cp->mm         = mm;
+			cp->gva        = cbase;
+			cp->gpa        = gpa;
+			cp->length     = clen;
+			cp->handle_id  = handle;
+			cp->mmap_token = token;
+			cp->prot       = (__u32)prot;
+			mmgrab(mm);
+			mutex_lock(&ctx->cpu_pages_lock);
+			list_add_tail(&cp->list, &ctx->cpu_pages);
+			mutex_unlock(&ctx->cpu_pages_lock);
+		}   /* else: mapping is live; accept the tracking leak, as above */
+	}
+	return 0;
+}
+
+/*
  * nvkvm_cpu_pages_migrate_range — migrate every guest page covering
  * [gva, gva+len) onto memfds shared with the isolate.  Pages already
  * migrated are skipped (cpu_page_migrate dedupes by gva).  Used to set
@@ -1487,8 +1964,10 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
  * overhead negligible, so batching chunks on top of it bought nothing.
  * Restoring the per-chunk order removes the array, removes the per-call
  * ceiling, and tightens the duplicate from 16 MiB to 2 MiB.
+ *
+ * (NVKVM_MIG_CHUNK itself is defined above, ahead of the sharing code that
+ * also needs it — see the comment there.)
  */
-#define NVKVM_MIG_CHUNK   (2UL << 20)
 
 /*
  * Largest range a single call will migrate.  This is no longer structural —
@@ -1525,6 +2004,12 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	long got = 0;
 	unsigned long i;
 	int ret = 0, nck = 0;
+	bool cow_forced_write = false;
+	bool is_shmem_obj = false;         /* object-keyed sharing, see below */
+	struct inode *reg_inode = NULL;
+	unsigned long reg_pgoff_base = 0;
+	struct nvkvm_shared_pending *shared_claim = NULL;
+	unsigned int mapcount_retries = 0; /* object-keyed sharing, see below */
 
 	if (!len)
 		return 0;
@@ -1556,12 +2041,37 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * VALIDATE results so a stale "valid" can't survive a free+remap. */
 	nvkvm_session_vcache_clear(ctx->session);
 
+	/*
+	 * Object-keyed sharing (see the comment block above
+	 * nvkvm_cpu_pages_share_range()): if every chunk of this range is
+	 * already migrated under an earlier registration of the same backing
+	 * object, share it instead of relocating a second time.  Decided here,
+	 * BEFORE any page is pinned and before the mapcount guard can even be
+	 * reached — the share path is for ranges that are NOT being relocated,
+	 * so it must never be reachable through that guard.
+	 *
+	 * nvkvm_shared_resolve() also closes the race two peer processes
+	 * hit racing straight out of fork() with no synchronisation between
+	 * them (see its comment): it waits out a sibling's in-flight
+	 * migration of the same object rather than letting both fall into
+	 * the relocate path together, and hands this call a claim to release
+	 * once its own attempt (below) is decided.
+	 */
+	{
+		struct inode *sh_inode = NULL;
+		unsigned long sh_pgoff = 0;
+
+		if (nvkvm_shared_resolve(mm, start, end, &sh_inode, &sh_pgoff,
+					 &shared_claim))
+			return nvkvm_cpu_pages_share_range(ctx, start, end, prot,
+							   sh_inode, sh_pgoff);
+	}
+
 	range_len = end - start;
 	npages    = range_len >> PAGE_SHIFT;
 
 	pages = kvmalloc_array(npages, sizeof(*pages), GFP_KERNEL);
-	if (!pages)
-		return -ENOMEM;
+	if (!pages) { ret = -ENOMEM; goto err_unpin; }
 
 	/*
 	 * Pin every page up front — BEFORE any VMA mutation, so a later
@@ -1591,6 +2101,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * Doing the conversion here rather than per chunk also means the
 	 * per-chunk loop below only ever touches PTEs.
 	 */
+retry_mapcount:
 	mmap_write_lock(mm);
 	vma = find_vma(mm, start);
 	if (!vma || vma->vm_start > start || vma->vm_end < end) {
@@ -1632,6 +2143,20 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		ret = -EINVAL; goto err_unpin;
 	}
 
+	/*
+	 * Captured once, under the same write lock that is about to retype
+	 * this VMA, for the registry insert at the end of each chunk below.
+	 * NULL/false when this is an ordinary MAP_PRIVATE|MAP_ANONYMOUS range
+	 * (nothing to key: it can never legitimately have a second view, so
+	 * sharing does not apply and nothing is recorded).  See the
+	 * object-keyed sharing comment above nvkvm_cpu_pages_share_range().
+	 */
+	is_shmem_obj = vma->vm_file && nvkvm_vma_file_is_memory(vma);
+	if (is_shmem_obj) {
+		reg_inode      = file_inode(vma->vm_file);
+		reg_pgoff_base = vma->vm_pgoff +
+			((start - vma->vm_start) >> PAGE_SHIFT);
+	}
 	/*
 	 * Under mmap_write_lock, and after the VMA type check, on purpose.
 	 *
@@ -1677,14 +2202,155 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * mmap_lock outer, i_mmap_rwsem inner, so doing it in that direction is
 	 * an ABBA inversion, and rmap_walk() is not exported to modules.  Until
 	 * that is solved, an honest -EINVAL beats silent corruption.
+	 *
+	 * The threshold is 1 (exactly this VMA, nothing else) UNLESS we are
+	 * holding an object-keyed claim (shared_claim != NULL) that other
+	 * processes are actively waiting on -- see
+	 * nvkvm_cpu_pages_share_range()'s comment block and
+	 * nvkvm_shared_resolve() for the mechanism.
+	 *
+	 * WHERE THE EXTRA MAPPING ACTUALLY COMES FROM, MEASURED, NOT ASSUMED:
+	 * an earlier revision of this comment blamed CUDA's own bring-up
+	 * (cuInit/cuCtxCreate) for faulting a sibling's PTE in before it ever
+	 * called cuMemHostRegister. That was wrong -- disproved by a direct
+	 * probe (a helper that checks its own /proc/self/pagemap "present"
+	 * bit after each of cuInit/cuDeviceGet/cuCtxCreate/registerA, on a
+	 * MAP_SHARED page it never touches otherwise): the bit stays 0 the
+	 * entire time. CUDA bring-up does not touch unrelated host memory.
+	 *
+	 * The real mechanism is simpler and entirely inside this function:
+	 * get_user_pages_fast(FOLL_WRITE) in the pin loop above is an
+	 * ordinary write-fault. If the calling process had NO PTE for this
+	 * page yet (true for whichever of the two fork siblings does not
+	 * already hold one -- fork does not eagerly copy PTEs for a
+	 * MAP_SHARED|MAP_ANONYMOUS VMA, confirmed separately via the same
+	 * pagemap technique across a bare fork() with no CUDA involved at
+	 * all), that gup call PERMANENTLY installs one, exactly as an
+	 * ordinary read/write through the pointer would -- and it does so
+	 * whether this call's migrate_range() attempt goes on to SUCCEED or
+	 * FAIL. err_unpin's put_page() only drops the extra pin gup itself
+	 * took; it does not, and cannot, unmap the page-table entry that the
+	 * underlying fault installed. So a sibling that tries and fails once
+	 * leaves a real, ordinary PTE behind, and every later attempt -- by
+	 * anyone, on this object -- sees it. Two consequences fall out of
+	 * this directly: (1) the "race" is not fundamentally about ioctl
+	 * timing, it is about whichever sibling's fault happens second
+	 * relative to the other's still-resident PTE, which includes a
+	 * pre-fork write (fork_both_register.c's parent writes the buffer
+	 * before forking, so it always already holds one); (2) a sibling's
+	 * FAILED attempt does not "cost nothing" -- it leaves the exact
+	 * evidence a later attempt needs to explain itself.
+	 *
+	 * A page mapping contributed by a process that is, RIGHT NOW, blocked
+	 * inside OUR OWN kernel-verified wait-for-this-exact-object protocol
+	 * is safe to relocate past: nvkvm_shared_resolve() guarantees that
+	 * waiter will re-decide once we release the claim, and either share
+	 * the memfd we are about to create (repointing its VMA and discarding
+	 * whatever stray PTE it had) or become the new claimant itself -- it
+	 * can never be left stranded on the original pages, which is the only
+	 * thing this guard exists to prevent.
+	 *
+	 * SAFETY OF THE CREDIT, stated precisely because a wrong credit here
+	 * is the actual danger (a wrong RETRY only costs latency; a wrong
+	 * CREDIT relocates a range out from under a real, uncredited view):
+	 *
+	 *   - What is credited: shared_claim->refs, read fresh under
+	 *     nvkvm_shared_lock immediately before this loop (and again on
+	 *     every retry pass below) -- never a stale or cached count.
+	 *   - What proves a credited reference is a genuine co-registrant,
+	 *     not a third party: the ONLY way refs is incremented is
+	 *     nvkvm_shared_find_pending_locked() matching a waiter's OWN
+	 *     `inode` (from ITS OWN live VMA over this exact object, resolved
+	 *     the same way we resolved ours) against our pend. There is no
+	 *     path to being counted that does not go through a real
+	 *     migrate_range() ioctl call on a VMA that genuinely maps this
+	 *     object -- an attacker cannot inflate refs without first having
+	 *     ordinary OS-level access to map the object at all, at which
+	 *     point ordinary POSIX MAP_SHARED semantics already give it
+	 *     read/write access to the same bytes; this guard is about GPU-
+	 *     view coherence, not confidentiality.
+	 *   - Can a credited waiter walk away without reconciling, leaving
+	 *     its counted-but-unaccounted-for view behind? No: after
+	 *     wait_for_completion() returns, nvkvm_shared_resolve()'s `continue`
+	 *     unconditionally re-enters its loop -- there is no return path
+	 *     for a woken waiter except SHARE (repoint) or reclaim-as-new-
+	 *     claimant (subject to this same guard again). The control flow
+	 *     enforces this; it does not rely on the calling process behaving
+	 *     itself.
+	 *   - What if a credited waiter is killed mid-wait? wait_for_completion()
+	 *     (not the _interruptible variant) does not observe signals, so a
+	 *     SIGKILL to a waiter does not take effect until its claim
+	 *     resolves and it runs the re-decide above -- verified live with
+	 *     an adversarial probe (a waiter SIGKILLed while its /proc state
+	 *     read 'D' stayed 'D', alive, for the full duration of the
+	 *     claimant's registration and only exited, WIFSIGNALED, after the
+	 *     claimant finished): see
+	 *     docs/investigations/shared-registration-two-processes/README.md,
+	 *     "Why page_mapcount() > 1 needed a threshold change, and why it
+	 *     is still safe". There is no window where a dying credited
+	 *     waiter's contribution is real but its reconciliation is skipped.
+	 *
+	 *   Net: refs cannot be inflated by anything that is not itself bound
+	 *   to go through this same protocol, so crediting it never lets a
+	 *   GENUINELY uninvolved view (e.g. shared_view_desync.c's child,
+	 *   which never calls migrate_range at all and so is never counted)
+	 *   get relocated past. Confirmed by that test still refusing,
+	 *   unchanged, across repeated runs.
+	 *
+	 * BOUNDED RETRY: refs only credits a sibling that is CONCURRENTLY
+	 * blocked in nvkvm_shared_resolve() at the exact instant of this
+	 * check, and the two siblings' migrate_range(B) calls frequently do
+	 * not overlap in time at all (measured via dmesg: fully sequential,
+	 * non-overlapping claim/release pairs, both hitting this refusal,
+	 * before this retry existed). Since we still hold our claim, a
+	 * genuinely cooperating sibling that has not yet reached its own call
+	 * will do so shortly and become a counted waiter -- so retry a
+	 * bounded number of times with a short sleep (mmap_write_lock dropped
+	 * first) instead of failing on the very first sample.
+	 *
+	 * MEASURED (2026-08-31, 8-vCPU guest, stress-ng --cpu 8 in the
+	 * background): 60 fork_both_register.c runs (30 idle + 30 under full
+	 * 8-way CPU stress), zero hard refusals. Of ~270 mapcount checks per
+	 * batch, ~95-97% needed 0 retries (refs-crediting alone already
+	 * covered them); under stress the remainder needed up to 10 retries
+	 * (worst case observed), comfortably inside the 25-attempt budget.
+	 * On exhaustion this fails CLOSED (-EINVAL, the pr_warn_ratelimited()
+	 * below fires and reports the retry count) -- refusing a legitimate
+	 * registration under extreme load is an acceptable failure mode here;
+	 * relocating past an unaccounted view is not, and nothing above
+	 * trades one for the other.
+	 *
+	 * For a process that will NEVER call migrate_range on this object --
+	 * shared_view_desync.c's child -- retrying changes nothing but
+	 * latency: its mapcount source never goes away and no claim ever
+	 * appears to account for it, so every retry sees the same unexplained
+	 * excess and the loop still gives up and refuses, just later.
 	 */
+#define NVKVM_MAPCOUNT_RETRY_MAX     25   /* ~50ms worst case, see delay below */
+#define NVKVM_MAPCOUNT_RETRY_DELAY_MS 2
+	{
+		unsigned long mc_allowed = 1;
+
+		if (shared_claim) {
+			mutex_lock(&nvkvm_shared_lock);
+			mc_allowed = (unsigned long)shared_claim->refs;
+			mutex_unlock(&nvkvm_shared_lock);
+		}
+
 	for (i = 0; i < (unsigned long)got; i++) {
 		int mc = page_mapcount(pages[i]);
 
-		if (mc > 1) {
+		if ((unsigned long)mc > mc_allowed) {
+			if (is_shmem_obj &&
+			    mapcount_retries < NVKVM_MAPCOUNT_RETRY_MAX) {
+				mapcount_retries++;
+				mmap_write_unlock(mm);
+				msleep(NVKVM_MAPCOUNT_RETRY_DELAY_MS);
+				goto retry_mapcount;
+			}
 			pr_warn_ratelimited(
-				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
-				start, end, i, mc);
+				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times (allowed %lu, after %u retries) -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
+				start, end, i, mc, mc_allowed, mapcount_retries);
 			/* Under mmap_write_lock now -- every sibling error
 			 * path in this section unlocks before unwinding, and
 			 * err_unpin does not. */
@@ -1692,6 +2358,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			ret = -EINVAL;
 			goto err_unpin;
 		}
+	}
 	}
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
@@ -1741,8 +2408,37 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * invariant today, so this changes no behaviour -- it avoids leaving a
 	 * VMA in a shape future mm code may reasonably assume cannot exist.
 	 */
-	if (is_cow_mapping(vma->vm_flags))
-		vm_flags_set(vma, VM_SHARED | VM_MAYSHARE);
+	if (is_cow_mapping(vma->vm_flags)) {
+		/*
+		 * Two constraints that look contradictory, satisfied separately.
+		 *
+		 * remap_pfn_range() refuses a sub-VMA remap on a COW mapping
+		 * (is_cow_mapping() is (VM_SHARED|VM_MAYWRITE) == VM_MAYWRITE),
+		 * so VM_MAYWRITE has to go. But vm_get_page_prot() encodes COW by
+		 * mapping (VM_WRITE, !VM_SHARED) to a READ-ONLY protection, so
+		 * deriving the protection from the flags afterwards gives
+		 * read-only PTEs and the process SIGSEGVs on its first write.
+		 *
+		 * Setting VM_SHARED fixed the write and broke something else:
+		 * measured, it makes a MAP_PRIVATE buffer genuinely shared, so
+		 * after fork the parent sees the child's writes (16384/16384)
+		 * where the stock driver keeps them private (0/16384).
+		 * tests/repro/fork_mapping_semantics.c is that measurement.
+		 *
+		 * The COW is already resolved before we reach here:
+		 * get_user_pages_fast(FOLL_WRITE) above breaks it and the KERNEL
+		 * does the copy, which is the right place for it. By this point
+		 * the pages are exclusively ours, and after the retype the VMA is
+		 * VM_PFNMAP over device memory, where COW has no meaning -- so
+		 * the read-only encoding describes nothing real.
+		 *
+		 * Clear VM_MAYWRITE for remap_pfn_range; set the protection
+		 * writable EXPLICITLY below rather than deriving it. The VMA
+		 * stays private.
+		 */
+		vm_flags_clear(vma, VM_MAYWRITE);
+		cow_forced_write = true;
+	}
 	/*
 	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
 	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
@@ -1761,7 +2457,12 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * so we rewrite the PTEs to WB with nvkvm_force_range_wb() after each
 	 * chunk's remap.
 	 */
-	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	/* Derive normally, except in the COW case above where the flags no
+	 * longer describe the mapping: ask for the protection a SHARED
+	 * writable mapping would get, without marking the VMA shared. */
+	vma->vm_page_prot = vm_get_page_prot(cow_forced_write
+					     ? (vma->vm_flags | VM_SHARED)
+					     : vma->vm_flags);
 	mmap_write_unlock(mm);
 
 	/*
@@ -1930,6 +2631,14 @@ chunk_fail_h:
 			mutex_unlock(&ctx->cpu_pages_lock);
 		}   /* else: mapping is live; accept the tracking leak */
 
+		/* Object-keyed sharing: make this chunk findable by a sibling
+		 * process registering the same backing object later.  See the
+		 * comment block above nvkvm_cpu_pages_share_range(). */
+		if (is_shmem_obj)
+			nvkvm_shared_add(reg_inode,
+					 reg_pgoff_base + (coff >> PAGE_SHIFT),
+					 clen, handle);
+
 		/*
 		 * Release this chunk's pinned pages.  The data's only home is
 		 * now the memfd, so the guest gets these page frames back
@@ -1954,6 +2663,10 @@ chunk_fail_mapped:
 	/* Every chunk is migrated, recorded and unpinned.  Nothing is left to
 	 * do but free the descriptor array. */
 	kvfree(pages);
+	/* Object-keyed sharing: our attempt succeeded — wake anyone waiting
+	 * on this object so they re-check the (now populated) registry. */
+	if (shared_claim)
+		nvkvm_shared_claim_release(shared_claim);
 	return 0;
 
 err_unpin:
@@ -1974,5 +2687,11 @@ err_unpin:
 	kvfree(pages);
 	pr_warn("nvkvm: migrate_range(bulk) failed ret=%d at chunk %d (%d chunk(s) already migrated and left mapped)\n",
 		ret, nck, nck);
+	/* Object-keyed sharing: our attempt failed — release the claim (the
+	 * registry has nothing for this object) so a waiting sibling becomes
+	 * the new claimant and tries the migration itself, rather than
+	 * waiting forever on a claim that will never resolve. */
+	if (shared_claim)
+		nvkvm_shared_claim_release(shared_claim);
 	return ret;
 }

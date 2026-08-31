@@ -4456,15 +4456,33 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 
 	/*
 	 * S-2 (cross-isolate): the guest names an (isolate, handle) PAIR here,
-	 * exactly as XISO_IMPORT does, and the two are independent assertions.
-	 * `h->fd >= 0` alone only proves the handle exists SOMEWHERE in this VM
-	 * — it says nothing about who owns it — so without this an isolate could
-	 * map any other host-process isolate's live /dev/nvidia* fd into the
-	 * window, at a GPA of its choosing, in the privileged QEMU process.
-	 * Isolates are separate host processes, so that is the host-process
-	 * boundary this layer is responsible for, not intra-VM policy; PRESENT
-	 * and XISO_IMPORT already check the same two things (handle→session,
-	 * session→isolate) and this handler simply did not.
+	 * exactly as XISO_IMPORT does, and the two used to be checked as ONE
+	 * assertion: h->session_id == req->session_id (handle belongs to the
+	 * requesting session) AND session_has_isolate(req->session_id,
+	 * req->isolate_id) (that session owns the isolate it named).
+	 *
+	 * The session-equality half is GUEST policy, not a host boundary, and
+	 * it is gone.  Isolation between two guest processes is the guest
+	 * kernel module's job (see nvkvm_mmap.c's object-keyed sharing,
+	 * fork_both_register.c): when a guest process shares a buffer with a
+	 * sibling that legitimately maps the same backing object (typically a
+	 * post-fork MAP_SHARED range), the guest module itself asks to map
+	 * session A's handle into session B's isolate.  QEMU has no way to
+	 * tell that request apart from a hostile one by session id alone, and
+	 * is not supposed to try -- a compromised guest KERNEL is already a
+	 * whole-VM compromise in this threat model, same as every other
+	 * guest-policy check in this file.
+	 *
+	 * What MUST still hold, and does not depend on trusting guest policy,
+	 * is the host-process boundary: `h->fd >= 0` alone only proves the
+	 * handle exists SOMEWHERE in this VM -- it says nothing about who is
+	 * allowed to reach it -- so without session_has_isolate() below, ANY
+	 * session could map ANY other host-process isolate's live
+	 * /dev/nvidia* fd into the window, at a GPA of its choosing, in the
+	 * privileged QEMU process, merely by naming a foreign isolate_id.
+	 * That is the check that stays: the isolate named must belong to the
+	 * session making the request, exactly as PRESENT and XISO_IMPORT
+	 * check their own (isolate, handle) pairs.
 	 *
 	 * NOT uid-separated, whatever this comment used to say.  On the rung
 	 * nvkvm_iso_auto_select() prefers, mode is NS|SECCOMP with no
@@ -4479,10 +4497,9 @@ int nvkvm_req_mmap_on_isolate(VirtIONvgpu *nv,
 	 * CLONE_NEWUSER fails.  Do not reason about this layer as though a
 	 * DAC check were backing it up.
 	 */
-	if (h->session_id != req->session_id ||
-	    !session_has_isolate(nv, req->session_id, req->isolate_id)) {
-		NVKVM_DBG("nvkvm: mmap_on_isolate: handle/isolate session "
-			  "mismatch (h=%u h_sess=%u req_sess=%u iso=%u)\n",
+	if (!session_has_isolate(nv, req->session_id, req->isolate_id)) {
+		NVKVM_DBG("nvkvm: mmap_on_isolate: requesting session does not "
+			  "own isolate (h=%u h_sess=%u req_sess=%u iso=%u)\n",
 			  req->handle_id, h->session_id, req->session_id,
 			  req->isolate_id);
 		resp->status = EPERM;

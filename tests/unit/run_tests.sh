@@ -50,7 +50,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 # The number is the exact case count that must run AND pass.
 declare -A TALLY_SUITES=(
     [test_objects]=20
-    [test_handle]=11
+    [test_handle]=12
     [test_tables]=17
     [test_nvkms_allowlist]=618
     [test_stub_ptr_sanitize]=17
