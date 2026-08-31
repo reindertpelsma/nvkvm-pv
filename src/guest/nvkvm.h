@@ -501,6 +501,16 @@ void nvkvm_fd_ctx_close(struct nvkvm_fd_ctx *ctx);
 /* G-6: take/drop a lifetime ref (proxy GEMs that outlive their drm_file). */
 void nvkvm_fd_ctx_get(struct nvkvm_fd_ctx *ctx);
 void nvkvm_fd_ctx_put(struct nvkvm_fd_ctx *ctx);
+/* Ensure the given session has an isolate, creating one on first use.
+ * Non-static so nvkvm_devmem.c (spike/dev-nvkvm-mem) can reuse it instead of
+ * duplicating the create-isolate dance. */
+int  nvkvm_ensure_isolate(struct nvkvm_session *session);
+
+/* nvkvm_devmem.c — SPIKE (spike/dev-nvkvm-mem): /dev/nvkvm-mem, a
+ * from-birth host-visible memory window.  See the file header comment for
+ * what this is and is not. */
+int  nvkvm_devmem_init(void);
+void nvkvm_devmem_exit(void);
 
 /* #101 async event delivery: registry of poll-capable fd contexts keyed by
  * (isolate_id, handle_id). register on open, unregister on close. deliver() is

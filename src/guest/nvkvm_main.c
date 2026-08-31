@@ -611,8 +611,10 @@ static void nvkvm_session_setup_ring(struct nvkvm_session *session)
 	}
 }
 
-/* Ensure the session has an isolate; creates one if isolate_id == 0. */
-static int nvkvm_ensure_isolate(struct nvkvm_session *session)
+/* Ensure the session has an isolate; creates one if isolate_id == 0.
+ * Non-static: also called from nvkvm_devmem.c (spike/dev-nvkvm-mem) — see
+ * nvkvm.h. */
+int nvkvm_ensure_isolate(struct nvkvm_session *session)
 {
 	__u32 isolate_id;
 	int ret;
@@ -3481,12 +3483,20 @@ static int __init nvkvm_init(void)
 
 	nvkvm_hostfile_init();
 
+	/* SPIKE (spike/dev-nvkvm-mem): /dev/nvkvm-mem, a from-birth host-visible
+	 * memory window with no migration involved.  Best-effort — a failure
+	 * here does not affect the real GPU-passthrough devices, so just warn. */
+	ret = nvkvm_devmem_init();
+	if (ret)
+		pr_warn("nvkvm: nvkvm-mem spike device registration failed: %d\n", ret);
+
 	pr_info("nvkvm: NVIDIA GPU passthrough guest module loaded\n");
 	return 0;
 }
 
 static void __exit nvkvm_exit(void)
 {
+	nvkvm_devmem_exit();
 	nvkvm_hostfile_exit();
 	unregister_devices();
 	unregister_virtio_driver(&nvkvm_virtio_driver);

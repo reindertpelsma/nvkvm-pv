@@ -6,7 +6,8 @@ nvkvm-guest-objs := nvkvm_main.o \
                     nvkvm_mmap.o \
                     nvkvm_uvm_ext.o \
                     nvkvm_session.o \
-                    nvkvm_hostfile.o
+                    nvkvm_hostfile.o \
+                    nvkvm_devmem.o
 
 ccflags-y := -I$(src)/.. -I$(src)/../..
 
