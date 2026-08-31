@@ -190,21 +190,28 @@ takes the by-base free path.
 
 ## Vulkan compute on Hopper — root-caused; it was ours, and it was never a driver bug
 
-**Status: root-caused, fixed once, and the fix is not on `main` today.**
+**Status: root-caused, fixed, reverted by accident, and restored.**
 `HOPPER_USERMODE_A` (`0xc661`) had no entry in the guest module's
 alloc-parameter size-by-`hClass` tables, so nvkvm forwarded a **NULL parameter
 block** for it and the host RM built a different object than the caller asked
 for. On an H100 that cost Vulkan its compute queue.
 
-> **The fix is currently absent from this tree.** It landed in `0492685`
-> (merged as `14e7511`) and was removed again by `4fece85`, a single-parent
-> commit that reverted several unrelated things it did not conflict with — see
+> **The fix is present on `main`.** It landed in `0492685` (merged as
+> `14e7511`), was removed again by `4fece85` — a single-parent commit that
+> reverted several unrelated things it did not conflict with, see
 > [What a clean merge can still revert](#what-a-clean-merge-can-still-revert)
-> below. `src/guest/nvkvm_main.c` has no `nvkvm_alloc_parms_probe_len()` on
-> `main` as of `f9f187f`. The **diagnosis** below is measured and stands; the
-> **28/28 rows** were measured on a tree that carried the fix. Restore
-> `0492685`'s `src/guest/nvkvm_main.c` hunk before quoting a current Hopper
-> result.
+> below — and was **restored by `c9e3875`**. Verified 2026-08-31 on `main`:
+> `nvkvm_alloc_parms_probe_len()` is at `src/guest/nvkvm_main.c:1145`, its
+> function body is byte-identical to `0492685`'s, and both call sites are
+> present. The **diagnosis** below is measured and stands, and the **28/28
+> rows** were measured on a tree carrying this same fix, so they may be quoted
+> for the tree as it stands.
+>
+> This note previously read "the fix is currently absent from this tree",
+> pinned to `f9f187f`. That was true when written and stayed on the page for
+> 541 commits after it stopped being true. A staleness caveat needs the same
+> re-checking as the claim it qualifies — an out-of-date warning costs real
+> credibility in the direction of understating the work.
 
 ### The driver sweep that found it (2026-08-21)
 
