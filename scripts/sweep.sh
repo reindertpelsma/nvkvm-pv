@@ -145,6 +145,11 @@ KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
 
 ARCHES=""
 ALL_ARCHES=0
+# Renting a pre-Turing card is normally pointless: nvkvm does not support it, so
+# the row is a documented negative and the money buys nothing.  It IS worth it
+# when the goal is to find out WHY it fails.  Opt-in, never default, and such a
+# row must never be counted as coverage.
+INCLUDE_UNSUPPORTED=0
 GPU_FILTER=""
 DRIVERS_REQ=""
 DRIVER_CACHE_DIR="${NVKVM_SWEEP_DRIVER_CACHE:-}"
@@ -285,6 +290,7 @@ usage() { sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --arch)         ARCHES="$2"; shift 2 ;;
+        --include-unsupported) INCLUDE_UNSUPPORTED=1; shift ;;
         --all-arches)   ALL_ARCHES=1; shift ;;
         --gpu)          GPU_FILTER="$2"; shift 2 ;;
         --drivers)      DRIVERS_REQ="$2"; shift 2 ;;
@@ -921,9 +927,17 @@ pick_offer() {
     vj search offers 'vms_enabled=true num_gpus=1 rentable=true' -o dph >"$offers_json"
     python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" \
              "$MAX_STORAGE_PER_GB_MONTH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" \
-             "$EST_DOWN_GB_PER_BOX" "$DISK" <<'PY'
+             "$EST_DOWN_GB_PER_BOX" "$DISK" "$INCLUDE_UNSUPPORTED" <<'PY'
 import json, sys, os, importlib.util
 repo, want_arch, max_dph, gpu_filter, tried, kbfile, offers_path = sys.argv[1:8]
+# APPENDED LAST, and read from the end.  This flag originally went in at
+# argv[8], which silently shifted max_stor_gb_mo/max_down_tb/max_up_tb/
+# est_down_gb/disk_gb -- the caps read from sys.argv[8:13] on the next line --
+# by one.  max_stor_gb_mo became 0.0, so "storage_cost > 0" rejected EVERY
+# offer on the marketplace and the sweep reported "no rentable KVM offer" for
+# every architecture.  bash -n was clean and the new flag's own path worked;
+# only a control run against main caught it.  Positional argv is why.
+include_unsupported = len(sys.argv) > 13 and sys.argv[13] == "1"
 max_stor_gb_mo, max_down_tb, max_up_tb, est_down_gb, disk_gb = (float(x) for x in sys.argv[8:13])
 spec = importlib.util.spec_from_file_location(
     "sweep_matrix", os.path.join(repo, "scripts", "sweep_matrix.py"))
@@ -946,7 +960,7 @@ except Exception:
 cands = []
 for o in offers:
     gpu = o.get("gpu_name") or ""
-    if m.is_unsupported(gpu):
+    if m.is_unsupported(gpu) and not include_unsupported:
         continue          # pre-Turing: a documented negative, never a coverage slot
     if gpu_filter and gpu_filter.upper() not in gpu.upper():
         continue
