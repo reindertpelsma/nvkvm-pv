@@ -192,6 +192,39 @@ static inline void vma_start_write(struct vm_area_struct *vma)
 #endif
 
 /*
+ * page_mapcount() was removed in 6.16.  It answered "how many page tables map
+ * THIS page", which is exactly what nvkvm_cpu_pages_migrate_range() asks before
+ * it relocates a range: >1 means something else already maps these pages and
+ * relocating would desynchronise the two views (the silent-corruption bug in
+ * docs/investigations/shared-mapping-desync/).
+ *
+ * The replacement, folio_mapcount(), counts mappings of the whole FOLIO.  For
+ * an order-0 folio -- one page -- that is the same number the old call gave,
+ * exactly.  For a large folio (THP) it is the sum across the folio, so it can
+ * read HIGHER than the true per-page count.  There is no exported precise
+ * per-page count on 6.16: folio_precise_page_mapcount() lives in mm/internal.h
+ * and is not available to modules.
+ *
+ * Over-reporting is the direction we want.  An over-count refuses a
+ * registration that might have been safe -- an honest -EINVAL the caller sees.
+ * An under-count would let us relocate a range somebody else maps, which is
+ * silent data corruption.  Given the choice, refuse.
+ *
+ * Verified by compiling against 6.16.12-valve24.5 (SteamOS); before this shim
+ * the guest module did not build there at all.
+ * Spelled as a macro, not an inline: this header is pulled in via nvkvm.h
+ * before <linux/mm.h> in most translation units, so an inline body here would
+ * reference folio_mapcount() before mm.h declares it -- which fails to build
+ * with "static declaration follows non-static declaration".  A macro defers
+ * that lookup to the call site, where mm.h is already included.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+#define nvkvm_page_mapcount(page)   folio_mapcount(page_folio(page))
+#else
+#define nvkvm_page_mapcount(page)   page_mapcount(page)
+#endif
+
+/*
  * PDE_DATA() was lowercased to pde_data() in 5.17 (commit 359745d78351).
  * RHEL 9 carries the lowercase spelling at version code 5.14.
  */
