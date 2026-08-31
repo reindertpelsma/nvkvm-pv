@@ -23,3 +23,4 @@
 18856	# KVM never provisioned: created + 'Domain not found' frozen log (instance 48933447, 2026-08-27)
 91962	# SSH refused on BOTH direct (191.223.212.127:32512) and proxy (ssh1.vast.ai:25476) across two independent runs on 2026-08-29; box reached actual_status=running but never accepted a connection. Added by hand: the SSH-timeout path deliberately does not auto-blacklist, and this machine is the cheapest ampere offer, so it is re-picked every run.
 56883	# KVM never provisioned: created + 'Domain not found' frozen log (added automatically by sweep.sh on 2026-08-30)
+55691	# KVM never provisioned: created + 'Domain not found' frozen log (added automatically by sweep.sh on 2026-08-31)
