@@ -204,9 +204,21 @@ must be labelled as such, exactly like the 515/525 ABI rows.
 10. `matrix.md`, auto-generated from `sweep.jsonl`, rendering UNTESTED as its
     own state. It is the artifact that makes "here is what we tested, here is
     what we did not" concrete.
-11. Check whether CI's kernel matrix (which runs `ubuntu:26.04` and
-    `fedora:42`) has been red on `main` and unnoticed. Its stated purpose is
-    exactly to catch what `page_mapcount` did.
+11. **CI's kernel matrix is blind at the top of the range, not red.**
+    Measured locally: `tests/kernel_matrix.sh ubuntu:26.04` returns
+    `SKIP -- no kernel headers in this image`. It never compiles anything, so
+    it could not have caught `page_mapcount`. The job is not failing to notice
+    a break; the row that would have found it does not run.
+
+    `kernel_matrix.sh:100` is `[ "$verdict" = SKIP ] && [ "$STRICT_SKIP" = 1 ]
+    && rc=1`, and `.github/workflows/kernel-matrix.yml` sets `STRICT_SKIP: "1"`
+    -- so on GitHub this should be a hard failure, unless headers resolve there
+    and not here. **Unverified from this machine:** whether GitHub's runners can
+    install `linux-headers` for `ubuntu:26.04`. Check the actual CI run history
+    before concluding which of the two it is.
+
+    The script's own header anticipated this exact failure: "a package gets
+    renamed would quietly degrade to 'passing'". It degraded.
 
 ### Not blocking
 
