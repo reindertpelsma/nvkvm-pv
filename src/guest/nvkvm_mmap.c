@@ -33,6 +33,7 @@
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
 #include <linux/pgtable.h>
+#include <linux/delay.h>       /* msleep() — mapcount retry, see below */
 #include <linux/fs.h>          /* file_inode() — VMA type check below */
 #include <uapi/linux/magic.h>  /* TMPFS_MAGIC  — VMA type check below */
 #include <asm/pgtable_types.h>
@@ -2020,6 +2021,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	struct inode *reg_inode = NULL;
 	unsigned long reg_pgoff_base = 0;
 	struct nvkvm_shared_pending *shared_claim = NULL;
+	unsigned int mapcount_retries = 0; /* object-keyed sharing, see below */
 
 	if (!len)
 		return 0;
@@ -2111,6 +2113,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * Doing the conversion here rather than per chunk also means the
 	 * per-chunk loop below only ever touches PTEs.
 	 */
+retry_mapcount:
 	mmap_write_lock(mm);
 	vma = find_vma(mm, start);
 	if (!vma || vma->vm_start > start || vma->vm_end < end) {
@@ -2249,7 +2252,34 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * calls migrate_range on the buffer at all -- contributes nothing to
 	 * the threshold and the guard fires exactly as it did before this
 	 * mechanism existed. Confirmed against that test below.
+	 *
+	 * BOUNDED RETRY, and why refs-counting alone still is not enough:
+	 * refs only credits a sibling that is CONCURRENTLY blocked in
+	 * nvkvm_shared_resolve() at the exact instant of this check. Measured
+	 * live: fork_both_register.c's two peer processes frequently reach
+	 * their OWN migrate_range(B) calls with NO temporal overlap at all --
+	 * one claims, fails this very check (mapcount already 2 from the
+	 * sibling's earlier, unrelated CUDA bring-up activity touching the
+	 * page), and fully releases its claim BEFORE the other even starts,
+	 * so refs was 1 (nobody waiting) for both attempts and neither is
+	 * accounted for by the other. Confirmed via dmesg: both processes'
+	 * claim/release pairs were fully sequential, non-overlapping, and
+	 * both hit this refusal.
+	 *
+	 * Since we still hold our claim, a genuinely cooperating sibling that
+	 * has not YET reached its own call will do so shortly and become a
+	 * counted waiter -- so retry the check a bounded number of times with
+	 * a short sleep (mmap_write_lock dropped first; nothing here needs it
+	 * held across the sleep) rather than failing on the very first
+	 * sample. For a process that will NEVER call migrate_range on this
+	 * object -- shared_view_desync.c's child -- this changes nothing
+	 * except adding a bounded amount of latency before the SAME correct
+	 * refusal: its mapcount source never goes away and no claim ever
+	 * appears for it to be counted against, so every retry sees the same
+	 * unexplained excess and the loop still gives up and refuses.
 	 */
+#define NVKVM_MAPCOUNT_RETRY_MAX     25   /* ~50ms worst case, see delay below */
+#define NVKVM_MAPCOUNT_RETRY_DELAY_MS 2
 	{
 		unsigned long mc_allowed = 1;
 
@@ -2263,9 +2293,16 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		int mc = page_mapcount(pages[i]);
 
 		if ((unsigned long)mc > mc_allowed) {
+			if (is_shmem_obj &&
+			    mapcount_retries < NVKVM_MAPCOUNT_RETRY_MAX) {
+				mapcount_retries++;
+				mmap_write_unlock(mm);
+				msleep(NVKVM_MAPCOUNT_RETRY_DELAY_MS);
+				goto retry_mapcount;
+			}
 			pr_warn_ratelimited(
-				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times (allowed %lu) -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
-				start, end, i, mc, mc_allowed);
+				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times (allowed %lu, after %u retries) -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
+				start, end, i, mc, mc_allowed, mapcount_retries);
 			/* Under mmap_write_lock now -- every sibling error
 			 * path in this section unlocks before unwinding, and
 			 * err_unpin does not. */
