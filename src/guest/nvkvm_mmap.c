@@ -1525,6 +1525,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	long got = 0;
 	unsigned long i;
 	int ret = 0, nck = 0;
+	bool cow_forced_write = false;
 
 	if (!len)
 		return 0;
@@ -1741,8 +1742,37 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * invariant today, so this changes no behaviour -- it avoids leaving a
 	 * VMA in a shape future mm code may reasonably assume cannot exist.
 	 */
-	if (is_cow_mapping(vma->vm_flags))
-		vm_flags_set(vma, VM_SHARED | VM_MAYSHARE);
+	if (is_cow_mapping(vma->vm_flags)) {
+		/*
+		 * Two constraints that look contradictory, satisfied separately.
+		 *
+		 * remap_pfn_range() refuses a sub-VMA remap on a COW mapping
+		 * (is_cow_mapping() is (VM_SHARED|VM_MAYWRITE) == VM_MAYWRITE),
+		 * so VM_MAYWRITE has to go. But vm_get_page_prot() encodes COW by
+		 * mapping (VM_WRITE, !VM_SHARED) to a READ-ONLY protection, so
+		 * deriving the protection from the flags afterwards gives
+		 * read-only PTEs and the process SIGSEGVs on its first write.
+		 *
+		 * Setting VM_SHARED fixed the write and broke something else:
+		 * measured, it makes a MAP_PRIVATE buffer genuinely shared, so
+		 * after fork the parent sees the child's writes (16384/16384)
+		 * where the stock driver keeps them private (0/16384).
+		 * tests/repro/fork_mapping_semantics.c is that measurement.
+		 *
+		 * The COW is already resolved before we reach here:
+		 * get_user_pages_fast(FOLL_WRITE) above breaks it and the KERNEL
+		 * does the copy, which is the right place for it. By this point
+		 * the pages are exclusively ours, and after the retype the VMA is
+		 * VM_PFNMAP over device memory, where COW has no meaning -- so
+		 * the read-only encoding describes nothing real.
+		 *
+		 * Clear VM_MAYWRITE for remap_pfn_range; set the protection
+		 * writable EXPLICITLY below rather than deriving it. The VMA
+		 * stays private.
+		 */
+		vm_flags_clear(vma, VM_MAYWRITE);
+		cow_forced_write = true;
+	}
 	/*
 	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
 	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
@@ -1761,7 +1791,12 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * so we rewrite the PTEs to WB with nvkvm_force_range_wb() after each
 	 * chunk's remap.
 	 */
-	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+	/* Derive normally, except in the COW case above where the flags no
+	 * longer describe the mapping: ask for the protection a SHARED
+	 * writable mapping would get, without marking the VMA shared. */
+	vma->vm_page_prot = vm_get_page_prot(cow_forced_write
+					     ? (vma->vm_flags | VM_SHARED)
+					     : vma->vm_flags);
 	mmap_write_unlock(mm);
 
 	/*
