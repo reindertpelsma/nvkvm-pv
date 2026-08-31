@@ -12,6 +12,7 @@ the driver's, not nvkvm's.
 | `opencl_input_visibility.c` | `cc -O2 -o clvis opencl_input_visibility.c -lOpenCL` | whether the guest CPU and the GPU see the *same* memory, and what makes them diverge |
 | `opencl_map_churn.c` | `cc -O2 -o clchurn opencl_map_churn.c -lOpenCL` | the map/unmap corruption above, parameterised, and it classifies each wrong value as zero / stale-from-earlier-iteration / junk |
 | `uvm_vma_lifetime.c` | `cc -O2 -Wall -Wextra -o uvm-vma uvm_vma_lifetime.c -ldl` | nvkvm managed-fallback fork/split lifetime; keeps inherited VMAs live while churn exceeds both GPA-quarantine limits |
+| `kill_waiter_test.c` | `cc -O2 -Wall -o kill_waiter_test kill_waiter_test.c -lcuda` | adversarial: can a credited object-keyed-sharing waiter (`nvkvm_shared_resolve()`) be SIGKILLed mid-wait and skip reconciling? See `docs/investigations/shared-registration-two-processes/` |
 | `gbm_egl_import.c` | `cc -o gbmtest gbm_egl_import.c $(pkg-config --cflags --libs gbm egl glesv2)` | the GBM bo -> dmabuf -> EGLImage -> texture -> FBO round trip that Xorg's glamor needs; separates the dmabuf import path from the `EGL_NATIVE_PIXMAP_KHR` one |
 
 `opencl_map_churn.c` takes `<iters> <pinned> <clFinish> <log2(N)> <churn>`, e.g.
