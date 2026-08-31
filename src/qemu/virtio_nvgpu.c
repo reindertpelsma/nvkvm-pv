@@ -112,9 +112,14 @@ struct nvkvm_session *nvkvm_session_create(VirtIONvgpu *nv,
  * #80 (audit H-2/H-3): destroy a session whose last isolate has been killed.
  * Unlinks it from the table first (so no later lookup races a free), then
  * reclaims everything the guest is no longer able to close itself:
- *   - all host /dev/nvidia* + memfd fds for the session (force, ignoring
- *     isolate_refcount — the isolates are gone), which releases the kernel RM
- *     objects + GPU memory;
+ *   - all host /dev/nvidia* + memfd fds for the session THIS session's own
+ *     isolate still held (this session's own isolates are gone, so its own
+ *     isolate_refcount is moot) -- but NOT a handle another session's LIVE
+ *     isolate is still referencing via cross-session sharing
+ *     (fork_both_register.c): nvkvm_handle_close_session() now skips those
+ *     and leaves them for the surviving sharer to close normally.  See its
+ *     comment in nvkvm_handle.c.  This releases the kernel RM objects + GPU
+ *     memory for everything that WAS closed;
  *   - the QEMU-side RM object graph (clients[]);
  *   - the legacy fd / mmap lists (empty in the handle-based model, drained
  *     defensively);
@@ -137,7 +142,8 @@ void nvkvm_session_destroy(VirtIONvgpu *nv, struct nvkvm_session *session)
 	TAILQ_REMOVE(&nv->sessions, session, link);
 	pthread_mutex_unlock(&nv->sessions_lock);
 
-	/* Force-close host fds → releases kernel RM objects + GPU memory. */
+	/* Close this session's host fds, except any a sibling session's live
+	 * isolate is still sharing (see nvkvm_handle_close_session()'s comment). */
 	nvkvm_handle_close_session(&nv->handles, session->id);
 
 	/*
