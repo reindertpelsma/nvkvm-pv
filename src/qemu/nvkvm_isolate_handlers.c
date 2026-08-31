@@ -2909,19 +2909,51 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				 * and therefore that the type describes the same
 				 * handle the dup came from.
 				 */
+				/*
+				 * Audit 2026-08-31: these two used to `continue`,
+				 * which FAILS OPEN -- it leaves the guest's raw
+				 * 32-bit value in the buffer and forwards it, so
+				 * the host UVM driver resolves it against QEMU's
+				 * OWN fd table. That is exactly the failure this
+				 * whole path exists to stop, and the one the
+				 * commit log demonstrates:
+				 *
+				 *   nvkvmdiag: fd2hid fd=2 NOT OURS comm=worker
+				 *
+				 * QEMU handing the driver its own stderr. A
+				 * guest that names any unregistered non-zero id
+				 * reached it. Note 0 and (uint32_t)-1 are
+				 * filtered above as "no fd", so arriving here
+				 * means the guest named something and it did not
+				 * resolve -- deny, do not forward.
+				 */
 				struct nvkvm_handle *eh =
 					nvkvm_handle_get(&nv->handles, hid);
-				if (!eh)
-					continue;
-				int      etype = eh->type;
-				uint64_t egen0 = eh->generation;
+				int      etype = eh ? eh->type : -1;
+				uint64_t egen0 = eh ? eh->generation : 0;
 				int      edev  = -1;
 				uint64_t egen  = 0;
-				int efd = nvkvm_handle_acquire_fd(&nv->handles,
-								  hid, &edev,
-								  &egen);
-				if (efd < 0)
-					continue;
+				int efd = eh ? nvkvm_handle_acquire_fd(&nv->handles,
+								       hid, &edev,
+								       &egen)
+					     : -1;
+				if (!eh || efd < 0) {
+					fprintf(stderr,
+						"nvkvm: DENY UVM cmd=0x%x "
+						"embedded fd handle %u: %s\n",
+						req->cmd, hid,
+						eh ? "handle closed under us"
+						   : "no such handle");
+					if (efd >= 0)
+						close(efd);
+					for (int j = 0; j < nsaved; j++)
+						close(emb_fd[j]);
+					resp->retval     = (uint64_t)(int64_t)(-EBADF);
+					resp->status     = 0;
+					resp->nvstatus   = 0x1f; /* INVALID_ARGUMENT */
+					resp->fault_addr = 0;
+					return 0;
+				}
 				int want_dev =
 					nvkvm_uvm_embedded_fd_dev(req->cmd);
 				if (etype != NVKVM_HANDLE_TYPE_NVIDIA ||
