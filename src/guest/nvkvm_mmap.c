@@ -1424,6 +1424,24 @@ static bool nvkvm_vma_file_is_memory(struct vm_area_struct *vma)
 
 	if (!inode || !inode->i_sb)
 		return false;
+
+	/*
+	 * Provenance is NOT the test.  An earlier revision returned
+	 * IS_PRIVATE(inode) here to reject memfds, because a VMM's guest-RAM
+	 * memfd is the aliased case that corrupted under nesting.  That asked
+	 * who CREATED the object, which is the wrong question twice over: it
+	 * missed MAP_SHARED|MAP_ANONYMOUS shared across fork() (shmem_zero_setup
+	 * sets S_PRIVATE, so it passed), and it refused single-view memfds that
+	 * were never a problem.
+	 *
+	 * The real test -- "do these pages already have another mapping" -- is
+	 * page_mapcount() in nvkvm_cpu_pages_migrate_range(), which subsumes
+	 * this one: an aliased guest-RAM memfd has a second view by definition.
+	 * Measured: with the mapcount check in place, the nested case is still
+	 * refused with this predicate back to plain magic, and a single-view
+	 * memfd works again.  So keep this answering only its original
+	 * question -- is the mapping still just process memory.
+	 */
 	return inode->i_sb->s_magic == TMPFS_MAGIC ||
 	       inode->i_sb->s_magic == RAMFS_MAGIC;
 }
@@ -1507,7 +1525,6 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	long got = 0;
 	unsigned long i;
 	int ret = 0, nck = 0;
-	ktime_t _t0 = ktime_get();   /* DIAG */
 
 	if (!len)
 		return 0;
@@ -1563,6 +1580,7 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		got += n;
 	}
 
+
 	/*
 	 * ONE VMA conversion for the whole range, up front.  It moves no data,
 	 * and it does not split the VMA: vm_flags_set()/vm_flags_clear() take
@@ -1613,6 +1631,68 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 			!!vma->vm_file);
 		ret = -EINVAL; goto err_unpin;
 	}
+
+	/*
+	 * Under mmap_write_lock, and after the VMA type check, on purpose.
+	 *
+	 * Audit 2026-08-31: this ran BEFORE the lock was taken, which left a
+	 * TOCTOU in the same bug class it exists to close -- a sibling thread
+	 * calling fork() between the check and the conversion shares these anon
+	 * pages COW, so the count the check saw (1) is stale by the time the
+	 * VMA is retyped, and the child is left on the original pages exactly
+	 * as in the desync this guards against. dup_mmap() takes
+	 * mmap_write_lock on the parent's mm, so holding it here excludes that.
+	 *
+	 * After the type check as well, so a hugetlb or real-file VMA is
+	 * refused with the accurate "not plain anonymous memory" rather than a
+	 * misleading "shared with another mapping".
+	 */
+	/*
+	 * THE PAGES MUST NOT ALREADY BE MAPPED BY ANYONE ELSE.
+	 *
+	 * Everything below relocates this range: the data is copied into a host
+	 * memfd and the VMA is repointed at a GPA window.  That rewrites THIS
+	 * mm's view and nothing else.  Any second view keeps the original pages
+	 * and silently stops sharing with this one -- measured total divergence,
+	 * with every ioctl returning success, in
+	 * docs/investigations/shared-mapping-desync/.
+	 *
+	 * Ways in, all ordinary rather than exotic:
+	 *   - MAP_SHARED|MAP_ANONYMOUS inherited across fork()
+	 *   - a memfd deliberately shared between cooperating processes
+	 *   - a VMM's guest-RAM memfd aliased into a KVM memslot (nesting)
+	 *
+	 * The earlier vm_file/s_magic/S_PRIVATE tests all ask who CREATED the
+	 * object.  That is the wrong question and missed the fork case entirely
+	 * (shmem_zero_setup() sets S_PRIVATE, so MAP_SHARED|MAP_ANONYMOUS
+	 * passed).  The question is how many mappings the pages already have,
+	 * and page_mapcount() answers it directly for every case above.
+	 *
+	 * We hold a pin on each page here, which does not itself raise mapcount
+	 * -- so 1 means "this VMA only" and >1 means someone else is mapping it.
+	 *
+	 * This REFUSES rather than repairing.  Repairing would mean migrating
+	 * every other view onto the new pages, which needs an i_mmap walk plus
+	 * mmap_write_lock on foreign mms -- the kernel's lock order is
+	 * mmap_lock outer, i_mmap_rwsem inner, so doing it in that direction is
+	 * an ABBA inversion, and rmap_walk() is not exported to modules.  Until
+	 * that is solved, an honest -EINVAL beats silent corruption.
+	 */
+	for (i = 0; i < (unsigned long)got; i++) {
+		int mc = page_mapcount(pages[i]);
+
+		if (mc > 1) {
+			pr_warn_ratelimited(
+				"nvkvm: refusing to migrate 0x%lx-0x%lx: page %lu is mapped %d times -- the range is shared with another mapping, and relocating it would desynchronise them (see docs/investigations/shared-mapping-desync)\n",
+				start, end, i, mc);
+			/* Under mmap_write_lock now -- every sibling error
+			 * path in this section unlocks before unwinding, and
+			 * err_unpin does not. */
+			mmap_write_unlock(mm);
+			ret = -EINVAL;
+			goto err_unpin;
+		}
+	}
 	vm_flags_set(vma, VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP);
 	/*
 	 * remap_pfn_range() refuses ANY sub-VMA remap on a copy-on-write
@@ -1632,8 +1712,37 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * VM_MAYWRITE.  VM_WRITE is untouched, so userspace keeps write access
 	 * — only a later mprotect() trying to re-add PROT_WRITE is refused.
 	 */
+	/*
+	 * Make it a SHARED passthrough rather than stripping VM_MAYWRITE.
+	 *
+	 * remap_pfn_range() refuses a sub-VMA remap on a COW mapping, and
+	 * is_cow_mapping() is (VM_SHARED|VM_MAYWRITE) == VM_MAYWRITE. Clearing
+	 * VM_MAYWRITE satisfied that test but left the VMA private-and-
+	 * unwritable: vm_get_page_prot() maps (VM_WRITE, !VM_SHARED) to a
+	 * read-only protection -- that is how COW is expressed -- so the PTEs
+	 * installed below came out read-only, and with VM_MAYWRITE gone the
+	 * resulting write fault had no way to resolve.
+	 *
+	 * MEASURED: a MAP_PRIVATE buffer registered fine and then SIGSEGV'd on
+	 * the first write, while the same binary on the stock driver wrote it
+	 * happily (tests/repro/private_register_write.c). That is ordinary
+	 * malloc'd heap, and the 30-check suite missed it because every CUDA
+	 * check registers cuMemHostAlloc memory, which is MAP_SHARED.
+	 *
+	 * Setting VM_SHARED makes is_cow_mapping() false for the same reason,
+	 * so remap_pfn_range() is satisfied -- and it is the honest description
+	 * of what this VMA now is. After the conversion it is a straight
+	 * passthrough of host window pages: there is no COW left to perform, and
+	 * a fork must share the window rather than try to copy it.
+	 *
+	 * VM_MAYSHARE is set with it because mmap() always pairs the two
+	 * (_calc_vm_trans sets both for MAP_SHARED); VM_SHARED alone is a flag
+	 * combination the kernel never produces on its own. Nothing asserts the
+	 * invariant today, so this changes no behaviour -- it avoids leaving a
+	 * VMA in a shape future mm code may reasonably assume cannot exist.
+	 */
 	if (is_cow_mapping(vma->vm_flags))
-		vm_flags_clear(vma, VM_MAYWRITE);
+		vm_flags_set(vma, VM_SHARED | VM_MAYSHARE);
 	/*
 	 * CACHED (write-back), NOT pgprot_noncached.  The GPA window is backed by
 	 * a memfd — normal host RAM in a KVM RAM memslot — not real device MMIO.
@@ -1845,9 +1954,6 @@ chunk_fail_mapped:
 	/* Every chunk is migrated, recorded and unpinned.  Nothing is left to
 	 * do but free the descriptor array. */
 	kvfree(pages);
-	pr_info("nvkvm DIAG: migrate_range(bulk) %lu pages, %d chunks, dup_peak=%lu B in %lld us\n",
-		npages, nck, dup_peak,
-		ktime_to_us(ktime_sub(ktime_get(), _t0)));
 	return 0;
 
 err_unpin:

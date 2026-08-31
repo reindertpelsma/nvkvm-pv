@@ -2300,6 +2300,60 @@ while [ $i -lt ${#RESULT_NAMES[@]} ]; do
     i=$((i+1))
 done
 
+# ---------------------------------------------------------------------------
+# host-memory registration invariants
+# ---------------------------------------------------------------------------
+# Regressions the CUDA checks above structurally cannot see: every one of them
+# registers cuMemHostAlloc memory, which is MAP_SHARED. The bugs live on the
+# MAP_PRIVATE and genuinely-shared paths.
+#
+#   * MAP_PRIVATE (ordinary malloc'd heap) registered fine and then SIGSEGV'd
+#     on the first write -- migrate_range cleared VM_MAYWRITE and
+#     vm_get_page_prot() then yielded a read-only protection. Present on main,
+#     invisible to 30/30 and to the app matrix, since GL/Vulkan/NVENC never
+#     call cuMemHostRegister.
+#   * A range something else already maps must be REFUSED, not relocated:
+#     relocating rewrites one VMA and silently desynchronises every other view.
+#   * register-then-fork must stay coherent (the worker-pool shape).
+#   * COW heap inherited across fork must register, parent's copy intact.
+#
+# Missing source or no compiler is SKIP, not FAIL, so this stays runnable on a
+# bare guest.
+section "host-memory registration invariants"
+
+REPRO_DIR="${NVKVM_REPRO_DIR:-$(cd "$(dirname "$0")/repro" 2>/dev/null && pwd)}"
+
+reg_invariant() {
+    # reg_invariant <check-name> <source.c> <detail-on-pass>
+    local name="$1" src="$2" okdetail="$3"
+    if ! command -v gcc >/dev/null 2>&1; then
+        record "$name" SKIP "no compiler on this guest"; return
+    fi
+    if [ -z "$REPRO_DIR" ] || [ ! -f "$REPRO_DIR/$src" ]; then
+        record "$name" SKIP "tests/repro/$src not present"; return
+    fi
+    if ! gcc -O1 -o "$WORK/${name}" "$REPRO_DIR/$src" -lcuda >"$WORK/${name}.cc" 2>&1; then
+        record "$name" SKIP "will not build (no libcuda?)"
+        return
+    fi
+    local out rc
+    out="$(timeout 120 "$WORK/${name}" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ]; then
+        record "$name" PASS "$okdetail"
+    else
+        record "$name" FAIL "rc=$rc: $(printf '%s' "$out" | grep -iE 'VERDICT|SEGV|REFUSED' | head -1 | cut -c1-72)"
+    fi
+}
+
+reg_invariant host_register_private_rw private_register_write.c \
+    "MAP_PRIVATE and MAP_SHARED both writable after cuMemHostRegister"
+reg_invariant host_register_shared_refused shared_view_desync.c \
+    "a range another process maps is refused; both views stay coherent"
+reg_invariant host_register_then_fork register_then_fork.c \
+    "child sees the parent's writes after register-then-fork"
+reg_invariant host_register_cow_fork cow_after_fork.c \
+    "child registered inherited COW heap; parent's copy intact"
+
 # --- classify skips ----------------------------------------------------------
 UNEXPECTED_SKIPS=""
 i=0

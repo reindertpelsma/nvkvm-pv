@@ -1320,9 +1320,31 @@ struct nvkvm_uvm_desc {
  * with no visible reason.  MEASURED by bisect 2026-08-30: 0a5527a is the first
  * commit where cuInit fails; its parent d8553ee passes.
  *
- *   25 UVM_REGISTER_GPU_VASPACE.rmCtrlFd @16  -> /dev/nvidiactl
- *   37 UVM_REGISTER_GPU.rmCtrlFd        @24  -> /dev/nvidiactl
- *   75 UVM_MM_INITIALIZE.uvmFd          @0   -> /dev/nvidia-uvm
+ *   25 UVM_REGISTER_GPU_VASPACE.rmCtrlFd @16    -> /dev/nvidiactl
+ *   27 UVM_REGISTER_CHANNEL.rmCtrlFd     @16    -> /dev/nvidiactl
+ *   33 UVM_MAP_EXTERNAL_ALLOCATION.rmCtrlFd @prof -> /dev/nvidiactl
+ *   37 UVM_REGISTER_GPU.rmCtrlFd        @24    -> /dev/nvidiactl
+ *   75 UVM_MM_INITIALIZE.uvmFd          @0     -> /dev/nvidia-uvm
+ *
+ * FIVE, not three.  The set that must appear here is not a judgement call: it
+ * is exactly the set nvkvm_sanitize_ioctl_params() rewrites into a handle_id
+ * (src/guest/nvkvm_ioctl.c) and exactly the set the stub translates back
+ * (src/stub/nvkvm_stub.c) -- 25, 27, 33, 37, 75.  Two of the five, 27 and 33,
+ * had fd_off = {0xffff, 0xffff} in the schema, so QEMU forwarded the handle_id
+ * to the driver AS A RAW FD NUMBER.  33 is missed twice over because its offset
+ * is version-variant, so the static fd_off[] cannot name it (it stays 0xffff
+ * there and is overridden from the ABI profile at the call site, exactly as
+ * min_size is).  MEASURED
+ * 2026-08-30 on nested nvkvm (an nvkvm guest hosting an nvkvm guest): with no
+ * translation the guest's handle_id went to the driver AS A RAW FD NUMBER --
+ * the inner guest module logged
+ *     nvkvmdiag: uvm33 comm=worker off=9248 fd=2
+ *     nvkvmdiag: fd2hid fd=2 NOT OURS comm=worker name=nvkvm-l2-qemu.log
+ * i.e. QEMU handed the driver fd 2, its own stderr.  On bare metal the real UVM
+ * driver does not dereference that field on this path, so L1 passed 30/30 and
+ * the bug stayed invisible; nested, the "driver" is another nvkvm guest module,
+ * which DOES validate it, returns -EBADF, and libcuda frees the allocation it
+ * had just made and answers cuCtxCreate_v2 with CUDA_ERROR_UNKNOWN (999).
  *
  * Returns -1 for anything else, which the caller treats as DENY: a command that
  * grows an embedded fd must be added here deliberately, not admitted by default.
@@ -1331,6 +1353,8 @@ static int nvkvm_uvm_embedded_fd_dev(uint32_t cmd)
 {
 	switch (cmd) {
 	case 25: /* UVM_REGISTER_GPU_VASPACE */
+	case 27: /* UVM_REGISTER_CHANNEL     */
+	case 33: /* UVM_MAP_EXTERNAL_ALLOCATION */
 	case 37: /* UVM_REGISTER_GPU         */
 		return NVKVM_DEV_CTL;
 	case 75: /* UVM_MM_INITIALIZE        */
@@ -1359,11 +1383,20 @@ static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
 	{ 24 /* UVM_DESTROY_RANGE_GROUP         */,  16, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 25 /* UVM_REGISTER_GPU_VASPACE        */,  32, { 16, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 26 /* UVM_UNREGISTER_GPU_VASPACE      */,  20, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
-	{ 27 /* UVM_REGISTER_CHANNEL            */,  48, { 0xffff, 0xffff }, 32, NVKVM_UVM_VA_CREATE },
+	/* rmCtrlFd@16 (uvm_uuid is 16 bytes; src/abi/uvm.h:110-118, and the
+	 * stub's own copy says "offset 16").  This row read {0xffff, 0xffff}
+	 * until 2026-08-30 even though the guest sanitizer rewrites the field
+	 * and the stub translates it back -- so on the QEMU hop the handle_id
+	 * went to the driver unconverted. */
+	{ 27 /* UVM_REGISTER_CHANNEL            */,  48, { 16, 0xffff }, 32, NVKVM_UVM_VA_CREATE },
 	{ 28 /* UVM_UNREGISTER_CHANNEL          */,  28, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 29 /* UVM_ENABLE_PEER_ACCESS          */,  40, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 30 /* UVM_DISABLE_PEER_ACCESS         */,  40, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 31 /* UVM_SET_RANGE_GROUP             */,  32, { 0xffff, 0xffff }, 8, NVKVM_UVM_VA_USE },
+	/* fd_off is 0xffff here and NOT "no embedded fd": rmCtrlFd's offset is
+	 * version-variant, so it is supplied from the ABI profile at the call
+	 * site (search emb_off).  min_size is overridden from the profile in
+	 * the same place for the same reason. */
 	{ 33 /* UVM_MAP_EXTERNAL_ALLOCATION     */, 9264, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
 	{ 34 /* UVM_FREE                        */,  24, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_FREE },
 	{ 37 /* UVM_REGISTER_GPU                */, NVKVM_UVM_REGISTER_GPU_SIZE,
@@ -2809,8 +2842,19 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			int      saved_off[2];
 			int      emb_fd[2];
 			int      nsaved = 0;
-			for (int k = 0; k < 2 && d->fd_off[k] != 0xffff; k++) {
-				uint32_t off = d->fd_off[k];
+			/* #81, third time: MAP_EXTERNAL_ALLOCATION's rmCtrlFd
+			 * offset is version-variant (1184 pre-V550, 9248 from
+			 * 550.54.14 on), so the static fd_off[] cannot carry
+			 * it.  Override from the active profile here, the same
+			 * way min_size is overridden above, rather than leaving
+			 * the field untranslated -- see
+			 * nvkvm_uvm_embedded_fd_dev() for what untranslated
+			 * actually sent. */
+			uint16_t emb_off[2] = { d->fd_off[0], d->fd_off[1] };
+			if (req->cmd == 33 /* UVM_MAP_EXTERNAL_ALLOCATION */)
+				emb_off[0] = (uint16_t)prof->uvm_map_ext_fd_off;
+			for (int k = 0; k < 2 && emb_off[k] != 0xffff; k++) {
+				uint32_t off = emb_off[k];
 				if (!param_buf || req->param_size < off + 4)
 					continue;
 				uint32_t hid;
@@ -2865,19 +2909,51 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 				 * and therefore that the type describes the same
 				 * handle the dup came from.
 				 */
+				/*
+				 * Audit 2026-08-31: these two used to `continue`,
+				 * which FAILS OPEN -- it leaves the guest's raw
+				 * 32-bit value in the buffer and forwards it, so
+				 * the host UVM driver resolves it against QEMU's
+				 * OWN fd table. That is exactly the failure this
+				 * whole path exists to stop, and the one the
+				 * commit log demonstrates:
+				 *
+				 *   nvkvmdiag: fd2hid fd=2 NOT OURS comm=worker
+				 *
+				 * QEMU handing the driver its own stderr. A
+				 * guest that names any unregistered non-zero id
+				 * reached it. Note 0 and (uint32_t)-1 are
+				 * filtered above as "no fd", so arriving here
+				 * means the guest named something and it did not
+				 * resolve -- deny, do not forward.
+				 */
 				struct nvkvm_handle *eh =
 					nvkvm_handle_get(&nv->handles, hid);
-				if (!eh)
-					continue;
-				int      etype = eh->type;
-				uint64_t egen0 = eh->generation;
+				int      etype = eh ? eh->type : -1;
+				uint64_t egen0 = eh ? eh->generation : 0;
 				int      edev  = -1;
 				uint64_t egen  = 0;
-				int efd = nvkvm_handle_acquire_fd(&nv->handles,
-								  hid, &edev,
-								  &egen);
-				if (efd < 0)
-					continue;
+				int efd = eh ? nvkvm_handle_acquire_fd(&nv->handles,
+								       hid, &edev,
+								       &egen)
+					     : -1;
+				if (!eh || efd < 0) {
+					fprintf(stderr,
+						"nvkvm: DENY UVM cmd=0x%x "
+						"embedded fd handle %u: %s\n",
+						req->cmd, hid,
+						eh ? "handle closed under us"
+						   : "no such handle");
+					if (efd >= 0)
+						close(efd);
+					for (int j = 0; j < nsaved; j++)
+						close(emb_fd[j]);
+					resp->retval     = (uint64_t)(int64_t)(-EBADF);
+					resp->status     = 0;
+					resp->nvstatus   = 0x1f; /* INVALID_ARGUMENT */
+					resp->fault_addr = 0;
+					return 0;
+				}
 				int want_dev =
 					nvkvm_uvm_embedded_fd_dev(req->cmd);
 				if (etype != NVKVM_HANDLE_TYPE_NVIDIA ||
