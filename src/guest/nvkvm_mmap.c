@@ -1558,6 +1558,8 @@ static void nvkvm_shared_add(struct inode *inode, unsigned long pgoff,
 	mutex_lock(&nvkvm_shared_lock);
 	list_add_tail(&sr->list, &nvkvm_shared_ranges);
 	mutex_unlock(&nvkvm_shared_lock);
+	pr_info("nvkvm: DEBUG shared_add inode=%p pgoff=%lu len=%lu handle=%u\n",
+		inode, pgoff, len, handle_id);
 }
 
 static void nvkvm_shared_remove_handle(__u32 handle_id)
@@ -1594,6 +1596,11 @@ static bool nvkvm_migrate_range_is_shareable(struct mm_struct *mm,
 
 	mmap_read_lock(mm);
 	vma = find_vma(mm, start);
+	pr_info("nvkvm: DEBUG is_shareable vma=%p vm_start=%lx vm_end=%lx "
+		"vm_file=%p vm_flags=%lx start=%lx end=%lx\n",
+		vma, vma ? vma->vm_start : 0, vma ? vma->vm_end : 0,
+		vma ? vma->vm_file : NULL, vma ? (unsigned long)vma->vm_flags : 0,
+		start, end);
 	if (vma && vma->vm_start <= start && vma->vm_end >= end &&
 	    vma->vm_file && nvkvm_vma_file_is_memory(vma) &&
 	    !(vma->vm_flags & (VM_PFNMAP | VM_IO | VM_MIXEDMAP | VM_HUGETLB))) {
@@ -1607,8 +1614,11 @@ static bool nvkvm_migrate_range_is_shareable(struct mm_struct *mm,
 			unsigned long clen = min((unsigned long)NVKVM_MIG_CHUNK,
 						 range_len - coff);
 			unsigned long pgoff = pgoff_base + (coff >> PAGE_SHIFT);
+			__u32 h = nvkvm_shared_find(inode, pgoff, clen);
 
-			if (!nvkvm_shared_find(inode, pgoff, clen)) {
+			pr_info("nvkvm: DEBUG is_shareable chunk inode=%p pgoff=%lu "
+				"clen=%lu -> handle=%u\n", inode, pgoff, clen, h);
+			if (!h) {
 				ok = false;
 				break;
 			}
@@ -1617,6 +1627,10 @@ static bool nvkvm_migrate_range_is_shareable(struct mm_struct *mm,
 			*inode_out = inode;
 			*pgoff_out = pgoff_base;
 		}
+	} else {
+		pr_info("nvkvm: DEBUG is_shareable precondition failed "
+			"(is_memory=%d)\n",
+			vma && vma->vm_file ? nvkvm_vma_file_is_memory(vma) : -1);
 	}
 	mmap_read_unlock(mm);
 	return ok;
@@ -1976,6 +1990,9 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 		reg_pgoff_base = vma->vm_pgoff +
 			((start - vma->vm_start) >> PAGE_SHIFT);
 	}
+	pr_info("nvkvm: DEBUG migrate_range main-path is_shmem_obj=%d inode=%p "
+		"pgoff_base=%lu start=%lx vm_file=%p\n",
+		is_shmem_obj, reg_inode, reg_pgoff_base, start, vma->vm_file);
 
 	/*
 	 * Under mmap_write_lock, and after the VMA type check, on purpose.
