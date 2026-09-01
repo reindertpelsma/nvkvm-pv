@@ -27,6 +27,26 @@ baseline was given, one explicit `small_tier:comparison_support` Comparison
 tier's own design brief, verbatim: a tier that structurally cannot compare
 must say so explicitly, never quietly report a single-sided number as if
 the baseline had simply been forgotten.
+
+KNOWN GAP, confirmed against a real ssh-reachable box while wiring
+run_tests.py's --target/--baseline CLI, NOT fixed here: this tier reads
+validate.sh's --json output back with a plain local `Path.exists()` /
+`Path.read_text()` on the `json_out` path returned by `machine.scratch()`.
+That is correct for ThisMachine (real local path) and ChrootMachine (a
+host-side path the chroot bind-mounts, so it's ALSO a real local path from
+this process's point of view) -- but for SSHMachine/VMMachine, `scratch()`
+returns a path that only exists ON THE REMOTE MACHINE; validate.sh runs
+there successfully and writes real JSON there, and this process's local
+`json_out.exists()` then (almost always correctly) reports False, so the
+tier reports UNTESTED "without producing --json output" even though it
+did. The Machine interface has no generic "read a file back from this
+machine" primitive (need() is for read-only, checksum-known INPUTS;
+scratch() output was never meant to be read back this way) -- adding one is
+real, separate work, not done in this slice. `--tier small --target ssh`
+(or `vm`) is therefore NOT currently usable end to end; `medium`/`large`
+have no equivalent gap (they read results from `command.stdout`, which IS
+captured correctly for every Machine kind) and were confirmed working over
+a real ssh target while diagnosing this.
 """
 
 from __future__ import annotations
@@ -40,7 +60,8 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from machine import Machine
+from item import Item, sha256_file
+from machine import Machine, ensure_dir
 from result import Comparison, Observation, Report, Status
 
 VALIDATE_SH = Path(__file__).resolve().parent.parent.parent / "validate.sh"
@@ -94,8 +115,18 @@ async def run(
         return report
 
     scratch = machine.scratch()
+    await ensure_dir(machine, scratch, timeout=bound)
     json_out = scratch / "validate_result.json"
-    cmd = ["bash", str(VALIDATE_SH), "--json", str(json_out)]
+    # VALIDATE_SH is a path on THIS process's filesystem -- for ThisMachine/
+    # ChrootMachine that's also where `machine` reads it from (same or
+    # bind-mounted filesystem), but for SSHMachine/VMMachine it is a
+    # completely different machine and that bare path would not exist
+    # there. need() materialises it correctly either way (a no-op copy for
+    # ThisMachine, a real upload for SSHMachine) -- same pattern medium.py's
+    # _compile() uses for its own probe sources.
+    validate_sh_item = Item(name="validate.sh", sha256=sha256_file(VALIDATE_SH), local_path=VALIDATE_SH)
+    validate_sh_on_machine = await machine.need(validate_sh_item)
+    cmd = ["bash", str(validate_sh_on_machine), "--json", str(json_out)]
     if extra_args:
         cmd += list(extra_args)
 

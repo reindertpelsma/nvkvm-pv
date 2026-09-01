@@ -145,6 +145,8 @@ def test_gemm_no_gpu_is_skip_not_fail():
 def test_gemm_compile_failure_is_untested_not_fail():
     async def body():
         def responder(cmd):
+            if cmd[0] == "mkdir":
+                return 0, b"", b""
             assert cmd[0] == "cc"
             return 1, b"", b"cc: fatal error: no such file\n"
 

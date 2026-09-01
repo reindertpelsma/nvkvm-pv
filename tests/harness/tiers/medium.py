@@ -52,7 +52,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from item import Item, sha256_file
-from machine import Machine
+from machine import Machine, ensure_dir
 from result import Comparison, Observation, Report, Status, ToleranceBand
 
 PROBES_DIR = Path(__file__).resolve().parent.parent / "probes"
@@ -78,6 +78,12 @@ class ProbeCompileError(RuntimeError):
 
 async def _compile(machine: Machine, src_path: Path, out_name: str, timeout: float) -> Path:
     scratch = machine.scratch()
+    # See machine.ensure_dir's own docstring: SSHMachine/VMMachine's
+    # scratch() is bare path arithmetic (no local filesystem to
+    # synchronously mkdir into), so `cc -o <scratch>/<out_name>` fails with
+    # a plain "No such file or directory" against either of those unless
+    # something creates the directory first.
+    await ensure_dir(machine, scratch, timeout=timeout)
     item = Item(name=f"harness-src-{src_path.name}", sha256=sha256_file(src_path), local_path=src_path)
     src_on_machine = await machine.need(item)
     out_path = scratch / out_name

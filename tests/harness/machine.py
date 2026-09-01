@@ -150,6 +150,33 @@ class Machine(abc.ABC):
         not."""
 
 
+async def ensure_dir(machine: Machine, path: Path, *, timeout: float) -> None:
+    """`mkdir -p path` on `machine`, via a plain `run()` call.
+
+    Closes a real gap: `Machine.scratch()` is documented as "created on
+    first use" (this class's own docstring above), but it is a SYNCHRONOUS
+    method -- it can only ever be path arithmetic for a Machine with no
+    resident local filesystem to synchronously touch. `ThisMachine`
+    (`tempfile.mkdtemp`) and `ChrootMachine` (mkdir's the HOST-side backing
+    dir eagerly, before the bind mount) really do create it inline. `
+    SSHMachine`/`VMMachine` cannot -- both say so directly in their own
+    `scratch()` docstrings ("the actual mkdir is deferred... callers that
+    write into scratch() do so via run()") -- so a tier that calls
+    `machine.scratch()` and then hands a path under it straight to `cc -o`
+    or a script's `--json <path>` arg, on either of those two, fails with a
+    plain "No such file or directory" the first time it is actually
+    exercised against a real remote target (confirmed against a real
+    ssh-reachable box while wiring run_tests.py's --target/--baseline CLI:
+    tests/validate.sh itself uploaded and ran fine via need(), then failed
+    writing its own --json output for exactly this reason).
+
+    A no-op in effect for ThisMachine/ChrootMachine (mkdir -p on an already-
+    existing directory just succeeds), so tiers can call this unconditionally
+    without knowing which kind of Machine they were handed."""
+    command = await machine.run(["mkdir", "-p", str(path)], timeout=timeout)
+    await command.wait(timeout=timeout)
+
+
 async def run_to_completion(
     machine: Machine,
     cmd: Sequence[str],

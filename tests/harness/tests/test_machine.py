@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from machine import ThisMachine
+from machine import ThisMachine, ensure_dir
 
 
 def test_run_captures_stdout_and_returncode():
@@ -158,3 +158,29 @@ def test_defaults_never_touch_a_directory_the_caller_did_not_name():
     # and never touched until a test actually calls need() -- assert the
     # computed default path directly rather than forcing a real fetch.
     assert machine._cache_dir.resolve().is_relative_to(tmp_root)
+
+
+# --- ensure_dir --------------------------------------------------------------
+
+
+def test_ensure_dir_creates_a_nested_directory(tmp_path):
+    async def body():
+        machine = ThisMachine()
+        target = tmp_path / "does" / "not" / "exist" / "yet"
+        assert not target.exists()
+        await ensure_dir(machine, target, timeout=5)
+        assert target.is_dir()
+
+    asyncio.run(body())
+
+
+def test_ensure_dir_is_idempotent_on_an_existing_directory(tmp_path):
+    async def body():
+        machine = ThisMachine()
+        target = tmp_path / "already-here"
+        target.mkdir()
+        (target / "keep-me.txt").write_text("still here")
+        await ensure_dir(machine, target, timeout=5)
+        assert (target / "keep-me.txt").read_text() == "still here"
+
+    asyncio.run(body())

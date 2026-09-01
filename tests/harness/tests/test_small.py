@@ -69,7 +69,13 @@ class FakeMachine(Machine):
         return FakeCommand(rc, out, err)
 
     async def need(self, item: Item) -> Path:
-        raise NotImplementedError("small.py never calls need()")
+        # small.py materialises validate.sh itself via need() before
+        # building its argv (so this tier works against a machine with a
+        # separate filesystem, e.g. SSHMachine/VMMachine, not just
+        # ThisMachine/ChrootMachine) -- the returned path only has to be
+        # something this fake's own responder is willing to accept as
+        # argv[1], never actually read.
+        return Path(f"/fake/{item.name}")
 
     def scratch(self) -> Path:
         self._scratch_dir.mkdir(parents=True, exist_ok=True)
@@ -80,9 +86,13 @@ def _validate_sh_responder(json_out: Path, payload: dict, rc: int = 0):
     """Writes `payload` to wherever validate.sh's --json arg pointed (the
     exact call shape small.py builds: ["bash", VALIDATE_SH, "--json",
     str(json_out)]) and returns `rc` -- standing in for a real validate.sh
-    run without executing any shell script."""
+    run without executing any shell script. Also answers small.py's
+    `ensure_dir()` preflight ("mkdir -p <scratch>", issued before the bash
+    call -- see machine.ensure_dir's docstring) with a clean success."""
 
     def responder(cmd):
+        if cmd[0] == "mkdir":
+            return 0, b"", b""
         assert cmd[0] == "bash"
         assert cmd[2] == "--json"
         Path(cmd[3]).write_text(json.dumps(payload))
