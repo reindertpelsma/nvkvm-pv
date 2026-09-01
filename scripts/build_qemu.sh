@@ -84,9 +84,13 @@ done
 #
 # Telling the operator to remember --force (as the old message did) is not a
 # guard. The stamp is a hash of everything that ends up IN the binary: the
-# nvkvm QEMU sources and the patch series.
+# EVERYTHING that reaches the binary, not just src/qemu: this script copies
+# src/abi/*.h and src/common/*.h into the QEMU tree (see the 2026-07-04 note
+# further down) and builds src/stub. A stamp over src/qemu alone would let an
+# edit to src/abi/nvgpu.h -- where every GPU object class lives -- reuse a
+# stale binary, which is the exact bug this guard exists to prevent.
 nvkvm_build_stamp() {
-    { find src/qemu patches -type f \( -name '*.c' -o -name '*.h' -o -name '*.patch' \) \
+    { find src/qemu src/common src/abi src/stub patches -type f \( -name '*.c' -o -name '*.h' -o -name '*.patch' -o -name 'Makefile' \) \
         -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
       printf '%s\n' "$QEMU_VERSION"
     } | sha256sum | cut -d' ' -f1
