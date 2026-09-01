@@ -71,6 +71,28 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
  * (chan_alloc_size), PASCAL_DMA_COPY_A takes NVB0B5_ALLOCATION_PARAMETERS
  * like every other *_DMA_COPY_* class, and PASCAL_A/_B/_COMPUTE_A/_COMPUTE_B
  * take NV_GR_ALLOCATION_PARAMETERS like every other graphics/compute class. */
+/* Maxwell (pre-Turing, arch mapping "maxwell": GM107/GM108 = MAXWELL_A, and
+ * GM200/GM204/GM206 = MAXWELL_B).  Same situation as Pascal below: absent from
+ * gVisor nvproxy, therefore never allowlisted, therefore refused by QEMU's
+ * default-deny gate before any guest-side code could matter.  Maxwell is the
+ * OLDEST generation nvkvm can reach at all -- Kepler's last driver is 470,
+ * below our 515 ABI floor, so this is the floor by arithmetic, not by effort.
+ * Ids from open-gpu-kernel-modules (clb06f.h, clb097.h, clb197.h, clb0b5.h,
+ * clb0c0.h, clb1c0.h).  Alloc-param shapes need no new structs, exactly as for
+ * Pascal.  Note there is NO MAXWELL_DMA_COPY_B: Pascal is the only generation
+ * that ships an _A and a _B copy engine (GP100 vs GP10x dies).
+ * UNMEASURED at the time of writing -- unlike the Pascal ids below, no DENY
+ * line has yet confirmed which of these a GM107 actually asks for.  The run
+ * that first exercises this must be read for residual "DENY alloc class"
+ * lines, which is exactly how PASCAL_DMA_COPY_B was caught after being
+ * missed in the first pass. */
+#define MAXWELL_CHANNEL_GPFIFO_A            0x0000B06FU
+#define MAXWELL_A                           0x0000B097U
+#define MAXWELL_B                           0x0000B197U
+#define MAXWELL_DMA_COPY_A                  0x0000B0B5U
+#define MAXWELL_COMPUTE_A                   0x0000B0C0U
+#define MAXWELL_COMPUTE_B                   0x0000B1C0U
+
 #define PASCAL_CHANNEL_GPFIFO_A             0x0000C06FU
 #define TURING_CHANNEL_GPFIFO_A             0x0000C46FU
 #define AMPERE_CHANNEL_GPFIFO_A             0x0000C56FU

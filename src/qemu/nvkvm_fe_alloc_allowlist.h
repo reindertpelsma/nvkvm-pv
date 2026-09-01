@@ -98,6 +98,14 @@ static const uint32_t nvkvm_alloc_class_allowlist[] = {
 	0x0000b8b0u,
 	0x0000b8d1u,
 	0x0000b8fau,
+	/* Maxwell -- the oldest generation reachable at all (Kepler's last driver
+	 * is 470, below the 515 ABI floor).  Not in nvproxy, same as Pascal. */
+	0x0000b06fu,  /* MAXWELL_CHANNEL_GPFIFO_A */
+	0x0000b097u,  /* MAXWELL_A -- GM107/GM108 */
+	0x0000b0b5u,  /* MAXWELL_DMA_COPY_A -- no _B exists for this generation */
+	0x0000b0c0u,  /* MAXWELL_COMPUTE_A */
+	0x0000b197u,  /* MAXWELL_B -- GM200/GM204/GM206 */
+	0x0000b1c0u,  /* MAXWELL_COMPUTE_B */
 	0x0000c06fu,  /* PASCAL_CHANNEL_GPFIFO_A -- pre-Turing, not in nvproxy */
 	0x0000c097u,  /* PASCAL_A */
 	0x0000c0b5u,  /* PASCAL_DMA_COPY_A */

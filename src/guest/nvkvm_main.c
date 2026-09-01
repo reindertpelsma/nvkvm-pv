@@ -2519,6 +2519,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case FERMI_CONTEXT_SHARE_A:
 				ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
 				break;
+			case MAXWELL_CHANNEL_GPFIFO_A:
 			case PASCAL_CHANNEL_GPFIFO_A:
 			case VOLTA_CHANNEL_GPFIFO_A:
 			case TURING_CHANNEL_GPFIFO_A:
@@ -2553,6 +2554,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case NV_MEMORY_MAPPER:
 				ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 				break;
+			case MAXWELL_DMA_COPY_A:
 			case PASCAL_DMA_COPY_A:
 			case PASCAL_DMA_COPY_B:
 			case VOLTA_DMA_COPY_A:
@@ -2572,6 +2574,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case GT200_DEBUGGER:
 				ap_size = sizeof(struct nv83de_alloc_parameters);
 				break;
+			case MAXWELL_COMPUTE_A: case MAXWELL_COMPUTE_B:
+			case MAXWELL_A: case MAXWELL_B:
 			case PASCAL_COMPUTE_A: case PASCAL_COMPUTE_B:
 			case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
 			case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
@@ -2693,6 +2697,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case FERMI_CONTEXT_SHARE_A:
 					ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
 					break;
+				case MAXWELL_CHANNEL_GPFIFO_A:
 				case PASCAL_CHANNEL_GPFIFO_A:
 			case VOLTA_CHANNEL_GPFIFO_A:
 				case TURING_CHANNEL_GPFIFO_A:
@@ -2719,6 +2724,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case NV_MEMORY_MAPPER:
 					ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 					break;
+				case MAXWELL_DMA_COPY_A:
 				case PASCAL_DMA_COPY_A:
 				case PASCAL_DMA_COPY_B:
 				case VOLTA_DMA_COPY_A:
@@ -2736,6 +2742,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case GT200_DEBUGGER:
 					ap_size = sizeof(struct nv83de_alloc_parameters);
 					break;
+				case MAXWELL_COMPUTE_A: case MAXWELL_COMPUTE_B:
+				case MAXWELL_A: case MAXWELL_B:
 				case PASCAL_COMPUTE_A: case PASCAL_COMPUTE_B:
 				case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
 				case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
