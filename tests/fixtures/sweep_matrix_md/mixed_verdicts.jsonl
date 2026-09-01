@@ -1,0 +1,2 @@
+{"arch": "turing", "gpu": "RTX 2060S", "driver": "575.51.03", "status": "pass", "summary": "30P/0F/0S", "role": "driver-set", "ts": "2026-08-01T00:00:00Z"}
+{"arch": "turing", "gpu": "RTX 2060S", "driver": "575.51.03", "status": "fail", "summary": "28P/2F/0S", "role": "driver-set", "ts": "2026-08-02T00:00:00Z"}

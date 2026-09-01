@@ -1,0 +1,5 @@
+{"arch": "pascal", "gpu": "Quadro P4000", "driver": "control:575.51.03", "driver_actual": "575.51.03", "status": "control-pass", "summary": "30P/0F/0S", "role": "control", "ts": "2026-09-01T12:41:49Z"}
+{"arch": "pascal", "gpu": "Quadro P4000", "driver": "580.95.05", "status": "validate-unparsed", "detail": "validate.sh exited 124 but produced no /tmp/r.json", "role": "driver-set", "ts": "2026-09-01T13:24:43Z"}
+{"arch": "pascal", "gpu": "Quadro P4000", "driver": "580.95.05", "status": "steamos-fail", "phase": "install", "detail": "OTA failed at 40%", "role": "steamos", "ts": "2026-09-01T14:00:00Z"}
+{"arch": "pascal", "gpu": "Quadro P4000", "driver": "580.95.05", "status": "steamos-untested", "phase": "slotb", "detail": "the stage never reached this phase", "role": "steamos", "ts": "2026-09-01T14:00:01Z"}
+{"arch": "pascal", "gpu": "Quadro P4000", "driver": "-", "status": "coverage-shortfall", "detail": "1 of 2 applicable drivers produced a validate.sh verdict; --min-drivers is 1", "ts": "2026-09-01T13:24:54Z"}
