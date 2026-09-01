@@ -115,7 +115,7 @@ else
     last="$(tail -5 "$WORK/install.log" 2>/dev/null | tr -dc '[:print:]\n' | tail -1 | cut -c1-200)"
     verdict "install" fail "rc=$rc after $(( t1 - t0 ))s: $last"
     say "STAGE FAILED at install"
-    echo done >"$WORK/DONE"
+    echo "done" >"$WORK/DONE"
     exit 1
 fi
 
@@ -132,4 +132,4 @@ if [ -x "$WORK/nvkvm-kata/scripts/nvkvm-kata-uninstall.sh" ]; then
 fi
 
 say "nvkvm-kata stage complete"
-echo done >"$WORK/DONE"
+echo "done" >"$WORK/DONE"
