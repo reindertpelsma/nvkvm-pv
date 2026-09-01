@@ -98,6 +98,14 @@ static const uint32_t nvkvm_alloc_class_allowlist[] = {
 	0x0000b8b0u,
 	0x0000b8d1u,
 	0x0000b8fau,
+	/* Kepler channel classes.  MEASURED on a GTX 750 Ti (GM107): a first-gen
+	 * Maxwell part asks for THESE, not the 0xB06F Maxwell channel class --
+	 * 6x 0xa06f and 7x 0xa16f in one bring-up, every one of them DENIED
+	 * here.  Sizing them in the guest was necessary and not sufficient:
+	 * the guest stopped guessing a 256-byte window, and QEMU then refused
+	 * the alloc outright because the ids were never in this list. */
+	0x0000a06fu,  /* KEPLER_CHANNEL_GPFIFO_A */
+	0x0000a16fu,  /* KEPLER_CHANNEL_GPFIFO_B */
 	/* Maxwell -- the oldest generation reachable at all (Kepler's last driver
 	 * is 470, below the 515 ABI floor).  Not in nvproxy, same as Pascal. */
 	0x0000b06fu,  /* MAXWELL_CHANNEL_GPFIFO_A */
