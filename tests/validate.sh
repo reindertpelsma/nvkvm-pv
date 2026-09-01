@@ -171,7 +171,7 @@ record() {
     esac
 }
 
-section() { printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET"; }
+section() { checkpoint "section:$1"; printf '\n%s== %s ==%s\n' "$C_BOLD" "$1" "$C_RESET"; }
 
 # ---------------------------------------------------------------------------
 # the verdict
@@ -475,30 +475,223 @@ emit_probe() {   # <name> <source> <ldflags...>
 # fail, and nothing made the check structurally impossible; it simply did not
 # finish.  It also cannot be silenced by --allow-skip and it moves the exit
 # code, which is what stops a hang being read as a pass.
+#
+# `timeout --kill-after=N` was tried first and MEASURED (2026-09-01, same
+# Quadro P4000) to not be enough: a sweep run sat for 2573s and produced
+# neither PROBE_TIMEOUT's own UNTESTED nor a JSON verdict -- the wrapper never
+# even reached `local rc=$?`.  HYPOTHESIS (not proven): `timeout` sends the
+# signal but then still blocks in its own waitpid() for the child to actually
+# exit; if the child is asleep in an uninterruptible ioctl into the guest
+# module, it never returns from the kernel to take the SIGKILL, never exits,
+# and `timeout` never returns either -- so the outer bound silently becomes no
+# bound at all. So: never let this shell block waiting on the probe. Start it
+# in the background and poll its liveness with `kill -0`, which only asks the
+# kernel "does this pid still exist" and -- unlike wait()/waitpid() -- does
+# NOT block even on a process stuck in D state. See _wait_bounded below.
 PROBE_TIMEOUT="${NVKVM_PROBE_TIMEOUT:-300}"
+PROBE_KILL_AFTER="${NVKVM_PROBE_KILL_AFTER:-10}"
 PROBE_TIMED_OUT=""
+PROBE_SURVIVED=""
+
+# ---------------------------------------------------------------------------
+# wedge diagnostics
+# ---------------------------------------------------------------------------
+# fd 9 is a private duplicate of this process's REAL stdout, taken once here
+# before anything wraps a call in `$(...)`. run_probe/sh_bounded's callers
+# capture combined output into a variable (e.g. `SMI_RAW="$(sh_bounded ...)"`,
+# `out="$(timeout 120 ...)"`) -- writing wedge evidence to fd 1 or fd 2 there
+# would land IN that variable instead of in the console/log a sweep pulls.
+# Writing to fd 9 always reaches the same underlying stream as stdout, no
+# matter what a call site does with 1 and 2 locally.
+exec 9>&1
+
+LAST_CHECKPOINT="(none yet)"
+# checkpoint <label> -- record, BEFORE a step runs, what is about to happen.
+# Written immediately (one write(2) per call, unbuffered) so that if the step
+# wedges and nothing else ever gets printed, the last CHECKPOINT line in
+# whatever log a sweep pulled names the exact step that was in flight.
+checkpoint() {
+    LAST_CHECKPOINT="$1"
+    printf 'CHECKPOINT|%s|%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$1" >&9
+}
+
+# dump_wedge_evidence <label> <reaped|survived> <pid>
+#   reaped   -- the kill (TERM, or KILL after the grace period) actually
+#               terminated the process. A slow probe/command, not a wedge.
+#   survived -- after SIGKILL plus the grace period the process is STILL
+#               alive. This is the stronger claim: nothing but the kernel
+#               finishing whatever uninterruptible syscall it is in can end
+#               this process. Consistent with the D-state HYPOTHESIS above,
+#               not proof of it.
+dump_wedge_evidence() {
+    local label="$1" kill_result="$2" pid="${3:-?}"
+    {
+        printf 'WEDGE-EVIDENCE|step=%s|pid=%s|kill_result=%s|last_checkpoint=%s\n' \
+               "$label" "$pid" "$kill_result" "$LAST_CHECKPOINT"
+        if [ "$kill_result" = survived ]; then
+            printf '  ** process SURVIVED SIGKILL -- stronger than a plain timeout, consistent with an uninterruptible-sleep (D-state) wedge **\n'
+        fi
+
+        printf -- '--- ps -eo pid,stat,wchan:32,comm (D-state processes) ---\n'
+        local dstate dpid
+        dstate="$(ps -eo pid,stat,wchan:32,comm 2>/dev/null | awk 'NR==1{print; next} $2 ~ /^D/')"
+        if [ -n "$dstate" ]; then
+            printf '%s\n' "$dstate"
+            for dpid in $(printf '%s\n' "$dstate" | awk 'NR>1{print $1}'); do
+                if [ -r "/proc/$dpid/stack" ]; then
+                    printf -- '--- /proc/%s/stack ---\n' "$dpid"
+                    cat "/proc/$dpid/stack" 2>/dev/null || printf '  (read failed)\n'
+                else
+                    printf -- '--- /proc/%s/stack: unreadable (needs root, or process already gone) ---\n' "$dpid"
+                fi
+            done
+        else
+            printf '  (ps unavailable, or no D-state processes right now)\n'
+        fi
+
+        printf -- '--- dmesg tail ---\n'
+        local dm
+        if dm="$(dmesg 2>&1)" && [ -n "$dm" ]; then
+            printf '%s\n' "$dm" | tail -n 40
+        elif dm="$(sudo -n dmesg 2>&1)" && [ -n "$dm" ]; then
+            printf '%s\n' "$dm" | tail -n 40
+        else
+            printf '  (dmesg unavailable: restricted, and no passwordless sudo)\n'
+        fi
+        printf 'WEDGE-EVIDENCE-END|step=%s\n' "$label"
+    } >&9
+}
+
+# _wait_bounded <pid> <budget> <kill_after> <label> -- the shared poll loop
+# behind both run_probe and sh_bounded. NEVER calls a blocking `wait <pid>` on
+# a pid that might still be running -- only `kill -0`, which is non-blocking
+# always, D-state or not. Sets:
+#   _BOUNDED_RC         real exit status if the process ended on its own or
+#                       was reaped after being killed; 124 if it never died
+#   _BOUNDED_TIMED_OUT  1 if <budget> was exceeded at all
+#   _BOUNDED_SURVIVED   1 if it was still alive after SIGKILL + grace
+_wait_bounded() {
+    local pid="$1" budget="$2" kill_after="$3" label="$4" waited=0 grace=0
+    _BOUNDED_TIMED_OUT=0
+    _BOUNDED_SURVIVED=0
+    while kill -0 "$pid" 2>/dev/null; do
+        [ "$waited" -ge "$budget" ] && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null
+        _BOUNDED_RC=$?
+        return 0
+    fi
+
+    _BOUNDED_TIMED_OUT=1
+    checkpoint "${label}:budget(${budget}s)-exceeded,sending-TERM"
+    kill -TERM "$pid" 2>/dev/null
+    while [ "$grace" -lt "$kill_after" ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        grace=$((grace + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        checkpoint "${label}:TERM-ignored,sending-KILL"
+        kill -KILL "$pid" 2>/dev/null
+        sleep 1
+    fi
+
+    if kill -0 "$pid" 2>/dev/null; then
+        _BOUNDED_SURVIVED=1
+        _BOUNDED_RC=124
+        dump_wedge_evidence "$label" survived "$pid"
+    else
+        wait "$pid" 2>/dev/null
+        _BOUNDED_RC=$?
+        dump_wedge_evidence "$label" reaped "$pid"
+    fi
+    return 0
+}
 
 run_probe() {
     local bin="$1"; shift
-    # --kill-after: a probe wedged in an uninterruptible ioctl ignores TERM.
-    timeout --kill-after=10 "$PROBE_TIMEOUT" "$WORK/$bin" "$@" > "$WORK/$bin.out" 2>&1
-    local rc=$?
+    checkpoint "probe:$bin"
+    "$WORK/$bin" "$@" > "$WORK/$bin.out" 2>&1 &
+    local pid=$!
+    _wait_bounded "$pid" "$PROBE_TIMEOUT" "$PROBE_KILL_AFTER" "probe:$bin"
     [ "$VERBOSE" = 1 ] && sed 's/^/    | /' "$WORK/$bin.out"
-    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+    if [ "$_BOUNDED_TIMED_OUT" = 1 ]; then
         PROBE_TIMED_OUT="$bin"
+        if [ "$_BOUNDED_SURVIVED" = 1 ]; then PROBE_SURVIVED="$bin"; else PROBE_SURVIVED=""; fi
     else
         PROBE_TIMED_OUT=""
+        PROBE_SURVIVED=""
     fi
-    return $rc
+    return "$_BOUNDED_RC"
 }
 
 # Call after ingest() when run_probe may have timed out, so the partial results
-# are kept AND the truncation is visible.
+# are kept AND the truncation is visible. The wording is the machine-readable
+# split this whole mechanism exists for: "bounded and reaped" (a slow probe)
+# is a materially weaker claim than "bounded and the process SURVIVED the
+# kill" (the D-state signature) -- never collapse the two into one message.
 note_probe_timeout() {
     [ -n "${PROBE_TIMED_OUT:-}" ] || return 0
-    record "${PROBE_TIMED_OUT}_completed" UNTESTED \
-           "probe exceeded ${PROBE_TIMEOUT}s and was killed -- it HUNG rather than failed; any checks it had not yet reported are missing, not passing"
+    if [ -n "${PROBE_SURVIVED:-}" ]; then
+        record "${PROBE_TIMED_OUT}_completed" UNTESTED \
+               "WEDGE: probe exceeded ${PROBE_TIMEOUT}s, was sent SIGKILL, and SURVIVED the kill -- bounded and the process SURVIVED the kill, not just bounded and reaped; see WEDGE-EVIDENCE above"
+    else
+        record "${PROBE_TIMED_OUT}_completed" UNTESTED \
+               "probe exceeded ${PROBE_TIMEOUT}s and was killed (bounded and reaped) -- it HUNG rather than failed; any checks it had not yet reported are missing, not passing"
+    fi
     PROBE_TIMED_OUT=""
+    PROBE_SURVIVED=""
+}
+
+# sh_bounded <label> <budget-seconds> <cmd...> -- the SHELL_TIMEOUT layer for
+# shell-level commands that talk to the driver (nvidia-smi, a repro binary)
+# but are not one of the compiled probes above. Same non-blocking poll, same
+# evidence dump. Runs <cmd...> with its normal stdout/stderr (so a caller can
+# still do `SMI_RAW="$(sh_bounded nvidia_smi_banner "$SHELL_TIMEOUT" "$NVSMI")"`
+# and get exactly what the command printed); on timeout, sets
+# SH_BOUNDED_TIMED_OUT / SH_BOUNDED_SURVIVED for note_shell_timeout to read.
+SHELL_TIMEOUT="${NVKVM_SHELL_TIMEOUT:-60}"
+SHELL_KILL_AFTER="${NVKVM_SHELL_KILL_AFTER:-5}"
+SH_BOUNDED_TIMED_OUT=""
+SH_BOUNDED_SURVIVED=""
+
+sh_bounded() {
+    local label="$1" budget="$2"; shift 2
+    checkpoint "shell:$label"
+    "$@" &
+    local pid=$!
+    _wait_bounded "$pid" "$budget" "$SHELL_KILL_AFTER" "shell:$label"
+    if [ "$_BOUNDED_TIMED_OUT" = 1 ]; then
+        SH_BOUNDED_TIMED_OUT="$label"
+        if [ "$_BOUNDED_SURVIVED" = 1 ]; then SH_BOUNDED_SURVIVED="$label"; else SH_BOUNDED_SURVIVED=""; fi
+    else
+        SH_BOUNDED_TIMED_OUT=""
+        SH_BOUNDED_SURVIVED=""
+    fi
+    return "$_BOUNDED_RC"
+}
+
+# note_shell_timeout <name...> -- call right after sh_bounded with the check
+# name(s) that command's result would otherwise feed. Returns 0 (and records
+# each as UNTESTED, same split as note_probe_timeout) only if that sh_bounded
+# call actually timed out, so callers can gate their normal parse path on it:
+#     SMI_RAW="$(sh_bounded nvidia_smi "$SHELL_TIMEOUT" "$NVSMI")"
+#     if note_shell_timeout nvidia_smi_gpu nvidia_smi_driver nvidia_smi_cuda; then :
+#     elif ... # normal parsing, unchanged
+note_shell_timeout() {
+    [ -n "${SH_BOUNDED_TIMED_OUT:-}" ] || return 1
+    local reason n
+    if [ -n "${SH_BOUNDED_SURVIVED:-}" ]; then
+        reason="WEDGE: ${SH_BOUNDED_TIMED_OUT} exceeded ${SHELL_TIMEOUT}s, was sent SIGKILL, and SURVIVED the kill -- bounded and the process SURVIVED the kill, not just bounded and reaped; see WEDGE-EVIDENCE above"
+    else
+        reason="${SH_BOUNDED_TIMED_OUT} exceeded ${SHELL_TIMEOUT}s and was killed (bounded and reaped)"
+    fi
+    for n in "$@"; do record "$n" UNTESTED "$reason"; done
+    SH_BOUNDED_TIMED_OUT=""
+    SH_BOUNDED_SURVIVED=""
+    return 0
 }
 
 # ingest <outfile> -- parse CHECK|name|status|detail lines from a probe's output
@@ -514,6 +707,18 @@ ingest() {
         esac
     done < "$f"
 }
+
+# LIBRARY MODE.  tests/wedge_diagnostics_test.sh sources this file to exercise
+# checkpoint/_wait_bounded/run_probe/sh_bounded/note_probe_timeout/
+# note_shell_timeout/dump_wedge_evidence against deliberately-wedged and
+# deliberately-slow-but-killable fakes, which is the only way to test the
+# unkillable-D-state path without a GPU. Stop here, before any phase that
+# needs one. The `trap cleanup EXIT` installed above (with $WORK) is already
+# in place and needs no change -- it fires normally when the sourcing
+# harness's shell exits, removing this same $WORK.
+if [ "${NVKVM_VALIDATE_LIB:-0}" = 1 ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # =============================================================================
 # PHASE 1 -- guest bring-up (shell level)
@@ -574,19 +779,25 @@ if [ -z "$NVSMI" ]; then
     record nvidia_smi_driver SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
     record nvidia_smi_cuda   SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
 else
-    SMI_RAW="$("$NVSMI" 2>&1)"; SMI_RC=$?
-    if [ $SMI_RC -ne 0 ]; then
+    SMI_RAW="$(sh_bounded nvidia_smi_banner "$SHELL_TIMEOUT" "$NVSMI" 2>&1)"; SMI_RC=$?
+    if note_shell_timeout nvidia_smi_gpu nvidia_smi_driver nvidia_smi_cuda; then
+        :
+    elif [ $SMI_RC -ne 0 ]; then
         record nvidia_smi_gpu    FAIL "nvidia-smi exit=$SMI_RC: $(echo "$SMI_RAW" | head -3 | tr '\n' ' ')"
         record nvidia_smi_driver SKIP "nvidia-smi failed"
         record nvidia_smi_cuda   SKIP "nvidia-smi failed"
     else
-        SMI_GPU="$("$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
-        SMI_DRV="$("$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
+        SMI_GPU="$(sh_bounded nvidia_smi_query_name "$SHELL_TIMEOUT" "$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+        SMI_GPU_TIMED_OUT=0; note_shell_timeout nvidia_smi_gpu && SMI_GPU_TIMED_OUT=1
+        SMI_DRV="$(sh_bounded nvidia_smi_query_driver "$SHELL_TIMEOUT" "$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
+        SMI_DRV_TIMED_OUT=0; note_shell_timeout nvidia_smi_driver && SMI_DRV_TIMED_OUT=1
         SMI_CUDA_FIELD="$(smi_cuda_field "$SMI_RAW")"
         SMI_CUDA="${SMI_CUDA_FIELD#value }"
         [ "$SMI_CUDA_FIELD" = "$SMI_CUDA" ] && SMI_CUDA=""
 
-        if [ -z "$SMI_GPU" ]; then
+        if [ "$SMI_GPU_TIMED_OUT" = 1 ]; then
+            :
+        elif [ -z "$SMI_GPU" ]; then
             record nvidia_smi_gpu FAIL "nvidia-smi reported no GPU name"
         elif [ -n "$EXPECT_GPU" ] && ! printf '%s' "$SMI_GPU" | grep -qiF -- "$EXPECT_GPU"; then
             record nvidia_smi_gpu FAIL "got '$SMI_GPU', expected to contain '$EXPECT_GPU'"
@@ -594,7 +805,9 @@ else
             record nvidia_smi_gpu PASS "$SMI_GPU"
         fi
 
-        if [ -z "$SMI_DRV" ]; then
+        if [ "$SMI_DRV_TIMED_OUT" = 1 ]; then
+            :
+        elif [ -z "$SMI_DRV" ]; then
             record nvidia_smi_driver FAIL "nvidia-smi reported no driver version"
         elif [ -n "$EXPECT_DRIVER" ] && [ "$SMI_DRV" != "$EXPECT_DRIVER" ]; then
             record nvidia_smi_driver FAIL "got '$SMI_DRV', expected '$EXPECT_DRIVER'"
@@ -2378,8 +2591,13 @@ reg_invariant() {
         return
     fi
     local out rc
-    out="$(timeout 120 "$WORK/${name}" 2>&1)"; rc=$?
-    if [ "$rc" -eq 0 ]; then
+    # These touch cuMemHostRegister -- the same class of call a Pascal wedge
+    # was measured on -- so they get the same non-blocking bound as the
+    # probes/nvidia-smi, not a plain `timeout` that can itself hang.
+    out="$(sh_bounded "$name" 120 "$WORK/${name}" 2>&1)"; rc=$?
+    if note_shell_timeout "$name"; then
+        :
+    elif [ "$rc" -eq 0 ]; then
         record "$name" PASS "$okdetail"
     else
         record "$name" FAIL "rc=$rc: $(printf '%s' "$out" | grep -iE 'VERDICT|SEGV|REFUSED' | head -1 | cut -c1-72)"
