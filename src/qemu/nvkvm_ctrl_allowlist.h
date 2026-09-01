@@ -301,9 +301,34 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x20803d07u,
 	0x2080a0d1u,
 	0x20810107u,
-	0x90960101u, /* NV9096 GR/zbc controls */
-	0x90960106u,
-	0x90960107u,
+	0x90960101u, /* NV9096 GR/zbc controls -- GET_ZBC_CLEAR_TABLE */
+	/* SET_ZBC_COLOR_CLEAR and SET_ZBC_DEPTH_CLEAR. Absent because this table
+	 * is generated from nvproxy's compUtil (CUDA-COMPUTE) tagged set, and a
+	 * compute workload never sets a colour clear value -- graphics does. The
+	 * set was therefore asymmetric in a way no policy justifies: the two
+	 * getters and the STENCIL setter were allowed while the COLOUR and DEPTH
+	 * setters were not.
+	 *
+	 * OBSERVED 2026-09-01 on the SteamOS guest: Red Dead Redemption 2 (a
+	 * Windows title via Proton/DXVK, unlike the native-Vulkan titles the
+	 * README claims) died at ERR_GFX_INIT, and
+	 *     nvkvm: DENY ctrl cmd 0x90960102 (not in allowlist / oversize)
+	 * fired once, at 15:21:07Z, which is when the game launched. CAUSATION IS
+	 * NOT ESTABLISHED -- the correlation is one denial at the right moment,
+	 * and ZBC is normally an optimisation rather than a hard requirement.
+	 * This must be confirmed by rebuilding and relaunching before anyone
+	 * claims it fixed the game.
+	 *
+	 * SECURITY: the ZBC clear table is small, per-GPU, and shared with the
+	 * host. A guest that writes it can evict the host's entries and cost it
+	 * fast-clear performance. That is an interference/DoS surface, not a
+	 * memory-safety one, and nvkvm makes no multi-tenant security claim --
+	 * it targets a single operator running their own guests. Anyone who does
+	 * put an untrusted guest behind this should drop these two rows. */
+	0x90960102u,  /* SET_ZBC_COLOR_CLEAR */
+	0x90960103u,  /* SET_ZBC_DEPTH_CLEAR */
+	0x90960106u,  /* GET_ZBC_CLEAR_TABLE_SIZE */
+	0x90960107u,  /* SET_ZBC_STENCIL_CLEAR */
 	0xa06f0104u, /* channel (GPFIFO) controls */
 	0xc36f010au,
 	/* #81 / 535 bring-up 2026-08-17: NVC36F_CTRL_GET_CLASS_ENGINEID.
