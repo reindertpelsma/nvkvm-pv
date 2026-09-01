@@ -20,12 +20,14 @@ matmul, Vulkan compute, and EGL pixel verification.
 | RTX 4070 | Ada AD104 | 535.309.01 | 535 | `0b48bb5` | 30/30 |
 | RTX 4070 | Ada AD104 | 610.43.02 | 610 | `0b48bb5` | 30/30 |
 
-## Pre-Turing (`exp/pre-turing` ONLY — NOT on `main`)
+## Pre-Turing — EXPERIMENTAL, not a supported configuration
 
-> **These rows do not apply to `main`.** nvkvm on `main` supports Turing and
-> newer. The object classes, control commands and UVM ioctls these GPUs need
-> live on the `exp/pre-turing` branch and have not been merged. A `main` build
-> will NOT reproduce anything below. Measured 2026-09-01.
+> **nvkvm supports Turing and newer. Pre-Turing is not a supported
+> configuration, and these rows do not describe one.** The object classes,
+> control commands and UVM ioctls these GPUs need are experimental work; a
+> build that does not contain the exact trees named in the table below will not
+> reproduce any of it. The tree column is the authority here — a commit sha
+> stays true, and a branch name would not. Measured 2026-09-01.
 
 | GPU | architecture | host driver | ABI | tree | `validate.sh` |
 |---|---|---|---:|---|---:|
