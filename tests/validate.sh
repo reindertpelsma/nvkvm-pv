@@ -455,12 +455,50 @@ emit_probe() {   # <name> <source> <ldflags...>
 
 # run_probe <binary> -- runs it, tees combined output, returns its exit code.
 # Output is captured to $WORK/<binary>.out and NEVER discarded.
+# A PROBE THAT HANGS IS NOT A PROBE THAT FAILED.
+#
+# This used to run the binary with no bound at all.  A probe that blocked --
+# CUDA context setup waiting on something the host refused, say -- never
+# returned, so validate.sh never reached its own JSON write and the caller got
+# NOTHING: no verdict, no counts, no per-check detail.  From outside that is
+# indistinguishable from a crash, and a sweep records it as "validate-unparsed",
+# which reads like a harness defect rather than "the GPU path hung".
+#
+# MEASURED 2026-09-01 on a Quadro P4000: a run took 2260s against ~500s for a
+# healthy one and produced no verdict, four times over, while the thing we were
+# actually trying to learn -- whether Pascal gets past the alloc-class gate --
+# was unanswerable because a hang and a failure looked the same.
+#
+# So: bound every probe, and when one exceeds the bound, ingest whatever it did
+# emit (partial CHECK lines are still real results) and then record the probe
+# itself UNTESTED.  UNTESTED is the honest status -- nothing was observed to
+# fail, and nothing made the check structurally impossible; it simply did not
+# finish.  It also cannot be silenced by --allow-skip and it moves the exit
+# code, which is what stops a hang being read as a pass.
+PROBE_TIMEOUT="${NVKVM_PROBE_TIMEOUT:-300}"
+PROBE_TIMED_OUT=""
+
 run_probe() {
     local bin="$1"; shift
-    "$WORK/$bin" "$@" > "$WORK/$bin.out" 2>&1
+    # --kill-after: a probe wedged in an uninterruptible ioctl ignores TERM.
+    timeout --kill-after=10 "$PROBE_TIMEOUT" "$WORK/$bin" "$@" > "$WORK/$bin.out" 2>&1
     local rc=$?
     [ "$VERBOSE" = 1 ] && sed 's/^/    | /' "$WORK/$bin.out"
+    if [ "$rc" = 124 ] || [ "$rc" = 137 ]; then
+        PROBE_TIMED_OUT="$bin"
+    else
+        PROBE_TIMED_OUT=""
+    fi
     return $rc
+}
+
+# Call after ingest() when run_probe may have timed out, so the partial results
+# are kept AND the truncation is visible.
+note_probe_timeout() {
+    [ -n "${PROBE_TIMED_OUT:-}" ] || return 0
+    record "${PROBE_TIMED_OUT}_completed" UNTESTED \
+           "probe exceeded ${PROBE_TIMEOUT}s and was killed -- it HUNG rather than failed; any checks it had not yet reported are missing, not passing"
+    PROBE_TIMED_OUT=""
 }
 
 # ingest <outfile> -- parse CHECK|name|status|detail lines from a probe's output
@@ -1343,6 +1381,7 @@ else
     run_probe cuda_probe
     CUDA_RC=$?
     ingest "$WORK/cuda_probe.out"
+    note_probe_timeout
     if [ $CUDA_RC -ge 128 ]; then
         skip_remaining "cuda_probe died on signal $((CUDA_RC-128)); tail: $(tail -2 "$WORK/cuda_probe.out" | tr '\n' ' ')" $CUDA_CHECKS
     else
@@ -1880,6 +1919,7 @@ else
     run_probe vk_probe "$WORK/comp.spv"
     VK_RC=$?
     ingest "$WORK/vk_probe.out"
+    note_probe_timeout
     if [ $VK_RC -ge 128 ]; then
         skip_remaining "vk_probe died on signal $((VK_RC-128)); tail: $(tail -2 "$WORK/vk_probe.out" | tr '\n' ' ')" $VK_CHECKS
     else
@@ -2271,6 +2311,7 @@ else
     run_probe gl_probe
     GL_RC=$?
     ingest "$WORK/gl_probe.out"
+    note_probe_timeout
     if [ $GL_RC -ge 128 ]; then
         skip_remaining "gl_probe died on signal $((GL_RC-128)); tail: $(tail -2 "$WORK/gl_probe.out" | tr '\n' ' ')" $GL_CHECKS
     else

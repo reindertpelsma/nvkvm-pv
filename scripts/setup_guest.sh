@@ -27,8 +27,26 @@ if [ "$CLOUD_IMG_URL" = "$DEFAULT_CLOUD_IMG_URL" ] \
    && [ -z "$CLOUD_IMG_SHA256" ] && [ -z "$CLOUD_IMG_SHA256_URL" ]; then
     CLOUD_IMG_SHA256_URL="$DEFAULT_CLOUD_IMG_SHA256_URL"
 fi
-CLOUD_IMG_RAW="$GUEST_DIR/noble-server-cloudimg-amd64.img"
-QCOW2_IMG="$GUEST_DIR/ubuntu-24.04.qcow2"
+# DERIVED FROM THE URL, not hardcoded.  These were noble-server-cloudimg-amd64.img
+# and ubuntu-24.04.qcow2 literally, so a run pointed at a different series
+# downloaded that series and then stored it under the noble name -- the content
+# was right and every filename, log line and cached artifact said "noble".  A
+# name that lies about its contents is how a cache serves the wrong image to the
+# next run and nothing looks wrong.
+CLOUD_IMG_RAW="$GUEST_DIR/$(basename "$CLOUD_IMG_URL")"
+CLOUD_IMG_SERIES="$(basename "$CLOUD_IMG_URL" | sed 's/-server-cloudimg.*//')"
+# noble KEEPS the historical ubuntu-24.04.qcow2 name.  Three things test for that
+# exact path -- run_test_vm.sh's default, container-entrypoint.sh's "is the guest
+# already built" check, and the qemu command in docs/howto/run.md that users
+# copy-paste.  Renaming it unconditionally would make the container rebuild the
+# guest every start and would break the documented command, to fix a problem
+# nobody has on the default path.  Only a NON-default series gets a new name,
+# because only a non-default series was ever mislabelled.
+if [ "$CLOUD_IMG_SERIES" = "noble" ]; then
+    QCOW2_IMG="$GUEST_DIR/ubuntu-24.04.qcow2"
+else
+    QCOW2_IMG="$GUEST_DIR/ubuntu-${CLOUD_IMG_SERIES}.qcow2"
+fi
 SEED_ISO="$GUEST_DIR/seed.iso"
 
 valid_sha256_text() {

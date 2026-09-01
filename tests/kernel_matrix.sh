@@ -38,15 +38,34 @@ cat > "$WORK/harness.sh" <<'INNER'
 set -u
 export DEBIAN_FRONTEND=noninteractive
 
+# KEEP THE INSTALLER'S OUTPUT.  It used to go to /dev/null, which made two
+# completely different situations produce the identical result line:
+#
+#   * this image genuinely has no kernel-headers package, and
+#   * the mirror was unreachable, so nothing could be installed at all.
+#
+# The second is a run that DID NOT HAPPEN, and reporting it as "no kernel
+# headers in this image" is the same class of false green this script exists to
+# prevent.  MEASURED 2026-09-01: on a host whose containers had no DNS, every
+# image reported "no kernel headers" -- archlinux was really
+# "Resolving timed out after 10002 milliseconds" -- and that was briefly written
+# up as a finding about CI coverage before the network was checked.
+#
+# Under STRICT_SKIP a mirror outage now still fails the row, but it fails with
+# the reason attached instead of a sentence that is not true.
+INSTALL_LOG="$(mktemp)"
 if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq >/dev/null 2>&1
-    apt-get install -y -q build-essential >/dev/null 2>&1
-    apt-get install -y -q linux-headers-amd64 >/dev/null 2>&1 || \
-    apt-get install -y -q linux-headers-generic >/dev/null 2>&1
+    { apt-get update -qq
+      apt-get install -y -q build-essential
+      apt-get install -y -q linux-headers-amd64 || \
+      apt-get install -y -q linux-headers-generic
+    } >>"$INSTALL_LOG" 2>&1
 elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q gcc make kernel-devel elfutils-libelf-devel >/dev/null 2>&1
+    dnf install -y -q gcc make kernel-devel elfutils-libelf-devel >>"$INSTALL_LOG" 2>&1
 elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm --quiet base-devel linux-headers >/dev/null 2>&1
+    pacman -Sy --noconfirm --quiet base-devel linux-headers >>"$INSTALL_LOG" 2>&1
+else
+    echo "no supported package manager (apt-get/dnf/pacman) in this image" >>"$INSTALL_LOG"
 fi
 
 KDIR=""
@@ -54,7 +73,17 @@ for c in /usr/src/linux-headers-*-generic /usr/src/linux-headers-*-amd64 \
          /usr/src/kernels/* /usr/lib/modules/*/build /usr/src/linux-headers-*; do
     [ -d "$c" ] && [ -f "$c/Makefile" ] && KDIR="$c" && break
 done
-[ -z "$KDIR" ] && { echo "RESULT|${DISTRO_TAG}|?|SKIP|no kernel headers in this image"; exit 0; }
+if [ -z "$KDIR" ]; then
+    # Say WHY.  A network error and a missing package are different failures and
+    # only one of them is about this image.
+    why="$(grep -ioE "(temporary failure resolving|resolving timed out|could not resolve|failed to (retrieve|synchronize|fetch)|connection timed out|network is unreachable|503 |connection refused)[^|]{0,60}" "$INSTALL_LOG" 2>/dev/null | head -1 | tr -d '|')"
+    if [ -n "$why" ]; then
+        echo "RESULT|${DISTRO_TAG}|?|SKIP|INSTALL FAILED (not an image property): ${why}"
+    else
+        echo "RESULT|${DISTRO_TAG}|?|SKIP|no kernel headers in this image: $(tail -1 "$INSTALL_LOG" 2>/dev/null | tr -d '|' | cut -c1-80)"
+    fi
+    exit 0
+fi
 
 KVER=$(make -s -C "$KDIR" kernelversion 2>/dev/null || basename "$KDIR")
 GCCV=$(gcc -dumpversion 2>/dev/null || echo '?')

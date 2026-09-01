@@ -179,6 +179,13 @@ GUEST_IMAGE_CACHE_SHA256=""
 GUEST_IMAGE_SERIES="${NVKVM_SWEEP_GUEST_SERIES:-noble}"
 GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
 GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
+# The qcow2 setup_guest.sh will produce.  noble keeps the historical name (three
+# other places test for that exact path); every other series is named for itself.
+if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
+    GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+else
+    GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
+fi
 PRESET="boundary"
 MIN_DRIVERS=5
 # The SteamOS product stage: off by default because it costs ~2h of box time and
@@ -317,6 +324,16 @@ while [ $# -gt 0 ]; do
                         esac
                         GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
                         GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
+                        # Recompute here too: the defaults block runs BEFORE
+                        # argument parsing, so without this --guest-image would
+                        # change the download and leave the launcher pointed at
+                        # noble's qcow2 -- the same class of mismatch this whole
+                        # change exists to remove.
+                        if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
+                            GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+                        else
+                            GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
+                        fi
                         shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
@@ -1529,7 +1546,21 @@ provision_box() {
     # build_qemu.sh EXITS 0 WITHOUT REBUILDING when the binary already exists,
     # so adding the variable on a second run is a SILENT NO-OP -- it needs
     # --force as well.  That has wasted a full box cycle before.
+    # --guest-image was a NO-OP until this line.  GUEST_IMAGE_URL was computed,
+    # validated against a known-good list, and printed in the plan as "the guest
+    # KERNEL axis" -- and then never reached the box, so setup_guest.sh fell back
+    # to its hardcoded noble default and EVERY sweep in this project's history
+    # booted Ubuntu 24.04 on 6.8, whatever was asked for.  That is why the 6.16
+    # page_mapcount break survived: the guest-kernel axis was not skipped, it was
+    # unreachable.  setup_guest.sh already honours NVKVM_GUEST_IMAGE_URL; only
+    # the export was missing.
     local ENVP='DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1'
+    ENVP="$ENVP NVKVM_GUEST_IMAGE_URL='$GUEST_IMAGE_URL'"
+    ENVP="$ENVP NVKVM_GUEST_IMAGE_SHA256_URL='https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/SHA256SUMS'"
+    # run_test_vm.sh defaults to /opt/nvkvm-guest/ubuntu-24.04.qcow2.  Now that
+    # the qcow2 is named for its series, point the launcher at the one we built
+    # rather than letting it fall back to a name that may not exist.
+    ENVP="$ENVP VM_IMG=$GUEST_QCOW2"
     for step in build guest; do
         if ! quiesce_host_apt; then
             PROVISION_FAIL_DETAIL="$HOST_APT_DETAIL"
@@ -1763,6 +1794,10 @@ invocation_journal_query() {
 boot_and_validate() {
     local drv="$1" gpu="$2" rc bundles G mod out booted=0 vm_inv vm_journal
     VR_STATUS=""; VR_DETAIL=""; VR_JSON=""; VR_ABI=""; VR_SUMMARY=""; VR_WARNINGS=""; VR_RC=""; VR_FAILED=""
+    # Reset here too: set -u is on, and boot_and_validate() has a dozen early
+    # returns before the guest is ever reached.  An unset reference in the emit
+    # below would abort the whole run rather than record a row.
+    VR_GUEST_KERNEL=""; VR_GUEST_SERIES=""
 
     # The host-libs bundle is the HOST DRIVER's userspace and MUST be rebuilt
     # after every swap.  Staging a 580 bundle against a 535 kernel module fails
@@ -1816,7 +1851,15 @@ boot_and_validate() {
         return
     fi
 
-    rsh_t 200 'systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --working-directory=/root/nvkvm bash scripts/run_test_vm.sh' >/dev/null 2>&1
+    # VM_IMG MUST be passed as --setenv.  systemd-run starts the unit in a fresh
+    # environment, so nothing exported for the provisioning steps reaches it.
+    # The qcow2 is named for its series now, and run_test_vm.sh's built-in
+    # default is ubuntu-24.04.qcow2 -- so on any non-noble series the launcher
+    # looked for a file that does not exist, QEMU never started, and the run
+    # died as `vm-journal-scope-missing`, which reads like a systemd/journal
+    # problem and is really a missing disk image.  MEASURED on the first
+    # questing run, 2026-09-01.
+    rsh_t 200 "systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --setenv=VM_IMG='$GUEST_QCOW2' --working-directory=/root/nvkvm bash scripts/run_test_vm.sh" >/dev/null 2>&1
 
     vm_inv="$(rsh_t 90 'systemctl show nvkvm-vm.service --property=InvocationID --value 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
     if ! vm_journal="$(invocation_journal_query "$vm_inv")"; then
@@ -1844,6 +1887,29 @@ boot_and_validate() {
     # identical pass/fail counts on cards that differ -- which reads like a GPU
     # verdict and is not one.
     rsh_t 1300 "$G 'sudo cloud-init status --wait'" >/dev/null 2>&1
+
+    # WHAT ACTUALLY BOOTED, not what was asked for.
+    #
+    # This sweep is scrupulous about that for drivers -- every row carries the
+    # version /proc/driver/nvidia/version really reported -- and had NO such
+    # check for the guest.  The cost: --guest-image was a no-op for this
+    # project's whole history (the URL never reached the box), so every run
+    # booted Ubuntu 24.04 on 6.8 while the plan printed whichever series was
+    # requested, and the guest-kernel axis looked exercised and never was.  The
+    # 6.16 page_mapcount break survived precisely there.
+    #
+    # A mismatch is UNTESTED, not a failure: nothing about the GPU was measured,
+    # so it must not be scored as a GPU verdict, and it must move the exit code
+    # rather than pass quietly.
+    VR_GUEST_KERNEL="$(rsh_t 90 "$G 'uname -r'" 2>/dev/null | tr -d '\r\n ')"
+    VR_GUEST_SERIES="$(rsh_t 90 "$G '. /etc/os-release 2>/dev/null; printf %s \"\$VERSION_CODENAME\"'" 2>/dev/null | tr -d '\r\n ')"
+    info "  guest booted: ${VR_GUEST_SERIES:-unknown} kernel ${VR_GUEST_KERNEL:-unknown} (requested $GUEST_IMAGE_SERIES)"
+    if [ -n "$VR_GUEST_SERIES" ] && [ "$VR_GUEST_SERIES" != "$GUEST_IMAGE_SERIES" ]; then
+        VR_STATUS="guest-image-mismatch"
+        VR_DETAIL="requested --guest-image $GUEST_IMAGE_SERIES but the guest booted '$VR_GUEST_SERIES' (kernel ${VR_GUEST_KERNEL:-unknown}). Nothing here measures the GPU, so this is NOT TESTED, not a failure. Check that NVKVM_GUEST_IMAGE_URL reaches the box and that no stale qcow2 is being reused."
+        return
+    fi
+
     rsh_t 1300 "$G 'sudo systemctl restart nvkvm-guest.service'" >/dev/null 2>&1
     mod="$(rsh_t 120 "$G 'lsmod | grep -q nvkvm_guest && echo LOADED || echo NOMODULE'" 2>/dev/null)"
     case "$mod" in
@@ -2323,6 +2389,7 @@ sweep_drivers_on_box() {
         emit "$(jrec arch "$arch" gpu "$gpu" driver "control:$cur0" driver_actual "$cur0" \
                 abi_expected "$(abi_expected "$cur0")" abi_selected "${VR_ABI:-?}" \
                 status "control-$VR_STATUS" summary "${VR_SUMMARY:-}" \
+                guest_series "${VR_GUEST_SERIES:-}" guest_kernel "${VR_GUEST_KERNEL:-}" \
                 module "$(module_flavour)" \
                 failed_checks "${VR_FAILED:0:1000}" \
                 instance "$iid" machine "$machine" role "control" \
@@ -2442,6 +2509,7 @@ sweep_drivers_on_box() {
             driver_substituted "$([ "$actual" = "$drv" ] && echo false || echo true)" \
             abi_expected "$prof" abi_selected "${VR_ABI:-?}" abi_matches_header "$abi_ok" \
             status "$VR_STATUS" summary "${VR_SUMMARY:-}" validate_rc "${VR_RC:-}" \
+            guest_series "${VR_GUEST_SERIES:-}" guest_kernel "${VR_GUEST_KERNEL:-}" \
             module "$(module_flavour)" \
             failed_checks "${VR_FAILED:0:1000}" \
             instance "$iid" machine "$machine" dph "$CUR_DPH" \
