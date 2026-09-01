@@ -178,6 +178,69 @@ must be labelled as such, exactly like the 515/525 ABI rows.
 
 ---
 
+## 4b. Audit of the guest-library staging path
+
+Prompted by an `RTX 4060 Ti` failing `cuda_ptx_jit` with
+`CUDA_ERROR_JIT_COMPILER_NOT_FOUND` on four consecutive drivers (30P/1F/4S each,
+with `cuda_kernel_launch`, `cuda_matmul`, `cuda_managed_alloc` and
+`cuda_managed_coherence` cascading to SKIP). The guest had `libnvidia-nvvm` but
+no `libnvidia-ptxjitcompiler`, and `nvkvm-guest.service` reported success.
+
+**Expectation going in: the staging path was fragile.** Three failures of this
+family are on record (stale driver via `ldconfig`; wrong bundle picked
+alphabetically; this one). **Finding: it is in better shape than that history
+suggests.** Each of those was fixed, and the fixes hold up:
+
+* **Bundle selection is sound.** `stage_guest_libs.sh` prefers
+  `host-libs-$HOSTV` matching the running host driver (read from `dmesg`), and
+  when it must choose between several candidates it **exits 1 rather than
+  guessing**. The alphabetical bug cannot recur.
+* **Stale-library cleanup is comprehensive.** I expected a coverage gap and
+  went looking for one. There isn't: three cleanup passes, and the second
+  globs `"$SYS"/libnvidia-*.so.[0-9]*` plus explicit entries for `libcuda`,
+  `libEGL_nvidia`, `libGLX_nvidia`, `libGLESv2_nvidia`, `libGLESv1_CM_nvidia`,
+  which between them cover **every** library the script stages to `$SYS`.
+  `$CUDADIR` is cleaned wholesale. I briefly believed `libnvidia-cfg`,
+  `libnvidia-glvkspirv` and `libnvidia-opencl` were uncovered; they are matched
+  by the `libnvidia-*` wildcard and my analysis had turned it into a literal.
+* **`make_host_bundle.sh` fails loudly** when a REQUIRED library is absent
+  (`libcuda`, `libnvidia-ml`, `libnvidia-ptxjitcompiler`, `libnvidia-nvvm`) —
+  exit 1 with the names.
+
+### Two real defects
+
+**(a) A failed bundle is left on disk, indistinguishable from a good one.**
+`make_host_bundle.sh` creates `host-libs-$V` and populates it with whatever it
+can find, and only checks `missing_required` at the very end. So a run that
+exits 1 still leaves a partial bundle behind, with no marker. Nothing downstream
+can tell it from a complete one — `stage_guest_libs.sh` selects by directory
+name. The sweep happens to be safe because it `rm -rf`s bundles before each
+build; a user following the docs is not. **Fix:** build into a temporary
+directory and rename into place only on success, or drop a `.complete` sentinel
+that staging requires.
+
+**(b) Critical and cosmetic staging failures shared one exit code.** FIXED
+tonight on `fix/staging-critical-libs`. `stage_guest_libs.sh` exited 2 both for
+an absent Wayland/GBM EGL library (which a headless host legitimately lacks) and
+for an absent `libnvidia-ptxjitcompiler` (without which CUDA does not work).
+One code, two meanings, so `nvkvm-guest.service` could only express its
+tolerance as `|| true` — and that tolerance, written for the cosmetic case,
+swallowed the fatal one. Critical libraries now exit 3, cosmetic stays 2, and
+the unit fails on 3.
+
+### Not resolved
+
+Why `libnvidia-ptxjitcompiler` failed to reach that particular guest is **still
+unknown**. Fix (b) makes such a failure announce itself at staging time instead
+of surfacing later as a CUDA error on an unrelated-looking check, but it does
+not explain the cause. The box was still running when this was written and the
+staging logs had no mention of either library — itself suspicious, since a
+`stage()` failure prints to stderr.
+
+**This is not a regression in anything merged tonight.** turing and ampere ran
+7/7 clean on identical code; it is a pre-existing fragility that one host
+exposed.
+
 ## 5. TODO, ordered
 
 ### Before announcing
