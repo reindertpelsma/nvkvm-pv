@@ -241,7 +241,7 @@ sudo bash scripts/setup_guest.sh            # fetches an Ubuntu 24.04 cloud imag
 
 Most of the wall clock is QEMU. The script is a convenience, not the
 mechanism: everything it changes in upstream QEMU is twelve patch files in
-[`patches/`](patches/) — 2271 lines, applied with `git apply` — plus a copy of the
+[`patches/`](patches/) — 2273 lines, applied with `git apply` — plus a copy of the
 device sources into `hw/misc/`.
 [`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
 same build by hand, command by command, if you would rather not run a script
