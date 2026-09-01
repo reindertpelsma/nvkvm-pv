@@ -91,6 +91,29 @@ signal `kill()` sends:
 Either mismatch is treated as gone, never as still running, and `kill()`
 refuses to signal a pid whose cmdline no longer matches.
 
+THE CMDLINE COMPARE MUST BE `cmp FILE1 FILE2 >/dev/null 2>&1`, NEVER
+`cmp -s`. MEASURED against real hardware (a bare-metal Ubuntu 24.04.4 box,
+GNU diffutils 3.10, 2026-09-01): `cmp -s /proc/$pid/cmdline recorded_file`
+reports "differ" on EVERY call, unconditionally, even for a healthy,
+unchanged process whose recorded copy is the literal output of `cat
+/proc/$pid/cmdline` moments earlier. Cause: `/proc/$pid/cmdline` always
+reports `st_size=0` (every procfs pseudo-file does), and `-s`'s silent mode
+takes a stat()-size fast path -- "sizes differ (0 vs N) -> files differ,
+skip reading" -- that never fires for two ordinary regular files but always
+fires here, so `-s` never actually compares content against a procfs file.
+Plain `cmp` (no `-s`) does not take that shortcut (it still has to find and
+report *where* two files differ, so it always reads), and was confirmed
+correct both ways on the same box: identical content compares equal,
+different content compares unequal, either argument order. This bug did
+not show up against the throwaway local sshd this module's own tests use
+(that environment's diffutils happens not to hit it) -- it was only found
+by running this class against a real, separately-hosted target, which is
+exactly the gap this project's "not yet proven against a rented box"
+caveat (above) was flagging. Every command this class launches against a
+target whose `cmp` has this behaviour was misdiagnosed as DIED
+"pid-reused" the moment its first status poll landed before `exit.rc` was
+written -- i.e. almost always, for anything slower than instant.
+
 STDIN: supplied at launch only (uploaded once, referenced by the detached
 process's own redirect) and then never touched again -- same contract, same
 reasons, as `ThisMachine`. There is no interactive stdin here either.
@@ -242,7 +265,7 @@ if [ "$expected_boot" != "unknown" ] && [ "$expected_boot" != "$current_boot" ];
     died_reason="reboot-detected"
 elif ! kill -0 "$pid" 2>/dev/null; then
     died_reason="pid-not-alive"
-elif [ -s "$RUNDIR/pid.cmdline" ] && ! cmp -s "/proc/$pid/cmdline" "$RUNDIR/pid.cmdline" 2>/dev/null; then
+elif [ -s "$RUNDIR/pid.cmdline" ] && ! cmp "/proc/$pid/cmdline" "$RUNDIR/pid.cmdline" >/dev/null 2>&1; then
     died_reason="pid-reused"
 fi
 
@@ -265,7 +288,7 @@ if [ -z "$pid" ]; then
     exit 0
 fi
 if [ -s "$RUNDIR/pid.cmdline" ]; then
-    if ! cmp -s "/proc/$pid/cmdline" "$RUNDIR/pid.cmdline" 2>/dev/null; then
+    if ! cmp "/proc/$pid/cmdline" "$RUNDIR/pid.cmdline" >/dev/null 2>&1; then
         echo NOTOURS
         exit 0
     fi

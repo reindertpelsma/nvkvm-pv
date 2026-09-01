@@ -349,6 +349,36 @@ def test_died_without_status_pid_reused(sshd):
     asyncio.run(body())
 
 
+def test_a_genuinely_running_process_is_never_misreported_as_pid_reused(sshd):
+    """Regression test for a real bug found against real hardware (a
+    bare-metal box, GNU diffutils 3.10, 2026-09-01, not this test's own
+    throwaway sshd -- see ssh_machine.py's module docstring, "THE CMDLINE
+    COMPARE MUST BE `cmp FILE1 FILE2 ...`, NEVER `cmp -s`"): `cmp -s` took a
+    stat()-size fast path against `/proc/$pid/cmdline` (which always reports
+    st_size=0) and declared EVERY still-running process "pid-reused",
+    unconditionally -- so every SSHMachine command whose first status poll
+    landed before its exit.rc was written (i.e. almost all of them, against
+    a target slower than instant) was misdiagnosed as DIED. This
+    environment's own diffutils does not happen to reproduce that specific
+    quirk (confirmed separately: GNU diffutils 3.12 here vs 3.10 on the box
+    the bug was found on), so this test does not fail on the pre-fix code in
+    THIS environment -- it is here anyway as the direct assertion of the
+    invariant the fix restores: a real, unmodified, still-running process's
+    cmdline must always compare equal to itself, never DIED."""
+
+    async def body():
+        m = sshd.machine()
+        c = await m.run(["sleep", "3"], timeout=None)
+        # No tampering with pid/pid.cmdline/boot_id at all -- this is exactly
+        # the healthy, untouched case. Must resolve as a normal completion,
+        # never raise CommandDiedWithoutStatus.
+        rc = await c.wait(timeout=15)
+        assert rc == 0
+        assert c.returncode == 0
+
+    asyncio.run(body())
+
+
 def test_died_without_status_pid_not_alive_and_no_rc(sshd):
     async def body():
         m = sshd.machine()
