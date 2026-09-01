@@ -1,0 +1,2 @@
+{"arch": "turing", "gpu": "RTX 2060S", "driver": "515.65.01", "driver_actual": "515.65.01", "status": "pass", "summary": "30P/0F/0S", "validate_rc": "0", "role": "driver-set", "ts": "2026-08-24T13:33:31Z"}
+{"arch": "turing", "gpu": "GTX 1660S", "driver": "580.95.05", "driver_actual": "580.95.05", "status": "pass", "summary": "30P/0F/0S", "validate_rc": "0", "role": "driver-set", "ts": "2026-08-24T13:34:00Z"}

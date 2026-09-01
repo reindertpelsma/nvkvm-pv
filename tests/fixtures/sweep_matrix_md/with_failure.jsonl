@@ -1,0 +1,3 @@
+{"arch": "ampere", "gpu": "RTX 3060", "driver": "515.65.01", "driver_actual": "515.65.01", "status": "pass", "summary": "30P/0F/0S", "role": "driver-set", "ts": "2026-08-24T13:33:31Z"}
+{"arch": "ampere", "gpu": "RTX 3060", "driver": "580.95.05", "driver_actual": "580.95.05", "status": "fail", "summary": "29P/1F/0S", "failed_checks": "cuda_matmul", "role": "driver-set", "ts": "2026-08-24T13:40:00Z"}
+{"arch": "ampere", "gpu": "RTX 3060", "driver": "-", "status": "coverage-shortfall", "detail": "1 of 2 applicable drivers produced a validate.sh verdict; --min-drivers is 2", "ts": "2026-08-24T13:41:00Z"}

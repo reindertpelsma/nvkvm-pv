@@ -1,0 +1,5 @@
+{"arch": "ada", "gpu": "RTX 4070S", "driver": "575.51.03", "status": "pass", "summary": "30P/0F/0S", "role": "driver-set"}
+
+{"arch": "ada", "gpu": "RTX 4070S", "driv
+not even json
+{"arch": "ada", "gpu": "RTX 4070S", "driver": "580.95.05", "status": "incomplete", "summary": "27P/0F/3S", "role": "driver-set"}
