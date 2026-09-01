@@ -182,14 +182,31 @@ class FfmpegNvencWorkload(_FfmpegWorkload):
 WORKLOADS = (FfmpegCpuX264Workload(), FfmpegNvencWorkload())
 
 
-async def run(target: Machine, *, baseline: Optional[Machine] = None, timeout: Optional[float] = None) -> Report:
+async def run(
+    target: Machine,
+    *,
+    baseline: Optional[Machine] = None,
+    timeout: Optional[float] = None,
+    target_label: Optional[str] = None,
+    baseline_label: Optional[str] = None,
+) -> Report:
+    """`target_label`/`baseline_label` are the real attribution -- which
+    machine actually produced which side (see result.py's module docstring:
+    "a ratio with no attribution is not evidence"). Left as `None` (the
+    default -- what direct callers of this module, and its own tests, still
+    exercise), each falls back to a generic placeholder: "guest"/"this
+    machine" for the target depending on whether a baseline was given, and
+    "host" for the baseline. `tiers/large.py.run()` -- and, through it,
+    run_tests.py's `--target`/`--baseline` CLI -- always passes the real
+    labels of the Machines it built."""
     report = Report(tier="large")
     bound = timeout if timeout is not None else DEFAULT_TIMEOUT
-    target_label = "guest" if baseline is not None else "this machine"
+    resolved_target_label = target_label if target_label is not None else ("guest" if baseline is not None else "this machine")
+    resolved_baseline_label = baseline_label if baseline_label is not None else "host"
     for workload in WORKLOADS:
         comparison = await compare(
             workload, target=target, timeout=bound,
-            target_label=target_label, baseline=baseline, baseline_label="host",
+            target_label=resolved_target_label, baseline=baseline, baseline_label=resolved_baseline_label,
         )
         report.add(comparison)
     report.finish()
