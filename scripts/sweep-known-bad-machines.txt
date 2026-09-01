@@ -11,10 +11,29 @@
 # BYTE-IDENTICAL frozen log, so retrying the same machine is pure waste. It says
 # nothing whatsoever about the guest stack -- re-rent on a different machine_id.
 #
-# scripts/sweep.sh reads this file to skip these machines when picking offers,
-# and APPENDS to it whenever it observes the signature itself.
+# THIS FILE IS NOW ONLY THE DEFAULT SEED, not the live list.  scripts/sweep.sh
+# no longer reads or appends here directly: the live, growing list is runtime
+# state at ${XDG_STATE_HOME:-~/.local/state}/nvkvm/sweep-known-bad-machines.txt
+# (override with NVKVM_SWEEP_KNOWN_BAD_FILE), so a dead box learned by one
+# worktree no longer dirties the tree the sweep is about to ship, and does not
+# grow this tracked file forever in git history.  The first time sweep.sh runs
+# on a machine with no runtime file yet, it copies THIS file in as the
+# starting point -- see init_known_bad_file() in scripts/sweep.sh.  Edit this
+# file only to change what a FRESH environment starts blacklisted with; it is
+# no longer where new detections land.
 #
 # One machine_id per line. Everything after '#' is a comment.
+#
+# AUDIT 2026-09-01 (docs/release-readiness-2026-09-01.md §2.3, task 4): the two
+# entries marked SUSPECT below were condemned by box_is_dead()/wait_for_box()
+# before they read vast's `cur_state` field, which could sit at
+# actual_status=created (the dead-box signature) for 7+ minutes on a genuinely
+# healthy, merely-slow-to-report box while cur_state was already "running" and
+# ssh worked fine -- see commit 8229d98 on exp/pascal-diagnosis-mine (MEASURED
+# on machine 55691, instance 49452150, 2026-09-01). sweep.sh's box_is_dead() is
+# fixed on this branch (feat/sweep-infra) to check cur_state too. Left
+# blacklisted rather than silently unblocked -- re-verify on real hardware
+# before trusting either entry again.
 
 42636	# 8x RTX 3060 -- instance 48297558, 2026-08-20
 44906	# single RTX 4090, Denmark -- 2026-08-23; proved this is not a multi-GPU-only defect
@@ -22,5 +41,5 @@
 24044	# single RTX 4070S, Quebec -- instance 48910285, 2026-08-27; sshd never listened, instance log frozen at 'Domain not found: no domain with matching name' past 35 min
 18856	# KVM never provisioned: created + 'Domain not found' frozen log (instance 48933447, 2026-08-27)
 91962	# SSH refused on BOTH direct (191.223.212.127:32512) and proxy (ssh1.vast.ai:25476) across two independent runs on 2026-08-29; box reached actual_status=running but never accepted a connection. Added by hand: the SSH-timeout path deliberately does not auto-blacklist, and this machine is the cheapest ampere offer, so it is re-picked every run.
-56883	# KVM never provisioned: created + 'Domain not found' frozen log (added automatically by sweep.sh on 2026-08-30)
-55691	# KVM never provisioned: created + 'Domain not found' frozen log (added automatically by sweep.sh on 2026-08-31)
+56883	# SUSPECT (audit 2026-09-01, see header): KVM never provisioned: created + 'Domain not found' frozen log (added automatically by sweep.sh on 2026-08-30, BEFORE the cur_state fix). Not independently confirmed dead or healthy -- re-verify before trusting.
+55691	# SUSPECT -- LIKELY A FALSE POSITIVE (audit 2026-09-01, see header): added automatically by sweep.sh on 2026-08-31, BEFORE the cur_state fix. MEASURED 2026-09-01 (instance 49452150): cur_state was "running" and ssh worked while actual_status stayed "created". Left blacklisted pending re-verification, not silently unblocked.

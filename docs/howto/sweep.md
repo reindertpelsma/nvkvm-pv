@@ -110,11 +110,21 @@ Everything lands in `sweep-runs/<UTC timestamp>/` (gitignored):
 ```
 sweep.jsonl              one JSON record per unit, appended immediately
 summary.md               the rendered tables
+matrix.md                architecture x driver coverage matrix (see below)
 autodestroy.log          what the timer did
 instances.registry       every instance id this run created
 logs/<arch>-<instance>/  build.log, guest.log, bundle.log, drv-*.log,
                          qemu-nvkvm-vm.log — pulled off the box before it dies
 ```
+
+`matrix.md` is generated at the end of every run by `scripts/sweep_matrix_md.py`
+against every `sweep.jsonl` this repo/worktree knows about (this run's own,
+plus every prior run under `sweep-runs/`), not just this run's slice — a
+coverage claim is about the project, not one invocation. It states which
+input files it consumed, and every cell that is not a real validate.sh
+pass/fail/incomplete verdict renders as **UNTESTED** with its reason, never a
+blank cell. Generation is a reporting step and cannot fail the sweep: if it
+errors, a warning is printed and the run's own exit code is unaffected.
 
 `sweep.jsonl` is written after every unit and `fsync`ed, so a crash loses at
 most the unit in flight. Each record carries the architecture, the GPU, the
@@ -205,6 +215,20 @@ renamed to `/opt/nvkvm-guest/noble-server-cloudimg-amd64.img`; a matching
 missing option preserves the direct-download behavior, while a missing,
 malformed, or mismatched trusted checksum fails before any instance is rented.
 
+**The guest kernel is a swept axis, not a constant** (sweep rule 4):
+`nvkvm-guest.ko` is compiled against whatever kernel the guest boots, and
+different Ubuntu cloud-image series ship different kernels for free (no
+different QEMU, no different NVIDIA driver). `--guest-image SERIES` picks one
+series (`jammy` 5.15, `noble` 6.8, `questing`, or `resolute`, each verified to
+resolve); `--guest-images LIST` (comma-separated) wires the axis into the
+routine sweep itself -- one box is rented per `(architecture, guest series)`
+pair, so `--guest-images jammy,resolute` exercises both ends of the range in
+one invocation instead of that depending on someone remembering to pass
+`--guest-image` by hand. Every record states which series was *requested*
+(`guest_series_requested`); the two rows where a guest actually booted also
+state what *actually* booted (`guest_series`/`guest_kernel`), and a mismatch
+between the two is `guest-image-mismatch` -- UNTESTED, never a silent pass.
+
 The expected profile in that table is **not** hardcoded anywhere. `sweep.sh`
 compiles `src/common/nvkvm_abi.h` and calls `nvkvm_abi_id_for_version()`, so the
 expectation is by construction whatever the shipped selector says. The
@@ -269,13 +293,28 @@ left to be rediscovered.
   image is still pulling. The sweep waits up to 45 minutes and prints a
   heartbeat; it never destroys on a stopwatch. Three healthy instances were
   destroyed mid-pull on 2026-08-23 and paid for twice.
-- **The only signature of a genuinely dead box is the log.** Not the status
-  string, and never elapsed time. Dead is `actual_status: created` **plus** an
-  instance log frozen at `Domain not found: no domain with matching name
-  'C.<id>'`, unchanged across two polls ≥2 minutes apart. That is host-side and
-  deterministic per machine, so the machine goes on the known-bad list in
-  `scripts/sweep-known-bad-machines.txt` (seeded with 42636, 44906, 11908) and
-  the sweep re-rents on a different `machine_id`.
+- **The only signature of a genuinely dead box is the log -- and `cur_state`
+  can veto it.** Not `actual_status` alone, and never elapsed time. Dead is
+  `actual_status: created` **plus** an instance log frozen at `Domain not
+  found: no domain with matching name 'C.<id>'`, unchanged across two polls
+  ≥2 minutes apart -- **unless** vast's separate `cur_state` field already
+  reads `running`, in which case the box is not condemned and `wait_for_box`
+  tries ssh anyway. `actual_status` can lag the real state indefinitely on
+  some hosts (MEASURED 2026-09-01, machine 55691: `cur_state: running` and ssh
+  reachable while `actual_status` sat at `created` for 7+ minutes with the
+  dead-box log signature present). That is host-side and deterministic per
+  machine, so a genuinely dead machine goes on the known-bad list and the
+  sweep re-rents on a different `machine_id`.
+- **The known-bad list is runtime state, not source.** It lives at
+  `${XDG_STATE_HOME:-~/.local/state}/nvkvm/sweep-known-bad-machines.txt`
+  (override with `NVKVM_SWEEP_KNOWN_BAD_FILE`), shared by every worktree and
+  branch on this machine, so a dead box learned by one run does not dirty the
+  tree another run is about to ship and does not diverge per worktree.
+  `scripts/sweep-known-bad-machines.txt` in the repo is now only the default
+  SEED (currently 42636, 44906, 11908, 24044, 18856, 91962, plus two entries
+  marked SUSPECT pending re-verification -- see its header) copied in once, the
+  first time the sweep runs on a machine with no runtime file yet. The sweep
+  logs which file it actually read at startup.
 - **You must actually get a VM, not a container.** Checked with
   `systemd-detect-virt` within seconds of the first ssh. `grep vmx
   /proc/cpuinfo` is **not** a valid check — a container inherits the host's CPU

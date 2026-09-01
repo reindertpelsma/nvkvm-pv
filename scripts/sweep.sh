@@ -83,6 +83,7 @@
 #   scripts/sweep.sh --arch ampere --drivers 580.95.05 --go     # L1
 #   scripts/sweep.sh --arch ada --driver-cache /srv/nvidia --go  # relay CDN-blocked installers
 #   scripts/sweep.sh --arch ada --guest-image-cache /srv/images/noble-server-cloudimg-amd64.img --go
+#   scripts/sweep.sh --arch ampere --guest-images jammy,resolute --go  # guest-kernel axis, both ends
 #   scripts/sweep.sh --arch ampere --go                          # L2
 #   scripts/sweep.sh --all-arches --go --max-spend 12            # L3
 #   scripts/sweep.sh --resume sweep-runs/2026-08-23T10-00-00Z --go
@@ -141,7 +142,24 @@ STOP_FILE="/tmp/nvkvm-sweep.stop"
 # Assigned for real once OUT_DIR exists; empty here so the --reconcile path,
 # which runs reap_strays() before that point, cannot trip `set -u`.
 KEPT_FILE=""
-KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
+# Runtime, ACCOUNT-LEVEL state -- not source.  A dead machine_id is one
+# person's rented-box bad luck, not a fact about this codebase.  Keeping it in
+# the versioned tree had two costs, both observed on 2026-08-30/31: (a) the
+# sweep ships the WORKING TREE and refuses to run against a dirty one, so one
+# dead box appending to a tracked file blocked every later sweep until someone
+# committed; (b) the list is per-worktree/per-branch, so it diverged four ways
+# in one night and a retry from a different worktree re-rented and re-waited
+# on a machine already known bad. See docs/release-readiness-2026-09-01.md §2.2.
+#
+# Default: $XDG_STATE_HOME (or ~/.local/state)/nvkvm/sweep-known-bad-machines.txt
+# -- one file, shared by every worktree and branch on this machine, outside
+# any git tree so it can never dirty one.  Override with
+# NVKVM_SWEEP_KNOWN_BAD_FILE.  Backward compat for anyone who still has the
+# old tracked file: init_known_bad_file() migrates it in, once, the first time
+# this runs on a machine where the new location does not exist yet.
+NVKVM_SWEEP_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/nvkvm"
+KNOWN_BAD_FILE="${NVKVM_SWEEP_KNOWN_BAD_FILE:-$NVKVM_SWEEP_STATE_DIR/sweep-known-bad-machines.txt}"
+KNOWN_BAD_FILE_LEGACY="$REPO/scripts/sweep-known-bad-machines.txt"
 
 ARCHES=""
 ALL_ARCHES=0
@@ -178,16 +196,37 @@ GUEST_IMAGE_CACHE_SHA256=""
 # different URL. --guest-image picks one.
 #
 # VERIFIED 2026-08-30 that each of these resolves; oracular and plucky 404.
-GUEST_IMAGE_SERIES="${NVKVM_SWEEP_GUEST_SERIES:-noble}"
-GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
-GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
-# The qcow2 setup_guest.sh will produce.  noble keeps the historical name (three
-# other places test for that exact path); every other series is named for itself.
-if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
-    GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
-else
-    GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
-fi
+#
+# set_guest_image_series() is the ONE place that turns a series name into the
+# name/URL/qcow2-path triple -- it used to be duplicated (defaults block +
+# --guest-image parsing), and a duplicate is exactly how --guest-image stayed
+# a no-op unnoticed: one copy could be fixed while the other kept shipping
+# noble. Called once for the default, once per value of --guest-image /
+# --guest-images.
+set_guest_image_series() {
+    local series="$1"
+    case "$series" in
+        jammy|noble|questing|resolute) ;;
+        *) echo "$SELF: guest image series wants jammy|noble|questing|resolute (each verified to resolve); got '$series'" >&2; exit 3 ;;
+    esac
+    GUEST_IMAGE_SERIES="$series"
+    GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
+    GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
+    # The qcow2 setup_guest.sh will produce.  noble keeps the historical name
+    # (three other places test for that exact path); every other series is
+    # named for itself.
+    if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
+        GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+    else
+        GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
+    fi
+}
+set_guest_image_series "${NVKVM_SWEEP_GUEST_SERIES:-noble}"
+# RULE 4, continued: the axis is claimed unexercised unless something actually
+# iterates it. GUEST_IMAGES_REQ is the comma list the routine sweep loops
+# over (one box per (arch, guest series) pair); --guest-image alone still
+# means "just this one", which is the historical/default behaviour.
+GUEST_IMAGES_REQ="$GUEST_IMAGE_SERIES"
 PRESET="boundary"
 MIN_DRIVERS=5
 # The SteamOS product stage: off by default because it costs ~2h of box time and
@@ -250,6 +289,11 @@ WAIT_BUDGET=2700
 # instead of minutes; the defaults are what a real run uses.
 POLL_INTERVAL="${NVKVM_SWEEP_POLL:-20}"
 DEADCHECK_SETTLE="${NVKVM_SWEEP_DEADCHECK_SETTLE:-120}"
+# How long to give a `vastai start` a chance to work before giving up on a
+# cur_state=stopped instance. MEASURED 2026-09-01 (instance 49552045): a
+# stopped instance never boots on its own, so the ~45m WAIT_BUDGET is not the
+# right timescale to apply to it -- this is deliberately much shorter.
+STOPPED_RESTART_GRACE="${NVKVM_SWEEP_STOPPED_GRACE:-180}"
 # Backoff between destroy attempts.  Real values give vast.ai time to actually
 # tear the instance down before we re-check the listing; the offline test sets
 # them to 0 so it can assert the retry COUNT without waiting 90 seconds for it.
@@ -318,23 +362,25 @@ while [ $# -gt 0 ]; do
         --driver-cache) DRIVER_CACHE_DIR="$2"; shift 2 ;;
         --boot-kernel)  BOOT_KERNEL="$2"; shift 2 ;;
         --guest-image-cache) GUEST_IMAGE_CACHE="$2"; shift 2 ;;
-        --guest-image)  GUEST_IMAGE_SERIES="$2"
-                        case "$GUEST_IMAGE_SERIES" in
-                            jammy|noble|questing|resolute) ;;
-                            *) echo "$SELF: --guest-image wants jammy|noble|questing|resolute (each verified to resolve); got '$GUEST_IMAGE_SERIES'" >&2; exit 3 ;;
-                        esac
-                        GUEST_IMAGE_NAME="$GUEST_IMAGE_SERIES-server-cloudimg-amd64.img"
-                        GUEST_IMAGE_URL="https://cloud-images.ubuntu.com/$GUEST_IMAGE_SERIES/current/$GUEST_IMAGE_NAME"
-                        # Recompute here too: the defaults block runs BEFORE
-                        # argument parsing, so without this --guest-image would
-                        # change the download and leave the launcher pointed at
-                        # noble's qcow2 -- the same class of mismatch this whole
-                        # change exists to remove.
-                        if [ "$GUEST_IMAGE_SERIES" = "noble" ]; then
-                            GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-24.04.qcow2"
-                        else
-                            GUEST_QCOW2="/opt/nvkvm-guest/ubuntu-$GUEST_IMAGE_SERIES.qcow2"
-                        fi
+        --guest-image)  set_guest_image_series "$2"
+                        GUEST_IMAGES_REQ="$2"
+                        shift 2 ;;
+        # Plural: the guest-kernel axis, wired into the ROUTINE sweep. One box
+        # is rented per (arch, guest series) pair in the main loop below, so a
+        # single invocation can exercise both ends (jammy 5.15, resolute
+        # current) instead of that being a fact only ever true of --guest-image
+        # run by hand once. Validated eagerly, same as --guest-image, so a typo
+        # is a rejection at parse time and not a cost-estimate lie.
+        --guest-images) GUEST_IMAGES_REQ="$2"
+                        for _gi in ${GUEST_IMAGES_REQ//,/ }; do
+                            set_guest_image_series "$_gi"
+                        done
+                        # set_guest_image_series left the globals on the LAST
+                        # value; restore the first so the plan/estimate section
+                        # (which reads GUEST_IMAGE_SERIES before the per-series
+                        # loop starts) prints something real rather than the
+                        # last list entry mislabelled as "the" series.
+                        set_guest_image_series "${GUEST_IMAGES_REQ%%,*}"
                         shift 2 ;;
         --preset)       PRESET="$2"; shift 2 ;;
         --min-drivers)  MIN_DRIVERS="$2"; shift 2 ;;
@@ -625,18 +671,41 @@ drivers_for_arch() {
 #     libvirt: QEMU Driver error : Domain not found: no domain with matching
 #     name 'C.<id>'
 # `reboot instance` and `recycle instance` reproduce a byte-identical frozen
-# log, so retrying the same machine is pure waste.  The list is committed so the
-# knowledge outlives the run that learned it, and grows automatically below.
+# log, so retrying the same machine is pure waste.  The list lives at
+# $KNOWN_BAD_FILE (runtime state, see its definition above -- NOT the
+# versioned tree) so the knowledge outlives the run that learned it without
+# growing forever in git history, and it grows automatically below.
 # ---------------------------------------------------------------------------
+
+# One-time migration for anyone who still has the OLD tracked location
+# (scripts/sweep-known-bad-machines.txt) and nothing at the new one yet.
+# Idempotent: a no-op once $KNOWN_BAD_FILE exists, which is true after the
+# first run on any given machine. NEVER overwrites an existing new-location
+# file -- if two worktrees each still have the legacy file, whichever one
+# runs the new sweep.sh first seeds the shared state; reconcile the rest by
+# hand (`cat` the others' entries in) if that matters to you.
+init_known_bad_file() {
+    if [ ! -f "$KNOWN_BAD_FILE" ] && [ -f "$KNOWN_BAD_FILE_LEGACY" ]; then
+        mkdir -p "$(dirname "$KNOWN_BAD_FILE")" 2>/dev/null
+        if cp -- "$KNOWN_BAD_FILE_LEGACY" "$KNOWN_BAD_FILE" 2>/dev/null; then
+            info "known-bad machines: migrated the old tracked file into $KNOWN_BAD_FILE"
+            info "  ($KNOWN_BAD_FILE_LEGACY is no longer written to; safe to remove by hand)"
+        else
+            warn "known-bad machines: could not migrate $KNOWN_BAD_FILE_LEGACY -> $KNOWN_BAD_FILE"
+        fi
+    fi
+    mkdir -p "$(dirname "$KNOWN_BAD_FILE")" 2>/dev/null
+}
 known_bad() {
     [ -f "$KNOWN_BAD_FILE" ] || return 1
     grep -oE '^[0-9]+' "$KNOWN_BAD_FILE" 2>/dev/null | grep -qx "$1"
 }
 blacklist_machine() {
     known_bad "$1" && return 0
+    mkdir -p "$(dirname "$KNOWN_BAD_FILE")" 2>/dev/null
     printf '%s\t# %s (added automatically by %s on %s)\n' \
         "$1" "$2" "$SELF" "$(date -u +%Y-%m-%d)" >>"$KNOWN_BAD_FILE"
-    warn "machine $1 added to the known-bad list: $2"
+    warn "machine $1 added to the known-bad list: $2 ($KNOWN_BAD_FILE)"
 }
 
 # ---------------------------------------------------------------------------
@@ -1177,11 +1246,23 @@ if d.get("ssh_host") and d.get("ssh_port"):
 # "Domain not found: no domain with matching name 'C.<id>'".  We additionally
 # require the log to be byte-identical across two polls at least ~2 minutes
 # apart, so a box merely mid-transition is not condemned.
+#
+# actual_status ALONE IS NOT ENOUGH.  MEASURED 2026-09-01 on machine 55691
+# (instance 49452150): actual_status sat at "created" past 7 minutes while
+# vast's OWN independent `cur_state` field already read "running" and ssh
+# answered fine -- a genuinely healthy box that the log-only check both
+# condemns (once DEADCHECK_SETTLE elapses) and, in wait_for_box() below, never
+# even ssh-probes (its "try ssh" branch also gated on actual_status=="running"
+# alone). cur_state=="running" is checked FIRST and is conclusive: a box whose
+# domain is actually up cannot be the "no domain ever started" case this
+# function exists to catch, whatever actual_status or the log say.
 DEADCHECK_HASH=""
 DEADCHECK_WHEN=0
 box_is_dead() {
-    local id="$1" status="$2" logtxt h now
+    local id="$1" status="$2" logtxt h now cur
     [ "$status" = "created" ] || { DEADCHECK_HASH=""; return 1; }
+    cur="$(instance_field "$id" cur_state)"
+    [ "$cur" = "running" ] && { DEADCHECK_HASH=""; return 1; }
     logtxt="$(timeout 120 vastai logs "$id" --tail 40 2>/dev/null)"
     printf '%s' "$logtxt" | grep -q "Domain not found: no domain with matching name" \
         || { DEADCHECK_HASH=""; return 1; }
@@ -1197,24 +1278,74 @@ box_is_dead() {
 
 # Returns 0 with CUR_HOST/CUR_PORT set, 1 for "dead machine -- blacklist and
 # re-rent elsewhere", 2 for "timed out or stopped".
+#
+# cur_state=stopped after creation, MEASURED 2026-09-01 (instance 49552045): a
+# rented box sat at actual_status=exited / cur_state=stopped, and the ORIGINAL
+# loop below printed "still 'exited' -- Nm of patience left (this is normal;
+# VM images take ~30m)" for 32 minutes -- actively misleading, because a
+# stopped instance never starts on its own; this was never a "still booting"
+# situation. Set by wait_for_box(); read by its caller for the exit detail.
+WAIT_FOR_BOX_DETAIL=""
 wait_for_box() {
-    local id="$1" deadline status host port out last_status="" hb=""
+    local id="$1" deadline status cur_state host port out last_status="" hb=""
+    local stop_started=0 stop_grace_deadline=0
+    WAIT_FOR_BOX_DETAIL=""
     deadline=$(( $(date +%s) + WAIT_BUDGET ))
     DEADCHECK_HASH=""; DEADCHECK_WHEN=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
         stop_requested && return 2
         status="$(instance_field "$id" actual_status)"
+        cur_state="$(instance_field "$id" cur_state)"
+
+        # cur_state=stopped IS ACTIONABLE, NEVER A WAIT CONDITION.  Unlike a
+        # slow pull (actual_status stays e.g. "loading"/"created" while the
+        # image downloads), "stopped" means the instance will not progress by
+        # itself.  Issue ONE start, on a short bounded grace window -- NOT
+        # WAIT_BUDGET, which is sized for "this is normal, keep waiting" and is
+        # exactly wrong here.  If it does not recover, fail fast and let the
+        # caller try a different offer rather than burning the rest of the
+        # ~45m budget on a box that was never going to boot.
+        if [ "$cur_state" = "stopped" ]; then
+            if [ "$stop_started" = 0 ]; then
+                warn "  instance $id: cur_state=stopped (actual_status=$status) -- NOT a slow boot;"
+                warn "  issuing 'vastai start instance $id' and giving it ${STOPPED_RESTART_GRACE}s"
+                timeout 60 vastai start instance "$id" >/dev/null 2>&1
+                stop_started=1
+                stop_grace_deadline=$(( $(date +%s) + STOPPED_RESTART_GRACE ))
+            elif [ "$(date +%s)" -ge "$stop_grace_deadline" ]; then
+                warn "  instance $id: still cur_state=stopped ${STOPPED_RESTART_GRACE}s after 'vastai start' --"
+                warn "  giving up on THIS BOX.  Not the deterministic dead-box log signature, so the"
+                warn "  machine is NOT blacklisted; this reads as a marketplace/provider hiccup."
+                WAIT_FOR_BOX_DETAIL="cur_state=stopped and did not recover within ${STOPPED_RESTART_GRACE}s of 'vastai start instance $id'. Not the deterministic 'Domain not found' signature, so the machine is NOT blacklisted -- this looks like a marketplace/provider-side hiccup, not a defect in this machine specifically."
+                return 2
+            fi
+        elif [ -n "$cur_state" ] && [ "$cur_state" != "running" ]; then
+            stop_started=0     # left "stopped" some other way -- treat a later stop as a fresh occurrence
+        fi
+
         if [ "$status" != "$last_status" ]; then
             info "  instance $id: actual_status=$status"
             last_status="$status"
         elif [ "$hb" != "$(( $(date +%s) / 300 ))" ]; then
             hb="$(( $(date +%s) / 300 ))"
-            # A heartbeat, not a warning.  `loading` means the image is still
-            # pulling and the correct action is to keep waiting.
-            info "  instance $id: still '$status' -- $(( (deadline - $(date +%s)) / 60 ))m of patience left (this is normal; VM images take ~30m)"
+            if [ "$cur_state" = "stopped" ]; then
+                # NOT the "this is normal" heartbeat: cur_state already said
+                # this box is not merely slow, and the message must not claim
+                # otherwise while a restart is pending.
+                info "  instance $id: still '$status' (cur_state=stopped, restart issued) -- giving it up to $(( (stop_grace_deadline - $(date +%s)) / 60 ))m more before moving on"
+            else
+                # A heartbeat, not a warning.  `loading` means the image is still
+                # pulling and the correct action is to keep waiting.
+                info "  instance $id: still '$status' -- $(( (deadline - $(date +%s)) / 60 ))m of patience left (this is normal; VM images take ~30m)"
+            fi
         fi
 
-        if [ "$status" = "running" ]; then
+        # MEASURED 2026-09-01 (instance 49452150, machine 55691): actual_status
+        # can sit at "created" indefinitely while cur_state is already "running"
+        # and sshd is reachable -- gating the ssh attempt on actual_status alone
+        # means a genuinely healthy box is never even tried. Try ssh on EITHER
+        # signal saying running.
+        if [ "$status" = "running" ] || [ "$cur_state" = "running" ]; then
             while read -r host port; do
                 [ -z "$host" ] && continue
                 # -n: this loop's stdin is the endpoint list; ssh must not eat it.
@@ -1338,14 +1469,14 @@ sweep_manual_box() {
     set_manual_endpoint "$MANUAL_SSH"
 
     if ! rsh_t 60 'echo NVKVM_SSH_OK' 2>/dev/null | grep -q NVKVM_SSH_OK; then
-        emit "$(jrec arch "$arch" driver "-" status "no-ssh" host "$CUR_HOST" \
+        emit "$(jrec arch "$arch" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "no-ssh" host "$CUR_HOST" \
                 detail "could not reach the manual host over ssh" \
                 cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
         warn "manual host unreachable over ssh"
         return 2
     fi
     if ! verify_host_capable; then
-        emit "$(jrec arch "$arch" driver "-" status "host-not-capable" host "$CUR_HOST" \
+        emit "$(jrec arch "$arch" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "host-not-capable" host "$CUR_HOST" \
                 detail "$MANUAL_HOST_DETAIL" \
                 cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
         warn "manual host is not usable: $MANUAL_HOST_DETAIL"
@@ -1384,7 +1515,7 @@ ARCHOF
         arch="$detected"
         info "  arch detected from the GPU: $arch"
     elif [ -n "$detected" ] && [ "$detected" != "$arch" ]; then
-        emit "$(jrec arch "$arch" driver "-" status "host-arch-mismatch" host "$CUR_HOST" \
+        emit "$(jrec arch "$arch" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "host-arch-mismatch" host "$CUR_HOST" \
                 gpu "$gpu" detail "--arch says $arch, the GPU '$gpu' is $detected" \
                 cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
         warn "--arch says '$arch' but '$gpu' is '$detected'. Refusing: the driver floor and"
@@ -1396,7 +1527,7 @@ ARCHOF
     mkdir -p "$logdir"
 
     if ! provision_box; then
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "build-failed" host "$CUR_HOST" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "build-failed" host "$CUR_HOST" \
                 detail "${PROVISION_FAIL_DETAIL:0:400}" \
                 cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
         return 2
@@ -2178,7 +2309,7 @@ sweep_one_box() {
 
     offer_line="$(pick_offer "$arch")" || {
         warn "no rentable KVM offer for arch=$arch under \$$MAX_DPH/hr"
-        emit "$(jrec arch "$arch" driver "-" status "no-offer" \
+        emit "$(jrec arch "$arch" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "no-offer" \
                 detail "no rentable vms_enabled offer for this architecture under the price cap (machines already tried this run and the known-bad list are excluded)" \
                 ts "$(date -u +%FT%TZ)")"
         return 2
@@ -2192,7 +2323,7 @@ sweep_one_box() {
     projected="$(python3 -c "print(round($dph * (1.2 + 0.25 * $ndrv), 4))")"
     if ! spend_room "$projected"; then
         warn "spend cap reached: \$$SPENT committed, this box would add ~\$$projected, cap \$$MAX_SPEND"
-        emit "$(jrec arch "$arch" driver "-" status "spend-cap" \
+        emit "$(jrec arch "$arch" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "spend-cap" \
                 detail "projected \$$projected would exceed --max-spend \$$MAX_SPEND (already committed \$$SPENT)" \
                 ts "$(date -u +%FT%TZ)")"
         return 3
@@ -2217,7 +2348,7 @@ sweep_one_box() {
         warn "  ${out:0:300}"
         warn "  a contract may exist anyway -- checking the listing"
         reap_strays
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "create-failed" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "create-failed" \
                 detail "${out:0:400}" machine "$machine" ts "$(date -u +%FT%TZ)")"
         return 2
     fi
@@ -2230,22 +2361,22 @@ sweep_one_box() {
     wait_for_box "$iid"; rc=$?
     if [ "$rc" = 1 ]; then
         blacklist_machine "$machine" "KVM never provisioned: created + 'Domain not found' frozen log"
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "box-never-provisioned" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "box-never-provisioned" \
                 instance "$iid" machine "$machine" \
                 detail "actual_status=created with the instance log frozen at 'Domain not found: no domain with matching name'. Host-side and deterministic for this machine; machine added to the known-bad list." \
                 ts "$(date -u +%FT%TZ)")"
         box_status="dead"
     elif [ "$rc" = 2 ]; then
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "box-never-provisioned" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "box-never-provisioned" \
                 instance "$iid" machine "$machine" \
-                detail "no ssh within $((WAIT_BUDGET/60))m and the log never showed the dead-box signature, so this is treated as slow or unlucky rather than broken and the machine is NOT blacklisted" \
+                detail "${WAIT_FOR_BOX_DETAIL:-no ssh within $((WAIT_BUDGET/60))m and the log never showed the dead-box signature, so this is treated as slow or unlucky rather than broken and the machine is NOT blacklisted}" \
                 ts "$(date -u +%FT%TZ)")"
         box_status="noshow"
     fi
 
     if [ "$box_status" = "ok" ] && ! verify_is_vm; then
         # Caught in the first seconds of the first ssh: cents, not hours.
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "not-a-vm" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "not-a-vm" \
                 instance "$iid" machine "$machine" \
                 detail "systemd-detect-virt=${BOX_VIRT:-?} /dev/kvm=${BOX_KVM:-?} -- this is a container, not a KVM VM, so the NVIDIA module belongs to the physical host and no driver could be replaced" \
                 ts "$(date -u +%FT%TZ)")"
@@ -2253,7 +2384,7 @@ sweep_one_box() {
     fi
 
     if [ "$box_status" = "ok" ] && [ -n "$BOOT_KERNEL" ] && ! boot_kernel_series "$BOOT_KERNEL"; then
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "kernel-switch-failed" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "kernel-switch-failed" \
                 instance "$iid" machine "$machine" \
                 detail "could not bring the box up on kernel ${BOOT_KERNEL}.x; sweeping on the wrong kernel would turn 'this driver cannot build here' into rows that read like driver verdicts" \
                 ts "$(date -u +%FT%TZ)")"
@@ -2265,7 +2396,7 @@ sweep_one_box() {
         info "  driver actually present in the instance: ${preinstalled:-none}"
         info "  provisioning nvkvm (QEMU + guest image) -- once, amortised over the driver set"
         if ! provision_box; then
-            emit "$(jrec arch "$arch" gpu "$gpu" driver "-" \
+            emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" \
                     status "${PROVISION_FAILED_STEP:-provision}-failed" \
                     instance "$iid" machine "$machine" \
                     detail "${PROVISION_FAIL_DETAIL:0:3000}" ts "$(date -u +%FT%TZ)")"
@@ -2326,7 +2457,7 @@ sweep_one_box() {
         [ -n "${KEPT_FILE:-}" ] && { printf '%s\n' "$iid" >>"$KEPT_FILE" 2>/dev/null; sync 2>/dev/null || true; }
         warn "  $BOX_FAILED failure(s) on this box -- KEEPING it for inspection (--destroy-on-error to opt out)"
         warn "    ssh -p $CUR_PORT root@$CUR_HOST     # auto-destroys at +${BUDGET_HOURS}h regardless"
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "box-kept-for-inspection" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "box-kept-for-inspection" \
                 instance "$iid" role "box" \
                 detail "kept because $BOX_FAILED driver(s)/phase(s) failed; reachable at root@$CUR_HOST:$CUR_PORT until the +${BUDGET_HOURS}h auto-destroy" \
                 ts "$(date -u +%FT%TZ)")"
@@ -2356,7 +2487,7 @@ sweep_drivers_on_box() {
 
     todo="$(drivers_for_arch "$arch")"
     if [ -z "$todo" ]; then
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "no-applicable-drivers" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "no-applicable-drivers" \
                 instance "$iid" detail "the driver set has no rows at or above the $arch floor" \
                 ts "$(date -u +%FT%TZ)")"
         return
@@ -2372,7 +2503,7 @@ sweep_drivers_on_box() {
     # so the matrix never implies coverage that was not measured.
     if [ -n "$MANUAL_SSH" ] && [ "$ALLOW_DRIVER_INSTALL" != 1 ]; then
         if [ -z "$cur0" ]; then
-            emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "no-driver-present" \
+            emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "no-driver-present" \
                     instance "$iid" host "${CUR_HOST:-}" \
                     detail "no NVIDIA driver is installed on this manual host and --allow-driver-install was not given, so there is nothing to measure" \
                     cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
@@ -2403,7 +2534,7 @@ sweep_drivers_on_box() {
         emit "$(jrec arch "$arch" gpu "$gpu" driver "control:$cur0" driver_actual "$cur0" \
                 abi_expected "$(abi_expected "$cur0")" abi_selected "${VR_ABI:-?}" \
                 status "control-$VR_STATUS" summary "${VR_SUMMARY:-}" \
-                guest_series "${VR_GUEST_SERIES:-}" guest_kernel "${VR_GUEST_KERNEL:-}" \
+                guest_series_requested "$GUEST_IMAGE_SERIES" guest_series "${VR_GUEST_SERIES:-}" guest_kernel "${VR_GUEST_KERNEL:-}" \
                 module "$(module_flavour)" \
                 failed_checks "${VR_FAILED:0:1000}" \
                 instance "$iid" machine "$machine" role "control" \
@@ -2523,7 +2654,7 @@ sweep_drivers_on_box() {
             driver_substituted "$([ "$actual" = "$drv" ] && echo false || echo true)" \
             abi_expected "$prof" abi_selected "${VR_ABI:-?}" abi_matches_header "$abi_ok" \
             status "$VR_STATUS" summary "${VR_SUMMARY:-}" validate_rc "${VR_RC:-}" \
-            guest_series "${VR_GUEST_SERIES:-}" guest_kernel "${VR_GUEST_KERNEL:-}" \
+            guest_series_requested "$GUEST_IMAGE_SERIES" guest_series "${VR_GUEST_SERIES:-}" guest_kernel "${VR_GUEST_KERNEL:-}" \
             module "$(module_flavour)" \
             failed_checks "${VR_FAILED:0:1000}" \
             instance "$iid" machine "$machine" dph "$CUR_DPH" \
@@ -2577,7 +2708,7 @@ sweep_drivers_on_box() {
     applicable="$(drivers_for_arch "$arch" | wc -l)"
     if [ "$tested" -lt "$MIN_DRIVERS" ]; then
         warn "  COVERAGE SHORTFALL on $gpu ($arch): $tested driver(s) produced a verdict, $MIN_DRIVERS required"
-        emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "coverage-shortfall" \
+        emit "$(jrec arch "$arch" gpu "$gpu" guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status "coverage-shortfall" \
                 instance "$iid" \
                 detail "$tested of $applicable applicable drivers produced a validate.sh verdict; --min-drivers is $MIN_DRIVERS" \
                 ts "$(date -u +%FT%TZ)")"
@@ -2820,6 +2951,50 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# matrix.md -- the coverage claim, generated, not asserted
+#
+# scripts/sweep_matrix_md.py already does the hard part (30 unit tests,
+# deterministic, tolerates empty/malformed sweep.jsonl, renders UNTESTED as a
+# first-class cell rather than a blank one). This is just the wiring: call it
+# at the end of a run and write the result next to summary.md.
+#
+# A REPORTING STEP MUST NEVER TURN A GOOD RUN INTO A BAD ONE. Every failure
+# mode below is caught and downgraded to a warning; emit_matrix_md() always
+# returns 0, and nothing it does can change the sweep's own exit code (which
+# is computed from $RESULTS alone, further down).
+# ---------------------------------------------------------------------------
+emit_matrix_md() {
+    local md="$OUT_DIR/matrix.md" script="$REPO/scripts/sweep_matrix_md.py"
+    local -a inputs=()
+    local f
+
+    if [ ! -f "$script" ]; then
+        warn "matrix.md: $script not found -- skipping (non-fatal, summary.md above is unaffected)"
+        return 0
+    fi
+
+    # Every sweep.jsonl this repo/worktree knows about, not just this run's --
+    # a coverage claim ("here is what we tested") is about the project, not
+    # about one invocation. This run's own $RESULTS is always included even if
+    # --out pointed outside $REPO/sweep-runs (--resume, a custom --out).
+    while IFS= read -r f; do
+        inputs+=("$f")
+    done < <(find "$REPO/sweep-runs" -mindepth 2 -maxdepth 2 -name 'sweep.jsonl' 2>/dev/null | sort)
+    case " ${inputs[*]-} " in
+        *" $RESULTS "*) ;;
+        *) inputs+=("$RESULTS") ;;
+    esac
+
+    if ! python3 "$script" "${inputs[@]}" -o "$md" 2>"$OUT_DIR/matrix.md.stderr"; then
+        warn "matrix.md generation FAILED (non-fatal -- this is a reporting step, not a"
+        warn "  verdict; the sweep result above stands). stderr: $OUT_DIR/matrix.md.stderr"
+        return 0
+    fi
+    info "matrix   : $md  (${#inputs[@]} sweep.jsonl file(s) consumed, listed in the file itself)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 # LIBRARY MODE.  tests/sweep_offline_test.sh sources this file to exercise the
@@ -2835,6 +3010,9 @@ command -v vastai  >/dev/null || die "vastai CLI not found"
 command -v python3 >/dev/null || die "python3 not found (used for JSON and for the driver matrix)"
 [ -f "$HOME/.config/vastai/vast_api_key" ] || [ -n "${VAST_API_KEY:-}" ] \
     || die "no vast.ai api key (~/.config/vastai/vast_api_key)"
+
+init_known_bad_file
+info "known-bad machines: $KNOWN_BAD_FILE"
 
 if [ "$RECONCILE" = 1 ]; then
     # Labels are per-run now, so a reconcile scoped to THIS run's label would
@@ -2941,7 +3119,13 @@ say "  driver set    : --preset $PRESET${DRIVERS_REQ:+  (restricted to $DRIVERS_
 say "  driver cache  : ${DRIVER_CACHE_DIR:-none (rentals download directly from NVIDIA)}"
 say "  guest image   : ${GUEST_IMAGE_CACHE:-none (rentals download directly from Ubuntu)}"
 say "  disk          : ${DISK} GB per box"
-say "  guest series  : $GUEST_IMAGE_SERIES (the guest KERNEL axis -- sweep rule 4)"
+n_guest_series="$(printf '%s' "${GUEST_IMAGES_REQ//,/ }" | wc -w)"
+if [ "$n_guest_series" -gt 1 ]; then
+    say "  guest series  : $GUEST_IMAGES_REQ (the guest KERNEL axis -- sweep rule 4;"
+    say "                  one box per (arch, guest series) pair -- ${n_guest_series}x the boxes below)"
+else
+    say "  guest series  : $GUEST_IMAGE_SERIES (the guest KERNEL axis -- sweep rule 4)"
+fi
 say "  min drivers   : $MIN_DRIVERS per box (fewer verdicts than this FAILS the box)"
 if [ "$RUN_STEAMOS" = 1 ]; then
     say "  steamos stage : ON (ref $STEAMOS_REF) -- installs SteamOS on each box and"
@@ -2965,7 +3149,7 @@ total_units=0
 nboxes=0
 for a in ${ARCHES//,/ }; do
     n="$(drivers_for_arch "$a" | wc -l)"
-    total_units=$(( total_units + n )); nboxes=$(( nboxes + 1 ))
+    total_units=$(( total_units + n * n_guest_series )); nboxes=$(( nboxes + n_guest_series ))
     open=""; arch_needs_open_module "$a" && open="  [needs -m=kernel-open]"
     say "  $a: $n applicable driver(s), floor $(arch_floor "$a")$open"
     drivers_for_arch "$a" | while IFS='|' read -r v _ p w; do
@@ -3006,11 +3190,15 @@ if [ "$GO" != 1 ] && [ -z "$MANUAL_SSH" ]; then
         hours="$(python3 -c "print(round(1.2 + 0.25 * $n + (2.5 if $RUN_STEAMOS else 0), 2))")"
         # Network scales with the DRIVER COUNT, not with time: one .run per
         # driver is the bulk of it, so a long cheap box is not a cheap box.
-        c="$(python3 -c "print(round($odph * $hours + $onet * max(1,$n) / max(1,$n), 2))")"
+        # ONE BOX PER GUEST SERIES: n_guest_series > 1 means this architecture
+        # is rented once per requested guest series (--guest-images), so the
+        # per-arch cost below is multiplied here -- leaving it out is exactly
+        # how the SteamOS stage used to silently cost 3x its printed price.
+        c="$(python3 -c "print(round(($odph * $hours + $onet * max(1,$n) / max(1,$n)) * $n_guest_series, 2))")"
         netc="$(python3 -c "print(round($onet, 3))")"
         est="$(python3 -c "print(round($est + $c, 2))")"
-        printf '    %-10s %-16s $%-7s (disk $%s) machine=%-8s %-18s ~%sh  net~$%s@$%s/TB -> ~$%s\n' \
-               "$a" "$gname" "$odph" "$ostor" "$mid" "$ogeo" "$hours" "$netc" "$odowntb" "$c"
+        printf '    %-10s %-16s $%-7s (disk $%s) machine=%-8s %-18s ~%sh x%d guest-series  net~$%s@$%s/TB -> ~$%s\n' \
+               "$a" "$gname" "$odph" "$ostor" "$mid" "$ogeo" "$hours" "$n_guest_series" "$netc" "$odowntb" "$c"
     done
     say ""
     say "  estimated total: ~\$$est   (cap is \$$MAX_SPEND)"
@@ -3065,24 +3253,32 @@ if [ -n "$MANUAL_SSH" ]; then
     # nothing reads only looked like it was load-bearing.
     sweep_manual_box "${1:-}" || true
 else
-for arch in ${ARCHES//,/ }; do
-    if stop_requested; then
-        warn "STOP requested -- not renting any further boxes"
-        break
-    fi
-    say "=== architecture: $arch ==============================================="
-    attempt=1
-    while [ "$attempt" -le "$BOX_ATTEMPTS" ]; do
-        sweep_one_box "$arch"; rc=$?
-        # rc=2 means the BOX failed (dead machine, container, build).  Those are
-        # worth another try on a DIFFERENT machine -- the blacklist and
-        # TRIED_MACHINES guarantee it will not be the same one.  rc=3 is the
-        # spend cap, which no retry can fix.
-        [ "$rc" = 3 ] && break
-        [ "$rc" = 0 ] && break
-        attempt=$(( attempt + 1 ))
-        [ "$attempt" -le "$BOX_ATTEMPTS" ] && \
-            info "retrying $arch on a different machine (attempt $attempt/$BOX_ATTEMPTS)"
+# RULE 4, wired: one box per (guest series, arch) pair, so --guest-images
+# jammy,resolute actually rents at BOTH ends instead of that being a fact
+# only ever true when someone remembers to pass --guest-image by hand. The
+# single-series default (GUEST_IMAGES_REQ == GUEST_IMAGE_SERIES) makes this
+# loop run exactly once, byte-for-byte the pre-existing behaviour.
+for guest_series in ${GUEST_IMAGES_REQ//,/ }; do
+    set_guest_image_series "$guest_series"
+    for arch in ${ARCHES//,/ }; do
+        if stop_requested; then
+            warn "STOP requested -- not renting any further boxes"
+            break 2
+        fi
+        say "=== architecture: $arch (guest series: $GUEST_IMAGE_SERIES) ==============="
+        attempt=1
+        while [ "$attempt" -le "$BOX_ATTEMPTS" ]; do
+            sweep_one_box "$arch"; rc=$?
+            # rc=2 means the BOX failed (dead machine, container, build).  Those are
+            # worth another try on a DIFFERENT machine -- the blacklist and
+            # TRIED_MACHINES guarantee it will not be the same one.  rc=3 is the
+            # spend cap, which no retry can fix.
+            [ "$rc" = 3 ] && break
+            [ "$rc" = 0 ] && break
+            attempt=$(( attempt + 1 ))
+            [ "$attempt" -le "$BOX_ATTEMPTS" ] && \
+                info "retrying $arch on a different machine (attempt $attempt/$BOX_ATTEMPTS)"
+        done
     done
 done
 fi
@@ -3090,6 +3286,7 @@ fi
 say ""
 say "=== summary ==========================================================="
 render_summary | tee "$OUT_DIR/summary.md"
+emit_matrix_md
 say ""
 info "results  : $RESULTS"
 info "summary  : $OUT_DIR/summary.md"

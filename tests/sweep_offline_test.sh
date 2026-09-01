@@ -51,6 +51,8 @@ echo '[]' >"$STATE/offers.json"
 : >"$STATE/destroy_deaf.txt"
 : >"$STATE/create_output.txt"
 : >"$STATE/destroy_calls.txt"
+: >"$STATE/start_calls.txt"
+: >"$STATE/start_recovers.txt"
 
 cat >"$TMP/bin/vastai" <<'STUB'
 #!/usr/bin/env bash
@@ -84,6 +86,24 @@ else:
       cat "$S/offers.json" ;;
   "create instance")
       cat "$S/create_output.txt" ;;
+  "start instance")
+      id="$3"
+      echo "$id" >> "$S/start_calls.txt"
+      # start_recovers.txt scripts which ids a start actually revives (moves
+      # to cur_state=running) -- everything else stays stopped, modelling a
+      # start that did not help.
+      if grep -qx "$id" "$S/start_recovers.txt" 2>/dev/null; then
+          python3 -c '
+import json,sys
+p=sys.argv[1]; tid=sys.argv[2]
+d=json.load(open(p))
+for i in d:
+    if str(i.get("id"))==tid:
+        i["cur_state"]="running"
+json.dump(d,open(p,"w"))
+' "$S/instances.json" "$id"
+      fi
+      echo "starting $id" ;;
   "destroy instance")
       id="$3"
       echo "$id" >> "$S/destroy_calls.txt"
@@ -116,6 +136,7 @@ set_log()       { printf '%s' "$2" >"$STATE/logs/$1.txt"; }
 export NVKVM_SWEEP_LIB=1
 export NVKVM_SWEEP_POLL=1
 export NVKVM_SWEEP_DEADCHECK_SETTLE=1
+export NVKVM_SWEEP_STOPPED_GRACE=1
 export NVKVM_SWEEP_DESTROY_SETTLE=0      # assert the retry COUNT, not the wall clock
 export NVKVM_SWEEP_DESTROY_BACKOFF=0
 set --                       # sweep.sh parses "$@"; give it nothing
@@ -574,6 +595,210 @@ else
     ok "a guest cache without a trusted digest source is rejected"
 fi
 rm -f "$TMP/bin/scp"
+
+echo
+echo "=== 24. matrix.md is wired into the end of a run, alongside summary.md ==="
+OUT_DIR="$TMP/matrix-out"; mkdir -p "$OUT_DIR"
+: >"$RESULTS"
+emit "$(jrec arch ampere driver 580.95.05 status pass)"
+emit "$(jrec arch turing guest_series_requested jammy driver "-" status no-offer detail "no offer")"
+out="$(emit_matrix_md 2>&1)"; rc=$?
+check "emit_matrix_md always returns 0" "$rc" "0"
+if [ -f "$OUT_DIR/matrix.md" ]; then ok "matrix.md is written into --out, next to summary.md"; else bad "matrix.md was not created"; fi
+if grep -qF "$RESULTS" "$OUT_DIR/matrix.md"; then
+    ok "matrix.md states which sweep.jsonl file(s) it consumed"
+else
+    bad "matrix.md does not name its input file(s)"
+fi
+if grep -q "UNTESTED" "$OUT_DIR/matrix.md"; then
+    ok "UNTESTED is a first-class visible state in the generated matrix, not a blank cell"
+else
+    bad "no UNTESTED state rendered for the no-offer row"
+fi
+if printf '%s' "$out" | grep -q "matrix   :"; then ok "and says so on stdout"; else bad "no matrix.md info line printed"; fi
+
+echo
+echo "=== 25. a reporting step must never turn a good run into a bad one ==="
+# Break the generator two ways -- point --out at the repo's real script but
+# make it exit nonzero (a broken python3), and point at a script that does not
+# exist at all -- and prove emit_matrix_md still returns 0 both times, so
+# nothing downstream (in particular the sweep's own exit code, computed from
+# $RESULTS alone) can be dragged down by a reporting step.
+BROKEN_BIN="$TMP/broken-python-bin"; mkdir -p "$BROKEN_BIN"
+cat >"$BROKEN_BIN/python3" <<'PYSTUB'
+#!/usr/bin/env bash
+echo "simulated sweep_matrix_md.py crash" >&2
+exit 7
+PYSTUB
+chmod +x "$BROKEN_BIN/python3"
+rm -f "$OUT_DIR/matrix.md"
+_oldpath="$PATH"; PATH="$BROKEN_BIN:$PATH"
+out="$(emit_matrix_md 2>&1)"; rc=$?
+PATH="$_oldpath"
+check "a crashing generator still returns 0 from emit_matrix_md" "$rc" "0"
+if [ -f "$OUT_DIR/matrix.md" ]; then bad "a failed generation left a matrix.md behind"; else ok "a failed generation leaves no half-written matrix.md"; fi
+if printf '%s' "$out" | grep -qi "matrix.md generation FAILED"; then ok "and it says the failure is non-fatal"; else bad "no failure warning printed"; fi
+
+_missing_script="$REPO/scripts/does-not-exist-sweep_matrix_md.py"
+_orig_fn="$(declare -f emit_matrix_md)"
+eval "${_orig_fn/\$REPO\/scripts\/sweep_matrix_md.py/$_missing_script}"
+out2="$(emit_matrix_md 2>&1)"; rc2=$?
+eval "$_orig_fn"     # restore the real function for anything run after this
+check "a missing generator script also returns 0, not a crash" "$rc2" "0"
+
+echo
+echo "=== 26. guest-kernel axis: set_guest_image_series covers both ends ==="
+set_guest_image_series jammy
+check "jammy: series"    "$GUEST_IMAGE_SERIES" "jammy"
+check "jammy: image name" "$GUEST_IMAGE_NAME" "jammy-server-cloudimg-amd64.img"
+check "jammy: qcow2 is named for itself" "$GUEST_QCOW2" "/opt/nvkvm-guest/ubuntu-jammy.qcow2"
+set_guest_image_series resolute
+check "resolute: qcow2 is named for itself" "$GUEST_QCOW2" "/opt/nvkvm-guest/ubuntu-resolute.qcow2"
+set_guest_image_series noble
+check "noble: qcow2 keeps the historical path (3 places test for it)" "$GUEST_QCOW2" "/opt/nvkvm-guest/ubuntu-24.04.qcow2"
+if (set_guest_image_series bogus) 2>/dev/null; then bad "an invalid guest series was accepted"; else ok "an invalid guest series is rejected"; fi
+
+echo
+echo "=== 27. guest-kernel axis: the routine sweep loop actually visits BOTH ends ==="
+# This is the same loop shape sweep.sh's main() now runs (--guest-images
+# jammy,resolute), reproduced here without renting anything, to prove the
+# axis is wired into the routine sweep and not just reachable by hand once.
+GUEST_IMAGES_REQ="jammy,resolute"
+visited=""
+for gseries in ${GUEST_IMAGES_REQ//,/ }; do
+    set_guest_image_series "$gseries"
+    visited="$visited $GUEST_IMAGE_SERIES:$GUEST_QCOW2"
+done
+check "both ends of the guest-kernel axis are visited in one run, each with its own qcow2" \
+  "$visited" " jammy:/opt/nvkvm-guest/ubuntu-jammy.qcow2 resolute:/opt/nvkvm-guest/ubuntu-resolute.qcow2"
+set_guest_image_series noble   # leave globals in the default state for later sections
+
+echo
+echo "=== 28. every record -- even a box-level failure -- carries the requested guest series ==="
+set_guest_image_series jammy
+: >"$RESULTS"
+emit "$(jrec arch turing guest_series_requested "$GUEST_IMAGE_SERIES" driver "-" status no-offer detail "no offer")"
+row="$(tail -1 "$RESULTS")"
+check "a no-offer row (never even reached a guest) carries guest_series_requested" \
+  "$(printf '%s' "$row" | python3 -c 'import json,sys; print(json.load(sys.stdin)["guest_series_requested"])')" "jammy"
+# "make the RECORD carry the guest series ... finish it" means every box-level
+# row, not just the two rows where a guest actually booted (control + driver
+# verdict, which already carried it). Grep the source for any leftover
+# unpatched "driver \"-\"" row -- one that still starts a jrec call without
+# guest_series_requested somewhere before it -- and require there be none.
+unpatched="$(grep -n 'jrec arch "\$arch"\( gpu "\$gpu"\)\? driver "-"' "$REPO/scripts/sweep.sh" | grep -vc 'guest_series_requested')"
+check "no box-level driver-less row was left without guest_series_requested" "$unpatched" "0"
+set_guest_image_series noble
+
+echo
+echo "=== 29. box_is_dead / wait_for_box: cur_state overrides a stale actual_status ==="
+# MEASURED 2026-09-01, machine 55691, instance 49452150 (commit 8229d98 on
+# exp/pascal-diagnosis-mine, not yet on main): actual_status stayed "created"
+# -- with the classic dead-box log signature ALSO present -- for 7+ minutes
+# while cur_state was already "running" and ssh answered fine. Before this
+# fix box_is_dead() condemned that box and wait_for_box() never even tried
+# ssh, because both looked at actual_status alone.
+DEAD_HOST="192.0.2.50"; DEAD_PORT="2222"
+set_log 1001 "$DEAD_LOG"
+set_instances '[{"id":1001,"actual_status":"created","cur_state":"running","machine_id":77777}]'
+DEADCHECK_HASH=""; DEADCHECK_WHEN=0
+box_is_dead 1001 created >/dev/null; sleep 2
+if box_is_dead 1001 created; then
+    bad "cur_state=running was condemned anyway, despite the frozen dead-looking log"
+else
+    ok "cur_state=running refuses condemnation even with the classic dead-log signature present"
+fi
+
+set_instances "[{\"id\":1002,\"actual_status\":\"created\",\"cur_state\":\"running\",\"public_ipaddr\":\"$DEAD_HOST\",\"ports\":{\"22/tcp\":[{\"HostPort\":\"$DEAD_PORT\"}]}}]"
+set_log 1002 "still nothing new"
+cat >"$TMP/bin/ssh" <<'SSHOK'
+#!/usr/bin/env bash
+echo NVKVM_SSH_OK
+SSHOK
+chmod +x "$TMP/bin/ssh"
+WAIT_BUDGET=6; CUR_MACHINE=77778
+wait_for_box 1002 >/dev/null 2>&1; rc=$?
+check "wait_for_box tries ssh on cur_state=running even though actual_status never says running" "$rc" "0"
+check "  ...and picks up the endpoint" "$CUR_HOST:$CUR_PORT" "$DEAD_HOST:$DEAD_PORT"
+rm -f "$TMP/bin/ssh"
+
+# Regression guard: this must be strictly additive. The no-cur_state case is
+# exactly tests 7 and 8 above, byte for byte -- re-run the core assertion here
+# so a future edit that breaks the common case fails LOUDLY next to the fix
+# that motivated it, not just in a section someone might skip re-running.
+set_instances '[{"id":1003,"actual_status":"created"}]'
+set_log 1003 "$DEAD_LOG"
+DEADCHECK_HASH=""; DEADCHECK_WHEN=0
+box_is_dead 1003 created >/dev/null; sleep 2
+if box_is_dead 1003 created; then
+    ok "no cur_state field at all: unchanged, still condemned (regression guard)"
+else
+    bad "REGRESSION: a genuinely dead box (no cur_state field) is no longer condemned"
+fi
+
+echo
+echo "=== 30. cur_state=stopped is ACTIONABLE, never a 32-minute silent wait ==="
+# MEASURED 2026-09-01, instance 49552045: a rented box sat at
+# actual_status=exited / cur_state=stopped and the sweep printed "this is
+# normal; VM images take ~30m" for 32 minutes -- a stopped instance never
+# starts on its own. Hand-fixed live with `vastai start instance`, which
+# immediately moved it to cur_state=running.
+set_instances '[{"id":2001,"actual_status":"exited","cur_state":"stopped","machine_id":88888}]'
+: >"$STATE/start_calls.txt"
+WAIT_BUDGET=3600   # ~1h if this were still a plain timeout -- proves the FAST path, not a lucky short budget
+CUR_MACHINE=88888
+t0=$(date +%s)
+# NOT `out="$(wait_for_box ...)"`: command substitution runs the function in a
+# SUBSHELL, so its WAIT_FOR_BOX_DETAIL assignment (a plain global) would never
+# propagate back here. Redirect to a file instead so the call stays in this
+# shell.
+wait_for_box 2001 >"$TMP/wfb.out" 2>&1; rc=$?
+out="$(cat "$TMP/wfb.out")"
+t1=$(date +%s)
+elapsed=$(( t1 - t0 ))
+check "a stuck cur_state=stopped box gives up (rc=2), not a dead-box condemnation (rc=1)" "$rc" "2"
+check "'vastai start instance' was issued exactly once" "$(wc -l <"$STATE/start_calls.txt" | tr -d ' ')" "1"
+check "  ...naming the right instance" "$(cat "$STATE/start_calls.txt")" "2001"
+if known_bad 88888; then
+    bad "a stopped-and-not-recovered box got its MACHINE blacklisted (this is not the deterministic per-machine signature)"
+else
+    ok "machine is NOT blacklisted for a stopped instance"
+fi
+if [ "$elapsed" -lt 60 ]; then
+    ok "fails fast (${elapsed}s) instead of burning WAIT_BUDGET (regression guard for the 32-minute silent wait)"
+else
+    bad "took ${elapsed}s -- did not fail fast"
+fi
+check "the log never claims a stopped box is normal" \
+  "$(printf '%s' "$out" | grep -c 'this is normal')" "0"
+if printf '%s' "$out" | grep -qi "cur_state=stopped"; then
+    ok "the log instead says what it actually is: cur_state=stopped"
+else
+    bad "the log does not explain the stopped state at all"
+fi
+check "WAIT_FOR_BOX_DETAIL (surfaced in the row's detail) also skips 'this is normal'" \
+  "$(printf '%s' "$WAIT_FOR_BOX_DETAIL" | grep -c 'this is normal')" "0"
+if printf '%s' "$WAIT_FOR_BOX_DETAIL" | grep -q "cur_state=stopped"; then
+    ok "  ...and names cur_state=stopped as the reason, for the emitted record"
+else
+    bad "  ...WAIT_FOR_BOX_DETAIL does not explain the stopped state"
+fi
+
+# The mirror case: a start that DOES work ends in a normal ssh-ready box.
+set_instances '[{"id":2002,"actual_status":"exited","cur_state":"stopped","machine_id":88889,"public_ipaddr":"192.0.2.60","ports":{"22/tcp":[{"HostPort":"2299"}]}}]'
+echo 2002 >"$STATE/start_recovers.txt"
+: >"$STATE/start_calls.txt"
+cat >"$TMP/bin/ssh" <<'SSHOK2'
+#!/usr/bin/env bash
+echo NVKVM_SSH_OK
+SSHOK2
+chmod +x "$TMP/bin/ssh"
+WAIT_BUDGET=10
+wait_for_box 2002 >/dev/null 2>&1; rc=$?
+check "a stopped box that DOES recover after 'vastai start' reaches ssh (rc=0)" "$rc" "0"
+check "  ...and its endpoint is captured" "$CUR_HOST:$CUR_PORT" "192.0.2.60:2299"
+rm -f "$TMP/bin/ssh"
+: >"$STATE/start_recovers.txt"
 
 echo
 echo "======================================================================"
