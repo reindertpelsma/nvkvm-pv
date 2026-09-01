@@ -304,6 +304,31 @@ static const uint32_t nvkvm_ctrl_allowlist[] = {
 	0x90960101u, /* NV9096 GR/zbc controls */
 	0x90960106u,
 	0x90960107u,
+	/* GET_CLASS_ENGINEID on the KEPLER-era channel classes.
+	 *
+	 * MEASURED 2026-09-01 on a GTX 750 Ti (GM107), driver 535.309.01:
+	 *     nvkvm: DENY ctrl cmd 0xa16f0101 (not in allowlist / oversize)
+	 * and validate.sh reported 22P/6F/7S with cuda_ctx_create FAILING and
+	 * cuda_htod_dtoh_8mib / cuda_memset_d8 / cuda_ptx_jit all SKIPPED behind
+	 * it. Whole bring-up passes; the context will not create.
+	 *
+	 * This is the SAME BUG as #81, one generation further back, and the note
+	 * at 0xc36f0101 below already describes it: libcuda on 535.309.01 issues
+	 * GET_CLASS_ENGINEID during cuCtxCreate (libcuda on 575 does not), so a
+	 * table generated against the 575 ABI never saw it. There it was the Volta
+	 * channel class; a GM107 uses the Kepler channel classes instead, so it
+	 * needs the identical command under 0xa06f/0xa16f.
+	 *
+	 * Safe by the same standard, checked and not assumed: the id is FINN-derived
+	 * as (GPFIFO_INTERFACE_ID << 8) | MESSAGE_ID, so every *_CHANNEL_GPFIFO_*
+	 * class spells this command 0101 and they share one params struct,
+	 * NV906F_CTRL_GET_CLASS_ENGINEID_PARAMS (ctrl906f.h): 16 bytes,
+	 * { NvHandle hObject; NvU32 classEngineID, classID, engineID; } -- one RM
+	 * object handle in, three u32 out, NO embedded pointers, no host resource
+	 * named. The identical command is ALREADY allowed under 0x906f0101 and
+	 * 0xc36f0101, which is the precedent this row follows exactly. */
+	0xa06f0101u,  /* KEPLER_CHANNEL_GPFIFO_A GET_CLASS_ENGINEID */
+	0xa16f0101u,  /* KEPLER_CHANNEL_GPFIFO_B GET_CLASS_ENGINEID -- the id MEASURED denied */
 	0xa06f0104u, /* channel (GPFIFO) controls */
 	0xc36f010au,
 	/* #81 / 535 bring-up 2026-08-17: NVC36F_CTRL_GET_CLASS_ENGINEID.

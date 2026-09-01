@@ -120,6 +120,23 @@ int main(void)
 	assert(NVKVM_CTRL_NOOP_N == 4);
 	printf("  ok   no-op set is exactly the 4 audited commands\n");
 
+	/* GET_CLASS_ENGINEID must be allowed on EVERY channel class we can meet,
+	 * not just the ones a 575-generated table happened to see. libcuda on
+	 * 535.309.01 issues it during cuCtxCreate; a class where it is missing
+	 * means no CUDA context on that GPU. MEASURED on a GM107: 0xa16f0101
+	 * denied, cuda_ctx_create FAILED, three downstream checks SKIPPED. */
+	assert(nvkvm_ctrl_cmd_allowed(0x906f0101u));  /* GF100  */
+	assert(nvkvm_ctrl_cmd_allowed(0xa06f0101u));  /* KEPLER_A -- pre-Turing */
+	assert(nvkvm_ctrl_cmd_allowed(0xa16f0101u));  /* KEPLER_B -- the measured one */
+	assert(nvkvm_ctrl_cmd_allowed(0xc36f0101u));  /* VOLTA (added by #81)   */
+	printf("  ok   GET_CLASS_ENGINEID allowed on every reachable channel class\n");
+
+	/* And we did not open the channel classes wholesale. */
+	assert(!nvkvm_ctrl_cmd_allowed(0xa16f0102u));
+	assert(!nvkvm_ctrl_cmd_allowed(0xa16f0000u));
+	assert(!nvkvm_ctrl_cmd_allowed(0xa06f01ffu));
+	printf("  ok   channel classes are not wildcarded\n");
+
 	printf("test_ctrl_gate: PASS\n");
 	return 0;
 }
