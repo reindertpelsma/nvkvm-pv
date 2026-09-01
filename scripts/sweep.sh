@@ -160,6 +160,13 @@ MANUAL_SSH=""
 # manual host it is OFF unless asked for, and the run measures whatever driver
 # is already installed.  Never make "I pointed it at my workstation" cost
 # somebody their driver stack.
+# Guest sizing.  8G/4 is right for a rented box, but --ssh exists precisely to
+# run on hardware somebody already owns, and that is not always a 32 GB server:
+# the Maxwell floor boxes are 7 GB / 4 cores, where an 8 GB guest cannot start.
+# Overridable rather than clever -- the harness must not guess how much of
+# somebody else's machine it may take.
+VM_MEM_REQ="${NVKVM_VM_MEM:-8G}"
+VM_SMP_REQ="${NVKVM_VM_SMP:-4}"
 ALLOW_DRIVER_INSTALL=0
 GPU_FILTER=""
 DRIVERS_REQ=""
@@ -1879,7 +1886,7 @@ boot_and_validate() {
     # died as `vm-journal-scope-missing`, which reads like a systemd/journal
     # problem and is really a missing disk image.  MEASURED on the first
     # questing run, 2026-09-01.
-    rsh_t 200 "systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=8G --setenv=VM_SMP=4 --setenv=VM_IMG='$GUEST_QCOW2' --working-directory=/root/nvkvm bash scripts/run_test_vm.sh" >/dev/null 2>&1
+    rsh_t 200 "systemd-run --unit=nvkvm-vm --collect --setenv=VM_MEM=$VM_MEM_REQ --setenv=VM_SMP=$VM_SMP_REQ --setenv=VM_IMG='$GUEST_QCOW2' --working-directory=/root/nvkvm bash scripts/run_test_vm.sh" >/dev/null 2>&1
 
     vm_inv="$(rsh_t 90 'systemctl show nvkvm-vm.service --property=InvocationID --value 2>/dev/null' 2>/dev/null | tr -d '\r\n')"
     if ! vm_journal="$(invocation_journal_query "$vm_inv")"; then
