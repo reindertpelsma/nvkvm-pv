@@ -41,7 +41,10 @@ Every `run()` launches a DETACHED process on the target via one exec call:
   - the backgrounded pid is written out, along with two markers used later
     to rule out pid reuse (see below).
   - on completion, the exit code is written to a separate `.rc` file --
-    never inferred from the log, which carries no exit status.
+    never inferred from the log, which carries no exit status -- and that
+    write is ATOMIC (write to a `.tmp` sibling, then `mv` over the real
+    name), so a poll can only ever observe the file fully absent or fully
+    present, never a truncated in-progress write.
 
 The client never holds the exec channel open for the run's duration. It
 launches, gets the pid back immediately, and then POLLS: each poll re-reads
@@ -62,6 +65,19 @@ status by itself:
      timeout -- exactly the UNTESTED-vs-FAIL distinction already built into
      this harness's result vocabulary. A caller that turns this into
      anything but UNTESTED is the bug, not this class.
+
+     NEVER DECLARED ON THE FIRST OBSERVATION. A process that has just
+     finished looks, for a brief window, EXACTLY like one that died without
+     writing status: `.rc` hasn't landed yet, and if the kernel recycles
+     pids fast enough -- this harness's own test suite, spawning many
+     short-lived commands back to back, reproduced it -- `kill -0`/cmdline
+     can report the healthy, just-exited process as "gone" or "reused".
+     `_STATUS_SH`'s `grace_then_recheck` polls for `.rc` (up to ~2s, in
+     100ms steps) before concluding a died-looking process is genuinely
+     dead, rather than condemning it on one sample. See
+     test_ssh_machine.py's `test_status_check_survives_the_exit_rc_write_race`
+     for a deterministic reproduction (the delayed write is injected
+     directly, not hoped for via real process timing).
 
 PID REUSE GUARD: targets get rebooted (driver installs do this constantly),
 after which a bare `kill -0 $pid` can hit a completely unrelated process
@@ -155,7 +171,9 @@ setsid sh -c '
     echo "$child" > "$RUNDIR/pid"
     cat "/proc/$child/cmdline" > "$RUNDIR/pid.cmdline" 2>/dev/null
     wait "$child"
-    echo $? > "$RUNDIR/exit.rc"
+    rc=$?
+    echo "$rc" > "$RUNDIR/exit.rc.tmp"
+    mv "$RUNDIR/exit.rc.tmp" "$RUNDIR/exit.rc"
 ' nvkvm-inner "$RUNDIR" "$CWD" "$IN" "$@" </dev/null >/dev/null 2>&1 &
 i=0
 while [ ! -s "$RUNDIR/pid" ] && [ $i -lt 100 ]; do
@@ -173,34 +191,67 @@ fi
 _STATUS_SH = r"""
 set -e
 RUNDIR="$1"
-if [ -s "$RUNDIR/exit.rc" ]; then
-    printf 'DONE %s\n' "$(cat "$RUNDIR/exit.rc")"
-    exit 0
-fi
+
+# The .rc write in _LAUNCH_SH is now atomic (write to .tmp, then mv), so
+# "exists" and "complete" are the same fact -- no separate emptiness race to
+# worry about here, only the ONE window below.
+check_done() {
+    if [ -s "$RUNDIR/exit.rc" ]; then
+        printf 'DONE %s\n' "$(cat "$RUNDIR/exit.rc")"
+        return 0
+    fi
+    return 1
+}
+
+# A process that has JUST exited looks, for a brief window, EXACTLY like one
+# that died without ever writing its status: exit.rc has not landed yet, and
+# -- once the kernel has recycled the pid fast enough (this harness's own
+# test suite spawns many short-lived commands back to back and reproduced
+# this) -- kill -0/cmdline can also report "gone" or "reused" for a pid that
+# was in fact the healthy process, a heartbeat ago. Declaring DIED on that
+# single observation is a false negative that destroys a real, completed
+# result. So: never condemn on the first look. Poll for exit.rc a little
+# longer (the write is already issued by the time any of this is possible)
+# before concluding the process is genuinely gone.
+grace_then_recheck() {
+    i=0
+    while [ $i -lt 20 ]; do
+        check_done && return 0
+        sleep 0.1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+if check_done; then exit 0; fi
+
 pid=""
 [ -f "$RUNDIR/pid" ] && pid=$(cat "$RUNDIR/pid")
 if [ -z "$pid" ]; then
+    grace_then_recheck && exit 0
     echo "DIED no-pid-recorded"
     exit 0
 fi
+
+died_reason=""
 expected_boot=unknown
 [ -f "$RUNDIR/boot_id" ] && expected_boot=$(cat "$RUNDIR/boot_id")
 current_boot=unknown
 [ -f /proc/sys/kernel/random/boot_id ] && current_boot=$(cat /proc/sys/kernel/random/boot_id)
 if [ "$expected_boot" != "unknown" ] && [ "$expected_boot" != "$current_boot" ]; then
-    echo "DIED reboot-detected"
+    died_reason="reboot-detected"
+elif ! kill -0 "$pid" 2>/dev/null; then
+    died_reason="pid-not-alive"
+elif [ -s "$RUNDIR/pid.cmdline" ] && ! cmp -s "/proc/$pid/cmdline" "$RUNDIR/pid.cmdline" 2>/dev/null; then
+    died_reason="pid-reused"
+fi
+
+if [ -n "$died_reason" ]; then
+    grace_then_recheck && exit 0
+    echo "DIED $died_reason"
     exit 0
 fi
-if ! kill -0 "$pid" 2>/dev/null; then
-    echo "DIED pid-not-alive"
-    exit 0
-fi
-if [ -s "$RUNDIR/pid.cmdline" ]; then
-    if ! cmp -s "/proc/$pid/cmdline" "$RUNDIR/pid.cmdline" 2>/dev/null; then
-        echo "DIED pid-reused"
-        exit 0
-    fi
-fi
+
 echo RUNNING
 """
 

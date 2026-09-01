@@ -272,6 +272,53 @@ def test_timeout_raises_and_kills_the_remote_process(sshd):
 # --- the three completion states -----------------------------------------------
 
 
+def test_status_check_survives_the_exit_rc_write_race(sshd):
+    """Deterministic reproduction of the race reported against the full
+    suite: a process that has genuinely finished (its pid is confirmably
+    dead) but whose exit.rc write has not landed yet must NEVER be reported
+    as DIED WITHOUT STATUS. The delayed write is injected directly here --
+    not hoped for via real process-exit timing, which is exactly what made
+    the original bug pass 4/4 in isolation while flaking in the full suite
+    (only the full suite's pid churn made the window observable)."""
+
+    async def body():
+        m = sshd.machine()
+
+        # A pid CONFIRMED dead: run a real command to completion, then reuse
+        # its (now-exited) pid as the "recorded" pid of a hand-built rundir.
+        # No boot_id file is written, so the reboot-detection branch is
+        # skipped and the check falls straight to `kill -0`, which fails
+        # immediately -- landing exactly in the "looks dead, but did it
+        # really die without status" branch this test targets.
+        warmup = await m.run(["true"], timeout=20)
+        await warmup.wait(timeout=20)
+        dead_pid = warmup._pid
+
+        rundir = m._run_dir("run-exit-rc-race")
+        await m._with_reconnect(lambda conn: conn.run(f"mkdir -p {rundir}", check=True, timeout=20))
+        sftp = await m._ensure_sftp()
+        async with sftp.open(str(rundir / "pid"), "w") as f:
+            await f.write(str(dead_pid))
+
+        async def delayed_atomic_write_of_exit_rc():
+            await asyncio.sleep(0.4)  # well inside the ~2s server-side grace window
+            sftp2 = await m._ensure_sftp()
+            tmp, final = str(rundir / "exit.rc.tmp"), str(rundir / "exit.rc")
+            async with sftp2.open(tmp, "w") as f:
+                await f.write("42")
+            await sftp2.rename(tmp, final)
+
+        writer = asyncio.create_task(delayed_atomic_write_of_exit_rc())
+        cmd = sm.SSHCommand(m, rundir=rundir, pid=dead_pid, start_time=time.time(), default_timeout=None)
+        rc = await cmd.wait(timeout=10)  # must NOT raise CommandDiedWithoutStatus
+        await writer
+
+        assert rc == 42
+        assert cmd.returncode == 42
+
+    asyncio.run(body())
+
+
 def test_died_without_status_reboot_detected(sshd):
     async def body():
         m = sshd.machine()
