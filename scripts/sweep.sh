@@ -2575,11 +2575,22 @@ sweep_drivers_on_box() {
     # that produced fewer real verdicts than that has not delivered coverage for
     # its architecture, whatever its individual rows say.
     applicable="$(drivers_for_arch "$arch" | wc -l)"
-    if [ "$tested" -lt "$MIN_DRIVERS" ]; then
-        warn "  COVERAGE SHORTFALL on $gpu ($arch): $tested driver(s) produced a verdict, $MIN_DRIVERS required"
+    # ...but you cannot test more drivers than exist. blackwell's floor is 580,
+    # which leaves FOUR applicable rows, so against a flat --min-drivers=5 a
+    # blackwell box could never report coverage no matter how well it did --
+    # every run ends coverage-shortfall, exit 2, permanently. That is not a
+    # high standard, it is an unsatisfiable one, and an unsatisfiable check
+    # teaches people to ignore the result.
+    # Testing every applicable driver IS full coverage for that architecture.
+    required="$MIN_DRIVERS"
+    if [ "$applicable" -gt 0 ] && [ "$applicable" -lt "$required" ]; then
+        required="$applicable"
+    fi
+    if [ "$tested" -lt "$required" ]; then
+        warn "  COVERAGE SHORTFALL on $gpu ($arch): $tested driver(s) produced a verdict, $required required"
         emit "$(jrec arch "$arch" gpu "$gpu" driver "-" status "coverage-shortfall" \
                 instance "$iid" \
-                detail "$tested of $applicable applicable drivers produced a validate.sh verdict; --min-drivers is $MIN_DRIVERS" \
+                detail "$tested of $applicable applicable drivers produced a validate.sh verdict; required $required (--min-drivers is $MIN_DRIVERS, capped to the applicable count)" \
                 ts "$(date -u +%FT%TZ)")"
         BOX_UNTESTED=$(( BOX_UNTESTED + 1 ))
     fi
