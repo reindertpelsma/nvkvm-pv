@@ -33,7 +33,14 @@ TABLES_SRCS   = test_tables.c \
 
 OPEN_SCM_SRCS = test_open_scm.c
 
+# The allowlist table IS the thing under test, so it must be a build
+# dependency. Without this, editing the header does not relink the binary
+# and the suite silently re-runs a stale one -- MEASURED 2026-09-01, twice
+# independently: a reverted allowlist change left test_ctrl_gate passing
+# until a clean rebuild, at which point it aborted as it should.
+# test_nvkms_allowlist below already had it right.
 CTRL_GATE_SRCS = test_ctrl_gate.c
+CTRL_GATE_DEPS = ../../src/qemu/nvkvm_ctrl_allowlist.h
 
 .PHONY: all clean run check
 
@@ -61,7 +68,7 @@ test_tables: $(TABLES_SRCS)
 test_open_scm: $(OPEN_SCM_SRCS)
 	$(CC) $(CFLAGS) -D_GNU_SOURCE -o $@ $(OPEN_SCM_SRCS) $(LDFLAGS)
 
-test_ctrl_gate: $(CTRL_GATE_SRCS)
+test_ctrl_gate: $(CTRL_GATE_SRCS) $(CTRL_GATE_DEPS)
 	$(CC) $(CFLAGS) -o $@ $(CTRL_GATE_SRCS)
 
 # Header-only gate, so this needs no sources beyond the test itself.  It pins
