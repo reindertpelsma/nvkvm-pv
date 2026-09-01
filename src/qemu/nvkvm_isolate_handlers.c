@@ -1411,6 +1411,28 @@ static const struct nvkvm_uvm_desc nvkvm_uvm_schema[] = {
 	{ 47 /* UVM_UNSET_ACCESSED_BY           */,  40, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
 	{ 51 /* UVM_MIGRATE                     */,  48, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
 	{ 53 /* UVM_MIGRATE_RANGE_GROUP         */,   0, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	/* 54/55: UVM_{ENABLE,DISABLE}_SYSTEM_WIDE_ATOMICS. MEASURED 2026-09-01 on a
+	 * Quadro P4000 (Pascal) with driver 575.51.03: the guest issued cmd 55 seven
+	 * times, nvkvm logged `AUDIT unknown ioctl cmd=0x37 type=0x0 nr=0x37`, and
+	 * cuda_init FAILED -- earlier than any other pre-Turing failure seen so far
+	 * (Maxwell got as far as cuda_ctx_create).
+	 *
+	 * They are missing for a reason worth naming: these two commands DO NOT
+	 * EXIST in open-gpu-kernel-modules 595.84, the newest tree this schema was
+	 * built against. They are present in 580.159.04 and older. System-wide
+	 * atomics is a Pascal-era UVM feature that newer drivers dropped, so a
+	 * schema generated from the newest headers is structurally blind to it --
+	 * the same shape as the ctrl allowlist being generated from a 575 ABI and
+	 * missing what 535 sends. Tracking only the newest driver loses the old
+	 * ones silently.
+	 *
+	 * Params (identical for both, OGKM 580.159.04 uvm_ioctl.h):
+	 *     { NvProcessorUuid gpu_uuid; NV_STATUS rmStatus; }  -- 16 + 4 bytes
+	 * No embedded frontend fd, no VA range. min_size 0 like the other commands
+	 * absent from src/abi/uvm.h: we have no driver-verified layout of our own,
+	 * and an over-strict guess already mis-denied REGISTER_GPU once. */
+	{ 54 /* UVM_ENABLE_SYSTEM_WIDE_ATOMICS  */,   0, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
+	{ 55 /* UVM_DISABLE_SYSTEM_WIDE_ATOMICS */,   0, { 0xffff, 0xffff }, 0xffff, NVKVM_UVM_VA_NONE },
 	{ 65 /* UVM_MAP_DYNAMIC_PARALLELISM_REGION */, 0, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_CREATE },
 	{ 66 /* UVM_UNMAP_EXTERNAL              */,   0, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_USE },
 	{ 68 /* UVM_ALLOC_SEMAPHORE_POOL        */, 9248, { 0xffff, 0xffff }, 0, NVKVM_UVM_VA_CREATE },
