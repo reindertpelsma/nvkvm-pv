@@ -193,12 +193,15 @@ ARCH_FLOOR = {
     # window is 515..580 -- seven of the eight profiles, and frozen, which means
     # it cannot drift once mapped.
     "pascal": 515,
+    "volta": 515,
     "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 580,
 }
 
 # Architectures whose driver support ENDS at a known branch.  Absent = no ceiling.
 ARCH_CEILING = {
+    # 580 is the last branch supporting Maxwell/Pascal/Volta.
     "pascal": 580,
+    "volta": 580,
 }
 
 ARCH_OF = [   # substring -> architecture, FIRST MATCH WINS: specific before generic
@@ -206,6 +209,9 @@ ARCH_OF = [   # substring -> architecture, FIRST MATCH WINS: specific before gen
     # and must not be spelled "Quadro P4000" only -- P2000/P5000/P6000 are the
     # same GP10x silicon.  nvkvm does not support these yet; they are mapped so
     # the sweep can MEASURE the failure rather than refuse to rent the card.
+    # Volta.  "Titan V" before the generic TITAN X row below, and V100 covers
+    # both PCIe and SXM2 spellings.
+    ("V100", "volta"), ("Titan V", "volta"), ("TITAN V", "volta"), ("GV100", "volta"),
     ("Quadro P", "pascal"), ("GTX 10", "pascal"), ("TITAN X", "pascal"),
     ("P100", "pascal"), ("P40", "pascal"),
     ("RTX 6000 Ada", "ada"), ("RTX 5000 Ada", "ada"), ("RTX 4500 Ada", "ada"),
