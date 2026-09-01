@@ -1,5 +1,9 @@
 """machine_cli.py -- turning --target-*/--baseline-* argparse flags into
-real Machine objects. No network, no GPU: constructing an SSHMachine/
+real Machine objects. No network, no GPU. NOTE: constructing an SSHMachine
+does require the asyncssh package to be importable (its __init__ raises
+RuntimeError without it), so the cases that build one are skipped rather
+than failed when it is absent -- same convention as test_ssh_machine.py.
+Otherwise: an SSHMachine/
 ChrootMachine/VMMachine touches no filesystem/network at all (they connect
 lazily, on first real use) -- see machine.py/ssh_machine.py/chroot_machine.py
 /vm_machine.py's own __init__ methods. This file only checks that the right
@@ -18,6 +22,14 @@ import machine_cli
 from chroot_machine import ChrootMachine
 from machine import ThisMachine
 from ssh_machine import SSHMachine
+import ssh_machine as _ssh_machine
+
+# SSHMachine.__init__ raises RuntimeError when asyncssh is missing, so these
+# cases SKIP rather than FAIL on a box without the optional dependency.
+requires_asyncssh = pytest.mark.skipif(
+    getattr(_ssh_machine, "asyncssh", None) is None,
+    reason="needs asyncssh installed; SSHMachine's constructor requires it",
+)
 from vm_machine import GUEST_PASSWORD, GUEST_PORT, GUEST_USER, VMMachine
 
 
@@ -67,6 +79,7 @@ def test_ssh_requires_known_hosts_explicitly():
         machine_cli.build_machine(args, "target")
 
 
+@requires_asyncssh
 def test_ssh_known_hosts_none_disables_verification():
     args = _parser().parse_args([
         "--target", "ssh", "--target-host", "box", "--target-username", "root", "--target-known-hosts", "none",
@@ -77,6 +90,7 @@ def test_ssh_known_hosts_none_disables_verification():
     assert label == "ssh:root@box:22"
 
 
+@requires_asyncssh
 def test_ssh_known_hosts_path_is_passed_through():
     args = _parser().parse_args([
         "--target", "ssh", "--target-host", "box", "--target-username", "root",
@@ -91,6 +105,7 @@ def test_ssh_known_hosts_path_is_passed_through():
     assert label == "ssh:root@box:2200"
 
 
+@requires_asyncssh
 def test_ssh_label_override():
     args = _parser().parse_args([
         "--target", "ssh", "--target-host", "box", "--target-username", "root",
@@ -118,6 +133,7 @@ def test_chroot_repo_dir_override():
     assert str(machine._repo_dir) == "/somewhere/else"
 
 
+@requires_asyncssh
 def test_chroot_can_wrap_ssh_base_with_its_own_credentials():
     args = _parser().parse_args([
         "--target", "chroot",
@@ -155,6 +171,7 @@ def test_vm_wraps_this_by_default_with_library_defaults():
     assert machine._guest_port == GUEST_PORT
 
 
+@requires_asyncssh
 def test_vm_overrides_and_ssh_base_together():
     args = _parser().parse_args([
         "--target", "vm", "--target-guest-user", "poacher", "--target-guest-password", "s3cr3t", "--target-guest-port", "2299",
@@ -174,6 +191,7 @@ def test_vm_overrides_and_ssh_base_together():
 # --- the flagship scenario: target=vm and baseline=chroot on the SAME base -----------
 
 
+@requires_asyncssh
 def test_target_vm_and_baseline_chroot_on_the_same_physical_box():
     """tiers/realapps.py's own docstring names this exact composition as
     the point of the whole exercise: both sides wrap the identical ssh base
