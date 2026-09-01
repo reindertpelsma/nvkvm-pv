@@ -3052,8 +3052,12 @@ if [ -n "$MANUAL_SSH" ]; then
     # One host, given to us.  No renting, no destroying, no billing -- so the
     # whole offer/spend/reaper machinery is bypassed rather than fed dummy
     # values that would render as "$0.00" and read like a free run.
+    # Zero is allowed and is the good path: sweep_manual_box resolves the arch
+    # from the GPU the host actually reports, which cannot be wrong the way a
+    # typed --arch can. More than one is still refused -- one host is one
+    # architecture, and the driver floor and applicable set are per-arch.
     set -- ${ARCHES//,/ }
-    [ "$#" -eq 1 ] || die "--ssh takes exactly one --arch (got: '${ARCHES:-none}'). The driver floor and the applicable driver set are per-architecture, and we cannot infer them from a machine we did not choose." 3
+    [ "$#" -le 1 ] || die "--ssh takes at most one --arch (got: '${ARCHES:-none}'). One host is one architecture. Omit --arch to have it read off the GPU." 3
     say "=== manual host (arch: $1) ==========================================="
     # The exit code is derived from $RESULTS below, not from this rc: every
     # early return in sweep_manual_box emits a non-verdict row first, which
