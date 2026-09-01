@@ -138,25 +138,6 @@ that it failed; those are early rows that predate the suite.
 | 2x RTX PRO 6000 WS | **Blackwell GB202** `10de:2bb1` | 590.48.01 | 580 | 28/28 — the seam case: inside ABI_580's 580..595 struct row yet past the NVKMS 590 boundary, both tables behaved, no NVKMS DENY |
 | 2x RTX PRO 6000 WS | **Blackwell GB202** `10de:2bb1` | 610.57.04 | 610 | 28/28, crosses into ABI_610 (V610 channel, 376B). Offscreen GL holds — the 595/610 breakage fixed 2026-08-17 does not recur |
 | 2x RTX 5090 | **Blackwell GB202** `10de:2b85` | 580.105.08 | 580 | 28/28, `multi_gpu` 2/2, `peer_gpu` 7 pass / 1 skip (`p2p=no` — bare metal gives a byte-identical matrix, so hardware, not nvkvm) |
-
-> **Two failures reproduce on every Blackwell box tested, and on `main` as well as
-> on the branch — so they are pre-existing nvkvm bugs, not Blackwell regressions.**
-> Both are recorded here because a 28/28 row above would otherwise read as "all
-> good on this part", and it is not.
->
-> - **NCCL fails in-guest** (`Cuda failure 999`) while the same test passes on the
->   host, same driver, same torch, same NCCL, same GPUs. `DENY ctrl 0x00003d0b`
->   appears **only** during the failing run — `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD`,
->   the plural sibling of the `0x3d08` that caused the previous NCCL bug. `3d0b` is
->   absent from the entire tree. Seen on 590.48.01, 610.57.04 and 580.105.08, across
->   two Blackwell SKUs. Correlation plus a source argument, **not proven cause**.
-> - **`cuMemAllocManaged` failed `err=1`** via `DENY UVM cmd=0x48`
->   (`UVM_VALIDATE_VA_RANGE`, refused by the U-6 VA-ownership gate). **Fixed
->   2026-08-23** — see [Unified memory](#unified-memory-was-broken-everywhere-and-nothing-noticed)
->   below. It was **not** Blackwell-specific and not really a U-6 bug: QEMU never
->   made the `/dev/nvidia-uvm` mapping that creates a managed range, so no range
->   existed for U-6 to have recorded or for the driver to have found. Every
->   architecture was affected.
 | 2x RTX 4070 | Ada AD104 | 575.51.03 | 570 | 28/28, `cuda_device_count 2` |
 | GTX 1660 Ti | Turing TU116 | 575.51.03 | 570 | 28/28 |
 | H100 PCIe | **Hopper GH100** | 550.54.14 | 550 | 28/28 |
@@ -177,6 +158,25 @@ that it failed; those are early rows that predate the suite.
 | 4x RTX 5060 | Blackwell GB206 | 580.95.05 | 580 | 28/28, `cuda_device_count 4` |
 | 6x Tesla T4 | **Turing TU104** (datacenter) | 580.178.04 | 580 | 28/28, `cuda_device_count 6` \*\*\*\* |
 | 6x RTX A4000 | **Ampere GA104** (workstation) | 570.124.06 | 570 | 28/28, `cuda_device_count 6` |
+
+> **Two failures reproduce on every Blackwell box tested, and on `main` as well as
+> on the branch — so they are pre-existing nvkvm bugs, not Blackwell regressions.**
+> Both are recorded here because a 28/28 row above would otherwise read as "all
+> good on this part", and it is not.
+>
+> - **NCCL fails in-guest** (`Cuda failure 999`) while the same test passes on the
+>   host, same driver, same torch, same NCCL, same GPUs. `DENY ctrl 0x00003d0b`
+>   appears **only** during the failing run — `NV0000_CTRL_CMD_OS_UNIX_EXPORT_OBJECTS_TO_FD`,
+>   the plural sibling of the `0x3d08` that caused the previous NCCL bug. `3d0b` is
+>   absent from the entire tree. Seen on 590.48.01, 610.57.04 and 580.105.08, across
+>   two Blackwell SKUs. Correlation plus a source argument, **not proven cause**.
+> - **`cuMemAllocManaged` failed `err=1`** via `DENY UVM cmd=0x48`
+>   (`UVM_VALIDATE_VA_RANGE`, refused by the U-6 VA-ownership gate). **Fixed
+>   2026-08-23** — see [Unified memory](#unified-memory-was-broken-everywhere-and-nothing-noticed)
+>   below. It was **not** Blackwell-specific and not really a U-6 bug: QEMU never
+>   made the `/dev/nvidia-uvm` mapping that creates a managed range, so no range
+>   existed for U-6 to have recorded or for the driver to have found. Every
+>   architecture was affected.
 
 
 \* Both rows read 27/28 until the NVKMS inner-`cmdType` allowlist was fixed on
