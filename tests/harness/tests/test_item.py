@@ -2,8 +2,6 @@
 Runs entirely without a GPU."""
 
 import asyncio
-import tempfile
-from pathlib import Path
 
 import pytest
 

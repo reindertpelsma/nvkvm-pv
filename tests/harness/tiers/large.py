@@ -29,10 +29,8 @@ HONEST GAPS, not papered over:
 
 from __future__ import annotations
 
-import asyncio
 import re
 import sys
-import time
 from pathlib import Path
 from typing import Optional
 

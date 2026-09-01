@@ -144,7 +144,7 @@ async def run_to_completion(
     return command
 
 
-class _ThisCommand(Command):
+class LocalCommand(Command):
     def __init__(self, proc: "asyncio.subprocess.Process", start_time: float, default_timeout: Optional[float]):
         self._proc = proc
         self._start_time = start_time
@@ -217,10 +217,44 @@ class _ThisCommand(Command):
             pass
 
 
+async def spawn_local(
+    cmd: Sequence[str],
+    *,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    stdin: Optional[bytes] = None,
+    timeout: Optional[float] = None,
+) -> Command:
+    """Launch `cmd` as a local subprocess and return a `LocalCommand`. This is
+    the one place stdin-at-launch-then-closed and stdout/stderr capture are
+    implemented; `ThisMachine.run()` uses it directly, and `ChrootMachine`
+    uses it too for its `unshare`/`chroot` pipeline -- that pipeline is a
+    HOST-local syscall sequence regardless of what `ChrootMachine`'s own
+    `base` conceptually is, so it does not go through `base.run()`."""
+    full_env = dict(os.environ) if env is None else dict(env)
+    proc = await asyncio.create_subprocess_exec(
+        *[str(c) for c in cmd],
+        cwd=str(cwd) if cwd else None,
+        env=full_env,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    start_time = time.time()
+    if stdin is not None:
+        # Supplied at launch only, then closed -- see module docstring.
+        proc.stdin.write(stdin)
+        await proc.stdin.drain()
+        proc.stdin.close()
+    return LocalCommand(proc, start_time, timeout)
+
+
 class ThisMachine(Machine):
-    """Runs commands as local subprocesses. The only Machine implementation
-    in this slice; SSHMachine/ChrootMachine/VMMachine/ContainerMachine can
-    implement the same two interfaces later without touching call sites."""
+    """Runs commands as local subprocesses. The only ground-truth (non-
+    wrapping) Machine implementation in this slice; SSHMachine/ContainerMachine
+    can implement the same two interfaces later without touching call sites.
+    ChrootMachine/VMMachine (chroot_machine.py) wrap a base Machine -- often
+    this one -- rather than reimplementing local process spawning."""
 
     def __init__(self, *, cache_dir: Optional[Path] = None, scratch_root: Optional[Path] = None):
         self._cache_dir = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "nvkvm-harness-cache"
@@ -236,22 +270,7 @@ class ThisMachine(Machine):
         stdin: Optional[bytes] = None,
         timeout: Optional[float] = None,
     ) -> Command:
-        full_env = dict(os.environ) if env is None else dict(env)
-        proc = await asyncio.create_subprocess_exec(
-            *[str(c) for c in cmd],
-            cwd=str(cwd) if cwd else None,
-            env=full_env,
-            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        start_time = time.time()
-        if stdin is not None:
-            # Supplied at launch only, then closed -- see module docstring.
-            proc.stdin.write(stdin)
-            await proc.stdin.drain()
-            proc.stdin.close()
-        return _ThisCommand(proc, start_time, timeout)
+        return await spawn_local(cmd, cwd=cwd, env=env, stdin=stdin, timeout=timeout)
 
     async def need(self, item: Item) -> Path:
         dest = self._cache_dir / item.name
