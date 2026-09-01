@@ -777,7 +777,35 @@ the bare-metal host too, on the ffmpeg build used
 
 ## Vulkan
 
-### Seven device extensions fail `vkCreateDevice` — ray tracing does not work (2026-09-01)
+### Seven device extensions failed `vkCreateDevice` — RETRACTED, it was a staging bug (2026-09-01)
+
+> **RETRACTED THE SAME DAY. Ray tracing works. This entry was wrong and is kept
+> only so the reasoning is visible.**
+>
+> The cause was not nvkvm. `scripts/stage_guest_libs.sh` picked the guest's
+> system library directory with two branches — `/etc/redhat-release` →
+> `/usr/lib64`, else Debian multiarch. SteamOS is `ID_LIKE=arch` and matches
+> neither; its linker path is plain `/usr/lib`. So **`libcuda.so.1` was never
+> staged on that guest at all**. The NVIDIA Vulkan ICD `dlopen`s it inside the
+> init path of each of these seven extensions, got `ENOENT`, and silently
+> declined to build the device — which is why nothing was denied and nothing
+> was logged: nothing in the RM path was ever asked to do anything. The guest
+> looked healthy because the GL/EGL/Vulkan stack had been staged separately.
+>
+> After the fix, all seven pass individually and together, and the
+> zero-extension control still passes. `tests/repro/vk_device_extensions.c`
+> stays as a permanent check.
+>
+> **What I got wrong, and it is worth stating.** The host-vs-guest control was
+> real and correctly run, and it proved the guest differed from the host. I then
+> read "differs from the host" as "nvkvm refuses it", and wrote that down. A
+> control tells you two things differ; it does not tell you *which layer*
+> differs. The guest userspace was never in the frame, and it should have been —
+> the first question after "the same binary behaves differently" is "is it
+> actually the same environment?", and one `find / -name 'libcuda*'` would have
+> answered it.
+
+**The original entry follows, unchanged.**
 
 **A guest cannot create a Vulkan device that enables any of these:**
 
