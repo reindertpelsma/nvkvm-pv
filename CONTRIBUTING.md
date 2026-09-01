@@ -39,12 +39,16 @@ bash tests/unit/run_tests.sh                # the unit gate -- see the note belo
 
 Four things that have bitten people, including us:
 
-- **`build_qemu.sh` skips the build if the binary already exists**
-  (`scripts/build_qemu.sh:69-73`). After editing anything under `src/qemu/`,
-  `src/common/` or `src/stub/`, re-run it with `--force`, or you will spend an
-  afternoon testing your old code. This has happened more than once, and it does
-  not fail as a build error — it surfaces as a confusing mismatch between new
-  guest code and an old binary.
+- **`build_qemu.sh` rebuilds when its sources change** — it hashes everything
+  that reaches the binary (`src/qemu/`, `src/common/`, `src/abi/`, `src/stub/`
+  and `patches/`) into a stamp beside the install and compares it on entry, so
+  editing any of them triggers a rebuild without `--force`. Unchanged sources
+  still skip, so this stays idempotent.
+
+  This used to be existence-only, and it cost real measurements: on 2026-09-01
+  a sweep reused a binary built 1h37m before the tree it was measuring, so an
+  allowlist change was never compiled in *while every record carried the new
+  tree's git sha*. `--force` still exists for when you want to rebuild anyway.
 - **Run `tests/unit/run_tests.sh`, not `make run`.** `make run` exits non-zero
   by design: `test_isolate` fails 5 of its 7 cases at runtime on pre-existing API
   drift, documented at `tests/unit/Makefile:65-69`. Do not "fix" it by deleting
