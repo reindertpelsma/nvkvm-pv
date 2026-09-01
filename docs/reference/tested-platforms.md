@@ -57,6 +57,23 @@ behind a probe whose PTX was `.target sm_60` and could never JIT on sm_50.
 Lowering it to sm_50 turned three skips into passes and surfaced the real
 failure underneath.
 
+**Hardware that was available and NOT measured** (recorded so it is not
+forgotten). A fleet of KVM-capable consumer boxes was up on 2026-09-01 and only
+one of them was swept:
+
+| GPU | architecture | why it matters | status |
+|---|---|---|---|
+| GTX 960 | Maxwell **GM206**, sm_52 | the ONLY hardware that would exercise `MAXWELL_B` (`0xB197`) and `MAXWELL_COMPUTE_B` (`0xB1C0`) | **never run** |
+| GTX 1060 | Pascal **GP106**, sm_61 | a second Pascal SKU; the confirmed rows are all GP104 (Quadro P4000) | **never run** |
+| GTX 750 Ti x2 | Maxwell GM107 | duplicates of the box already measured | not run, low value |
+
+The GM206 gap is the significant one. `MAXWELL_B` and `MAXWELL_COMPUTE_B` were
+added **by pattern, not by measurement**, and nothing has touched them. That is
+exactly the reasoning that already failed once: six Maxwell classes were added
+the same way and a real GM107 turned out to use the **Kepler** channel classes
+instead, which is why `0xa06f0101`/`0xa16f0101` exist. Treat those two `_B`
+rows as unverified until a GM20x part runs.
+
 **Volta is UNVERIFIED and no row exists.** Not "untested for now" — no
 VM-capable Volta hardware has been found anywhere: vast lists Volta offers but
 zero with `vms_enabled`; three earlier attempts on machine 146997 (the only
