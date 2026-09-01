@@ -2338,7 +2338,7 @@ retry_mapcount:
 		}
 
 	for (i = 0; i < (unsigned long)got; i++) {
-		int mc = page_mapcount(pages[i]);
+		int mc = nvkvm_page_mapcount(pages[i]);
 
 		if ((unsigned long)mc > mc_allowed) {
 			if (is_shmem_obj &&
