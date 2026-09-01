@@ -97,8 +97,48 @@ fi
 # evidence it is on the linker's search path -- confirmed on the real T4
 # guest, where nvidia-smi kept failing after a first "fixed" run for exactly
 # this reason.
+#
+# Arch-family (SteamOS included) is a THIRD case, missed by the RHEL/Debian
+# split above: it has neither /etc/redhat-release nor the Debian multiarch
+# triplet dir, and its ld.so.conf.d carries no /usr/lib/x86_64-linux-gnu
+# entry at all -- the linker's real search path is plain /usr/lib (see
+# glibc's compiled-in trusted dirs; confirmed on a SteamOS guest's
+# /etc/ld.so.conf.d, which only pulls in lib32-glibc.conf and perf.conf).
+# Before this branch existed, a SteamOS guest fell into the Debian `else`,
+# so `stage "libcuda.so.$V" "$SYS" ...` targeted a directory that does not
+# exist on this distro at all -- `cp -f` into a missing dir fails, so this
+# should have been a loud CRITICAL_MISSING/exit-2, but on at least one guest
+# the graphics-stack libraries (libGLX_nvidia, libnvidia-glcore, etc.) had
+# separately been placed in /usr/lib by an earlier/manual provisioning step,
+# so the guest LOOKED staged (GL/EGL/Vulkan all present, `vulkaninfo` sees
+# the real GPU) while libcuda.so.1 was silently never installed anywhere.
+# Symptom: vkEnumerateDeviceExtensionProperties advertises
+# VK_KHR_acceleration_structure/ray_query/ray_tracing_pipeline,
+# VK_NV_ray_tracing/optical_flow/cuda_kernel_launch and
+# VK_NVX_binary_import (the NVIDIA Vulkan ICD's internal init path for each
+# of these seven dlopens libcuda.so.1), but vkCreateDevice fails
+# VK_ERROR_INITIALIZATION_FAILED for every one of them, independently, the
+# moment that dlopen comes up ENOENT -- silent because the dlopen failure is
+# inside the vendor ICD, not in anything nvkvm forwards or logs. Confirmed
+# by staging libcuda.so.1 alone into /usr/lib on the affected guest: all
+# seven extensions, and all seven together, went from -3 to VK_SUCCESS.
+# See docs/investigations/vkcreatedevice-init-failed/.
+#
+# Use /etc/os-release's ID/ID_LIKE rather than a directory-existence check,
+# for the same reason the RHEL branch above does not test for /usr/lib64.
+SYS_ARCH_LIKE=0
+if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    case " ${ID:-} ${ID_LIKE:-} " in
+        *" arch "*|*" steamos "*) SYS_ARCH_LIKE=1 ;;
+    esac
+fi
+
 if [ -f /etc/redhat-release ]; then
     SYS=/usr/lib64
+elif [ "$SYS_ARCH_LIKE" = 1 ]; then
+    SYS=/usr/lib
 else
     SYS=/usr/lib/x86_64-linux-gnu
 fi
