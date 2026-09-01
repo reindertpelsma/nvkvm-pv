@@ -141,7 +141,29 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
  * here and already had size-table entries, but this one was absent entirely --
  * so Volta could never have worked: the channel alloc is the FIRST thing
  * libcuda asks for, and the QEMU gate would refuse it exactly as it refused
- * PASCAL_CHANNEL_GPFIFO_A (0xC06F) with "DENY alloc class". OGKM clc36f.h. */
+ * PASCAL_CHANNEL_GPFIFO_A (0xC06F) with "DENY alloc class". OGKM clc36f.h.
+ *
+ * VOLTA IS UNVERIFIED. No Volta row has EVER been produced -- every attempt on
+ * record ends in box-never-provisioned or no-offer, zero verdicts, and that is
+ * still true as of 2026-09-01. Unlike Maxwell (measured 30P/0F/5S on a GM107)
+ * and Pascal (35P/0F/0S on a P4000 across three driver profiles), nothing here
+ * has touched silicon. Treat these five classes as reasoning, not as evidence,
+ * and label Volta the way the 515/525 ABI rows are labelled.
+ *
+ * Why it has not been measured, so nobody repeats the search: vast.ai carries
+ * Volta offers but NONE with vms_enabled -- checked directly against the API
+ * rather than through the sweep's picker (which has a history of false
+ * negatives): 10 Volta-named offers, 0 VM-capable, at both a $0.50/hr and a
+ * $2/hr cap. Three earlier attempts all landed on machine 146997, the only
+ * V100 with KVM, and none yielded a verdict. LeaderGPU is thin on old
+ * architectures (its largest set is Blackwell), and its Tesla stock was
+ * occupied rather than rentable -- which is what the pending-<id> 404s on
+ * those orders actually meant. No Volta exists in the local fleet either.
+ *
+ * The ONE thing that is not a guess: 0xC36F was absent outright while the
+ * other four were defined and sized, and the channel alloc is the first object
+ * libcuda asks for -- so Volta could not have worked before this, whatever
+ * else is or is not right. That is a structural argument. It is not a run. */
 #define VOLTA_CHANNEL_GPFIFO_A              0x0000C36FU
 #define VOLTA_COMPUTE_A                     0x0000C3C0U
 #define VOLTA_COMPUTE_B                     0x0000C4C0U
