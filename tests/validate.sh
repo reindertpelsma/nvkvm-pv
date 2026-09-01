@@ -2143,6 +2143,48 @@ else
     fi
 fi
 
+# --- vk_device_rt_extensions -------------------------------------------------
+# THE RDR2 REGRESSION CHECK. Seven advertised device extensions make
+# vkCreateDevice return VK_ERROR_INITIALIZATION_FAILED in an nvkvm guest while
+# the identical binary succeeds on bare metal. That is why D3D12 titles fail:
+# vkd3d-proton enables the ray-tracing extensions to expose DXR, device
+# creation fails, and the game dies at ERR_GFX_INIT with nothing in our logs --
+# no ctrl denial, no alloc denial. A whole class of failure that leaves no
+# trace anywhere else, which is exactly why it needs its own check.
+#
+# See tests/repro/vk_device_extensions.c and
+# docs/internal/known-limitations.md ("Seven device extensions fail
+# vkCreateDevice"). Root cause OPEN; this check is the acceptance criterion.
+VK_RT_EXTS="VK_KHR_acceleration_structure VK_KHR_ray_query VK_KHR_ray_tracing_pipeline VK_NV_ray_tracing VK_NV_optical_flow VK_NV_cuda_kernel_launch VK_NVX_binary_import"
+if [ -z "$BUILD_PROBES" ]; then
+    if ! command -v "$CC" >/dev/null 2>&1; then
+        record vk_device_rt_extensions SKIP "no compiler on this guest"
+    elif [ -z "$REPRO_DIR" ] || [ ! -f "$REPRO_DIR/vk_device_extensions.c" ]; then
+        record vk_device_rt_extensions SKIP "tests/repro/vk_device_extensions.c not present"
+    elif ! "$CC" -O1 -o "$WORK/vk_device_extensions" "$REPRO_DIR/vk_device_extensions.c" -ldl \
+            > "$WORK/vk_device_extensions.cc" 2>&1; then
+        record vk_device_rt_extensions SKIP "will not build (see $WORK/vk_device_extensions.cc)"
+    else
+        # Output to a FILE, never a command substitution: these probes can leave
+        # a child holding the pipe and the read would never see EOF. See
+        # tests/probe_orphan_pipe_test.sh -- that deadlock cost hours today.
+        # shellcheck disable=SC2086  # VK_RT_EXTS is a deliberate word list
+        sh_bounded vk_device_rt_extensions "$SHELL_TIMEOUT" \
+            "$WORK/vk_device_extensions" $VK_RT_EXTS > "$WORK/vk_device_rt.out" 2>&1
+        VK_EXT_RC=$?
+        VK_EXT_LINE="$(grep -m1 '^RESULT:' "$WORK/vk_device_rt.out" 2>/dev/null || true)"
+        if note_shell_timeout vk_device_rt_extensions; then
+            :
+        elif [ "$VK_EXT_RC" -eq 0 ]; then
+            record vk_device_rt_extensions PASS \
+                "vkCreateDevice succeeded with all 7 ray-tracing/NVX extensions enabled"
+        else
+            record vk_device_rt_extensions FAIL \
+                "vkCreateDevice rejected the 7 ray-tracing/NVX extensions (${VK_EXT_LINE:-no RESULT line}); ray tracing and D3D12 titles will not work"
+        fi
+    fi
+fi
+
 # =============================================================================
 # PHASE 4 -- OpenGL via offscreen EGL
 # =============================================================================
