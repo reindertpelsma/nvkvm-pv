@@ -52,6 +52,25 @@ from typing import Dict, Optional, Sequence
 from item import Item
 
 
+class CommandDiedWithoutStatus(RuntimeError):
+    """Raised by Command.wait() when the underlying process is confirmed to
+    no longer be running but no exit status could be recovered for it. This
+    is part of the shared Command contract, not an SSHMachine-specific
+    detail: any Machine without a resident supervisor over its commands (the
+    detached-process design SSHMachine uses, so it survives a dropped SSH
+    session) can hit this -- the target rebooted mid-run, or something
+    outside this harness's control killed the process before it could write
+    its own completion status.
+
+    This is NOT a timeout (the process is not hung -- it is confirmably
+    gone) and NOT a normal exit code. It is a third, distinct outcome from
+    Command.wait(), matching this harness's UNTESTED-vs-FAIL distinction:
+    callers MUST turn this into UNTESTED, never into FAIL and never into a
+    fabricated exit code. ThisMachine/ChrootMachine's LocalCommand never
+    raises this -- a local child process always yields a real waitpid()
+    status, so there is no missing-status case for it to represent."""
+
+
 class Command(abc.ABC):
     """A running (or finished) command on some Machine."""
 
@@ -70,6 +89,10 @@ class Command(abc.ABC):
         """Wait for completion, bounded by `timeout` seconds if given (falls
         back to whatever default `run()` was given, if any -- pass None with
         no default to wait unboundedly, which no tier should ever do).
+
+        May also raise `CommandDiedWithoutStatus` -- see that class -- for a
+        Machine whose commands run without a resident supervisor (SSHMachine).
+        ThisMachine/ChrootMachine never raise it.
 
         Raises `asyncio.TimeoutError` if the command has not finished within
         the bound; the process is killed as part of that (see `kill`), never

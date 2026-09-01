@@ -115,3 +115,4 @@ tests/unit/*.inc
 # reports, timestamped per run) and its on-disk item cache / rootfs staging.
 tests/harness/results/
 tests/harness/.chroot-roots/
+tests/harness/.venv/

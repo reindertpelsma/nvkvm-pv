@@ -1,0 +1,7 @@
+# Only needed for SSHMachine (tests/harness/ssh_machine.py) -- everything
+# else in tests/harness/ is standard library only, including `--tier small`.
+#
+#   python3 -m venv tests/harness/.venv
+#   tests/harness/.venv/bin/pip install -r tests/harness/requirements.txt
+#
+asyncssh>=2.14
