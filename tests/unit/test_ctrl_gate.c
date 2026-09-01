@@ -120,6 +120,47 @@ int main(void)
 	assert(NVKVM_CTRL_NOOP_N == 4);
 	printf("  ok   no-op set is exactly the 4 audited commands\n");
 
+	/* NV9096 ZBC: the family must be CONSISTENT.
+	 *
+	 * This table is generated from nvproxy's compUtil (CUDA-COMPUTE) tagged
+	 * set, and a compute workload never sets a colour clear -- so we
+	 * inherited the two getters and the STENCIL setter while the COLOUR and
+	 * DEPTH setters were denied. Allowing a stencil clear but not a colour
+	 * clear is not a boundary anyone chose. OBSERVED 2026-09-01: RDR2 on the
+	 * SteamOS guest died at ERR_GFX_INIT with exactly one denial,
+	 * 0x90960102, at the moment it launched.
+	 *
+	 * This is also the DRIVER-INDEPENDENCE check the fix needs.
+	 * nvkvm_ctrl_cmd_allowed() takes a cmd and nothing else -- no driver, no
+	 * ABI profile, no size -- so a row that is allowed is allowed on every
+	 * driver. The only size rule is a global 1 MiB inner-params cap, which a
+	 * ZBC struct of a few dozen bytes cannot reach. If anyone ever makes the
+	 * gate driver-dependent, this block is where that should get caught. */
+	assert(nvkvm_ctrl_cmd_allowed(0x90960101u));  /* GET_ZBC_CLEAR_TABLE      */
+	assert(nvkvm_ctrl_cmd_allowed(0x90960102u));  /* SET_ZBC_COLOR_CLEAR      */
+	assert(nvkvm_ctrl_cmd_allowed(0x90960103u));  /* SET_ZBC_DEPTH_CLEAR      */
+	assert(nvkvm_ctrl_cmd_allowed(0x90960106u));  /* GET_ZBC_CLEAR_TABLE_SIZE */
+	assert(nvkvm_ctrl_cmd_allowed(0x90960107u));  /* SET_ZBC_STENCIL_CLEAR    */
+	printf("  ok   NV9096 ZBC family is consistently allowed (5 commands)\n");
+
+	/* ...and we did NOT open the class. Only the five audited rows above are
+	 * allowed; the rest of 0x9096 stays denied. A wildcard here would be a
+	 * much larger change than the bug called for. */
+	assert(!nvkvm_ctrl_cmd_allowed(0x90960104u));
+	assert(!nvkvm_ctrl_cmd_allowed(0x90960105u));
+	assert(!nvkvm_ctrl_cmd_allowed(0x90960108u));
+	assert(!nvkvm_ctrl_cmd_allowed(0x909601ffu));
+	assert(!nvkvm_ctrl_cmd_allowed(0x90960000u));
+	printf("  ok   the rest of the 0x9096 class stays denied (no wildcard)\n");
+
+	/* The gate is a pure function of the command id: same input, same answer,
+	 * every time. Nothing driver- or state-dependent may creep in. */
+	for (int rep = 0; rep < 3; rep++) {
+		assert(nvkvm_ctrl_cmd_allowed(0x90960102u));
+		assert(!nvkvm_ctrl_cmd_allowed(0x90960104u));
+	}
+	printf("  ok   gate answers are stable across repeated calls\n");
+
 	printf("test_ctrl_gate: PASS\n");
 	return 0;
 }
