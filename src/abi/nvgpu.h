@@ -114,6 +114,12 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define HOPPER_A                            0x0000CB97U
 /* DMA copy */
 #define PASCAL_DMA_COPY_A                   0x0000C0B5U
+#define PASCAL_DMA_COPY_B                   0x0000C1B5U  /* missed in the first pass: OGKM
+ * clc1b5.h. AMPERE_DMA_COPY_A/_B already showed nvkvm carries both an _A
+ * and _B copy-engine class per generation; Pascal is no different.
+ * MEASURED: 12x DENY alloc class 0x0000c1b5 on a P4000 once 0xc06f
+ * (PASCAL_CHANNEL_GPFIFO_A) was allowlisted -- the channel alloc passed
+ * the gate and libnvidia-ml/libcuda moved on to the copy engine. */
 #define VOLTA_DMA_COPY_A                    0x0000C3B5U
 #define TURING_DMA_COPY_A                   0x0000C5B5U
 #define AMPERE_DMA_COPY_A                   0x0000C6B5U

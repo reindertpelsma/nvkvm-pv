@@ -2553,6 +2553,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 				break;
 			case PASCAL_DMA_COPY_A:
+			case PASCAL_DMA_COPY_B:
 			case VOLTA_DMA_COPY_A:
 			case TURING_DMA_COPY_A:
 			case AMPERE_DMA_COPY_A:
@@ -2563,8 +2564,8 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				/* 0xc9b5/0xcab5: both Blackwell copy-engine classes take
 				 * NVB0B5_ALLOCATION_PARAMETERS like every other _DMA_COPY_.
 				 * _A's id was wrong (0xcbb5) until #101, so neither real
-				 * class had an entry here. 0xc0b5 (PASCAL_DMA_COPY_A)
-				 * joins on the same reasoning. */
+				 * class had an entry here. 0xc0b5/0xc1b5 (PASCAL_DMA_COPY_A/_B)
+				 * join on the same reasoning. */
 				ap_size = sizeof(struct nvb0b5_allocation_parameters);
 				break;
 			case GT200_DEBUGGER:
@@ -2717,6 +2718,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 					break;
 				case PASCAL_DMA_COPY_A:
+				case PASCAL_DMA_COPY_B:
 				case VOLTA_DMA_COPY_A:
 				case TURING_DMA_COPY_A:
 				case AMPERE_DMA_COPY_A:
@@ -2725,7 +2727,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case BLACKWELL_DMA_COPY_A:
 				case BLACKWELL_DMA_COPY_B:
 					/* 0xc9b5/0xcab5: see the nvos21 switch above (#101).
-					 * 0xc0b5 (PASCAL_DMA_COPY_A) joins on the same
+					 * 0xc0b5/0xc1b5 (PASCAL_DMA_COPY_A/_B) join on the same
 					 * reasoning. */
 					ap_size = sizeof(struct nvb0b5_allocation_parameters);
 					break;

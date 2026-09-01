@@ -102,6 +102,7 @@ static const uint32_t nvkvm_alloc_class_allowlist[] = {
 	0x0000c097u,  /* PASCAL_A */
 	0x0000c0b5u,  /* PASCAL_DMA_COPY_A */
 	0x0000c0c0u,  /* PASCAL_COMPUTE_A */
+	0x0000c1b5u,  /* PASCAL_DMA_COPY_B -- MEASURED 12x DENY once 0xc06f was fixed */
 	0x0000c197u,  /* PASCAL_B */
 	0x0000c1c0u,  /* PASCAL_COMPUTE_B */
 	0x0000c361u,
