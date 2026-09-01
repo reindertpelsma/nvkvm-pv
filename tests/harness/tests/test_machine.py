@@ -3,7 +3,9 @@ without a GPU -- everything here uses `echo`, `cat`, `sleep`, `python3`."""
 
 import asyncio
 import sys
+import tempfile
 import time
+from pathlib import Path
 
 import pytest
 
@@ -141,3 +143,18 @@ def test_scratch_is_distinct_from_needs_cache(tmp_path):
     machine = ThisMachine(cache_dir=tmp_path / "cache")
     scratch_dir = machine.scratch()
     assert scratch_dir != (tmp_path / "cache")
+
+
+def test_defaults_never_touch_a_directory_the_caller_did_not_name():
+    """ThisMachine is what someone with their own GPU runs directly on a
+    machine they care about (see its class docstring) -- with no cache_dir/
+    scratch_root given at all, both of its writable locations must land
+    under the system temp dir, never under the current working directory,
+    the repo tree, or anything else the caller didn't explicitly hand it."""
+    tmp_root = Path(tempfile.gettempdir()).resolve()
+    machine = ThisMachine()
+    assert machine.scratch().resolve().is_relative_to(tmp_root)
+    # need()'s cache_dir is private, but its default is set at __init__ time
+    # and never touched until a test actually calls need() -- assert the
+    # computed default path directly rather than forcing a real fetch.
+    assert machine._cache_dir.resolve().is_relative_to(tmp_root)

@@ -277,7 +277,32 @@ class ThisMachine(Machine):
     wrapping) Machine implementation in this slice; SSHMachine/ContainerMachine
     can implement the same two interfaces later without touching call sites.
     ChrootMachine/VMMachine (chroot_machine.py) wrap a base Machine -- often
-    this one -- rather than reimplementing local process spawning."""
+    this one -- rather than reimplementing local process spawning.
+
+    THIS IS ALSO WHAT SOMEONE WITH THEIR OWN GPU RUNS DIRECTLY -- no SSH,
+    no container, no rented/throwaway box on the other end. run_tests.py
+    instantiates exactly this class with no wrapping and no baseline, so
+    every tier already works unchanged for that person: `need()` and
+    `scratch()` below are the only two things this class does without being
+    explicitly told to by a test, and neither is destructive to a machine
+    somebody cares about.
+      - `need()` never silently installs anything SYSTEM-WIDE: it writes
+        fetched/copied bytes only into `cache_dir` (a plain directory, not
+        a package manager, not `/usr`, not anything requiring root), and
+        only when a test actually calls it. There is no "verify presence,
+        else give up" mode here because unlike a rented box there is
+        nothing else this harness could install FROM -- an Item is either
+        already the right bytes at the cache path, or it gets fetched into
+        that same isolated cache path. Compare `preflight.py`, which is the
+        actual gate on anything system-wide (`apt-get install`, only ever
+        behind an explicit `--install` the caller passed) -- that module,
+        not this one, is where "never install without being asked" lives.
+      - `scratch()` is likewise a plain tempdir, never a path under the
+        caller's own tree.
+      - Nothing here ever mounts, chroots, or touches another machine's
+        filesystem -- that's ChrootMachine/VMMachine, which wrap a
+        ThisMachine (or an SSHMachine) rather than this class growing that
+        capability itself."""
 
     def __init__(self, *, cache_dir: Optional[Path] = None, scratch_root: Optional[Path] = None):
         self._cache_dir = Path(cache_dir) if cache_dir else Path(tempfile.gettempdir()) / "nvkvm-harness-cache"
