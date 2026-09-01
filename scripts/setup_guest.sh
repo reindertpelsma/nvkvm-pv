@@ -311,7 +311,13 @@ write_files:
       # not part of the driver, so a headless host legitimately has none).
       # That must not leave the unit in a failed state when compute is fine --
       # the warnings are in the journal either way.
-      ExecStart=/bin/bash -c 'if ls /opt/nvidia-host/libcuda.so.* >/dev/null 2>&1; then NVKVM_LINK_LIBS=1 bash /mnt/nvkvm/scripts/stage_guest_libs.sh /opt/nvidia-host; elif ls -d /mnt/nvkvm/host-libs-* >/dev/null 2>&1; then bash /mnt/nvkvm/scripts/stage_guest_libs.sh; fi || true'
+      # `|| true` used to be here, and it had to be: stage_guest_libs.sh exited 2
+      # both for an absent Wayland/GBM EGL library (which a headless host
+      # legitimately lacks) and for an absent libnvidia-ptxjitcompiler (which
+      # breaks CUDA outright).  One code, two meanings, so the only expressible
+      # policy was "ignore everything".  It now exits 3 for the CUDA-critical
+      # set, so tolerate 0 and 2 and let 3 fail the unit.
+      ExecStart=/bin/bash -c 'if ls /opt/nvidia-host/libcuda.so.* >/dev/null 2>&1; then NVKVM_LINK_LIBS=1 bash /mnt/nvkvm/scripts/stage_guest_libs.sh /opt/nvidia-host; elif ls -d /mnt/nvkvm/host-libs-* >/dev/null 2>&1; then bash /mnt/nvkvm/scripts/stage_guest_libs.sh; fi; rc=$?; if [ $rc -eq 3 ]; then echo "nvkvm-guest: CUDA-critical libraries did not stage; see stage_guest_libs output above" >&2; exit 3; fi; exit 0'
       [Install]
       WantedBy=multi-user.target
 

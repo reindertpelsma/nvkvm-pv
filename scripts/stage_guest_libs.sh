@@ -124,11 +124,31 @@ MISSING_LIBS=""
 # not mean a broken GPU stack, so it must not be reported as a missing library.
 MISSING_FILES=""
 STAGED_N=0
+# The CUDA-critical set.  These are the same four make_host_bundle.sh calls
+# REQUIRED, and the distinction matters to the CALLER: without them CUDA does
+# not work at all, whereas a missing Wayland/GBM EGL platform library only costs
+# a display path a headless host never had.  Both used to land in one bucket and
+# exit 2, so nvkvm-guest.service could only spell its tolerance as `|| true` --
+# which then swallowed the fatal case as well.  MEASURED 2026-09-01 on an
+# RTX 4060 Ti: libnvidia-ptxjitcompiler failed to stage, the service reported
+# success, and the first sign of trouble was cuda_ptx_jit failing
+# CUDA_ERROR_JIT_COMPILER_NOT_FOUND with three more CUDA checks cascading to
+# SKIP -- three drivers in a row, diagnosed only by reading validate.sh's own
+# per-check detail.
+is_critical_lib(){
+    case "$1" in
+        libcuda.so.*|libnvidia-ptxjitcompiler.so.*|libnvidia-nvvm.so.*|libnvidia-ml.so.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+CRITICAL_MISSING=""
+
 stage(){ # $1 basename-in-bundle  $2 destdir  [$3.. extra symlink names]
     local f="$1" dest="$2"; shift 2
     if [ ! -f "$GFXBUNDLE/$f" ]; then
         echo "stage_guest_libs: MISSING from bundle: $f  (-> $dest)" >&2
         MISSING_LIBS="$MISSING_LIBS $f"
+        is_critical_lib "$f" && CRITICAL_MISSING="$CRITICAL_MISSING $f"
         return 1
     fi
     if [ -n "${NVKVM_LINK_LIBS:-}" ]; then
@@ -566,6 +586,17 @@ if [ -n "$MISSING_FILES" ]; then
     # works without them and only the guest's own X session is affected.
     echo "stage_guest_libs: not installed from the repo share:" >&2
     for m in $MISSING_FILES; do echo "    $m" >&2; done
+fi
+if [ -n "$CRITICAL_MISSING" ]; then
+    # EXIT 3 == "CUDA IS BROKEN IN THIS GUEST".  Distinct from 2 so a caller can
+    # tolerate a cosmetic gap and still refuse to pretend this one is fine.
+    echo "stage_guest_libs: FATAL — CUDA-critical libraries missing from bundle:" >&2
+    for m in $CRITICAL_MISSING; do echo "    $m" >&2; done
+    echo "stage_guest_libs: CUDA will fail in this guest (expect CUDA_ERROR_JIT_COMPILER_NOT_FOUND" >&2
+    echo "stage_guest_libs: or CUDA_ERROR_SYSTEM_DRIVER_MISMATCH). This is not a display-only gap." >&2
+    [ -n "$MISSING_LIBS" ] && { echo "stage_guest_libs: all missing:" >&2
+                                for m in $MISSING_LIBS; do echo "    $m" >&2; done; }
+    exit 3
 fi
 if [ -n "$MISSING_LIBS" ]; then
     echo "stage_guest_libs: INCOMPLETE — missing from bundle:" >&2
