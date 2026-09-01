@@ -59,6 +59,41 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 /* Channel groups */
 #define KEPLER_CHANNEL_GROUP_A              0x0000A06CU
 /* GPFIFO channels */
+/* Pascal (pre-Turing, arch mapping "pascal": GP100/GP102/GP104/GP106/GP107/
+ * GP108, e.g. Quadro P4000).  Not in gVisor nvproxy (no pre-Turing classes
+ * there at all) so these were never in the allowlist -- QEMU's default-deny
+ * gate DENIED every one of them (nvkvm: DENY alloc class 0x0000c06f,
+ * MEASURED on a P4000, driver 575.51.03 preinstalled / 580.95.05 proprietary).
+ * Ids from open-gpu-kernel-modules (src/common/sdk/nvidia/inc/class/
+ * clc06f.h, clc097.h, clc197.h, clc0b5.h, clc0c0.h, clc1c0.h). Alloc-param
+ * shapes need no new structs: PASCAL_CHANNEL_GPFIFO_A takes the same
+ * NV_CHANNEL_ALLOC_PARAMS as every other *_CHANNEL_GPFIFO_* class below
+ * (chan_alloc_size), PASCAL_DMA_COPY_A takes NVB0B5_ALLOCATION_PARAMETERS
+ * like every other *_DMA_COPY_* class, and PASCAL_A/_B/_COMPUTE_A/_COMPUTE_B
+ * take NV_GR_ALLOCATION_PARAMETERS like every other graphics/compute class. */
+/* Maxwell (pre-Turing, arch mapping "maxwell": GM107/GM108 = MAXWELL_A, and
+ * GM200/GM204/GM206 = MAXWELL_B).  Same situation as Pascal below: absent from
+ * gVisor nvproxy, therefore never allowlisted, therefore refused by QEMU's
+ * default-deny gate before any guest-side code could matter.  Maxwell is the
+ * OLDEST generation nvkvm can reach at all -- Kepler's last driver is 470,
+ * below our 515 ABI floor, so this is the floor by arithmetic, not by effort.
+ * Ids from open-gpu-kernel-modules (clb06f.h, clb097.h, clb197.h, clb0b5.h,
+ * clb0c0.h, clb1c0.h).  Alloc-param shapes need no new structs, exactly as for
+ * Pascal.  Note there is NO MAXWELL_DMA_COPY_B: Pascal is the only generation
+ * that ships an _A and a _B copy engine (GP100 vs GP10x dies).
+ * UNMEASURED at the time of writing -- unlike the Pascal ids below, no DENY
+ * line has yet confirmed which of these a GM107 actually asks for.  The run
+ * that first exercises this must be read for residual "DENY alloc class"
+ * lines, which is exactly how PASCAL_DMA_COPY_B was caught after being
+ * missed in the first pass. */
+#define MAXWELL_CHANNEL_GPFIFO_A            0x0000B06FU
+#define MAXWELL_A                           0x0000B097U
+#define MAXWELL_B                           0x0000B197U
+#define MAXWELL_DMA_COPY_A                  0x0000B0B5U
+#define MAXWELL_COMPUTE_A                   0x0000B0C0U
+#define MAXWELL_COMPUTE_B                   0x0000B1C0U
+
+#define PASCAL_CHANNEL_GPFIFO_A             0x0000C06FU
 #define TURING_CHANNEL_GPFIFO_A             0x0000C46FU
 #define AMPERE_CHANNEL_GPFIFO_A             0x0000C56FU
 #define HOPPER_CHANNEL_GPFIFO_A             0x0000C86FU
@@ -79,6 +114,14 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define BLACKWELL_CHANNEL_GPFIFO_B          0x0000CA6FU
 /* Compute objects (hClass verified against the 575 open-driver SDK class
  * headers; the prior 0x*B1 codes were bogus). Use NV_GR_ALLOCATION_PARAMETERS. */
+#define PASCAL_COMPUTE_A                    0x0000C0C0U
+#define PASCAL_COMPUTE_B                    0x0000C1C0U
+/* VOLTA_CHANNEL_GPFIFO_A.  The other four Volta classes were already defined
+ * here and already had size-table entries, but this one was absent entirely --
+ * so Volta could never have worked: the channel alloc is the FIRST thing
+ * libcuda asks for, and the QEMU gate would refuse it exactly as it refused
+ * PASCAL_CHANNEL_GPFIFO_A (0xC06F) with "DENY alloc class". OGKM clc36f.h. */
+#define VOLTA_CHANNEL_GPFIFO_A              0x0000C36FU
 #define VOLTA_COMPUTE_A                     0x0000C3C0U
 #define VOLTA_COMPUTE_B                     0x0000C4C0U
 #define TURING_COMPUTE_A                    0x0000C5C0U
@@ -89,6 +132,8 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define BLACKWELL_COMPUTE_A                 0x0000CDC0U
 #define BLACKWELL_COMPUTE_B                 0x0000CEC0U
 /* Graphics/3D objects (same NV_GR_ALLOCATION_PARAMETERS) */
+#define PASCAL_A                            0x0000C097U
+#define PASCAL_B                            0x0000C197U
 #define VOLTA_A                             0x0000C397U
 #define TURING_A                            0x0000C597U
 #define AMPERE_A                            0x0000C697U
@@ -96,6 +141,13 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
 #define ADA_A                               0x0000C997U
 #define HOPPER_A                            0x0000CB97U
 /* DMA copy */
+#define PASCAL_DMA_COPY_A                   0x0000C0B5U
+#define PASCAL_DMA_COPY_B                   0x0000C1B5U  /* missed in the first pass: OGKM
+ * clc1b5.h. AMPERE_DMA_COPY_A/_B already showed nvkvm carries both an _A
+ * and _B copy-engine class per generation; Pascal is no different.
+ * MEASURED: 12x DENY alloc class 0x0000c1b5 on a P4000 once 0xc06f
+ * (PASCAL_CHANNEL_GPFIFO_A) was allowlisted -- the channel alloc passed
+ * the gate and libnvidia-ml/libcuda moved on to the copy engine. */
 #define VOLTA_DMA_COPY_A                    0x0000C3B5U
 #define TURING_DMA_COPY_A                   0x0000C5B5U
 #define AMPERE_DMA_COPY_A                   0x0000C6B5U

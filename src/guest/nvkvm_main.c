@@ -2519,6 +2519,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case FERMI_CONTEXT_SHARE_A:
 				ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
 				break;
+			case MAXWELL_CHANNEL_GPFIFO_A:
+			case PASCAL_CHANNEL_GPFIFO_A:
+			case VOLTA_CHANNEL_GPFIFO_A:
 			case TURING_CHANNEL_GPFIFO_A:
 			case AMPERE_CHANNEL_GPFIFO_A:
 			case HOPPER_CHANNEL_GPFIFO_A:
@@ -2530,7 +2533,15 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				 * alloc_parms_size=0 as the last step of cuCtxCreate;
 				 * without these cases we copy 0 bytes -> host RM returns
 				 * NV_ERR_INVALID_ARGUMENT (0x1f) and cuCtxCreate fails
-				 * CUDA_ERROR_INVALID_VALUE (1) (#101). */
+				 * CUDA_ERROR_INVALID_VALUE (1) (#101).
+				 * 0xc06f (PASCAL_CHANNEL_GPFIFO_A) is unmeasured beyond the
+				 * QEMU DENY -- it never got far enough to reach this guest
+				 * code path yet (the allowlist gate is upstream, in QEMU,
+				 * not here). Joins this group on the same NV_CHANNEL_
+				 * ALLOC_PARAMS reasoning; if chan_alloc_size's V570 +8
+				 * profile split (#81) does not cover Pascal's 515..580
+				 * driver window correctly, this is the likely next
+				 * failure (see KNOWN RISK in the sweep notes). */
 				ap_size = nvkvm_prof()->chan_alloc_size;    /* #81: base / V570 +8 */
 				break;
 			case NV01_EVENT_OS_EVENT:
@@ -2543,6 +2554,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 			case NV_MEMORY_MAPPER:
 				ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 				break;
+			case MAXWELL_DMA_COPY_A:
+			case PASCAL_DMA_COPY_A:
+			case PASCAL_DMA_COPY_B:
 			case VOLTA_DMA_COPY_A:
 			case TURING_DMA_COPY_A:
 			case AMPERE_DMA_COPY_A:
@@ -2553,17 +2567,22 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				/* 0xc9b5/0xcab5: both Blackwell copy-engine classes take
 				 * NVB0B5_ALLOCATION_PARAMETERS like every other _DMA_COPY_.
 				 * _A's id was wrong (0xcbb5) until #101, so neither real
-				 * class had an entry here. */
+				 * class had an entry here. 0xc0b5/0xc1b5 (PASCAL_DMA_COPY_A/_B)
+				 * join on the same reasoning. */
 				ap_size = sizeof(struct nvb0b5_allocation_parameters);
 				break;
 			case GT200_DEBUGGER:
 				ap_size = sizeof(struct nv83de_alloc_parameters);
 				break;
+			case MAXWELL_COMPUTE_A: case MAXWELL_COMPUTE_B:
+			case MAXWELL_A: case MAXWELL_B:
+			case PASCAL_COMPUTE_A: case PASCAL_COMPUTE_B:
 			case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
 			case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
 			case AMPERE_COMPUTE_B: case ADA_COMPUTE_A:
 			case HOPPER_COMPUTE_A: case BLACKWELL_COMPUTE_A:
 			case BLACKWELL_COMPUTE_B:
+			case PASCAL_A: case PASCAL_B:
 			case VOLTA_A: case TURING_A: case AMPERE_A:
 			case AMPERE_B: case ADA_A: case HOPPER_A:
 				ap_size = sizeof(struct nv_gr_allocation_parameters);
@@ -2678,6 +2697,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case FERMI_CONTEXT_SHARE_A:
 					ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
 					break;
+				case MAXWELL_CHANNEL_GPFIFO_A:
+				case PASCAL_CHANNEL_GPFIFO_A:
+			case VOLTA_CHANNEL_GPFIFO_A:
 				case TURING_CHANNEL_GPFIFO_A:
 				case AMPERE_CHANNEL_GPFIFO_A:
 				case HOPPER_CHANNEL_GPFIFO_A:
@@ -2687,7 +2709,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					 * older GPFIFO classes. This is the path libcuda
 					 * actually takes on Blackwell (nvos64, size=0) and the
 					 * one whose absence broke cuCtxCreate (#101); see the
-					 * nvos21 switch above. */
+					 * nvos21 switch above. 0xc06f (PASCAL_CHANNEL_GPFIFO_A)
+					 * joins on the same reasoning; see the nvos21 switch's
+					 * comment for the ABI-profile risk on this one. */
 					ap_size = nvkvm_prof()->chan_alloc_size;    /* #81 */
 					break;
 				case NV01_EVENT_OS_EVENT:
@@ -2700,6 +2724,9 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case NV_MEMORY_MAPPER:
 					ap_size = NV_MEMORY_MAPPER_ALLOC_PARAMS_SIZE;
 					break;
+				case MAXWELL_DMA_COPY_A:
+				case PASCAL_DMA_COPY_A:
+				case PASCAL_DMA_COPY_B:
 				case VOLTA_DMA_COPY_A:
 				case TURING_DMA_COPY_A:
 				case AMPERE_DMA_COPY_A:
@@ -2707,17 +2734,23 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				case HOPPER_DMA_COPY_A:
 				case BLACKWELL_DMA_COPY_A:
 				case BLACKWELL_DMA_COPY_B:
-					/* 0xc9b5/0xcab5: see the nvos21 switch above (#101). */
+					/* 0xc9b5/0xcab5: see the nvos21 switch above (#101).
+					 * 0xc0b5/0xc1b5 (PASCAL_DMA_COPY_A/_B) join on the same
+					 * reasoning. */
 					ap_size = sizeof(struct nvb0b5_allocation_parameters);
 					break;
 				case GT200_DEBUGGER:
 					ap_size = sizeof(struct nv83de_alloc_parameters);
 					break;
+				case MAXWELL_COMPUTE_A: case MAXWELL_COMPUTE_B:
+				case MAXWELL_A: case MAXWELL_B:
+				case PASCAL_COMPUTE_A: case PASCAL_COMPUTE_B:
 				case VOLTA_COMPUTE_A: case VOLTA_COMPUTE_B:
 				case TURING_COMPUTE_A: case AMPERE_COMPUTE_A:
 				case AMPERE_COMPUTE_B: case ADA_COMPUTE_A:
 				case HOPPER_COMPUTE_A: case BLACKWELL_COMPUTE_A:
 				case BLACKWELL_COMPUTE_B:
+				case PASCAL_A: case PASCAL_B:
 				case VOLTA_A: case TURING_A: case AMPERE_A:
 				case AMPERE_B: case ADA_A: case HOPPER_A:
 					ap_size = sizeof(struct nv_gr_allocation_parameters);

@@ -476,6 +476,18 @@ emit_probe() {   # <name> <source> <ldflags...>
 # finish.  It also cannot be silenced by --allow-skip and it moves the exit
 # code, which is what stops a hang being read as a pass.
 PROBE_TIMEOUT="${NVKVM_PROBE_TIMEOUT:-300}"
+# Shell-level checks need bounding too.  MEASURED 2026-09-01 on a Quadro P4000:
+# with run_probe() bounded, a control run STILL ran 40 minutes and produced no
+# verdict -- so the hang was never in a probe.  validate.sh had exactly ONE
+# bounded call site before this (the registration invariants); every bring-up
+# check, every compile and every nvidia-smi call was unbounded.
+#
+# nvidia-smi against a GPU the loaded driver cannot drive is a textbook
+# indefinite block, and it runs BEFORE any probe -- which is why bounding the
+# probes alone changed nothing.  sh_bounded() is for external commands whose
+# runtime is not ours to trust.
+SHELL_TIMEOUT="${NVKVM_SHELL_TIMEOUT:-60}"
+sh_bounded() { timeout --kill-after=5 "$SHELL_TIMEOUT" "$@"; }
 PROBE_TIMED_OUT=""
 
 run_probe() {
@@ -574,14 +586,20 @@ if [ -z "$NVSMI" ]; then
     record nvidia_smi_driver SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
     record nvidia_smi_cuda   SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
 else
-    SMI_RAW="$("$NVSMI" 2>&1)"; SMI_RC=$?
-    if [ $SMI_RC -ne 0 ]; then
+    SMI_RAW="$(sh_bounded "$NVSMI" 2>&1)"; SMI_RC=$?
+    # 124/137 == nvidia-smi never returned.  That is NOT "no GPU" and must not
+    # be recorded as a GPU verdict; it is the harness being unable to ask.
+    if [ $SMI_RC -eq 124 ] || [ $SMI_RC -eq 137 ]; then
+        record nvidia_smi_gpu    UNTESTED "nvidia-smi did not return within ${SHELL_TIMEOUT}s -- it HUNG, so nothing here is a GPU result"
+        record nvidia_smi_driver UNTESTED "nvidia-smi hung"
+        record nvidia_smi_cuda   UNTESTED "nvidia-smi hung"
+    elif [ $SMI_RC -ne 0 ]; then
         record nvidia_smi_gpu    FAIL "nvidia-smi exit=$SMI_RC: $(echo "$SMI_RAW" | head -3 | tr '\n' ' ')"
         record nvidia_smi_driver SKIP "nvidia-smi failed"
         record nvidia_smi_cuda   SKIP "nvidia-smi failed"
     else
-        SMI_GPU="$("$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
-        SMI_DRV="$("$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
+        SMI_GPU="$(sh_bounded "$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+        SMI_DRV="$(sh_bounded "$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
         SMI_CUDA_FIELD="$(smi_cuda_field "$SMI_RAW")"
         SMI_CUDA="${SMI_CUDA_FIELD#value }"
         [ "$SMI_CUDA_FIELD" = "$SMI_CUDA" ] && SMI_CUDA=""

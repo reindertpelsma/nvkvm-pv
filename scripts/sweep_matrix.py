@@ -182,10 +182,38 @@ DRIVER_ALTS = {
 # is genuinely narrower here than the arch supports -- 610.43.02 is still
 # UNTESTED on Blackwell (the second box was unrecoverable before it ran).
 ARCH_FLOOR = {
+    # Pascal's floor is 515 -- the first OGKM release -- NOT the oldest driver
+    # that can drive the silicon.  Below 515 the ABI boundaries are unmapped, so
+    # a result there would be uninterpretable rather than merely old.  The arch
+    # axis and the driver-version axis are independent: adding pre-Turing
+    # hardware never means descending into the unmapped range.
+    #
+    # Pascal is also CEILINGED at 580 (see PASCAL_MAX below): NVIDIA has
+    # confirmed 580 is the last branch supporting Maxwell/Pascal/Volta.  So its
+    # window is 515..580 -- seven of the eight profiles, and frozen, which means
+    # it cannot drift once mapped.
+    "pascal": 515,
+    "volta": 515,
     "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 580,
 }
 
+# Architectures whose driver support ENDS at a known branch.  Absent = no ceiling.
+ARCH_CEILING = {
+    # 580 is the last branch supporting Maxwell/Pascal/Volta.
+    "pascal": 580,
+    "volta": 580,
+}
+
 ARCH_OF = [   # substring -> architecture, FIRST MATCH WINS: specific before generic
+    # Pascal.  "Quadro P" must come BEFORE the generic "Quadro RTX" style rows
+    # and must not be spelled "Quadro P4000" only -- P2000/P5000/P6000 are the
+    # same GP10x silicon.  nvkvm does not support these yet; they are mapped so
+    # the sweep can MEASURE the failure rather than refuse to rent the card.
+    # Volta.  "Titan V" before the generic TITAN X row below, and V100 covers
+    # both PCIe and SXM2 spellings.
+    ("V100", "volta"), ("Titan V", "volta"), ("TITAN V", "volta"), ("GV100", "volta"),
+    ("Quadro P", "pascal"), ("GTX 10", "pascal"), ("TITAN X", "pascal"),
+    ("P100", "pascal"), ("P40", "pascal"),
     ("RTX 6000 Ada", "ada"), ("RTX 5000 Ada", "ada"), ("RTX 4500 Ada", "ada"),
     ("RTX 4000 Ada", "ada"), ("RTX 2000 Ada", "ada"),
     ("A100", "ampere"), ("H100", "hopper"), ("H200", "hopper"),
@@ -221,9 +249,17 @@ def drivers_for(gpu_name, requested):
     """
     arch = arch_of(gpu_name)
     floor = ARCH_FLOOR.get(arch, 0)
+    # A ceiling is not the same kind of exclusion as a floor.  Below the floor
+    # the driver predates the silicon and reports no devices -- nothing to say.
+    # ABOVE a ceiling the driver has DROPPED the silicon, which is equally not an
+    # nvkvm result, and running it anyway would bank an expected refusal as a
+    # failure.  Absent from ARCH_CEILING means no ceiling.
+    ceiling = ARCH_CEILING.get(arch)
     out = []
     for ver, prof, why in DRIVER_MATRIX:
         if requested and ver not in requested:
+            continue
+        if ceiling is not None and int(ver.split(".")[0]) > ceiling:
             continue
         if int(ver.split(".")[0]) < floor:
             continue

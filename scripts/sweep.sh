@@ -145,6 +145,11 @@ KNOWN_BAD_FILE="$REPO/scripts/sweep-known-bad-machines.txt"
 
 ARCHES=""
 ALL_ARCHES=0
+# Renting a pre-Turing card is normally pointless: nvkvm does not support it, so
+# the row is a documented negative and the money buys nothing.  It IS worth it
+# when the goal is to find out WHY it fails.  Opt-in, never default, and such a
+# row must never be counted as coverage.
+INCLUDE_UNSUPPORTED=0
 # --ssh: run against a box we did not rent.  Unlocks the axes vast cannot reach
 # (datacenter silicon, an old-kernel host for the 515/525 profiles, your own
 # hardware) and lets a THIRD PARTY run this identical harness and send back a
@@ -310,6 +315,7 @@ usage() { sed -n '2,95p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --arch)         ARCHES="$2"; shift 2 ;;
+        --include-unsupported) INCLUDE_UNSUPPORTED=1; shift ;;
         --ssh)          MANUAL_SSH="$2"; shift 2 ;;
         --allow-driver-install) ALLOW_DRIVER_INSTALL=1; shift ;;
         --all-arches)   ALL_ARCHES=1; shift ;;
@@ -955,12 +961,37 @@ pick_offer() {
     # discarded and the script reads its own source.  That silently reported
     # "no rentable offer" for every architecture on a market full of them.
     offers_json="$(mktemp)"
-    vj search offers 'vms_enabled=true num_gpus=1 rentable=true' -o dph >"$offers_json"
+    # ASK BROADLY, FILTER LOCALLY.  This used to pass `vms_enabled=true` to the
+    # server, and vast's server-side filter DROPS OFFERS WHOSE OWN JSON SAYS
+    # vms_enabled: True.  MEASURED 2026-09-01, same moment, same account:
+    #
+    #   vms_enabled=true num_gpus=1 rentable=true ->  47 offers,  0 V100
+    #           num_gpus=1 rentable=true          -> 572 offers, 10 V100,
+    #                                                1 of them vms_enabled=True
+    #
+    # So the sweep has been searching a market roughly twelve times smaller than
+    # the real one, for EVERY architecture, and the offers it could not see were
+    # invisible rather than reported -- no warning, just "no rentable KVM offer".
+    # That is how "zero Volta with KVM" and "zero datacenter with KVM" were
+    # concluded and written down; both were artifacts of this filter, not facts
+    # about the market.
+    #
+    # The field is trustworthy; the server-side filter over it is not.  So ask
+    # for everything rentable and apply vms_enabled ourselves, below.
+    vj search offers 'num_gpus=1 rentable=true' -o dph --limit 3000 >"$offers_json"
     python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" \
              "$MAX_STORAGE_PER_GB_MONTH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" \
-             "$EST_DOWN_GB_PER_BOX" "$DISK" <<'PY'
+             "$EST_DOWN_GB_PER_BOX" "$DISK" "$INCLUDE_UNSUPPORTED" <<'PY'
 import json, sys, os, importlib.util
 repo, want_arch, max_dph, gpu_filter, tried, kbfile, offers_path = sys.argv[1:8]
+# APPENDED LAST, and read from the end.  This flag originally went in at
+# argv[8], which silently shifted max_stor_gb_mo/max_down_tb/max_up_tb/
+# est_down_gb/disk_gb -- the caps read from sys.argv[8:13] on the next line --
+# by one.  max_stor_gb_mo became 0.0, so "storage_cost > 0" rejected EVERY
+# offer on the marketplace and the sweep reported "no rentable KVM offer" for
+# every architecture.  bash -n was clean and the new flag's own path worked;
+# only a control run against main caught it.  Positional argv is why.
+include_unsupported = len(sys.argv) > 13 and sys.argv[13] == "1"
 max_stor_gb_mo, max_down_tb, max_up_tb, est_down_gb, disk_gb = (float(x) for x in sys.argv[8:13])
 spec = importlib.util.spec_from_file_location(
     "sweep_matrix", os.path.join(repo, "scripts", "sweep_matrix.py"))
@@ -983,7 +1014,10 @@ except Exception:
 cands = []
 for o in offers:
     gpu = o.get("gpu_name") or ""
-    if m.is_unsupported(gpu):
+    # vms_enabled applied HERE, not server-side -- see the note on the query above.
+    if not o.get("vms_enabled"):
+        continue
+    if m.is_unsupported(gpu) and not include_unsupported:
         continue          # pre-Turing: a documented negative, never a coverage slot
     if gpu_filter and gpu_filter.upper() not in gpu.upper():
         continue
@@ -1180,8 +1214,17 @@ if d.get("ssh_host") and d.get("ssh_port"):
 DEADCHECK_HASH=""
 DEADCHECK_WHEN=0
 box_is_dead() {
-    local id="$1" status="$2" logtxt h now
+    local id="$1" status="$2" logtxt h now cur
     [ "$status" = "created" ] || { DEADCHECK_HASH=""; return 1; }
+    # MEASURED 2026-09-01 on machine 55691 (instance 49452150): actual_status
+    # stayed "created" past 7 minutes while cur_state was already "running"
+    # and ssh answered fine once sshd finished starting -- actual_status can
+    # lag the box's real state indefinitely on some hosts. cur_state is a
+    # second, independent field vast's API already returns; a box that is
+    # cur_state=running cannot be the dead-VM signature this function exists
+    # to catch (no domain ever started), whatever actual_status says.
+    cur="$(instance_field "$id" cur_state)"
+    [ "$cur" = "running" ] && { DEADCHECK_HASH=""; return 1; }
     logtxt="$(timeout 120 vastai logs "$id" --tail 40 2>/dev/null)"
     printf '%s' "$logtxt" | grep -q "Domain not found: no domain with matching name" \
         || { DEADCHECK_HASH=""; return 1; }
@@ -1198,12 +1241,13 @@ box_is_dead() {
 # Returns 0 with CUR_HOST/CUR_PORT set, 1 for "dead machine -- blacklist and
 # re-rent elsewhere", 2 for "timed out or stopped".
 wait_for_box() {
-    local id="$1" deadline status host port out last_status="" hb=""
+    local id="$1" deadline status cur_state host port out last_status="" hb=""
     deadline=$(( $(date +%s) + WAIT_BUDGET ))
     DEADCHECK_HASH=""; DEADCHECK_WHEN=0
     while [ "$(date +%s)" -lt "$deadline" ]; do
         stop_requested && return 2
         status="$(instance_field "$id" actual_status)"
+        cur_state="$(instance_field "$id" cur_state)"
         if [ "$status" != "$last_status" ]; then
             info "  instance $id: actual_status=$status"
             last_status="$status"
@@ -1214,7 +1258,12 @@ wait_for_box() {
             info "  instance $id: still '$status' -- $(( (deadline - $(date +%s)) / 60 ))m of patience left (this is normal; VM images take ~30m)"
         fi
 
-        if [ "$status" = "running" ]; then
+        # MEASURED 2026-09-01 (instance 49452150, machine 55691): actual_status
+        # can sit at "created" indefinitely while cur_state is already "running"
+        # and sshd is reachable -- gating the ssh attempt on actual_status alone
+        # means a genuinely healthy box is never even tried. Try ssh on EITHER
+        # signal saying running.
+        if [ "$status" = "running" ] || [ "$cur_state" = "running" ]; then
             while read -r host port; do
                 [ -z "$host" ] && continue
                 # -n: this loop's stdin is the endpoint list; ssh must not eat it.
