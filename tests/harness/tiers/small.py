@@ -14,11 +14,19 @@ overall exit code (0/1/2/3) is not re-derived here: this tier's
 Report.exit_code() is computed the normal way, from the individual per-check
 statuses.
 
-Every check becomes a DEGENERATE Comparison (baseline=None): validate.sh runs
-entirely inside one guest by design ("Run this INSIDE the guest VM" -- its
-own header), so there is no second side to compare against here, and most of
-its checks (device identity, byte-exact correctness) have no ratio-worthy
-number anyway. See result.py's module docstring for what "degenerate" means.
+Every check becomes a DEGENERATE Comparison (baseline=None): validate.sh's
+own checks are device identity and byte-exact correctness, not ratio-worthy
+numbers, so there is nothing here a host-vs-guest ratio could mean. See
+result.py's module docstring for what "degenerate" means.
+
+`run()` still accepts an optional `baseline` -- run_tests.py's CLI passes
+whatever `--baseline` it was given to every tier uniformly -- but this tier
+NEVER runs validate.sh against it and NEVER produces a ratio: instead, if a
+baseline was given, one explicit `small_tier:comparison_support` Comparison
+(SKIP, with a reason) says so up front. That is requirement #2 of this
+tier's own design brief, verbatim: a tier that structurally cannot compare
+must say so explicitly, never quietly report a single-sided number as if
+the baseline had simply been forgotten.
 """
 
 from __future__ import annotations
@@ -46,17 +54,42 @@ _STATUS_MAP = {
 }
 
 
-def _single(name: str, status: Status, detail: str, duration_s: Optional[float] = None) -> Comparison:
-    obs = Observation(status=status, detail=detail, duration_s=duration_s, label="this machine")
+def _single(name: str, status: Status, detail: str, duration_s: Optional[float] = None, label: str = "this machine") -> Comparison:
+    obs = Observation(status=status, detail=detail, duration_s=duration_s, label=label)
     return Comparison(name=name, tier="small", target=obs)
 
 
-async def run(machine: Machine, *, timeout: Optional[float] = None, extra_args: Optional[list] = None) -> Report:
+async def run(
+    machine: Machine,
+    *,
+    timeout: Optional[float] = None,
+    extra_args: Optional[list] = None,
+    baseline: Optional[Machine] = None,
+    target_label: str = "this machine",
+    baseline_label: str = "baseline",
+) -> Report:
     report = Report(tier="small")
     bound = timeout if timeout is not None else DEFAULT_TIMEOUT
 
+    if baseline is not None:
+        # Say so up front, loudly, rather than silently running only
+        # against `machine` and leaving a reader to wonder whether the
+        # baseline was ignored by accident. SKIP (never FAIL/UNTESTED,
+        # never moves the exit code) -- this is a structural property of
+        # the tier, not a result about either machine.
+        report.add(
+            _single(
+                "small_tier:comparison_support",
+                Status.SKIP,
+                f"small tier (tests/validate.sh) checks are device-identity/correctness, not "
+                f"ratio-worthy -- a baseline ({baseline_label}) was given but this tier produces "
+                f"no host-vs-guest comparison; every check below runs against {target_label} only",
+                label=target_label,
+            )
+        )
+
     if not VALIDATE_SH.exists():
-        report.add(_single("small_tier", Status.UNTESTED, f"tests/validate.sh not found at {VALIDATE_SH} -- harness/repo layout mismatch"))
+        report.add(_single("small_tier", Status.UNTESTED, f"tests/validate.sh not found at {VALIDATE_SH} -- harness/repo layout mismatch", label=target_label))
         report.finish()
         return report
 
@@ -77,6 +110,7 @@ async def run(machine: Machine, *, timeout: Optional[float] = None, extra_args: 
                 Status.UNTESTED,
                 f"tests/validate.sh did not finish within {bound:.0f}s and was killed",
                 duration_s=time.monotonic() - t0,
+                label=target_label,
             )
         )
         report.finish()
@@ -91,6 +125,7 @@ async def run(machine: Machine, *, timeout: Optional[float] = None, extra_args: 
                 Status.UNTESTED,
                 f"tests/validate.sh exited {rc} without producing --json output ({json_out}); stderr tail: {stderr_tail!r}",
                 duration_s=duration,
+                label=target_label,
             )
         )
         report.finish()
@@ -105,6 +140,7 @@ async def run(machine: Machine, *, timeout: Optional[float] = None, extra_args: 
                 Status.UNTESTED,
                 f"tests/validate.sh's --json output at {json_out} was not parseable: {exc}",
                 duration_s=duration,
+                label=target_label,
             )
         )
         report.finish()
@@ -127,6 +163,7 @@ async def run(machine: Machine, *, timeout: Optional[float] = None, extra_args: 
                 Status.UNTESTED,
                 f"tests/validate.sh's JSON reported zero checks (exit {rc}) -- nothing was evaluated",
                 duration_s=duration,
+                label=target_label,
             )
         )
         report.finish()
@@ -141,10 +178,10 @@ async def run(machine: Machine, *, timeout: Optional[float] = None, extra_args: 
             # validate.sh's own vocabulary is closed; a status we don't
             # recognise means something is broken in the harness/parity
             # between the two, not a real result about the GPU.
-            report.add(_single(name, Status.UNTESTED, f"unrecognised status {raw_status!r} in validate.sh's JSON output"))
+            report.add(_single(name, Status.UNTESTED, f"unrecognised status {raw_status!r} in validate.sh's JSON output", label=target_label))
             continue
         detail = c.get("detail") or f"(validate.sh gave no detail for this {raw_status})"
-        report.add(_single(name, status, detail, duration_s=per_check))
+        report.add(_single(name, status, detail, duration_s=per_check, label=target_label))
 
     report.finish()
     return report
