@@ -340,8 +340,15 @@ blocks `CLONE_NEWUSER` through its default seccomp profile and its
 on a stock container `kernel.unprivileged_userns_clone` reads `1` and
 `user.max_user_namespaces` reads `55416` while `unshare -U` still fails. Use
 `auto` (which attempts the clone and finds out) or pin `uid+chroot`, and add
-`--cap-add=SETUID --cap-add=SETGID --cap-add=SYS_CHROOT` if your runtime has
-dropped them.
+`--cap-add=SETUID --cap-add=SETGID --cap-add=SETPCAP --cap-add=SYS_CHROOT`
+if your runtime has dropped them.
+
+**All four, including `SETPCAP`.** This list previously omitted it and did not
+match [`docker-compose.yml`](../../docker-compose.yml), which has had all four
+all along. `SETPCAP` is what lets the isolate drop its capability **bounding
+set** before the uid drop; without it that drop silently does not happen and
+you get a weaker boundary than the one documented, with no error to tell you.
+[`SECURITY.md`](../../SECURITY.md) lists the same four.
 
 `uid+chroot` is a **materially weaker** boundary than `namespace`. Read
 [The isolate model → Isolation modes](../internal/isolate-model.md#isolation-modes)
