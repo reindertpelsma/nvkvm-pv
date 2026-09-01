@@ -29,11 +29,15 @@ DtoD has no equivalent row in that reference (H2D/D2H are the two legs it
 measures); this tier applies the same >=0.80 threshold to it as a reasonable
 default, not a validated number -- flagged in the band's `note`.
 
-THIS SLICE has only ThisMachine, so every Comparison here is degenerate
-(baseline=None): there is no second machine yet to hold the "host" side of a
-host-vs-guest ratio. The Comparison/ToleranceBand machinery is real and
-tested; wiring a real baseline (ChrootMachine / VMMachine) in is future work
-tracked in the harness README, not papered over here.
+`run()`/`gemm_comparison()`/`bandwidth_comparisons()` all take an optional
+`baseline` Machine, the same shape as tiers/realapps.py: give one (e.g.
+`baseline=ChrootMachine(base)` alongside `machine=VMMachine(base)`, both
+wrapping the same physical box) and every Comparison here carries a real
+target-vs-baseline ratio, gated by the bands above, with each Observation
+labelled by which machine produced it (`target_label`/`baseline_label`).
+`baseline=None` (the default) keeps the old degenerate single-sided
+behaviour -- run_tests.py's own default invocation, no --baseline given,
+exercises exactly that path.
 """
 
 from __future__ import annotations
@@ -128,57 +132,62 @@ def _device_line(stdout: str) -> str:
     return m.group(1).strip() if m and m.group(1).strip() else "(unnamed device)"
 
 
-async def gemm_comparison(machine: Machine, *, timeout: float) -> Comparison:
+async def _gemm_observation(machine: Machine, *, timeout: float, label: str) -> Observation:
     status, stdout, stderr, duration = await _run_gpu_bench(machine, timeout=timeout)
     if status is not None:
         detail = stderr.strip()[-500:] or f"gpu_bench produced no output (status {status.value})"
-        obs = Observation(status=status, detail=detail, unit="GFLOP/s", duration_s=duration, label="this machine")
-        return Comparison(name="medium:gemm_gflops", tier="medium", target=obs, band=GEMM_BAND)
+        return Observation(status=status, detail=detail, unit="GFLOP/s", duration_s=duration, label=label)
 
     m = re.search(r"A throughput.*?([\d.]+)\s*GFLOP/s", stdout)
     if not m:
-        obs = Observation(
+        return Observation(
             status=Status.UNTESTED,
             detail=f"gpu_bench exited 0 but its GEMM line was not parseable; stdout: {stdout.strip()[:300]!r}",
             unit="GFLOP/s",
             duration_s=duration,
-            label="this machine",
+            label=label,
         )
-        return Comparison(name="medium:gemm_gflops", tier="medium", target=obs, band=GEMM_BAND)
 
     gflops = float(m.group(1))
-    obs = Observation(
+    return Observation(
         status=Status.PASS,
         detail=f"{gflops:.1f} GFLOP/s (1024x1024 fp32, device: {_device_line(stdout)})",
         value=gflops,
         unit="GFLOP/s",
         duration_s=duration,
-        label="this machine",
+        label=label,
     )
-    return Comparison(name="medium:gemm_gflops", tier="medium", target=obs, band=GEMM_BAND)
 
 
-async def bandwidth_comparisons(machine: Machine, *, timeout: float) -> list:
+async def gemm_comparison(
+    target: Machine,
+    *,
+    timeout: float,
+    baseline: Optional[Machine] = None,
+    target_label: str = "this machine",
+    baseline_label: str = "baseline",
+) -> Comparison:
+    target_obs = await _gemm_observation(target, timeout=timeout, label=target_label)
+    baseline_obs = await _gemm_observation(baseline, timeout=timeout, label=baseline_label) if baseline is not None else None
+    return Comparison(name="medium:gemm_gflops", tier="medium", target=target_obs, baseline=baseline_obs, band=GEMM_BAND)
+
+
+_BANDWIDTH_LEGS = (("medium:mem_bandwidth_h2d", "H2D", H2D_BAND), ("medium:mem_bandwidth_d2d", "D2D", D2D_BAND), ("medium:mem_bandwidth_d2h", "D2H", D2H_BAND))
+
+
+async def _bandwidth_observations(machine: Machine, *, timeout: float, label: str) -> dict:
     """Compiles+runs mem_bandwidth_probe.c ONCE and turns its three legs into
-    three Comparisons -- deliberately not going through one-Workload-per-run,
-    to avoid three separate GPU probe invocations for numbers one run already
-    produces."""
+    three Observations, keyed "H2D"/"D2D"/"D2H" -- deliberately not going
+    through one-Workload-per-run, to avoid three separate GPU probe
+    invocations for numbers one run already produces."""
     t0 = time.monotonic()
-    legs = [("medium:mem_bandwidth_h2d", "H2D", H2D_BAND), ("medium:mem_bandwidth_d2d", "D2D", D2D_BAND), ("medium:mem_bandwidth_d2h", "D2H", D2H_BAND)]
+    keys = [key for _, key, _ in _BANDWIDTH_LEGS]
 
     try:
         binpath = await _compile(machine, BANDWIDTH_C, "mem_bandwidth_probe", COMPILE_TIMEOUT)
     except ProbeCompileError as exc:
         duration = time.monotonic() - t0
-        return [
-            Comparison(
-                name=name,
-                tier="medium",
-                target=Observation(status=Status.UNTESTED, detail=str(exc), unit="GB/s", duration_s=duration, label="this machine"),
-                band=band,
-            )
-            for name, _, band in legs
-        ]
+        return {key: Observation(status=Status.UNTESTED, detail=str(exc), unit="GB/s", duration_s=duration, label=label) for key in keys}
 
     try:
         command = await machine.run([str(binpath), "64", "8"], timeout=timeout)
@@ -186,32 +195,24 @@ async def bandwidth_comparisons(machine: Machine, *, timeout: float) -> list:
     except asyncio.TimeoutError:
         duration = time.monotonic() - t0
         detail = f"mem_bandwidth_probe did not finish within {timeout:.0f}s and was killed"
-        return [
-            Comparison(
-                name=name,
-                tier="medium",
-                target=Observation(status=Status.UNTESTED, detail=detail, unit="GB/s", duration_s=duration, label="this machine"),
-                band=band,
-            )
-            for name, _, band in legs
-        ]
+        return {key: Observation(status=Status.UNTESTED, detail=detail, unit="GB/s", duration_s=duration, label=label) for key in keys}
 
     stdout = command.stdout.decode(errors="replace")
     stderr = command.stderr.decode(errors="replace")
     duration = time.monotonic() - t0
     skip = _classify_failure(rc, stderr)
 
-    comparisons = []
-    for name, key, band in legs:
+    observations = {}
+    for key in keys:
         if skip is not None:
-            obs = Observation(status=skip, detail=stderr.strip()[-500:] or "no GPU/driver on this machine", unit="GB/s", duration_s=duration, label="this machine")
+            obs = Observation(status=skip, detail=stderr.strip()[-500:] or "no GPU/driver on this machine", unit="GB/s", duration_s=duration, label=label)
         elif rc != 0:
             obs = Observation(
                 status=Status.FAIL,
                 detail=f"mem_bandwidth_probe exited {rc}: {stderr.strip()[-400:] or '(no stderr)'}",
                 unit="GB/s",
                 duration_s=duration,
-                label="this machine",
+                label=label,
             )
         else:
             m = re.search(rf"^{key}:\s*([\d.]+)\s*GB/s", stdout, re.MULTILINE)
@@ -221,7 +222,7 @@ async def bandwidth_comparisons(machine: Machine, *, timeout: float) -> list:
                     detail=f"mem_bandwidth_probe exited 0 but its {key} line was not parseable; stdout: {stdout.strip()[:300]!r}",
                     unit="GB/s",
                     duration_s=duration,
-                    label="this machine",
+                    label=label,
                 )
             else:
                 gbs = float(m.group(1))
@@ -231,18 +232,47 @@ async def bandwidth_comparisons(machine: Machine, *, timeout: float) -> list:
                     value=gbs,
                     unit="GB/s",
                     duration_s=duration,
-                    label="this machine",
+                    label=label,
                 )
-        comparisons.append(Comparison(name=name, tier="medium", target=obs, band=band))
-    return comparisons
+        observations[key] = obs
+    return observations
 
 
-async def run(machine: Machine, *, timeout: Optional[float] = None) -> Report:
+async def bandwidth_comparisons(
+    target: Machine,
+    *,
+    timeout: float,
+    baseline: Optional[Machine] = None,
+    target_label: str = "this machine",
+    baseline_label: str = "baseline",
+) -> list:
+    target_obs = await _bandwidth_observations(target, timeout=timeout, label=target_label)
+    baseline_obs = await _bandwidth_observations(baseline, timeout=timeout, label=baseline_label) if baseline is not None else None
+    return [
+        Comparison(
+            name=name,
+            tier="medium",
+            target=target_obs[key],
+            baseline=(baseline_obs[key] if baseline_obs is not None else None),
+            band=band,
+        )
+        for name, key, band in _BANDWIDTH_LEGS
+    ]
+
+
+async def run(
+    machine: Machine,
+    *,
+    timeout: Optional[float] = None,
+    baseline: Optional[Machine] = None,
+    target_label: str = "this machine",
+    baseline_label: str = "baseline",
+) -> Report:
     report = Report(tier="medium")
     bound = timeout if timeout is not None else DEFAULT_TIMEOUT
 
-    report.add(await gemm_comparison(machine, timeout=bound))
-    for comparison in await bandwidth_comparisons(machine, timeout=bound):
+    report.add(await gemm_comparison(machine, timeout=bound, baseline=baseline, target_label=target_label, baseline_label=baseline_label))
+    for comparison in await bandwidth_comparisons(machine, timeout=bound, baseline=baseline, target_label=target_label, baseline_label=baseline_label):
         report.add(comparison)
 
     report.finish()
