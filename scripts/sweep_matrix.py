@@ -735,6 +735,25 @@ def sh(cmd, timeout=120, check=False):
     return p.stdout.strip(), p.returncode
 
 
+def vast_id(v, what="id"):
+    """A vast-assigned numeric id, or raise.
+
+    Every id here arrives in a JSON response and is then INTERPOLATED INTO A
+    shell=True COMMAND.  sweep.sh already refuses host/port from the same API
+    with "these fields are attacker-influenceable and are used to build commands
+    that run as root here" (sweep_valid_host/sweep_valid_port); the Python side
+    had no equivalent and interpolated ids unchecked.  Same data, same shell,
+    same risk -- so apply the same rule.
+
+    Numeric-only is the whole contract: vast ids are integers, so anything else
+    is either a malformed response or something we should not be running.
+    """
+    t = str(v).strip()
+    if not re.fullmatch(r"[0-9]{1,20}", t):
+        raise ValueError("refusing non-numeric %s from the vast API: %r" % (what, v))
+    return t
+
+
 def vast_json(args, timeout=120):
     out, rc = sh(f"vastai {args} --raw", timeout=timeout)
     if rc != 0:
@@ -826,7 +845,7 @@ def wait_ssh(iid, budget=2400):
     """
     deadline = time.time() + budget
     while time.time() < deadline:
-        d = vast_json(f"show instance {iid}") or {}
+        d = vast_json(f"show instance {vast_id(iid, 'instance id')}") or {}
         if d.get("actual_status") == "running":
             cands = []
             direct_port = (d.get("ports") or {}).get("22/tcp")
@@ -934,7 +953,7 @@ def destroy_verified(iid, tries=5):
         print(f"  !! REFUSING to destroy protected instance {iid}", file=sys.stderr, flush=True)
         return False
     for _ in range(tries):
-        sh(f"vastai destroy instance {iid} -y", timeout=90)
+        sh(f"vastai destroy instance {vast_id(iid, 'instance id')} -y", timeout=90)
         time.sleep(8)
         data = vast_json("show instances") or []
         if isinstance(data, dict):
@@ -1121,7 +1140,7 @@ def run_one(offer, args):
         return d
 
     try:
-        out, rc = sh(f"vastai create instance {offer['id']} --image {KVM_IMAGE} "
+        out, rc = sh(f"vastai create instance {vast_id(offer['id'], 'offer id')} --image {KVM_IMAGE} "
                      f"--disk {args.disk} --ssh --direct --label {SWEEP_LABEL}", timeout=180)
         iid = parse_contract(out)
         if not iid:
