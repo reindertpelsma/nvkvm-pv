@@ -20,6 +20,51 @@ matmul, Vulkan compute, and EGL pixel verification.
 | RTX 4070 | Ada AD104 | 535.309.01 | 535 | `0b48bb5` | 30/30 |
 | RTX 4070 | Ada AD104 | 610.43.02 | 610 | `0b48bb5` | 30/30 |
 
+## Pre-Turing (`exp/pre-turing` ONLY — NOT on `main`)
+
+> **These rows do not apply to `main`.** nvkvm on `main` supports Turing and
+> newer. The object classes, control commands and UVM ioctls these GPUs need
+> live on the `exp/pre-turing` branch and have not been merged. A `main` build
+> will NOT reproduce anything below. Measured 2026-09-01.
+
+| GPU | architecture | host driver | ABI | tree | `validate.sh` |
+|---|---|---|---:|---|---:|
+| Quadro P4000 | Pascal GP104, sm_61 | 565.57.01 | 550 | `1a823e1` | **35P / 0F / 0S** |
+| Quadro P4000 | Pascal GP104, sm_61 | 570.124.06 | 570 | `1a823e1` | **35P / 0F / 0S** |
+| Quadro P4000 | Pascal GP104, sm_61 | 580.95.05 | 580 | `1a823e1` | **35P / 0F / 0S** |
+| GTX 750 Ti | Maxwell GM107, sm_50 | 535.309.01 | 535 | `580db7b` | 33P / **1F** / 1S |
+
+**Pascal is clean** across all three driver/ABI profiles a P4000 can run.
+NVIDIA's installer refuses to bind 590/595/610 to this part ("Quadro P4000
+requires 580.xx"), so 580.x is Pascal's real ceiling and that is full coverage,
+not a sample. Two fixes were needed and BOTH were: `184cf69` added UVM 54/55
+(`UVM_{ENABLE,DISABLE}_SYSTEM_WIDE_ATOMICS`) to the QEMU schema and did **not**
+fix it on its own — a second gate in the guest module
+(`nvkvm_ioctl_param_size()`) rejected the ioctl locally with `-ENOTTY` before
+it ever reached the host, fixed in `1a823e1`.
+
+**Maxwell has one open failure**: `cuda_managed_alloc`.
+`cuMemAllocManaged` returns `CUDA_ERROR_INVALID_VALUE` in the guest while
+succeeding on the SAME GPU model on bare metal, with identical device
+attributes and plain `cuMemAlloc` working — so it is an nvkvm bug, not a
+Maxwell limitation. Root cause OPEN; see
+[`docs/investigations/managed-alloc-invalid-value/`](../investigations/managed-alloc-invalid-value/).
+The earlier 30P/0F/5S row on the same hardware is NOT a better result — three of
+those skips were `cuda_ptx_jit`/`cuda_kernel_launch`/`cuda_matmul` sitting
+behind a probe whose PTX was `.target sm_60` and could never JIT on sm_50.
+Lowering it to sm_50 turned three skips into passes and surfaced the real
+failure underneath.
+
+**Volta is UNVERIFIED and no row exists.** Not "untested for now" — no
+VM-capable Volta hardware has been found anywhere: vast lists Volta offers but
+zero with `vms_enabled`; three earlier attempts on machine 146997 (the only
+V100 with KVM) produced no verdict; Spheron/Verda's V100 16G SXM2 had no
+`/dev/kvm` and **zero `vmx|svm` in `/proc/cpuinfo`** — nested virt off at the
+hypervisor, nothing to enable; and LeaderGPU's Tesla stock was occupied rather
+than rentable. The five Volta classes in `src/abi/nvgpu.h` are reasoning, not
+evidence.
+
+
 The Turing evidence is retained at
 `/workspace/nvkvm-sweep-rr09-9311bcb/`; the Ampere evidence is retained at
 `/workspace/nvkvm-sweep-ampere-2dc9465/`; the Ada evidence is retained at
