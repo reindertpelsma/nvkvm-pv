@@ -71,6 +71,27 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
  * (chan_alloc_size), PASCAL_DMA_COPY_A takes NVB0B5_ALLOCATION_PARAMETERS
  * like every other *_DMA_COPY_* class, and PASCAL_A/_B/_COMPUTE_A/_COMPUTE_B
  * take NV_GR_ALLOCATION_PARAMETERS like every other graphics/compute class. */
+/* Kepler channel classes.  MEASURED 2026-09-01 on a GTX 750 Ti (GM107,
+ * driver 535.309.01, guest kernel 6.8.0-138): a first-generation Maxwell part
+ * does NOT ask for MAXWELL_CHANNEL_GPFIFO_A (0xB06F).  It asks for the KEPLER
+ * channel classes -- 0xA06F six times and 0xA16F three times in one bring-up --
+ * and neither had an alloc-param size entry, so nvkvm_main.c fell through to
+ *
+ *     nvkvm: RM_ALLOC hClass=0xa06f has no alloc-param size entry;
+ *            forwarding a 256-byte window
+ *
+ * i.e. a GUESS, on the very first thing libcuda allocates.  Note the gate was
+ * never the problem on this part: the whole bring-up logged ZERO "DENY alloc
+ * class" lines, because these ids already carry control-allowlist entries
+ * (0xa06f0103/0104 in nvkvm_ctrl_allowlist.h).  The Maxwell ids below remain
+ * correct for GM20x and are kept, but they were not what this GPU used.
+ *
+ * These take the same NV_CHANNEL_ALLOC_PARAMS as every other *_CHANNEL_GPFIFO_*
+ * class, so they join chan_alloc_size rather than needing a new struct.
+ * OGKM cla06f.h / cla16f.h. */
+#define KEPLER_CHANNEL_GPFIFO_A             0x0000A06FU
+#define KEPLER_CHANNEL_GPFIFO_B             0x0000A16FU
+
 /* Maxwell (pre-Turing, arch mapping "maxwell": GM107/GM108 = MAXWELL_A, and
  * GM200/GM204/GM206 = MAXWELL_B).  Same situation as Pascal below: absent from
  * gVisor nvproxy, therefore never allowlisted, therefore refused by QEMU's
