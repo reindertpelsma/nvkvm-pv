@@ -190,8 +190,17 @@ What it does, in the order it does it:
 **1b. Build and install the isolate stub** (`scripts/build_qemu.sh:90-94`).
 `make -C src/stub` produces `nvkvm_stub` and `nvkvm_stub_bin.h`. The build flags
 matter (`src/stub/Makefile:11-18`): `-nostdlib -static -fPIE -ffreestanding
--fno-stack-protector -fno-builtin`, linked `-nostdlib -static -pie
--Wl,-z,relro,-z,now` against `-lgcc` only. Then `strip --strip-all` and
+-fno-stack-protector -fno-builtin -DNVKVM_STUB_SELF_RELOC`, linked `-nostdlib
+-static-pie -Wl,-z,relro,-z,now` against `-lgcc` only.
+
+> **`-static-pie` is one word, and this document used to get it wrong.** It said
+> `-static -pie`, which does **not** produce a PIE: GCC's spec lets `-static`
+> win, you get `ET_EXEC`, and **ASLR is off in every isolate** — with no error.
+> `src/stub/Makefile` says so at line 8 and enforces it: its `verify-pie` target
+> fails the build if the stub is not `ET_DYN`. Anyone who followed the old text
+> to build the stub by hand bypassed that guard. `-DNVKVM_STUB_SELF_RELOC` was
+> also missing here; without it `apply_relocations()` is compiled out and a
+> position-independent stub will not relocate itself. Then `strip --strip-all` and
 `xxd -i` to produce the embed header. The binary is also installed to
 `/usr/lib/nvkvm/nvkvm_stub` as the runtime fallback path — skipped with a note
 when that directory is not writable, which is harmless because the stub is
