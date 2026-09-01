@@ -42,13 +42,15 @@ It is fast because the guest is not in a hot path. Control calls are forwarded;
 the work itself is not — launching a kernel is a write to memory the guest
 already has mapped, and nvkvm is not in that path at all:
 
-> **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of bare metal**, on four
+> **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of host**, on four
 > machines, published to Geekbench's own servers where neither we nor you can
 > edit them: [RTX 4070 99.6%](https://browser.geekbench.com/v7/gpu/compare/87004?baseline=87011)
 > · [RTX 3050 Laptop 99.9%](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
 > · [H100 PCIe 98.8%](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612)
 > · [A100 80GB 98.0%](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405).
-> Guest on one side, the same physical box on the other.
+> The RTX rows are bare metal on both sides; the datacenter rentals' "host" is
+> itself a VM, so those two measure nvkvm nested a level deeper, not bare metal
+> — [why that's still meaningful](docs/reference/parity.md).
 
 Our own numbers agree: a 32-billion-parameter model through vLLM runs at
 **0.99–1.00x** of host speed and produces token-identical output at temperature
@@ -202,7 +204,7 @@ sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
 ```
 
 ```bash
-bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image
+sudo bash scripts/setup_guest.sh    # fetches an Ubuntu 24.04 cloud image
 ```
 
 x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
@@ -233,17 +235,17 @@ in-guest module build needs it.
 
 ```bash
 git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm && cd nvkvm
-bash scripts/build_qemu.sh          # builds the isolate stub, then QEMU 11.1 with the nvkvm device
-bash scripts/setup_guest.sh         # fetches an Ubuntu 24.04 cloud image and prepares a disk
+bash scripts/build_qemu.sh --install-deps   # builds the isolate stub, then QEMU 11.1 with the nvkvm device
+sudo bash scripts/setup_guest.sh            # fetches an Ubuntu 24.04 cloud image and prepares a disk
 ```
 
 Most of the wall clock is QEMU. The script is a convenience, not the
-mechanism: everything it changes in upstream QEMU is nine patch files in
-[`patches/`](patches/) — 631 lines, applied with `git apply` — plus a copy of the
+mechanism: everything it changes in upstream QEMU is twelve patch files in
+[`patches/`](patches/) — 2271 lines, applied with `git apply` — plus a copy of the
 device sources into `hw/misc/`.
 [`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
 same build by hand, command by command, if you would rather not run a script
-over your QEMU tree; [`CONTRIBUTING.md`](CONTRIBUTING.md) has the three traps in
+over your QEMU tree; [`CONTRIBUTING.md`](CONTRIBUTING.md) has the traps in
 this build, including which changes need a `--force` rebuild.
 
 ### Staging the guest driver libraries
@@ -682,7 +684,7 @@ container support, llvmpipe, bit-identical results.
 | [`docs/internal/`](docs/internal/) | Design rationale, forwarding model, isolate model, known limitations |
 | [`src/broker/README.md`](src/broker/README.md) | The display broker: threat model, wire protocol, and running the VMM with no display-server connection |
 | [`SECURITY.md`](SECURITY.md) | Threat model, what is known broken, how to report a vulnerability |
-| [`CONTRIBUTING.md`](CONTRIBUTING.md) | What is most useful to send, and three traps in the build |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | What is most useful to send, and the traps in the build |
 | [Security audits](docs/internal/audit-boundaries-2026-08-20.md) | Both audits, findings and status — locations, not techniques |
 
 ## Status
