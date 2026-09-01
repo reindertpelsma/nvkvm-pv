@@ -72,10 +72,42 @@ for arg in "$@"; do
     esac
 done
 
+# The "already built" guard is CONTENT-ADDRESSED, not existence-only.
+#
+# MEASURED 2026-09-01: a --ssh sweep against a host that had been swept before
+# reused a QEMU binary built 1h37m earlier, so a change to
+# src/qemu/nvkvm_fe_alloc_allowlist.h was never compiled in -- while every
+# record still carried the NEW tree's git sha. The run measured a binary that
+# no commit corresponds to. On a rented box this cannot happen (the box is
+# fresh, there is no binary), which is exactly why it survived: the manual-host
+# axis is the first one that reuses a machine.
+#
+# Telling the operator to remember --force (as the old message did) is not a
+# guard. The stamp is a hash of everything that ends up IN the binary: the
+# nvkvm QEMU sources and the patch series.
+nvkvm_build_stamp() {
+    { find src/qemu patches -type f \( -name '*.c' -o -name '*.h' -o -name '*.patch' \) \
+        -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null
+      printf '%s\n' "$QEMU_VERSION"
+    } | sha256sum | cut -d' ' -f1
+}
+STAMP_FILE="$QEMU_PREFIX/.nvkvm-build-stamp"
+WANT_STAMP="$(nvkvm_build_stamp)"
+
 if [ -x "$QEMU_PREFIX/bin/qemu-system-x86_64" ] && [ "$NVKVM_FORCE" -eq 0 ]; then
-    echo "INFO: $QEMU_PREFIX/bin/qemu-system-x86_64 already exists — skipping build."
-    echo "INFO: re-run with --force to rebuild (needed after editing src/qemu/)."
-    exit 0
+    HAVE_STAMP="$(cat "$STAMP_FILE" 2>/dev/null || true)"
+    if [ -n "$HAVE_STAMP" ] && [ "$HAVE_STAMP" = "$WANT_STAMP" ]; then
+        echo "INFO: $QEMU_PREFIX/bin/qemu-system-x86_64 is current for these sources — skipping build."
+        exit 0
+    fi
+    if [ -z "$HAVE_STAMP" ]; then
+        echo "INFO: an existing binary carries no build stamp (built before stamping, or by hand)."
+        echo "INFO: REBUILDING rather than trusting it -- a binary we cannot attribute is not a binary we can measure."
+    else
+        echo "INFO: the QEMU sources changed since this binary was built. REBUILDING."
+        echo "INFO:   built from $HAVE_STAMP"
+        echo "INFO:   sources are $WANT_STAMP"
+    fi
 fi
 if [ "$NVKVM_FORCE" -eq 1 ]; then
     echo "INFO: --force given; rebuilding over the existing install."
@@ -539,5 +571,7 @@ echo "[9/9] Installing to $QEMU_PREFIX..."
 ninja -C "$BUILD_DIR" install
 
 echo ""
+printf '%s\n' "$WANT_STAMP" > "$STAMP_FILE" 2>/dev/null || \
+    echo "WARN: could not write $STAMP_FILE; the next run will rebuild rather than trust this binary."
 echo "=== Build complete ==="
 echo "Binary: $QEMU_PREFIX/bin/qemu-system-x86_64"
