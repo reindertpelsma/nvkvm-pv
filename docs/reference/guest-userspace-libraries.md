@@ -64,7 +64,15 @@ during Ada/Turing bring-up.
 | `libnvidia-eglcore` | system | EGL |
 | `libnvidia-glsi` | system | GL system interface |
 | `libnvidia-gpucomp` | system | shader compilation |
-| `libnvidia-rtcore` | system | ray tracing |
+| `libnvidia-rtcore` | system | ray tracing — staged, but see below |
+
+> **Ray tracing does not currently work in the guest.** `libnvidia-rtcore` is
+> staged because the driver expects it, not because the path functions: seven
+> Vulkan device extensions — including `VK_KHR_acceleration_structure`,
+> `VK_KHR_ray_query` and `VK_KHR_ray_tracing_pipeline` — make `vkCreateDevice`
+> return `VK_ERROR_INITIALIZATION_FAILED`, while the identical probe succeeds
+> on the host. See
+> [known limitations](../internal/known-limitations.md#seven-device-extensions-fail-vkcreatedevice--ray-tracing-does-not-work-2026-09-01).
 | `libnvidia-tls` | system | thread-local storage helper |
 | `libnvidia-glvkspirv` | system | Vulkan SPIR-V |
 | `libnvidia-allocator` | both (+ the GBM backend symlink) | GBM buffer allocation |

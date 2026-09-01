@@ -775,6 +775,57 @@ the bare-metal host too, on the ffmpeg build used
 
 ---
 
+## Vulkan
+
+### Seven device extensions fail `vkCreateDevice` — ray tracing does not work (2026-09-01)
+
+**A guest cannot create a Vulkan device that enables any of these:**
+
+| extension |
+|---|
+| `VK_KHR_acceleration_structure` |
+| `VK_KHR_ray_query` |
+| `VK_KHR_ray_tracing_pipeline` |
+| `VK_NV_ray_tracing` |
+| `VK_NV_optical_flow` |
+| `VK_NV_cuda_kernel_launch` |
+| `VK_NVX_binary_import` |
+
+`vkCreateDevice` returns `VK_ERROR_INITIALIZATION_FAILED`. Each one fails
+**independently** — no interaction between them is needed. In practice that
+means **ray tracing is unavailable in the guest**, and so is anything built on
+it.
+
+They are all **advertised as supported**. `vkEnumerateDeviceExtensionProperties`
+lists them, and `vulkaninfo` is perfectly happy, because enumerating a physical
+device is cheap; creating a *logical* device is what breaks. An application has
+no way to tell in advance except by trying.
+
+**The control says this is ours, not the driver's.** The same probe, the same
+binary, on the same RTX 4070 with the same driver 595.84 and a byte-identical
+275-extension advertised set, **succeeds on bare metal** for all seven,
+individually and together. Repeated three times on each side, deterministic
+both ways. Largest set that succeeds in the guest: 268 of 275 — everything
+except these seven.
+
+Ruled out: the RM control-command allowlist (a whole session logged one benign
+denial, `0x2080220b`), and the RM_ALLOC class allowlist (its
+`nvkvm: DENY alloc class` never fires across repeated failing runs). **The
+decision point has not been located.** Root cause is open.
+
+**What this breaks, concretely.** It is why Windows D3D12 titles fail. Red Dead
+Redemption 2 dies at `ERR_GFX_INIT`: the launcher asks for D3D12, vkd3d-proton
+enables the ray-tracing extensions to expose DXR, `vkCreateDevice` fails, and
+the game gives up. DXVK survives the same box only by falling back to its
+reduced "safe mode" set, which excludes them. Every game this project claims
+(Shadow of the Tomb Raider, Portal 2) is a **native Linux/Vulkan** title that
+never asks for these, which is why this went unnoticed.
+
+Probe, bisection log and the host/guest tables:
+`docs/investigations/vkcreatedevice-init-failed/`.
+
+---
+
 ## Numbers you should not quote
 
 - **"795 fps glmark2"** — appears in older notes with no commit citation, in a
