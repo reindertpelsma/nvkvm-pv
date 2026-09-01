@@ -124,11 +124,31 @@ MISSING_LIBS=""
 # not mean a broken GPU stack, so it must not be reported as a missing library.
 MISSING_FILES=""
 STAGED_N=0
+# The CUDA-critical set.  These are the same four make_host_bundle.sh calls
+# REQUIRED, and the distinction matters to the CALLER: without them CUDA does
+# not work at all, whereas a missing Wayland/GBM EGL platform library only costs
+# a display path a headless host never had.  Both used to land in one bucket and
+# exit 2, so nvkvm-guest.service could only spell its tolerance as `|| true` --
+# which then swallowed the fatal case as well.  MEASURED 2026-09-01 on an
+# RTX 4060 Ti: libnvidia-ptxjitcompiler failed to stage, the service reported
+# success, and the first sign of trouble was cuda_ptx_jit failing
+# CUDA_ERROR_JIT_COMPILER_NOT_FOUND with three more CUDA checks cascading to
+# SKIP -- three drivers in a row, diagnosed only by reading validate.sh's own
+# per-check detail.
+is_critical_lib(){
+    case "$1" in
+        libcuda.so.*|libnvidia-ptxjitcompiler.so.*|libnvidia-nvvm.so.*|libnvidia-ml.so.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+CRITICAL_MISSING=""
+
 stage(){ # $1 basename-in-bundle  $2 destdir  [$3.. extra symlink names]
     local f="$1" dest="$2"; shift 2
     if [ ! -f "$GFXBUNDLE/$f" ]; then
         echo "stage_guest_libs: MISSING from bundle: $f  (-> $dest)" >&2
         MISSING_LIBS="$MISSING_LIBS $f"
+        is_critical_lib "$f" && CRITICAL_MISSING="$CRITICAL_MISSING $f"
         return 1
     fi
     if [ -n "${NVKVM_LINK_LIBS:-}" ]; then
@@ -334,9 +354,29 @@ done
 # CUDA apps resolve libcuda there "via nvidia-guest.conf, AHEAD of the system
 # dir" — but nothing ever created that file, so the dir was off the ld.so path
 # entirely and every app silently resolved libcuda from $SYS instead.
-if [ ! -f /etc/ld.so.conf.d/nvidia-guest.conf ]; then
+# CHECK THE CONTENT, NOT THE EXISTENCE.
+#
+# This was `[ ! -f ... ]`, and a file that exists but is EMPTY then never got
+# repaired -- on any boot, ever.  MEASURED 2026-09-01 in a sweep guest:
+#
+#     conf exists: yes    conf bytes: 0    ptxjit resolvable: 0
+#     FAIL cuda_ptx_jit rc=221 CUDA_ERROR_JIT_COMPILER_NOT_FOUND
+#
+# ...on five consecutive drivers, while the preinstalled-driver control passed
+# 35P/0F/0S.  The libraries were staged perfectly; $CUDADIR simply was not on
+# the loader path, so libnvidia-ptxjitcompiler -- which lives ONLY there -- was
+# invisible.  libnvidia-nvvm survived because it also lands in $SYS, which is
+# why the error names both and only one was really absent.
+#
+# Zero length with intact metadata is the signature of ext4 delayed allocation
+# losing a recent write when the guest goes down uncleanly, and a driver swap
+# does exactly that.  An existence-only idempotence check cannot see a
+# half-finished write; this project has been bitten by that shape before (a
+# version-only check that skipped repairing an OOM-truncated driver install).
+if ! grep -qxF "$CUDADIR" /etc/ld.so.conf.d/nvidia-guest.conf 2>/dev/null; then
     echo "$CUDADIR" | sudo tee /etc/ld.so.conf.d/nvidia-guest.conf >/dev/null
-    echo "stage_guest_libs: created /etc/ld.so.conf.d/nvidia-guest.conf -> $CUDADIR"
+    sudo sync 2>/dev/null || true   # do not let the next unclean stop zero it again
+    echo "stage_guest_libs: wrote /etc/ld.so.conf.d/nvidia-guest.conf -> $CUDADIR"
 fi
 
 # -- sweep differently-versioned NVIDIA libraries out of $SYS BEFORE ldconfig --
@@ -566,6 +606,17 @@ if [ -n "$MISSING_FILES" ]; then
     # works without them and only the guest's own X session is affected.
     echo "stage_guest_libs: not installed from the repo share:" >&2
     for m in $MISSING_FILES; do echo "    $m" >&2; done
+fi
+if [ -n "$CRITICAL_MISSING" ]; then
+    # EXIT 3 == "CUDA IS BROKEN IN THIS GUEST".  Distinct from 2 so a caller can
+    # tolerate a cosmetic gap and still refuse to pretend this one is fine.
+    echo "stage_guest_libs: FATAL — CUDA-critical libraries missing from bundle:" >&2
+    for m in $CRITICAL_MISSING; do echo "    $m" >&2; done
+    echo "stage_guest_libs: CUDA will fail in this guest (expect CUDA_ERROR_JIT_COMPILER_NOT_FOUND" >&2
+    echo "stage_guest_libs: or CUDA_ERROR_SYSTEM_DRIVER_MISMATCH). This is not a display-only gap." >&2
+    [ -n "$MISSING_LIBS" ] && { echo "stage_guest_libs: all missing:" >&2
+                                for m in $MISSING_LIBS; do echo "    $m" >&2; done; }
+    exit 3
 fi
 if [ -n "$MISSING_LIBS" ]; then
     echo "stage_guest_libs: INCOMPLETE — missing from bundle:" >&2
