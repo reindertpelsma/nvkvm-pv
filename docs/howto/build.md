@@ -43,7 +43,7 @@ produced it:
 
 ```bash
 # the image, resolved from the registry
-gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2 \
+gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.2.0 \
     --repo reindertpelsma/nvkvm-pv \
     --signer-workflow reindertpelsma/nvkvm-pv/.github/workflows/release.yml
 
@@ -83,7 +83,7 @@ The source half is `git archive` output on purpose: it makes "does this tarball
 match the tag?" answerable rather than a matter of trust.
 
 ```bash
-V=<version>                                     # e.g. v0.1.0
+V=<version>                                     # e.g. v0.2.0
 tar xzf "nvkvm-$V-linux-x86_64.tar.gz"
 rm -rf "nvkvm-$V/qemu-nvkvm" "nvkvm-$V/src/stub/nvkvm_stub" "nvkvm-$V/RELEASE.md"
 

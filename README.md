@@ -146,7 +146,7 @@ come from this repository?" is a question you can answer rather than assume.
 docker run --rm -it --device /dev/kvm --gpus all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \
     -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \
-    ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2
+    ghcr.io/reindertpelsma/nvkvm-pv:v0.2.0
 ssh -p 2222 ubuntu@127.0.0.1    # into the guest -- nvidia-smi already works
 ```
 
@@ -275,7 +275,7 @@ built it, from which commit, in which workflow run — and
 
 ```bash
 # the image, resolved straight from the registry
-gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.0.1-rc2 \
+gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.2.0 \
     --repo reindertpelsma/nvkvm-pv
 
 # the tarball, on disk
