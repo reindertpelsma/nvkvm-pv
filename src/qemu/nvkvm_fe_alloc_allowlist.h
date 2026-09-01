@@ -102,14 +102,23 @@ static const uint32_t nvkvm_alloc_class_allowlist[] = {
 	0x0000c097u,  /* PASCAL_A */
 	0x0000c0b5u,  /* PASCAL_DMA_COPY_A */
 	0x0000c0c0u,  /* PASCAL_COMPUTE_A */
-	0x0000c1b5u,  /* PASCAL_DMA_COPY_B -- MEASURED 12x DENY once 0xc06f was fixed */
 	0x0000c197u,  /* PASCAL_B */
+	0x0000c1b5u,  /* PASCAL_DMA_COPY_B -- MEASURED 12x DENY once 0xc06f was fixed */
 	0x0000c1c0u,  /* PASCAL_COMPUTE_B */
 	0x0000c361u,
+	/* Volta.  0xc361 (VOLTA_USERMODE_A) was already here, and nvkvm_main.c
+	 * already sized VOLTA_A / _COMPUTE_A / _COMPUTE_B / _DMA_COPY_A -- but NONE
+	 * of them were allowlisted and the channel class was missing outright, so
+	 * the gate refused Volta before any of that work could matter. */
+	0x0000c36fu,  /* VOLTA_CHANNEL_GPFIFO_A */
+	0x0000c397u,  /* VOLTA_A */
+	0x0000c3b5u,  /* VOLTA_DMA_COPY_A */
+	0x0000c3c0u,  /* VOLTA_COMPUTE_A */
 	0x0000c461u,
 	0x0000c46fu,
 	0x0000c4b0u,
 	0x0000c4b7u,
+	0x0000c4c0u,  /* VOLTA_COMPUTE_B */
 	0x0000c4d1u,
 	0x0000c56fu,
 	0x0000c597u,

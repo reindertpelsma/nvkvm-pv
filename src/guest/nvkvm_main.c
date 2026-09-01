@@ -2520,6 +2520,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
 				break;
 			case PASCAL_CHANNEL_GPFIFO_A:
+			case VOLTA_CHANNEL_GPFIFO_A:
 			case TURING_CHANNEL_GPFIFO_A:
 			case AMPERE_CHANNEL_GPFIFO_A:
 			case HOPPER_CHANNEL_GPFIFO_A:
@@ -2693,6 +2694,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
 					break;
 				case PASCAL_CHANNEL_GPFIFO_A:
+			case VOLTA_CHANNEL_GPFIFO_A:
 				case TURING_CHANNEL_GPFIFO_A:
 				case AMPERE_CHANNEL_GPFIFO_A:
 				case HOPPER_CHANNEL_GPFIFO_A:

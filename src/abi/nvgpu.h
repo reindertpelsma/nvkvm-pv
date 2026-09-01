@@ -94,6 +94,12 @@ typedef __u64 nvp64_t;        /* NvP64 — 64-bit pointer-as-integer   */
  * headers; the prior 0x*B1 codes were bogus). Use NV_GR_ALLOCATION_PARAMETERS. */
 #define PASCAL_COMPUTE_A                    0x0000C0C0U
 #define PASCAL_COMPUTE_B                    0x0000C1C0U
+/* VOLTA_CHANNEL_GPFIFO_A.  The other four Volta classes were already defined
+ * here and already had size-table entries, but this one was absent entirely --
+ * so Volta could never have worked: the channel alloc is the FIRST thing
+ * libcuda asks for, and the QEMU gate would refuse it exactly as it refused
+ * PASCAL_CHANNEL_GPFIFO_A (0xC06F) with "DENY alloc class". OGKM clc36f.h. */
+#define VOLTA_CHANNEL_GPFIFO_A              0x0000C36FU
 #define VOLTA_COMPUTE_A                     0x0000C3C0U
 #define VOLTA_COMPUTE_B                     0x0000C4C0U
 #define TURING_COMPUTE_A                    0x0000C5C0U
