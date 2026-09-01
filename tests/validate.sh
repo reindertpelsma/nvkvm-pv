@@ -1283,6 +1283,37 @@ static int probe_main(void) {
         finish("no cuModuleLoadData");
         return 1;
     }
+    /* The PTX above is ".target sm_60" (Pascal). A device OLDER than that
+       cannot JIT it and the driver is right to refuse -- that is a fact about
+       the probe, not about nvkvm.
+
+       MEASURED 2026-09-01 on a GTX 750 Ti (GM107, sm_50): every other CUDA
+       check passed (30P) and this one FAILED, which reads as an nvkvm defect
+       and is not one. Worse, the failure path below calls finish() and
+       returns, so cuda_kernel_launch, cuda_matmul and cuda_managed_alloc were
+       all reported skipped behind a test that could never have passed on that
+       silicon.
+
+       Re-query rather than reuse maj/min from the compute-cap check above:
+       those are scoped to that block, and a probe that silently depended on
+       another check's locals would be a trap for the next editor. */
+    {
+        int jmaj = 0, jmin = 0;
+        if (p_cuDeviceGetAttribute &&
+            p_cuDeviceGetAttribute(&jmaj, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) == 0 &&
+            p_cuDeviceGetAttribute(&jmin, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) == 0 &&
+            jmaj > 0 && jmaj < 6) {
+            emit("cuda_ptx_jit", "SKIP",
+                 "device is sm_%d%d; this probe's PTX is .target sm_60 and cannot JIT below it",
+                 jmaj, jmin);
+            emit("cuda_kernel_launch",  "SKIP", "needs cuda_ptx_jit, which does not apply below sm_60");
+            emit("cuda_matmul",         "SKIP", "needs cuda_ptx_jit, which does not apply below sm_60");
+            emit("cuda_managed_alloc",  "SKIP", "needs cuda_ptx_jit, which does not apply below sm_60");
+            finish("PTX probe targets sm_60; device is older");
+            return 0;
+        }
+    }
+
     r = p_cuModuleLoadData(&mod, vec_add_ptx);
     if (r == 221) {
         emit("cuda_ptx_jit", "FAIL",
