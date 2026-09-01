@@ -1356,6 +1356,42 @@ sweep_manual_box() {
     [ -n "$gpu" ] || gpu="unknown"
     info "  gpu reports: $gpu"
 
+    # The GPU name is attacker-influenced in principle (it comes off a host we
+    # do not control), so it is passed to python as an ARGV element and never
+    # interpolated into a command.  arch_of() is the same map the offer search
+    # uses, so a manual row and a rented row cannot disagree about what an
+    # architecture is called.
+    detected="$(python3 - "$REPO" "$gpu" <<'ARCHOF' 2>/dev/null || true
+import sys, os, importlib.util
+repo, gpu = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location(
+    "sweep_matrix", os.path.join(repo, "scripts", "sweep_matrix.py"))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)          # guarded by __main__, so nothing runs
+print(m.arch_of(gpu) or "")
+ARCHOF
+)"
+    if [ -z "$arch" ]; then
+        if [ -z "$detected" ]; then
+            emit "$(jrec arch "unknown" driver "-" status "host-arch-unknown" host "$CUR_HOST" \
+                    gpu "$gpu" detail "could not identify the architecture of '$gpu'; pass --arch explicitly" \
+                    cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
+            warn "cannot identify the architecture of '$gpu' -- pass --arch explicitly."
+            warn "  (nvkvm supports Turing and newer; a pre-Turing part is not a supported"
+            warn "   architecture and has no driver floor defined here.)"
+            return 2
+        fi
+        arch="$detected"
+        info "  arch detected from the GPU: $arch"
+    elif [ -n "$detected" ] && [ "$detected" != "$arch" ]; then
+        emit "$(jrec arch "$arch" driver "-" status "host-arch-mismatch" host "$CUR_HOST" \
+                gpu "$gpu" detail "--arch says $arch, the GPU '$gpu' is $detected" \
+                cost "external host, cost not tracked" ts "$(date -u +%FT%TZ)")"
+        warn "--arch says '$arch' but '$gpu' is '$detected'. Refusing: the driver floor and"
+        warn "  the applicable driver set are per-architecture, so this would sweep the wrong set."
+        return 2
+    fi
+
     logdir="$OUT_DIR/logs/manual-$CUR_HOST"
     mkdir -p "$logdir"
 
@@ -2838,7 +2874,13 @@ if [ "$ALL_ARCHES" = 1 ]; then
     # which is recorded as no-offer, not as a failure of the guest stack.
     ARCHES="ampere,turing,ada,blackwell,hopper"
 fi
-[ -n "$ARCHES" ] || ARCHES="ampere"
+# Default only for a box we are about to RENT, where the arch is a choice we
+# make. For --ssh the GPU already exists and is knowable, so guessing "ampere"
+# would silently mislabel every record and sweep the wrong driver floor.
+# MEASURED 2026-09-01: a GTX 750 Ti swept and recorded as "arch: ampere".
+if [ -z "$ARCHES" ] && [ -z "$MANUAL_SSH" ]; then
+    ARCHES="ampere"
+fi
 
 # The tree that will be shipped, recorded in every record.  A result without the
 # tree it came from is not interpretable: a worktree sitting on uncommitted
