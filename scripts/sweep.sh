@@ -1322,7 +1322,7 @@ set_manual_endpoint() {
     # shellcheck disable=SC2206  # SSH_OPTS is a fixed local literal
     SSH_ARGV=(ssh $SSH_OPTS -o ConnectTimeout=20 -p "$port" "$user@$host")
     SSH="ssh $SSH_OPTS -o ConnectTimeout=20 -p $port $user@$host"
-    SCP_HOST="$host"; SCP_PORT="$port"; SCP_USER="$user"
+    SCP_HOST="$host"; SCP_PORT="$port"
     info "  manual host: $user@$host:$port"
 }
 
@@ -3006,8 +3006,11 @@ if [ -n "$MANUAL_SSH" ]; then
     set -- ${ARCHES//,/ }
     [ "$#" -eq 1 ] || die "--ssh takes exactly one --arch (got: '${ARCHES:-none}'). The driver floor and the applicable driver set are per-architecture, and we cannot infer them from a machine we did not choose." 3
     say "=== manual host (arch: $1) ==========================================="
-    sweep_manual_box "$1"; rc=$?
-    MANUAL_RC="$rc"
+    # The exit code is derived from $RESULTS below, not from this rc: every
+    # early return in sweep_manual_box emits a non-verdict row first, which
+    # counts as UNTESTED and forces exit 2. Capturing rc into a variable
+    # nothing reads only looked like it was load-bearing.
+    sweep_manual_box "$1" || true
 else
 for arch in ${ARCHES//,/ }; do
     if stop_requested; then
