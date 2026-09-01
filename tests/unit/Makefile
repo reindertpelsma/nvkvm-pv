@@ -44,7 +44,7 @@ CTRL_GATE_DEPS = ../../src/qemu/nvkvm_ctrl_allowlist.h
 
 .PHONY: all clean run check
 
-all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap
+all: test_objects test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap test_uidmap test_uvm_atomics_size
 
 test_objects: $(OBJECTS_SRCS)
 	$(CC) $(CFLAGS) -o $@ $(OBJECTS_SRCS) $(LDFLAGS)
@@ -102,6 +102,20 @@ kvm_slot_pool.inc: ../../src/qemu/nvkvm_mmap_host.c
 
 test_uidmap: test_uidmap.c ../../src/common/nvkvm_uidmap.h
 	$(CC) $(CFLAGS) -I../../src/common -o $@ test_uidmap.c $(LDFLAGS)
+
+# Pascal UVM 54/55.  src/guest/nvkvm_ioctl.c cannot be compiled hosted (other
+# functions in it pull in linux/fdtable.h), so the two new
+# UVM_{ENABLE,DISABLE}_SYSTEM_WIDE_ATOMICS cases are extracted verbatim and
+# spliced into a hosted switch, same trick as kvm_slot_pool.inc/win_alloc.inc
+# above. This pins the REAL guest-side size table -- the one that was found
+# 2026-09-01 to independently gate these two ioctls with -ENOTTY BEFORE they
+# ever reach the QEMU-side schema commit 184cf69 patched, which is why that
+# commit alone did not fix Pascal cuda_init.
+uvm_atomics_cases.inc: ../../src/guest/nvkvm_ioctl.c
+	awk '/NVKVM_UVM_ATOMICS_SIZE_BEGIN/,/NVKVM_UVM_ATOMICS_SIZE_END/' $< > $@
+
+test_uvm_atomics_size: test_uvm_atomics_size.c uvm_atomics_cases.inc ../../src/abi/uvm.h
+	$(CC) $(CFLAGS) -I. -o $@ test_uvm_atomics_size.c
 
 test_kvm_slot: test_kvm_slot.c kvm_slot_pool.inc
 	$(CC) $(CFLAGS) -I. -o $@ test_kvm_slot.c $(LDFLAGS)
@@ -218,7 +232,7 @@ test_relay_wiring: test_relay_wiring.c relay_state_helpers.inc \
 # fd 0).  run_tests.sh carries the full diagnosis.  `make run` exits 0 again;
 # `make check` / run_tests.sh is still the pass/fail signal, because it also
 # pins the case counts and catches a suite that silently stops building.
-run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_uidmap
+run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_uidmap test_uvm_atomics_size
 	./test_objects
 	./test_dispatch
 	./test_frontend
@@ -238,6 +252,7 @@ run: test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_g
 	./test_relay_state
 	./test_relay_clip
 	./test_relay_wiring test_uidmap
+	./test_uvm_atomics_size
 
 # `check` is what CI runs, and what you should run too.  `run` above is the raw
 # thing: it does not pin the assertion counts, so a suite that quietly loses
@@ -255,5 +270,5 @@ clean:
 	      drm_param_structs.inc r1_type_dev.inc r1_stub_type_dev.inc \
 	      relay_state_helpers.inc relay_clip_batch.inc relay_fd_ownership.inc \
 	      relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc \
-	      relay_bufmap.inc
+	      relay_bufmap.inc test_uvm_atomics_size uvm_atomics_cases.inc
 	rm -f test_dispatch test_frontend test_handle mock_stub test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize stub_sanitize.inc test_transport_ready transport_ready.inc test_relay_state relay_state_helpers.inc test_relay_clip relay_clip_batch.inc test_relay_wiring relay_fd_ownership.inc relay_clip_wiring.inc relay_writable_wiring.inc relay_connect_wiring.inc

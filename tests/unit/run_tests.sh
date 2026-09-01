@@ -70,6 +70,7 @@ declare -A MARKER_SUITES=(
     [test_uidmap]="test_uidmap passed"
     [test_open_scm]="ALL OPEN_SCM TESTS PASSED"
     [test_ctrl_gate]="test_ctrl_gate: PASS"
+    [test_uvm_atomics_size]="test_uvm_atomics_size: PASS"
 )
 
 # test_isolate is handled on its own, below.  NO case is expected to fail any
@@ -134,7 +135,7 @@ ISOLATE_KNOWN_FAIL=""
 # is environment-dependent, name it here WITH the reason.
 ISOLATE_ENV_DEPENDENT=""
 
-ALL_BINARIES="test_uidmap test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap mock_stub"
+ALL_BINARIES="test_uidmap test_objects test_handle test_isolate test_tables test_open_scm test_ctrl_gate test_nvkms_allowlist test_stub_ptr_sanitize test_kvm_slot test_stub_window test_drm_devinfo test_r1_type_dev test_transport_ready test_relay_state test_relay_clip test_relay_wiring test_relay_bufmap mock_stub test_uvm_atomics_size"
 
 rc=0
 fail() { echo "  FAIL: $*"; rc=1; }

@@ -41,6 +41,8 @@
 #define UVM_UNSET_ACCESSED_BY                   47
 #define UVM_MIGRATE                             51
 #define UVM_MIGRATE_RANGE_GROUP                 53
+#define UVM_ENABLE_SYSTEM_WIDE_ATOMICS          54
+#define UVM_DISABLE_SYSTEM_WIDE_ATOMICS         55
 #define UVM_TOOLS_READ_PROCESS_MEMORY           62
 #define UVM_TOOLS_WRITE_PROCESS_MEMORY          63
 #define UVM_MAP_DYNAMIC_PARALLELISM_REGION      65
@@ -239,6 +241,37 @@ struct uvm_disable_read_duplication_params {
 struct uvm_migrate_range_group_params {
 	__u64 range_group_id;
 	struct uvm_uuid destination_uuid;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
+/*
+ * UVM_ENABLE_SYSTEM_WIDE_ATOMICS (54) / UVM_DISABLE_SYSTEM_WIDE_ATOMICS (55).
+ *
+ * Layout from OGKM 580.159.04, kernel-open/nvidia-uvm/uvm_ioctl.h:795-815:
+ * an NvProcessorUuid (16 bytes) and an NV_STATUS -- same shape as
+ * UVM_UNREGISTER_GPU_PARAMS above, so the same uuid+status+reserved layout
+ * is used here for consistency with this table's other uuid-only params.
+ *
+ * These two commands do not exist in open-gpu-kernel-modules 595.84 (the
+ * newest tree this ABI header was built against) -- system-wide atomics is
+ * a Pascal-era UVM feature newer drivers dropped. Their absence here was the
+ * reason the QEMU-side schema addition in nvkvm_isolate_handlers.c (commit
+ * 184cf69) did not fix Pascal cuda_init on its own: this guest-side size
+ * table gates ioctls BEFORE they ever reach the host isolate schema, so cmd
+ * 55 was rejected locally with -ENOTTY (logged as "AUDIT unknown ioctl
+ * cmd=0x37") and the QEMU-side entry was never exercised. MEASURED
+ * 2026-09-01 on the same P4000, same 184cf69 tree: the guest dmesg still
+ * showed 7x that AUDIT line with no new dmesg activity afterward.
+ */
+struct uvm_enable_system_wide_atomics_params {
+	struct uvm_uuid gpu_uuid;
+	__u32 rm_status;
+	__u32 reserved;
+};
+
+struct uvm_disable_system_wide_atomics_params {
+	struct uvm_uuid gpu_uuid;
 	__u32 rm_status;
 	__u32 reserved;
 };

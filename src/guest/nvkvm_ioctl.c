@@ -98,6 +98,16 @@ size_t nvkvm_ioctl_param_size(unsigned int cmd)
 		return sizeof(struct uvm_disable_read_duplication_params);
 	case UVM_MIGRATE_RANGE_GROUP:
 		return sizeof(struct uvm_migrate_range_group_params);
+	/* NVKVM_UVM_ATOMICS_SIZE_BEGIN -- extracted verbatim by
+	 * tests/unit/Makefile into uvm_atomics_cases.inc and spliced into a
+	 * hosted test's own switch (this .c cannot be compiled hosted: other
+	 * functions in it pull in linux/fdtable.h). Keep this pair self-
+	 * contained (no kernel-only symbols) so the extraction stays valid. */
+	case UVM_ENABLE_SYSTEM_WIDE_ATOMICS:
+		return sizeof(struct uvm_enable_system_wide_atomics_params);
+	case UVM_DISABLE_SYSTEM_WIDE_ATOMICS:
+		return sizeof(struct uvm_disable_system_wide_atomics_params);
+	/* NVKVM_UVM_ATOMICS_SIZE_END */
 	case UVM_SET_ACCESSED_BY:
 		return sizeof(struct uvm_set_accessed_by_params);
 	case UVM_UNSET_ACCESSED_BY:
