@@ -110,3 +110,9 @@ src/guest/modules.order
 # stale object linking so `make check` still reported a pass. It also blocks
 # merges, because building the tree dirties a tracked file.
 tests/unit/*.inc
+
+# tests/harness/run_tests.py's default output location (JSON + markdown
+# reports, timestamped per run) and its on-disk item cache / rootfs staging.
+tests/harness/results/
+tests/harness/.chroot-roots/
+tests/harness/.venv/
