@@ -954,7 +954,24 @@ pick_offer() {
     # discarded and the script reads its own source.  That silently reported
     # "no rentable offer" for every architecture on a market full of them.
     offers_json="$(mktemp)"
-    vj search offers 'vms_enabled=true num_gpus=1 rentable=true' -o dph >"$offers_json"
+    # ASK BROADLY, FILTER LOCALLY.  This used to pass `vms_enabled=true` to the
+    # server, and vast's server-side filter DROPS OFFERS WHOSE OWN JSON SAYS
+    # vms_enabled: True.  MEASURED 2026-09-01, same moment, same account:
+    #
+    #   vms_enabled=true num_gpus=1 rentable=true ->  47 offers,  0 V100
+    #           num_gpus=1 rentable=true          -> 572 offers, 10 V100,
+    #                                                1 of them vms_enabled=True
+    #
+    # So the sweep has been searching a market roughly twelve times smaller than
+    # the real one, for EVERY architecture, and the offers it could not see were
+    # invisible rather than reported -- no warning, just "no rentable KVM offer".
+    # That is how "zero Volta with KVM" and "zero datacenter with KVM" were
+    # concluded and written down; both were artifacts of this filter, not facts
+    # about the market.
+    #
+    # The field is trustworthy; the server-side filter over it is not.  So ask
+    # for everything rentable and apply vms_enabled ourselves, below.
+    vj search offers 'num_gpus=1 rentable=true' -o dph --limit 3000 >"$offers_json"
     python3 - "$REPO" "$arch" "$MAX_DPH" "$GPU_FILTER" "$TRIED_MACHINES" "$KNOWN_BAD_FILE" "$offers_json" \
              "$MAX_STORAGE_PER_GB_MONTH" "$MAX_INET_DOWN_PER_TB" "$MAX_INET_UP_PER_TB" \
              "$EST_DOWN_GB_PER_BOX" "$DISK" "$INCLUDE_UNSUPPORTED" <<'PY'
@@ -990,6 +1007,9 @@ except Exception:
 cands = []
 for o in offers:
     gpu = o.get("gpu_name") or ""
+    # vms_enabled applied HERE, not server-side -- see the note on the query above.
+    if not o.get("vms_enabled"):
+        continue
     if m.is_unsupported(gpu) and not include_unsupported:
         continue          # pre-Turing: a documented negative, never a coverage slot
     if gpu_filter and gpu_filter.upper() not in gpu.upper():
