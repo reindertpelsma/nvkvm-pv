@@ -192,6 +192,7 @@ ARCH_FLOOR = {
     # confirmed 580 is the last branch supporting Maxwell/Pascal/Volta.  So its
     # window is 515..580 -- seven of the eight profiles, and frozen, which means
     # it cannot drift once mapped.
+    "maxwell": 515,
     "pascal": 515,
     "volta": 515,
     "turing": 410, "ampere": 450, "ada": 520, "hopper": 525, "blackwell": 580,
@@ -199,12 +200,19 @@ ARCH_FLOOR = {
 
 # Architectures whose driver support ENDS at a known branch.  Absent = no ceiling.
 ARCH_CEILING = {
+    "maxwell": 580,   # last branch to support GM10x/GM20x, same as pascal/volta
     # 580 is the last branch supporting Maxwell/Pascal/Volta.
     "pascal": 580,
     "volta": 580,
 }
 
 ARCH_OF = [   # substring -> architecture, FIRST MATCH WINS: specific before generic
+    # Maxwell. MEASURED on a GTX 750 Ti 2026-09-01. Kept ABOVE the generic
+    # "GTX 16"/"RTX" rows because first match wins and "GTX 9"/"GTX 7" would
+    # otherwise never be reached.
+    ("GTX 750", "maxwell"), ("GTX 745", "maxwell"), ("GTX 750 Ti", "maxwell"),
+    ("GTX 970", "maxwell"), ("GTX 980", "maxwell"), ("GTX 960", "maxwell"),
+    ("GTX 950", "maxwell"), ("GTX TITAN X", "maxwell"), ("Quadro M", "maxwell"),
     # Pascal.  "Quadro P" must come BEFORE the generic "Quadro RTX" style rows
     # and must not be spelled "Quadro P4000" only -- P2000/P5000/P6000 are the
     # same GP10x silicon.  nvkvm does not support these yet; they are mapped so
