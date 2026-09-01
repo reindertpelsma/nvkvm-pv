@@ -1956,9 +1956,31 @@ boot_and_validate() {
     # driver swap that silently did not take, which is the failure mode that
     # would otherwise let ONE version be measured five times and reported as
     # five drivers' worth of coverage.
-    rsh_t 2000 "$G 'cd /mnt/nvkvm && bash tests/validate.sh --expect-driver $drv --json /tmp/r.json'" >/dev/null 2>&1
+    # KEEP validate.sh's stdout. It was going to /dev/null, which threw away the
+    # only evidence that exists when the run does NOT finish: --json is written
+    # at the END, so a timeout leaves no JSON at all, and the CHECKPOINT /
+    # WEDGE-EVIDENCE lines that name the step in flight go to stdout.
+    #
+    # MEASURED 2026-09-01: a Pascal control ran the full 2000s, returned rc=124,
+    # and produced NOTHING to look at -- no verdict and no checkpoints -- while
+    # the diagnostics built that same morning to explain exactly this case were
+    # writing to the discarded stream. Evidence capture defeated by its caller.
+    #
+    # Redirected to a FILE on the guest rather than captured in a variable:
+    # these probes can leave a child holding a pipe, and a command substitution
+    # would never see EOF. See tests/probe_orphan_pipe_test.sh.
+    rsh_t 2000 "$G 'cd /mnt/nvkvm && bash tests/validate.sh --expect-driver $drv --json /tmp/r.json > /tmp/validate.out 2>&1'" >/dev/null 2>&1
     VR_RC=$?
     VR_JSON="$(rsh_t 120 "$G 'cat /tmp/r.json'" 2>/dev/null)"
+
+    # On a timeout there is no JSON, so the tail of stdout is all we get. Keep
+    # it short enough to live in a record and long enough to carry the last
+    # CHECKPOINT line, which names the step that was running.
+    if [ "$VR_RC" = 124 ] || [ "$VR_RC" = 137 ] || [ -z "$VR_JSON" ]; then
+        VR_STDOUT_TAIL="$(rsh_t 120 "$G 'grep -aE \"CHECKPOINT|WEDGE|SURVIVED\" /tmp/validate.out 2>/dev/null | tail -12; echo ---; tail -20 /tmp/validate.out 2>/dev/null'" 2>/dev/null)"
+    else
+        VR_STDOUT_TAIL=""
+    fi
 
     # Collect the early-warning lines EVEN ON A PASS.  Every real bug found on
     # new hardware announced itself here first, and a green table with a DENY
@@ -1973,7 +1995,16 @@ boot_and_validate() {
 
     if [ -z "$VR_JSON" ]; then
         VR_STATUS="validate-unparsed"
-        VR_DETAIL="validate.sh exited $VR_RC but produced no /tmp/r.json"
+        # Say WHERE it stopped, not just that it did. --json is written at the
+        # end, so this branch is exactly the case with no verdict -- and the
+        # CHECKPOINT line names the step that was in flight. Reporting only
+        # "no /tmp/r.json" is how a Pascal box burned 2000s and taught us
+        # nothing on 2026-09-01.
+        if [ -n "$VR_STDOUT_TAIL" ]; then
+            VR_DETAIL="validate.sh exited $VR_RC with no /tmp/r.json. Last checkpoints and output tail: $(printf '%s' "$VR_STDOUT_TAIL" | tr '\n' ' | ')"
+        else
+            VR_DETAIL="validate.sh exited $VR_RC but produced no /tmp/r.json, and no stdout was captured either"
+        fi
         return
     fi
     VR_SUMMARY="$(printf '%s' "$VR_JSON" | python3 -c '
