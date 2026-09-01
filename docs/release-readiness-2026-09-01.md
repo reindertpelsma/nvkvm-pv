@@ -228,18 +228,39 @@ tolerance as `|| true` — and that tolerance, written for the cosmetic case,
 swallowed the fatal one. Critical libraries now exit 3, cosmetic stays 2, and
 the unit fails on 3.
 
-### Not resolved
+### ROOT CAUSE — found, and it was not staging at all
 
-Why `libnvidia-ptxjitcompiler` failed to reach that particular guest is **still
-unknown**. Fix (b) makes such a failure announce itself at staging time instead
-of surfacing later as a CUDA error on an unrelated-looking check, but it does
-not explain the cause. The box was still running when this was written and the
-staging logs had no mention of either library — itself suspicious, since a
-`stage()` failure prints to stderr.
+Measured in the live guest:
 
-**This is not a regression in anything merged tonight.** turing and ampere ran
-7/7 clean on identical code; it is a pre-existing fragility that one host
-exposed.
+```
+conf exists: yes          conf bytes: 0          ptxjit resolvable: 0
+/usr/local/nvidia-guest/lib/libnvidia-ptxjitcompiler.so.1 -> ...610.57.04
+```
+
+`/etc/ld.so.conf.d/nvidia-guest.conf` existed but was **zero length**, so
+`$CUDADIR` was never on the loader path. The libraries were staged correctly;
+nothing could find them. The guard was `[ ! -f ... ]` — existence only — so an
+empty file passed and was never repaired on any later boot.
+
+Why exactly this pattern: `libnvidia-nvvm` also lands in `$SYS`, which is on the
+default path, so it stayed resolvable, while `libnvidia-ptxjitcompiler` lives
+only in `$CUDADIR` and vanished. `validate.sh` reports "so.1 **or** so.4 is
+missing/unstaged", which is why it read as a staging fault. The control passed
+35P/0F/0S because it runs before the guest has been through a driver swap.
+
+Zero length with intact metadata is ext4 delayed allocation dropping a recent
+write when the guest stops uncleanly — which a driver swap does. Same shape as
+the version-only idempotence check that could not detect an OOM-truncated
+NVIDIA install: **check the content, not the presence.**
+
+Fixed on `fix/staging-critical-libs` (`a137d30`): the guard now greps for the
+path, repairing missing, empty and wrong-content cases, with a `sync` after the
+write. Verified: missing/empty/wrong all repair, correct is left alone.
+
+Note this contradicts my own conclusion two sections up, which said the staging
+path was sound and the defect lay elsewhere. The staging path **was** sound.
+The bug was one layer past it, in loader configuration, and was only found by
+inspecting a live guest rather than reading the scripts.
 
 ## 5. TODO, ordered
 
