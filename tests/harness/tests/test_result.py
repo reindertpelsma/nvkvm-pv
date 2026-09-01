@@ -121,7 +121,10 @@ def test_two_sided_baseline_fail_also_fails():
     assert c.status is Status.FAIL
 
 
-def test_two_sided_missing_value_on_either_side_is_untested_never_a_ratio():
+def test_two_sided_missing_value_never_renders_a_ratio():
+    """Whatever the OVERALL status turns out to be (SKIP or UNTESTED --
+    see the precedence tests below), a missing side must never produce a
+    ratio."""
     band = ToleranceBand("higher_is_better", 0.80)
 
     baseline_missing = Comparison(
@@ -131,7 +134,6 @@ def test_two_sided_missing_value_on_either_side_is_untested_never_a_ratio():
         band=band,
     )
     assert baseline_missing.ratio is None
-    assert baseline_missing.status is Status.UNTESTED
 
     target_missing = Comparison(
         name="bw", tier="medium",
@@ -140,7 +142,54 @@ def test_two_sided_missing_value_on_either_side_is_untested_never_a_ratio():
         band=band,
     )
     assert target_missing.ratio is None
-    assert target_missing.status is Status.UNTESTED
+
+
+def test_two_sided_skip_on_either_side_is_skip_not_untested():
+    """A structurally impossible comparison (no GPU on the baseline, an app
+    missing on one side) is disclosed evidence, not an absence of it -- the
+    whole Comparison reports SKIP, carrying the reason, never a silently
+    downgraded UNTESTED and never a fabricated ratio. This is the exact
+    scenario run_tests.py's --baseline wiring hits when a baseline machine
+    genuinely has no GPU (e.g. the pre-Turing box)."""
+    band = ToleranceBand("higher_is_better", 0.80)
+
+    baseline_skip = Comparison(
+        name="bw", tier="medium",
+        baseline=obs(Status.SKIP, "no GPU on baseline machine", label="host"),
+        target=obs(Status.PASS, "13.4 GB/s", value=13.4, label="guest"),
+        band=band,
+    )
+    assert baseline_skip.status is Status.SKIP
+    assert baseline_skip.ratio is None
+
+    target_skip = Comparison(
+        name="ffmpeg", tier="large",
+        baseline=obs(Status.PASS, "110 fps", value=110.0, label="host"),
+        target=obs(Status.SKIP, "ffmpeg not found on PATH", label="guest"),
+    )
+    assert target_skip.status is Status.SKIP
+
+    both_skip = Comparison(
+        name="ffmpeg", tier="large",
+        baseline=obs(Status.SKIP, "ffmpeg not found on PATH", label="host"),
+        target=obs(Status.SKIP, "ffmpeg not found on PATH", label="guest"),
+    )
+    assert both_skip.status is Status.SKIP
+
+
+def test_two_sided_untested_outranks_skip():
+    """UNTESTED (no evidence -- a timeout, a broken harness) must never be
+    quietly reclassified as the calmer SKIP just because the OTHER side
+    happens to have skipped for a legitimate reason."""
+    band = ToleranceBand("higher_is_better", 0.80)
+    c = Comparison(
+        name="bw", tier="medium",
+        baseline=obs(Status.SKIP, "no GPU on baseline machine", label="host"),
+        target=obs(Status.UNTESTED, "probe timed out on guest", label="guest"),
+        band=band,
+    )
+    assert c.status is Status.UNTESTED
+    assert c.ratio is None
 
 
 def test_zero_baseline_value_does_not_divide_by_zero():

@@ -9,11 +9,12 @@ within a stated tolerance" is. Every tier produces `Comparison` objects:
     compare(workload, target=..., baseline=..., ...) -> Comparison
 
 A `Comparison` holds an `Observation` for the target machine and, optionally,
-one for the baseline machine. When there IS no baseline (today: this harness
-has only `ThisMachine`, so nothing to compare a guest against yet), that is
-the DEGENERATE case: `Comparison.baseline is None`, `Comparison.ratio is
-None`, and the report says exactly that -- it never fabricates a 1.00x, and
-it never silently drops the "no baseline" fact into a comment nobody reads.
+one for the baseline machine. When there IS no baseline -- `run_tests.py`
+was invoked with no `--baseline`, or a tier's own checks are structurally
+not ratio-worthy (see small.py) -- that is the DEGENERATE case:
+`Comparison.baseline is None`, `Comparison.ratio is None`, and the report
+says exactly that -- it never fabricates a 1.00x, and it never silently
+drops the "no baseline" fact into a comment nobody reads.
 
 Status vocabulary (copied deliberately from tests/validate.sh -- see the
 design-rules comment near the top of that file):
@@ -21,14 +22,25 @@ design-rules comment near the top of that file):
   PASS      ran, and (for a two-sided comparison) the ratio met its
             ToleranceBand, or (single-sided) the check itself passed.
   FAIL      ran, and did not. A FAIL on EITHER side of a comparison, or a
-            ratio outside its band, is the loudest thing there is.
-  SKIP      structurally impossible here (no GPU, headless, package absent).
-            Carries a reason. A legitimate, expected, non-alarming outcome.
+            ratio outside its band, is the loudest thing there is. Outranks
+            everything else in a two-sided Comparison's overall `.status`.
+  SKIP      structurally impossible here (no GPU, headless, package absent,
+            missing app on one side of a comparison). Carries a reason. A
+            legitimate, expected, non-alarming outcome -- and, in a
+            two-sided Comparison where neither side FAILed or came back
+            UNTESTED, SKIP is what the WHOLE Comparison reports too: a
+            structurally-impossible comparison is disclosed evidence
+            ("no GPU on the baseline"), not an absence of it.
   UNTESTED  no evidence either way -- timeout, harness broke, or (specific
             to comparisons) EITHER side of a two-sided comparison did not
-            produce a value. A ratio is NEVER computed against a missing
-            side, and a missing run NEVER renders as 1.00x or as a pass.
-            UNTESTED always moves the exit code and is never silenceable.
+            produce a value for a reason OTHER than a disclosed SKIP (e.g.
+            one side timed out while the other ran clean). A ratio is NEVER
+            computed against a missing side, and a missing run NEVER
+            renders as 1.00x or as a pass. In a two-sided Comparison,
+            UNTESTED outranks SKIP (see Comparison.status) -- a broken/timed
+            -out run must never be quietly reclassified as an expected skip
+            just because the other side also produced no value. UNTESTED
+            always moves the exit code and is never silenceable.
 
 Every Observation carries a non-empty `detail` -- the observed value or the
 reason. "Vulkan OK" is not an acceptable detail; "Vulkan: NVIDIA GeForce RTX
@@ -154,14 +166,38 @@ class Comparison:
             # Degenerate: nothing to compare against. Pass the target's own
             # status straight through -- there is no ratio to judge.
             return self.target.status
-        # Two-sided. A real, observed FAIL on either side outranks everything,
-        # exactly like validate.sh's verdict() ordering.
+        # Two-sided. Precedence, highest first: FAIL, then UNTESTED, then
+        # SKIP, then an actual ratio/band verdict. This is NOT the same
+        # ordering as Report.exit_code() (which only ever sees FAIL vs
+        # UNTESTED, since SKIP never reaches it) -- it's what a single
+        # Comparison reports about ITSELF when its two sides disagree:
+        #   - A real, observed FAIL on either side outranks everything,
+        #     exactly like validate.sh's verdict() ordering.
+        #   - UNTESTED beats SKIP: a harness that broke or timed out (no
+        #     evidence either way) is not the same claim as "this side
+        #     structurally can't run this" -- an UNTESTED anywhere must
+        #     surface as UNTESTED, never get quietly reclassified as an
+        #     expected, non-alarming SKIP just because the other side also
+        #     happened to skip.
+        #   - SKIP wins once neither side FAILed or came back UNTESTED: a
+        #     missing app on one side, or a GPU absent on the baseline, is a
+        #     structurally impossible comparison -- an expected, disclosed
+        #     outcome (SKIP, with a reason on the Observation that skipped),
+        #     never a fabricated ratio and never silently downgraded to
+        #     "no evidence" (UNTESTED) when there plainly IS evidence: we
+        #     know exactly why no ratio exists.
         if self.target.status is Status.FAIL or self.baseline.status is Status.FAIL:
             return Status.FAIL
+        if self.target.status is Status.UNTESTED or self.baseline.status is Status.UNTESTED:
+            return Status.UNTESTED
+        if self.target.status is Status.SKIP or self.baseline.status is Status.SKIP:
+            return Status.SKIP
         if self.ratio is None:
-            # One side SKIPped, was UNTESTED, or otherwise produced no value.
-            # We are structurally unable to judge parity: never compute a
-            # ratio against a missing side, and never render that as a pass.
+            # Neither side FAILed/UNTESTED/SKIPped, yet there's still no
+            # ratio (e.g. a zero baseline value -- nothing meaningful to
+            # divide by). Structurally unable to judge parity: never compute
+            # a ratio against a missing/unusable side, never render that as
+            # a pass.
             return Status.UNTESTED
         if self.band is None:
             return Status.PASS
