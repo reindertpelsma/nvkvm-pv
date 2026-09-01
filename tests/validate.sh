@@ -981,7 +981,7 @@ static const char *errname(CUresult r) {
 static const char vec_add_ptx[] =
 "//\n"
 ".version 7.5\n"
-".target sm_60\n"
+".target sm_50\n"
 ".address_size 64\n"
 "\n"
 ".visible .entry vec_add(\n"
@@ -1025,7 +1025,7 @@ static const char vec_add_ptx[] =
 static const char matmul_ptx[] =
 "//\n"
 ".version 7.5\n"
-".target sm_60\n"
+".target sm_50\n"
 ".address_size 64\n"
 "\n"
 ".visible .entry matmul(\n"
@@ -1283,7 +1283,8 @@ static int probe_main(void) {
         finish("no cuModuleLoadData");
         return 1;
     }
-    /* The PTX above is ".target sm_60" (Pascal). A device OLDER than that
+    /* The PTX above is ".target sm_50" (Maxwell, the oldest architecture
+       nvkvm can reach). A device OLDER than that
        cannot JIT it and the driver is right to refuse -- that is a fact about
        the probe, not about nvkvm.
 
@@ -1302,14 +1303,14 @@ static int probe_main(void) {
         if (p_cuDeviceGetAttribute &&
             p_cuDeviceGetAttribute(&jmaj, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, dev) == 0 &&
             p_cuDeviceGetAttribute(&jmin, CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, dev) == 0 &&
-            jmaj > 0 && jmaj < 6) {
+            jmaj > 0 && (jmaj < 5)) {
             emit("cuda_ptx_jit", "SKIP",
-                 "device is sm_%d%d; this probe's PTX is .target sm_60 and cannot JIT below it",
+                 "device is sm_%d%d; this probe's PTX is .target sm_50 and cannot JIT below it",
                  jmaj, jmin);
-            emit("cuda_kernel_launch",  "SKIP", "needs cuda_ptx_jit, which does not apply below sm_60");
-            emit("cuda_matmul",         "SKIP", "needs cuda_ptx_jit, which does not apply below sm_60");
-            emit("cuda_managed_alloc",  "SKIP", "needs cuda_ptx_jit, which does not apply below sm_60");
-            finish("PTX probe targets sm_60; device is older");
+            emit("cuda_kernel_launch",  "SKIP", "needs cuda_ptx_jit, which does not apply below sm_50");
+            emit("cuda_matmul",         "SKIP", "needs cuda_ptx_jit, which does not apply below sm_50");
+            emit("cuda_managed_alloc",  "SKIP", "needs cuda_ptx_jit, which does not apply below sm_50");
+            finish("PTX probe targets sm_50; device is older");
             return 0;
         }
     }
@@ -1327,7 +1328,7 @@ static int probe_main(void) {
         finish("PTX module load failed");
         return 1;
     }
-    emit("cuda_ptx_jit", "PASS", "cuModuleLoadData(PTX .version 7.5/.target sm_60) rc=0");
+    emit("cuda_ptx_jit", "PASS", "cuModuleLoadData(PTX .version 7.5/.target sm_50) rc=0");
 
     /* ---- 11. real kernel launch, output checked against expected ---------- */
     CUfunction fn = NULL;
