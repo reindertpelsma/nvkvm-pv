@@ -779,7 +779,8 @@ if [ -z "$NVSMI" ]; then
     record nvidia_smi_driver SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
     record nvidia_smi_cuda   SKIP "nvidia-smi not found on PATH or in the usual staging dirs"
 else
-    SMI_RAW="$(sh_bounded nvidia_smi_banner "$SHELL_TIMEOUT" "$NVSMI" 2>&1)"; SMI_RC=$?
+    sh_bounded nvidia_smi_banner "$SHELL_TIMEOUT" "$NVSMI" > "$WORK/smi_banner.out" 2>&1; SMI_RC=$?
+    SMI_RAW="$(cat "$WORK/smi_banner.out" 2>/dev/null || true)"
     if note_shell_timeout nvidia_smi_gpu nvidia_smi_driver nvidia_smi_cuda; then
         :
     elif [ $SMI_RC -ne 0 ]; then
@@ -787,9 +788,11 @@ else
         record nvidia_smi_driver SKIP "nvidia-smi failed"
         record nvidia_smi_cuda   SKIP "nvidia-smi failed"
     else
-        SMI_GPU="$(sh_bounded nvidia_smi_query_name "$SHELL_TIMEOUT" "$NVSMI" --query-gpu=name --format=csv,noheader 2>&1 | head -1)"
+        sh_bounded nvidia_smi_query_name "$SHELL_TIMEOUT" "$NVSMI" --query-gpu=name --format=csv,noheader > "$WORK/smi_name.out" 2>&1 || true
+        SMI_GPU="$(head -1 "$WORK/smi_name.out" 2>/dev/null || true)"
         SMI_GPU_TIMED_OUT=0; note_shell_timeout nvidia_smi_gpu && SMI_GPU_TIMED_OUT=1
-        SMI_DRV="$(sh_bounded nvidia_smi_query_driver "$SHELL_TIMEOUT" "$NVSMI" --query-gpu=driver_version --format=csv,noheader 2>&1 | head -1)"
+        sh_bounded nvidia_smi_query_driver "$SHELL_TIMEOUT" "$NVSMI" --query-gpu=driver_version --format=csv,noheader > "$WORK/smi_drv.out" 2>&1 || true
+        SMI_DRV="$(head -1 "$WORK/smi_drv.out" 2>/dev/null || true)"
         SMI_DRV_TIMED_OUT=0; note_shell_timeout nvidia_smi_driver && SMI_DRV_TIMED_OUT=1
         SMI_CUDA_FIELD="$(smi_cuda_field "$SMI_RAW")"
         SMI_CUDA="${SMI_CUDA_FIELD#value }"
@@ -2594,7 +2597,14 @@ reg_invariant() {
     # These touch cuMemHostRegister -- the same class of call a Pascal wedge
     # was measured on -- so they get the same non-blocking bound as the
     # probes/nvidia-smi, not a plain `timeout` that can itself hang.
-    out="$(sh_bounded "$name" 120 "$WORK/${name}" 2>&1)"; rc=$?
+    # NOT `out="$(sh_bounded ...)"`. Command substitution reads until EOF,
+    # and EOF needs EVERY write end of that pipe closed -- including one
+    # inherited by a grandchild that outlives the process we bounded. These
+    # repros FORK BY DESIGN, so that grandchild is the normal case, not an
+    # edge case. Redirect to a file (what run_probe already does) so no
+    # pipe exists for an orphan to hold open.
+    sh_bounded "$name" 120 "$WORK/${name}" > "$WORK/${name}.out" 2>&1; rc=$?
+    out="$(cat "$WORK/${name}.out" 2>/dev/null || true)"
     if note_shell_timeout "$name"; then
         :
     elif [ "$rc" -eq 0 ]; then
