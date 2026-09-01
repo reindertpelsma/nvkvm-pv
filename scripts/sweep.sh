@@ -3058,12 +3058,12 @@ if [ -n "$MANUAL_SSH" ]; then
     # architecture, and the driver floor and applicable set are per-arch.
     set -- ${ARCHES//,/ }
     [ "$#" -le 1 ] || die "--ssh takes at most one --arch (got: '${ARCHES:-none}'). One host is one architecture. Omit --arch to have it read off the GPU." 3
-    say "=== manual host (arch: $1) ==========================================="
+    say "=== manual host (arch: ${1:-from the GPU}) ============================"
     # The exit code is derived from $RESULTS below, not from this rc: every
     # early return in sweep_manual_box emits a non-verdict row first, which
     # counts as UNTESTED and forces exit 2. Capturing rc into a variable
     # nothing reads only looked like it was load-bearing.
-    sweep_manual_box "$1" || true
+    sweep_manual_box "${1:-}" || true
 else
 for arch in ${ARCHES//,/ }; do
     if stop_requested; then
