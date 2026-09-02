@@ -556,3 +556,44 @@ that skips the host-initiated post-alloc `NV_ESC_RM_SHARE`, so the +59
 measurement can be A/B'd against it directly. CUDA/UVM is expected to break
 under it -- that grant is what lets UVM dup objects during `cuCtxCreate` -- so it
 is for measurement only.
+
+## 25. Controls re-run 2026-09-03 — GPU containers do NOT leak
+
+The worry worth settling: if plain CUDA containers leaked this way, every
+multi-tenant GPU host (Vast.ai and friends) could be wedged by any tenant. They
+do not.
+
+| workload | teardowns | delta | notes |
+|---|---|---|---|
+| guest `vkcube` (presents) | 5 | **+59 each** | the leak |
+| GPU container, `--gpus all`, CUDA client | 3 | **0** | probe verifiably ran |
+| host-native CUDA client | 2 | **0** | matches sec.15 |
+
+**Trap that produced a false negative first time:** the image used had its own
+entrypoint, which refused to start and never executed the probe. The delta was
+0 because *nothing ran*. Always assert the probe's own output (`MAXCONTIG_MB=`)
+before believing a 0, and pass `--entrypoint`. `tools/reproduce_leak.sh` now
+does both.
+
+So the trigger is nvkvm-specific, and the "unprivileged process wedges a shared
+GPU" concern does not generalise to ordinary containers.
+
+## 26. On this host the leak has NOT yet cost measurable capacity
+
+After 1113 failed auto-unmaps on the 16 GB BAR1 host:
+
+```
+MAXCONTIG_MB=10622  TOTAL_MB=10496  CUDA_FREE_MB=10677     (tools/va_capacity.c)
+can't alloc VA space : 0
+reusemappingdbMap NO_MEMORY : 0
+```
+
+`MAXCONTIG ~= CUDA_FREE` (0.5% apart) is the healthy signature -- allocation is
+VRAM-bound, not VA-bound. So on this host the failed auto-unmaps are a **leading
+indicator that has not yet become harm**. On the 256 MiB host the same +59 rate
+exhausted the aperture and wedged host Vulkan (sec.7).
+
+State both halves when reporting this. "RM fails to reclaim 59 mappings per
+guest client teardown" is proven. "The host is currently degraded" is NOT true
+here, and claiming it would be as wrong as the nvidia-smi reading that said
+there was no leak at all.
