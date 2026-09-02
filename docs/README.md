@@ -12,6 +12,7 @@ value is), or rationale (why it is that way).
 
 | | |
 |---|---|
+| [Install a release](howto/install.md) | the `/dev/kvm` preflight, the container knobs, the tarball's runtime dependencies and glibc floor, the source build |
 | [Build](howto/build.md) | the isolate stub, the patched QEMU, the guest kernel module |
 | [Run a guest](howto/run.md) | image preparation, the QEMU command line, first bring-up, what to check |
 | [Stage the guest NVIDIA userspace](howto/stage-guest-libraries.md) | `make_host_bundle.sh` on the host, `stage_guest_libs.sh` in the guest, and why the failures here are silent |
