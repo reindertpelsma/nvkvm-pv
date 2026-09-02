@@ -470,3 +470,89 @@ before and after every restart, per the silent-rebuild warning.
 Sampler units left running on the host (harmless, `--collect`):
 `nvkvm-va-sampler`, `nvkvm-va-sampler2`, `nvkvm-cap-sampler`,
 `nvkvm-leak-sampler`, writing `/root/*log*.txt`.
+
+---
+
+# UPDATE 4 — re-measured 2026-09-03 on a 16 GB BAR1 host
+
+Host: PC "claude", RTX 4070, driver 595.84, **BAR1 resized to 16 GB (ReBAR on)**,
+guest = SteamOS 3.8.16 in Game Mode under gamescope, nvkvm-pv main `b092a9a`.
+
+## 19. A bigger aperture does NOT fix it — the rate is unchanged
+
+Five consecutive `vkcube` cycles (start under `WAYLAND_DISPLAY=gamescope-0`,
+render ~25 s, `SIGKILL`), counting the documented metric on the host:
+
+| cycle | before | after | delta |
+|---|---|---|---|
+| 1 | 728 | 787 | **+59** |
+| 2 | 787 | 846 | **+59** |
+| 3 | 846 | 905 | **+59** |
+| 4 | 905 | 964 | **+59** |
+| 5 | 964 | 1023 | **+59** |
+
+Exactly the +59 recorded in sec.13 on the 256 MiB host. **A 16 GB BAR1 buys ~64x
+more teardowns before the host wedges; it does not reduce the leak per teardown.**
+
+## 20. WARNING: nvidia-smi cannot measure this, and it looks reassuring
+
+Throughout all five cycles `nvidia-smi` reported BAR1 Used flat at
+**1014 / 16384 MiB**. Stopping the whole compose stack drops it 833 -> 351 MiB and
+restarting returns it to ~872 MiB, cycle after cycle, with QEMU verifiably dead
+(process count sampled per reading) during every "down" phase.
+
+That whole picture reads as "teardown returns the memory, nothing accumulates" —
+and it is **wrong**. It measures a counter sec.8 already said is blind to this
+leak. Anyone re-deriving "there is no leak" from `nvidia-smi` has reproduced a
+measurement error, not a result. Count `Failed to auto-unmap` instead.
+
+Corollary for hosts like the vast RTX 3060 (fixed 256 MiB BAR1, **no Resizable
+BAR capability at all**): with nvkvm not running *and zero QEMU processes*, that
+box still shows 255/256 MiB used, because a desktop alone exceeds that aperture
+(this host's desktop-only baseline is ~351 MiB). That is a separate, additive
+problem — too small an aperture — and it is not this leak. Do not conflate them.
+
+## 21. Structure of a single teardown (new)
+
+Per cycle, exactly **one** RM client accounts for all 59 failures:
+
+```
+58 c1d00285      59 c1d00294      59 c1d0029e
+58 c1d0028a      59 c1d00299      59 c1d002a3
+59 c1d0028f
+```
+
+- **One failing client per app teardown**, never several.
+- The failing client handle advances by **5** per cycle (0x285, 0x28a, 0x28f,
+  0x294, 0x299, 0x29e, 0x2a3), i.e. roughly **five RM clients are allocated per
+  guest Vulkan app** and exactly one of them fails teardown. That is consistent
+  with sec.17's hypothesis that one guest client is spread across several host
+  opens and the mapping owner is not the client RM tears down.
+- The leaked `hResource` handles are mostly low RM-assigned numbers
+  (7, 8, 9, b, c, d, e, f, 62, ...) plus exactly **2** nvkvm-synthesised
+  `0xbeef....` handles per teardown.
+
+## 22. `vulkaninfo` does NOT reproduce it
+
+Three `vulkaninfo --summary` runs in the guest: delta **0**. It creates a device
+and exits without a swapchain. The trigger therefore needs a
+rendering/presenting client, which narrows the suspect mappings to the
+presentation path rather than device creation.
+
+## 23. Framing (owner's, and it is the right one)
+
+Whoever triggers it, **an unprivileged process must not be able to permanently
+consume a global kernel resource that survives its death** — that is an invariant
+OGKM should hold regardless of how userspace arranges its file descriptors.
+close(2) failing to reclaim is a driver defect with nvkvm as, at most, the
+trigger. Practical consequence: this is worth an upstream reproducer, and nvkvm
+should not be contorted around it until the mechanism is proven.
+
+## 24. Next: `NVKVM_NO_POSTALLOC_SHARE`
+
+sec.17 experiment 2 previously needed an ad-hoc patch. Branch
+`diag/postalloc-share-gate` adds a runtime knob (`NVKVM_NO_POSTALLOC_SHARE=1`)
+that skips the host-initiated post-alloc `NV_ESC_RM_SHARE`, so the +59
+measurement can be A/B'd against it directly. CUDA/UVM is expected to break
+under it -- that grant is what lets UVM dup objects during `cuCtxCreate` -- so it
+is for measurement only.
