@@ -1,0 +1,400 @@
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 47
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15C24D000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 49
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10758D000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 4a
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10C363000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 4e
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 147FFE000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 4f
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 11EF51000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 50
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15CD97000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 51
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 149145000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 52
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B0F5000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 53
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 111AC0000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 54
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B2CD0000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 55
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15A0E3000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 57
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 112419000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 58
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15AB68000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 5d
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15ADBB000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 5f
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15ADC1000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 61
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 159B95000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: 62
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10C86D000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: beef00de
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0008a: hResource: beefc360
+Aug 28 18:59:09 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 4
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15719F000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 5
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1571BF000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 6
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B28A0000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 7
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10FE41000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 8
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10FE81000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 9
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15195C000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: a
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 11A350000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: b
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 11E87F000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: c
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1107A7000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: e
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1091E4000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: f
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 111B46000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 10
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B2930000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 11
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10F46D000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 12
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10D67D000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 14
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 119476000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 15
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 14983C000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 1f
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 156725000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: 21
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15C41A000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: beef00de
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004c: hResource: beefc360
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 1
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10E287000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 2
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1477F1000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 3
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B2820000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 4
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10F177000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 5
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10FE00000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 6
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10FE61000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 7
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 11386D000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 8
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 11ED7C000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 9
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 101F40000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: b
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 110D67000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: c
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 147834000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: d
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B2920000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: e
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 109C98000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: f
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 147836000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 11
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 110D6B000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 12
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 156721000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 1c
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 149841000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: 1e
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1567A5000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: beef00de
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0004f: hResource: beefc360
+Aug 28 18:59:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
+Aug 28 19:00:53 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0034c: hResource: beef00de
+Aug 28 19:00:53 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 19:00:53 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d0034c: hResource: beefc360
+Aug 28 19:00:53 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 4
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 149417000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 5
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1495F7000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 6
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B3F20000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 7
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 14D847000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 8
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 149737000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 9
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 14D816000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: a
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B16000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: b
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B15000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: c
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B14000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: e
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B10000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: f
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B0E000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 10
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B2B30000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 11
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B8DB000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 12
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4227C9000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 14
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1530D4000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 15
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1530D8000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 1f
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15315A000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 21
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15315B000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: 22
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15315E000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: beef00de
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d00388: hResource: beefc360
+Aug 28 19:01:00 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 1
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B8B1000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 2
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 409471000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B4320000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 4
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4039A0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 5
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4039DC000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 6
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4039FC000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 7
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 422434000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 8
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 422435000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 9
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 422436000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: b
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 42243A000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: c
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 42243C000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: d
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B43A0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: e
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 42244F000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: f
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E21000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 11
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4097FD000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 12
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B53000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 1c
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094EE000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 1e
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094EF000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 1f
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094F2000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 20
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15425E000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 21
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 154227000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 22
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E7D000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 23
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420FB1000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 24
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420FCD000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 25
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 421BF3000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 26
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 421BF4000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 27
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 421BF6000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 28
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B43C0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 29
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 422408000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 2b
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225B9000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 2c
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225BD000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 2f
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225C0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 34
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B46000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3a
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10D336000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3b
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 409556000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3c
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 409557000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3d
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 409559000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3e
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B43E0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 3f
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B809000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 40
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1543AA000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 4b
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4260B6000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 4c
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146A57000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 4d
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146A37000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 4e
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B927000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 4f
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B928000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 50
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B92A000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 51
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B44E0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 52
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B93A000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 54
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141E0000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 55
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141E4000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 5a
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141E5000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 5b
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094D2000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 5e
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146B4C000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 5f
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146B10000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 60
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146B0F000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 61
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146B0E000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: 62
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 426B20000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: beef00de
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003e2: hResource: beefc360
+Aug 28 19:05:59 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 1
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 409470000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 2
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 40399F000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B44F0000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 4
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4039DB000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 5
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4039FB000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 6
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 42263C000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 7
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E20000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 8
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E1F000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 9
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E1E000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: b
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E1A000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: c
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E18000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: d
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B43B0000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: e
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225F3000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: f
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4097FC000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 11
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094ED000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 12
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094E9000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 1c
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15425D000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 1e
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15425C000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 1f
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 154259000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 20
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 154226000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 21
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420E7C000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 22
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 422640000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 23
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 420FCC000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 24
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 42263E000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 25
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225B8000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 26
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225B7000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 27
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225B5000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 28
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B44D0000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 29
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4225A2000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 2b
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B45000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 2c
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 407B41000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 2f
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1494FD000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 34
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10D335000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3a
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 409555000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3b
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1543A9000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3c
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1543A8000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3d
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1543A6000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3e
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B4580000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 3f
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 154393000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 40
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1543C9000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 4b
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 10CB63000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 4c
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146A36000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 4d
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 15B926000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 4e
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141DF000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 4f
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141DE000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 50
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141DC000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 51
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr B45A0000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 52
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141C9000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 54
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 1141E3000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 55
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146B11000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 5a
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 146B12000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 5b
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 114189000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 5e
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 4094C9000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 5f
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 426B20000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 60
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 426B21000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 61
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 425F04000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: 62
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 42855C000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: beef00de
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr 126865000
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: Failed to auto-unmap (status=0x23) hClient c1d003f3: hResource: beefc360
+Aug 28 19:07:10 claude kernel: NVRM: clientUnmapResourceRefMappings: hContext: beef0004 at addr FBBB0000
