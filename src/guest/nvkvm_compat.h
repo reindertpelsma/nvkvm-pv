@@ -218,7 +218,16 @@ static inline void vma_start_write(struct vm_area_struct *vma)
  * with "static declaration follows non-static declaration".  A macro defers
  * that lookup to the call site, where mm.h is already included.
  */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
+/*
+ * THRESHOLD IS 6.12, NOT 6.16.  This shim was written against SteamOS 6.16
+ * and guarded at 6.16, but page_mapcount() was removed from the public
+ * headers well before that -- MEASURED by tests/kernel_matrix.sh: 6.8
+ * (ubuntu 24.04) builds, 6.12.107 (debian 13) and 6.14.11 (ubuntu 25.04)
+ * both fail with "implicit declaration of function 'page_mapcount'".
+ * Guarding at 6.16 left every kernel in 6.12..6.15 taking the removed
+ * spelling, so the guest module did not build on two current distros.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #define nvkvm_page_mapcount(page)   folio_mapcount(page_folio(page))
 #else
 #define nvkvm_page_mapcount(page)   page_mapcount(page)
