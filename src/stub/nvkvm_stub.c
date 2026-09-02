@@ -151,6 +151,8 @@
 
 /* prctl op: from <linux/prctl.h>. */
 #define PR_SET_NO_NEW_PRIVS 38
+#define PR_SET_PDEATHSIG    1
+#define NVKVM_SIGKILL       9
 
 /* socket cmsg / msghdr — kernel UAPI exposes the data but the userland
  * struct shapes are normally defined in <bits/socket.h>.  Hand-roll them. */
@@ -601,7 +603,31 @@ static long stub_sigaction(int sig, const struct kernel_sigaction *act,
 /* ── Constants ────────────────────────────────────────────────────────────── */
 
 #define SOCK_FD          STDIN_FD
-#define NVKVM_STUB_WORKERS   16
+/*
+ * Worker pool. NVKVM_STUB_WORKERS_MIN are spawned up front (this was the whole
+ * pool until 2026-09-03); the pool then GROWS on demand up to
+ * NVKVM_STUB_WORKERS when work queues behind busy workers.
+ *
+ * Why growth matters, and why "don't run untrusted guests" does not cover it:
+ * a fixed pool caps how many guest GPU operations can be in flight at once, and
+ * CUDA's contract implies they run in parallel.  A perfectly TRUSTED guest app
+ * that merely processes untrusted DATA -- a game client servicing a busy
+ * server, a service fanning out remote requests -- can exceed the cap through
+ * no fault of its own.  Work then queues behind operations that may block for
+ * seconds, and the app can trip its OWN watchdog (Chromium's GPU watchdog fires
+ * at ~10 s; see the Planetary Annihilation case in nvkvm_virtio.c).  That is an
+ * nvkvm-caused hang in correct software, not a misuse.
+ *
+ * Isolates are per guest mm, so this never let one guest app starve another --
+ * each has its own pool.  The failure was always self-inflicted-by-us within a
+ * single app.
+ *
+ * Growth FAILING is safe: if clone(2) is refused we simply stop growing and
+ * behave exactly as the old fixed pool did, because the floor is the old size.
+ */
+#define NVKVM_STUB_WORKERS_MIN   16
+#define NVKVM_STUB_WORKERS   64
+#define WORKER_STACK_SIZE (128 * 1024)  /* 128 KiB per worker */
 /*
  * Handle IDs in QEMU are a global monotonic counter that never resets, so
  * after a few thousand cumulative opens across multiple CUDA processes
@@ -991,6 +1017,54 @@ static struct fs_mutex    queue_mutex = FS_MUTEX_INIT;
 static struct fs_cond     queue_cond  = FS_COND_INIT;
 static volatile int       stub_exiting = 0;
 
+/*
+ * Worker pool growth.  g_worker_count is the number of worker threads that
+ * exist; slots [1 .. g_worker_count] are live (slot 0 is the reader).  Only
+ * grow_worker_pool() writes it, under queue_mutex, so the slot it hands to a
+ * new thread is unique by construction.
+ */
+static volatile int g_worker_count = 0;
+
+/* Defined below; grow_worker_pool() needs its address to clone onto. */
+static void worker_thread(void *arg);
+
+/*
+ * Spawn one more worker, if the pool is below its cap.  Caller MUST hold
+ * queue_mutex (this is called from enqueue_job, which already does).
+ *
+ * Uses legacy clone(2) rather than clone3: after apply_seccomp() only clone is
+ * reachable, because CLONE_THREAD can be enforced on it (flags in a register)
+ * and cannot be on clone3 (flags behind a pointer).  Failure is NOT an error --
+ * we simply keep the pool at its current size, which is why the floor is the
+ * old fixed size: degrading to "no growth" degrades to the old behaviour.
+ */
+static void grow_worker_pool(void)
+{
+	if (g_worker_count >= NVKVM_STUB_WORKERS)
+		return;
+
+	void *stack = stub_mmap(NULL, WORKER_STACK_SIZE,
+				PROT_READ | PROT_WRITE,
+				MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (stack == MAP_FAILED)
+		return;
+
+	int slot = g_worker_count + 1;
+	unsigned char *top = (unsigned char *)stack + WORKER_STACK_SIZE;
+	top = (unsigned char *)((uintptr_t)top & ~(uintptr_t)15);
+
+	unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES |
+			      CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM;
+	long tid = fs_clone_run(flags, top, worker_thread,
+				(void *)(uintptr_t)slot);
+	if (tid < 0) {
+		stub_munmap(stack, WORKER_STACK_SIZE);
+		return;
+	}
+	worker_tids[slot] = (int)tid;
+	g_worker_count = slot;
+}
+
 static void job_queue_init(void)
 {
 	for (int i = 0; i < MAX_INFLIGHT; i++)
@@ -1000,10 +1074,26 @@ static void job_queue_init(void)
 static void enqueue_job(const struct ioctl_job *job)
 {
 	fs_mutex_lock(&queue_mutex);
+	int queued = 0;
+	for (int i = 0; i < MAX_INFLIGHT; i++)
+		if (job_queue[i].valid)
+			queued++;
 	for (int i = 0; i < MAX_INFLIGHT; i++) {
 		if (!job_queue[i].valid) {
 			job_queue[i] = *job;
 			job_queue[i].valid = 1;
+			/*
+			 * Grow the pool when every worker is already busy.  A
+			 * signalled-but-unclaimed job is what a guest app
+			 * experiences as added latency, and with blocking
+			 * ioctls that latency can reach its own watchdog.  One
+			 * worker per such event, capped: correct software
+			 * plateaus well below the cap, and anything that does
+			 * not is the malicious-guest case the pool comment
+			 * describes.
+			 */
+			if (queued + 1 >= g_worker_count)
+				grow_worker_pool();
 			fs_cond_signal(&queue_cond);
 			fs_mutex_unlock(&queue_mutex);
 			return;
@@ -3382,6 +3472,37 @@ static long apply_seccomp(void)
 		      offsetof(struct seccomp_data, nr))); \
 } while (0)
 
+/*
+ * Allow nr_val only when args[0] has EVERY bit of `mask` set.  Used for
+ * clone(2): the stub grows its worker pool at runtime, and a THREAD (which dies
+ * with the thread group, and is covered by our RLIMIT_NPROC) is safe where a
+ * PROCESS would hand a compromised stub the process-creation primitive that
+ * audit F6-1 deliberately removed.
+ *
+ * This is why legacy clone is allowed here and clone3 is NOT, even though the
+ * startup path prefers clone3: clone(2) passes flags in a REGISTER, which BPF
+ * can test.  clone3 passes them in a `struct clone_args` POINTER, and seccomp
+ * cannot dereference memory -- CLONE_THREAD is simply UNENFORCEABLE for clone3,
+ * so allowing it would silently restore unrestricted process creation.
+ * Do not "simplify" this by allowing clone3.
+ *
+ * args[0] is loaded as a 32-bit word; CLONE_THREAD (0x00010000) lives in the
+ * low half, and we require the bit to be SET, so high garbage cannot help an
+ * attacker.  The kernel itself then requires CLONE_SIGHAND (and hence CLONE_VM)
+ * alongside CLONE_THREAD, so a "thread" here really is one.
+ */
+#define ALLOW_IF_ARG0_HAS(nr_val, mask) do { \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 5)); \
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
+		      offsetof(struct seccomp_data, args[0]))); \
+	EMIT(BPF_STMT(BPF_ALU|BPF_AND|BPF_K, (mask))); \
+	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (mask), 1, 0)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ERRNO | EPERM)); \
+	EMIT(BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW)); \
+	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
+		      offsetof(struct seccomp_data, nr))); \
+} while (0)
+
 #define ALLOW_IF_NO_EXEC(nr_val) do { \
 	EMIT(BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, (nr_val), 0, 5)); \
 	EMIT(BPF_STMT(BPF_LD|BPF_W|BPF_ABS, \
@@ -3431,6 +3552,23 @@ static long apply_seccomp(void)
 	ALLOW_IF(__NR_gettid);
 	ALLOW_IF(__NR_tgkill);   /* post SIGUSR1 to interrupt a worker's ioctl (#73) */
 	ALLOW_IF_ARG1_EQ(__NR_fcntl, NVKVM_F_DUPFD_CLOEXEC);
+	/* Threads only, never processes -- see ALLOW_IF_ARG0_HAS.
+	 *
+	 * NOT bounded by RLIMIT_NPROC: that is per real UID, and a unique UID
+	 * per isolate exists ONLY in uid mode -- namespace mode does not use
+	 * one, so a per-UID limit would not be a per-isolate bound and claiming
+	 * it would be false.  The count is bounded in the stub itself
+	 * (g_worker_count vs NVKVM_STUB_WORKERS).
+	 *
+	 * RESIDUAL RISK, stated plainly: a COMPROMISED stub ignores its own
+	 * counter and can spawn threads up to whatever the host allows.  That is
+	 * strictly less severe than what F6-1 removed -- threads die with the
+	 * thread group, so nothing survives the stub, and PR_SET_PDEATHSIG means
+	 * the stub itself dies with QEMU -- but it is a real memory-DoS
+	 * primitive that did not exist between F6-1 and this change.  Accepted
+	 * deliberately, because the alternative is a fixed pool that hangs
+	 * correct guest software (see the pool comment above). */
+	ALLOW_IF_ARG0_HAS(__NR_clone, CLONE_THREAD);
 	/* R2-L1: dropped vestigial entries with no freestanding caller —
 	 * clone (clone3 is used), set_robust_list, madvise, lseek, pread64,
 	 * readlinkat — to shrink the post-RCE syscall surface. */
@@ -3439,6 +3577,7 @@ static long apply_seccomp(void)
 
 #undef ALLOW_IF
 #undef ALLOW_IF_ARG1_EQ
+#undef ALLOW_IF_ARG0_HAS
 #undef EMIT
 
 	/* F8-1: fail closed — a truncated allowlist is not a sandbox. */
@@ -3531,7 +3670,6 @@ static void apply_relocations(void)
 
 /* ── main ────────────────────────────────────────────────────────────────── */
 
-#define WORKER_STACK_SIZE (128 * 1024)  /* 128 KiB per worker */
 
 /* Tiny freestanding strcmp — argv scanning only, no libc available. */
 static int stub_streq(const char *a, const char *b)
@@ -3604,6 +3742,65 @@ int main(int argc, char **argv)
 	if (stub_window_init() != 0)
 		return 1;
 
+	/*
+	 * DIE WITH QEMU.  An isolate that outlives its VMM is not merely idle:
+	 * it keeps its /dev/nvidia* file descriptions open, so RM cannot
+	 * release the BAR1 mappings anchored on them, and that address space
+	 * stays consumed until the process actually goes away.
+	 *
+	 * In the container deployment this is already guaranteed for free --
+	 * the stubs live in the vmm container's pid namespace, so when its PID
+	 * 1 exits the kernel SIGKILLs every one of them
+	 * (zap_pid_ns_processes).  Measured: stubs 8 -> 0 across a
+	 * `docker compose down`, with BAR1 returning to the host's desktop
+	 * baseline.  This is for the case that has no such net: QEMU started
+	 * DIRECTLY ON THE HOST, where a crash or a SIGKILL leaves the isolates
+	 * reparented to init with nothing to reap them.
+	 *
+	 * Set here, in the stub, rather than by QEMU before exec: the kernel
+	 * CLEARS pdeathsig across execve whenever credentials change, so a
+	 * pre-exec setting cannot be relied on.  Set before apply_seccomp()
+	 * too -- prctl is not in the filter's allowlist.
+	 *
+	 * NO getppid() RACE CHECK, deliberately.  The usual idiom (set the
+	 * signal, then exit if getppid() == 1 because the parent already died)
+	 * is WRONG here: QEMU is frequently PID 1 of the vmm container, so a
+	 * healthy stub legitimately has ppid 1 and would kill itself on every
+	 * start.  Closing that race properly needs QEMU to pass its own pid,
+	 * which is a protocol change; the window is a few microseconds and its
+	 * failure mode is exactly the orphan we have today, so this is a
+	 * strict improvement without it.
+	 *
+	 * WHY THIS IS A SECURITY PROPERTY AND NOT JUST HYGIENE.  The obvious
+	 * alternative -- notice the QEMU socket EOF and exit -- is COOPERATIVE,
+	 * and the isolate is precisely the component assumed to be
+	 * compromised: a hostile stub simply declines to act on the EOF and
+	 * keeps holding its /dev/nvidia* descriptions, so the operator who
+	 * SIGKILLs the VM believes cleanup happened when it did not, and the
+	 * BAR1 address space stays consumed until a driver reload.  That is a
+	 * denial of service against every other GPU user on the host.
+	 *
+	 * pdeathsig is kernel-enforced instead, and the seccomp filter closes
+	 * both ways out of it:
+	 *   - SIGKILL cannot be caught, blocked or ignored;
+	 *   - prctl is NOT in the allowlist, so the stub cannot clear the
+	 *     signal after the filter is installed;
+	 *   - the stub has NO process-creation primitive left at all -- fork,
+	 *     vfork, clone, clone3 and execve are all absent (see the F6-1 note
+	 *     in apply_seccomp) -- so it cannot escape into a child, which is
+	 *     the one place pdeathsig would not be inherited.
+	 * The signal is therefore un-evadable by the sandboxed code itself.
+	 *
+	 * CAVEAT for whoever changes the spawn path: pdeathsig fires when the
+	 * parent THREAD exits, not the parent process.  Isolates are cloned
+	 * from QEMU's virtio TX thread (nvkvm_isolate.c, dispatched inline with
+	 * the BQL held), which lives as long as the device.  If that ever
+	 * becomes a transient thread, every stub dies mid-session and takes the
+	 * guest's GPU with it -- a far worse failure than the leak this
+	 * prevents.
+	 */
+	stub_prctl(PR_SET_PDEATHSIG, NVKVM_SIGKILL, 0, 0, 0);
+
 	for (int i = 1; i < argc && argv && argv[i]; i++) {
 		if (stub_streq(argv[i], "--no-seccomp"))
 			want_seccomp = 0;
@@ -3658,7 +3855,7 @@ int main(int argc, char **argv)
 	 * and a slot id stashed in worker_tids[] for fault-addr indexing.
 	 * We don't pthread_join — workers exit via SYS_exit when dequeue
 	 * returns NULL (stub_exiting flag set by reader on EXIT). */
-	for (int i = 0; i < NVKVM_STUB_WORKERS; i++) {
+	for (int i = 0; i < NVKVM_STUB_WORKERS_MIN; i++) {
 		void *stack = stub_mmap(NULL, WORKER_STACK_SIZE,
 					PROT_READ | PROT_WRITE,
 					MAP_PRIVATE | MAP_ANONYMOUS |
@@ -3712,6 +3909,7 @@ int main(int argc, char **argv)
 		}
 		/* Slot 0 reserved for reader; workers occupy [1..N]. */
 		worker_tids[i + 1] = (int)tid;
+		g_worker_count = i + 1;
 	}
 
 	/* Pre-open /dev/nvidia-uvm so the stub itself owns the file's mm
