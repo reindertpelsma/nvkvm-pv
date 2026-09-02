@@ -244,3 +244,15 @@ different vCPU counts (25 vs 4 here) it is not a clean GPU-encode parity number.
   wlr-screencopy zero-copy capture fps run, and `run_mate_x11.sh`.  No evidence
   for or against a working MATE desktop was found in this pass; the script
   exists (added in 9c827a7) but records no result.
+
+
+## Fine-tuning: Unsloth LoRA on ARC-AGI (moved here from the README)
+
+A real Kaggle ARC-AGI notebook runs unmodified in the guest on an RTX 5090:
+Unsloth LoRA fine-tuning **Qwen3** (128 steps, 13 GB allocated), then decode and
+scoring inference at 14.7 GB -- a full puzzle in 177 s. Training as well as
+inference, multi-GB allocation churn between the two phases, and the Triton and
+xformers paths, all through the forwarder.
+
+Host parity: **--**, not measured yet for this workload; that is a gap in the
+measurements, not a known shortfall.
