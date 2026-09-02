@@ -807,7 +807,33 @@ struct nv2081_alloc_parameters {
  *        forwarding a wrong-sized window for a class libcuda really does
  *        allocate -- but the NV2081 row above is precedent for exactly this
  *        kind of fix removing its warning without curing the failure that
- *        prompted the search. Verify on hardware before claiming a fix. */
+ *        prompted the search.
+ *
+ *    HARDWARE VERIFICATION, 2026-08-29/30 -- both halves of that caveat now
+ *    MEASURED on two more GPUs and a DIFFERENT driver than the one the class
+ *    was found on. Rented vast.ai KVM boxes, host driver 580.95.05, SteamOS
+ *    3.8.14 guest under the Compose deployment, libcuda.so.580.95.05 driven
+ *    directly (ctypes) so nothing but this row changed between arms. Each run
+ *    cleared the guest ring with `dmesg -C` first, and each arm re-checked
+ *    that the image AND the guest's 9p share really carried the row:
+ *
+ *      RTX 3080 (GA102, Ampere) -- A/B/A on one box:
+ *        pre-fix  1dc47d45  3 runs: cuInit 999, alloc-param warnings = 1
+ *        post-fix ca1370d   3 runs: cuInit 999, alloc-param warnings = 0
+ *      RTX 4060 Ti (AD106, Ada) -- same two builds:
+ *        pre-fix  1dc47d45  cuInit 999, alloc-param warnings = 1
+ *        post-fix ca1370d   3 runs: cuInit 999, alloc-param warnings = 0
+ *
+ *    So the row does what it says -- the warning goes 1 -> 0, reproducibly, on
+ *    Ampere and Ada -- and it does NOT move the failure: cuInit is 999 before
+ *    and after on both. The NV2081 precedent holds, and the caveat above is
+ *    confirmed rather than lifted. Do not cite this row as a CUDA fix.
+ *
+ *    A trap worth recording, because it nearly produced a false negative: the
+ *    guest's nvkvm-boot unit REBUILDS AND RELOADS the module during boot, so a
+ *    probe run in the first ~30 s can still be talking to the previous module
+ *    and will show the old warning. Wait for the unit to finish, or read the
+ *    A/B/A above rather than a single post-reboot sample. */
 #define NV_CONFIDENTIAL_COMPUTE 0x0000cb33U
 struct nv_confidential_compute_alloc_params {
 	__u32 h_client;       /* [IN] @0 -- per clcb33.h */

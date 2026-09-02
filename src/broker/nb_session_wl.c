@@ -78,6 +78,23 @@ struct nb_session *nb_session_wayland(const struct nb_config *cfg)
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
 
 #define NB_TB_H     28
+
+/*
+ * Minimum CONTENT size, and the reason it has to exist.
+ *
+ * Nothing set a floor: set_min_size was never called (it appears only in
+ * the generated xdg-shell stub) and the X11 backend set no XSizeHints. A
+ * compositor is therefore free to configure the toplevel arbitrarily
+ * small, and top_configure() subtracts NB_TB_H for the title bar and then
+ * clamps anything <= 0 to 1 -- so any configure at or below 28px high
+ * produced a ONE PIXEL content area. OBSERVED 2026-09-02: the broker
+ * window starts collapsed and has to be resized by hand.
+ *
+ * The clamp itself was not wrong -- a zero-height surface is invalid --
+ * it just had no floor to clamp to.
+ */
+#define NB_MIN_W    320
+#define NB_MIN_H    240
 #define NB_TB_BTN   34          /* width of one button, from the right edge  */
 
 /* The close-confirmation overlay. */
@@ -3017,8 +3034,11 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
     if (w->tb_mapped) {
         ht -= NB_TB_H;
     }
-    if (ht <= 0) {
-        ht = 1;
+    if (ht < NB_MIN_H) {
+        ht = NB_MIN_H;          /* was `ht = 1` -- a collapsed window */
+    }
+    if (wd < NB_MIN_W) {
+        wd = NB_MIN_W;
     }
     /*
      * A configure that changes nothing is worth skipping -- but ONLY if the
@@ -3991,6 +4011,11 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     xdg_toplevel_add_listener(w->toplevel, &top_listener, w);
     xdg_toplevel_set_title(w->toplevel, cfg->title);
     xdg_toplevel_set_app_id(w->toplevel, "nvkvm-display-broker");
+    /* Tell the compositor the floor rather than only clamping after the
+     * fact: a min size it knows about stops the small configure being sent,
+     * and makes the resize edges stop at something usable. The geometry we
+     * set includes the title bar, so the minimum must too. */
+    xdg_toplevel_set_min_size(w->toplevel, NB_MIN_W, NB_MIN_H + NB_TB_H);
     if (w->deco_mgr) {
         w->deco = zxdg_decoration_manager_v1_get_toplevel_decoration(
             w->deco_mgr, w->toplevel);
