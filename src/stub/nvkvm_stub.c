@@ -151,6 +151,8 @@
 
 /* prctl op: from <linux/prctl.h>. */
 #define PR_SET_NO_NEW_PRIVS 38
+#define PR_SET_PDEATHSIG    1
+#define NVKVM_SIGKILL       9
 
 /* socket cmsg / msghdr — kernel UAPI exposes the data but the userland
  * struct shapes are normally defined in <bits/socket.h>.  Hand-roll them. */
@@ -3603,6 +3605,65 @@ int main(int argc, char **argv)
 	 */
 	if (stub_window_init() != 0)
 		return 1;
+
+	/*
+	 * DIE WITH QEMU.  An isolate that outlives its VMM is not merely idle:
+	 * it keeps its /dev/nvidia* file descriptions open, so RM cannot
+	 * release the BAR1 mappings anchored on them, and that address space
+	 * stays consumed until the process actually goes away.
+	 *
+	 * In the container deployment this is already guaranteed for free --
+	 * the stubs live in the vmm container's pid namespace, so when its PID
+	 * 1 exits the kernel SIGKILLs every one of them
+	 * (zap_pid_ns_processes).  Measured: stubs 8 -> 0 across a
+	 * `docker compose down`, with BAR1 returning to the host's desktop
+	 * baseline.  This is for the case that has no such net: QEMU started
+	 * DIRECTLY ON THE HOST, where a crash or a SIGKILL leaves the isolates
+	 * reparented to init with nothing to reap them.
+	 *
+	 * Set here, in the stub, rather than by QEMU before exec: the kernel
+	 * CLEARS pdeathsig across execve whenever credentials change, so a
+	 * pre-exec setting cannot be relied on.  Set before apply_seccomp()
+	 * too -- prctl is not in the filter's allowlist.
+	 *
+	 * NO getppid() RACE CHECK, deliberately.  The usual idiom (set the
+	 * signal, then exit if getppid() == 1 because the parent already died)
+	 * is WRONG here: QEMU is frequently PID 1 of the vmm container, so a
+	 * healthy stub legitimately has ppid 1 and would kill itself on every
+	 * start.  Closing that race properly needs QEMU to pass its own pid,
+	 * which is a protocol change; the window is a few microseconds and its
+	 * failure mode is exactly the orphan we have today, so this is a
+	 * strict improvement without it.
+	 *
+	 * WHY THIS IS A SECURITY PROPERTY AND NOT JUST HYGIENE.  The obvious
+	 * alternative -- notice the QEMU socket EOF and exit -- is COOPERATIVE,
+	 * and the isolate is precisely the component assumed to be
+	 * compromised: a hostile stub simply declines to act on the EOF and
+	 * keeps holding its /dev/nvidia* descriptions, so the operator who
+	 * SIGKILLs the VM believes cleanup happened when it did not, and the
+	 * BAR1 address space stays consumed until a driver reload.  That is a
+	 * denial of service against every other GPU user on the host.
+	 *
+	 * pdeathsig is kernel-enforced instead, and the seccomp filter closes
+	 * both ways out of it:
+	 *   - SIGKILL cannot be caught, blocked or ignored;
+	 *   - prctl is NOT in the allowlist, so the stub cannot clear the
+	 *     signal after the filter is installed;
+	 *   - the stub has NO process-creation primitive left at all -- fork,
+	 *     vfork, clone, clone3 and execve are all absent (see the F6-1 note
+	 *     in apply_seccomp) -- so it cannot escape into a child, which is
+	 *     the one place pdeathsig would not be inherited.
+	 * The signal is therefore un-evadable by the sandboxed code itself.
+	 *
+	 * CAVEAT for whoever changes the spawn path: pdeathsig fires when the
+	 * parent THREAD exits, not the parent process.  Isolates are cloned
+	 * from QEMU's virtio TX thread (nvkvm_isolate.c, dispatched inline with
+	 * the BQL held), which lives as long as the device.  If that ever
+	 * becomes a transient thread, every stub dies mid-session and takes the
+	 * guest's GPU with it -- a far worse failure than the leak this
+	 * prevents.
+	 */
+	stub_prctl(PR_SET_PDEATHSIG, NVKVM_SIGKILL, 0, 0, 0);
 
 	for (int i = 1; i < argc && argv && argv[i]; i++) {
 		if (stub_streq(argv[i], "--no-seccomp"))
