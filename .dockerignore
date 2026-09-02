@@ -87,3 +87,6 @@ docs/img/*.gif
 *.qcow2
 *.img
 *.iso
+tests/harness/results/
+tests/harness/.chroot-roots/
+tests/harness/.venv/
