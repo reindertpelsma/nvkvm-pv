@@ -4149,6 +4149,27 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 		int is_client_obj = (hObjNew == hClient && hClass == 0x0);
 		int needs_share = !is_client_obj && hClass != 0;
 
+		/* DIAGNOSTIC KNOB, not a fix.  NVKVM_NO_POSTALLOC_SHARE=1 skips
+		 * the grant entirely so the BAR1 VA leak can be A/B'd against
+		 * it: docs/investigations/va-space-leak/FINDINGS.md sec.17
+		 * asks exactly this question, and notes the SHARE already fails
+		 * 230x with ret=-22 (EINVAL) in a single session, so it is not
+		 * behaving as intended regardless.  Expect CUDA/UVM to break
+		 * with this set -- cuCtxCreate's UVM map is the consumer this
+		 * grant exists for -- so it is for measurement only.  Read once:
+		 * this is the RM_ALLOC hot path. */
+		static int share_disabled = -1;
+		if (share_disabled < 0) {
+			const char *e = getenv("NVKVM_NO_POSTALLOC_SHARE");
+			share_disabled = (e && *e && *e != '0') ? 1 : 0;
+			if (share_disabled)
+				fprintf(stderr, "nvkvm: post-alloc SHARE DISABLED by "
+					"NVKVM_NO_POSTALLOC_SHARE -- diagnostic only, "
+					"CUDA/UVM will likely fail\n");
+		}
+		if (share_disabled)
+			needs_share = 0;
+
 		if (needs_share && hClient && hObjNew) {
 			/* NVOS57_PARAMETERS layout (24 bytes):
 			 *   u32 hClient
