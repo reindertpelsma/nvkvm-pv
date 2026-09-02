@@ -597,3 +597,86 @@ State both halves when reporting this. "RM fails to reclaim 59 mappings per
 guest client teardown" is proven. "The host is currently degraded" is NOT true
 here, and claiming it would be as wrong as the nvidia-smi reading that said
 there was no leak at all.
+
+## 27. There are TWO distinct quantities. Only one of them is ours, and the other is not a bug.
+
+The counts and the bytes were being conflated. They are measured by disjoint
+instruments, each blind to the other, which is how this investigation produced
+two confident wrong answers in one session.
+
+| | Wall 1 | Wall 2 |
+|---|---|---|
+| what | mappings RM fails to auto-unmap at client teardown | BAR1 *Used* rising |
+| instrument | `journalctl -k \| grep -c "Failed to auto-unmap"` | `nvidia-smi` BAR1 Used |
+| visible in the other? | **no** | **no** |
+| nvkvm-specific? | **yes** (containers/host = 0) | n/a -- see below |
+
+**The arithmetic that forces the split.** sec.16 records a representative map as
+`length=0x400000` (4 MiB). If the 59 leaked mappings per teardown were all that
+size, ONE teardown would consume 236 MiB and a 256 MiB aperture would die on the
+first client. The leaking boot logged 5089 failures (~86 teardowns) before
+wedging -- ~20 GB into a 256 MiB aperture, which is impossible. So most leaked
+mappings must be small, and **"+59" says nothing about bytes.** Wall 1 cannot be
+the explanation for BAR1 Used climbing 18 -> 255 MiB.
+
+## 28. Wall 2 is REFUTED for containers -- OGKM reclaims correctly
+
+Tested with nvkvm entirely absent (`docker compose down`, verified
+`stubs=0 containers=0`), on the 16 GB host:
+
+```
+idle baseline                       415 MiB
+during a GPU container holding a
+CUDA context                        443 -> 2881 -> 6337 -> 577 -> 574 -> 432 MiB
+after the container is removed      415 MiB   <-- exactly baseline
+```
+
+Plus 8 sequential container cycles and 4 host-native cycles: **BAR1 Used flat at
+411 MiB, delta 0.**
+
+This is decisive *because of PID namespaces*: when PID 1 of a container's pid
+namespace exits the kernel SIGKILLs every remaining process in it
+(`zap_pid_ns_processes`), so a returned `docker run --rm` leaves no survivor that
+could legitimately still hold a reference. OGKM gives back **6.3 GB** cleanly.
+
+So the design constraint -- *an unprivileged process must not permanently consume
+a global kernel resource that survives its death* -- is **upheld** by OGKM here.
+No OGKM reclaim bug is demonstrated, and a Vast.ai-style tenant cannot wedge a
+shared GPU this way.
+
+**CRITICAL instrument check that made this result mean anything.** The first
+version of this test sampled BAR1 only AFTER container exit and got a flat 411
+MiB, which "confirmed" no ratchet. That was worthless until it was shown the
+workload moves BAR1 at all -- it peaks at 6337 MiB, so the flatness is real
+reclaim and not an inert probe. A flat series from a workload that never
+allocates proves nothing. Always demonstrate the instrument responds before
+believing that it didn't.
+
+## 29. Then what saturates a 256 MiB box? The desktop.
+
+This host's **desktop-only** baseline, with zero containers, zero QEMU and zero
+stubs, is **411-415 MiB** -- already larger than the vast RTX 3060's entire
+256 MiB aperture (that GPU has no Resizable BAR capability at all). Nothing has
+to leak for such a box to sit at 255/256 MiB with nvkvm absent, which is exactly
+what it does.
+
+Conclusion: a fixed 256 MiB BAR1 is too small to host a modern desktop plus a VM
+framebuffer. That is a hardware/firmware requirement to document (ReBAR, or a
+headless host), not a defect to fix in this project -- and it is NOT evidence of
+a leak. Do not cite a single 255/256 reading as proof of anything: only a
+*series* distinguishes a plateau from a ratchet.
+
+## 30. What is still open on Wall 1
+
+- **Bytes per teardown are still unmeasured.** `NVKVM_DEBUG=1` prints `length=`
+  per map; sum it for the failing client. NOTE: the host has **mawk**, which has
+  no `strtonum()` -- use `printf "%d" 0x$hex` or install gawk, or the sum silently
+  produces nothing.
+- **Whether the mappings survive when every host referrer is gone.** 8 stubs and
+  QEMU hold UVM fds after the guest client dies, so RM refusing to unmap may be
+  CORRECT. Until capacity is measured with `stubs=0` and QEMU truly dead, "leak"
+  is not established -- it may be deferred cleanup with an ugly log line.
+  (`pgrep -x qemu-system-x86_64` CANNOT be used for that check: the name exceeds
+  15 characters and it always matches nothing. Use `pgrep -f '[q]emu-system-x86_64 -name'`.)
+- On this host, after 1561 failures, `va_capacity` still reports
+  `MAXCONTIG ~= CUDA_FREE` and `can't alloc VA space` = 0. No measured harm.
