@@ -680,3 +680,63 @@ a leak. Do not cite a single 255/256 reading as proof of anything: only a
   15 characters and it always matches nothing. Use `pgrep -f '[q]emu-system-x86_64 -name'`.)
 - On this host, after 1561 failures, `va_capacity` still reports
   `MAXCONTIG ~= CUDA_FREE` and `can't alloc VA space` = 0. No measured harm.
+
+## 31. RESOLVED — Wall 1 is deferred cleanup, not a persistent leak
+
+The test this investigation had never run: accumulate teardowns, then kill
+**every** host referrer and re-measure capacity.
+
+```
+stack up, after 1849 cumulative failed auto-unmaps
+  MAXCONTIG_MB=10748  CUDA_FREE_MB=10787     (0.36% apart -- healthy)
+  BAR1=1026 MiB   qemu=1  stubs=8
+
+after `docker compose down`  ->  qemu=0  stubs=0  containers=0
+  MAXCONTIG_MB=11340  CUDA_FREE_MB=11370     (0.26% apart -- healthy)
+  MAXCONTIG_MB=11340  (probe 2, identical)
+  MAXCONTIG_MB=11340  (probe 3, identical)
+  BAR1=429 MiB  (the host desktop baseline)
+```
+
+Capacity did not merely hold, it **rose** (10748 -> 11340) as the VM's own
+mappings were released. Nothing was permanently lost.
+
+**So `Failed to auto-unmap (status=0x23 NV_ERR_INVALID_CLIENT)` is RM correctly
+declining to unmap on behalf of a guest client that no longer owns the
+reference** -- while the host-side referrers (8 stubs + QEMU, each holding
+/dev/nvidia-uvm descriptions) are still alive and legitimately hold it. A
+resource still referenced by a living process is not leaked. The log line is
+noisy, not wrong.
+
+This retires the framing this document opened with. Restated honestly:
+
+| claim | status |
+|---|---|
+| "BAR1 is consumed and never returned when our processes exit" | **FALSE** -- it is returned when the LAST referrer exits |
+| "+59 mappings leak per guest client teardown" | true as a count, but they are held, not lost |
+| "it is nvkvm-specific" | true, and expected: only nvkvm keeps host referrers alive past a guest client's death |
+| "recovery needs a module reload" | not on this evidence; ordinary teardown suffices |
+
+**What the 2026-08-29 exhaustion on the 256 MiB host most likely was:** that
+aperture (fixed 256 MiB, no ReBAR) is smaller than this host's desktop-only
+baseline of ~415 MiB, before any VM exists. A VM adds ~600 MiB on top. Running
+out is the expected outcome of the arithmetic, with no leak required. See
+sec.29.
+
+**Why the fix still matters.** If reclaim is deferred to process death, then
+*guaranteeing* process death is the fix. In the container deployment the pid
+namespace already guarantees it (stubs 8 -> 0 on compose down, measured above).
+QEMU run directly on the host has no such guarantee, which is what
+`fix/stub-dies-with-qemu` addresses with PR_SET_PDEATHSIG -- and that is also a
+security property, since a compromised isolate can ignore a cooperative
+socket-EOF shutdown but cannot ignore SIGKILL, cannot clear pdeathsig (prctl is
+not in the seccomp allowlist), and cannot escape into a child (no fork, vfork,
+clone, clone3 or execve survives the filter -- audit F6-1).
+
+**Forward guard requested by the owner:** if any thread-creation syscall is ever
+returned to the allowlist, it MUST be constrained to CLONE_THREAD, or the stub
+regains a process-creation primitive and pdeathsig stops being un-evadable.
+Note the asymmetry: legacy `clone` passes flags in a REGISTER and can be
+arg-filtered by seccomp; `clone3` passes them in a `struct clone_args` POINTER,
+which BPF cannot dereference, so CLONE_THREAD is UNENFORCEABLE for clone3 and it
+must stay out of the allowlist.
