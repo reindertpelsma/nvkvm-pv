@@ -206,7 +206,13 @@ rootfs build was broken for anyone whose mirror served a full index.
 1. **`KILL_ISOLATE` is unauthenticated** until the guest fills `reserved` and
    QEMU fails closed on zero. Protocol change across two components; needs a
    decision, not more code.
-2. **BAR1 VA leak** — the original release blocker. Untouched: not root-caused,
+2. **BAR1 VA leak** — **RESOLVED 2026-09-03, and it was not a leak.** With every
+   host referrer dead, `va_capacity` reports MAXCONTIG 11340 vs CUDA_FREE 11370 —
+   healthy, and higher than with the stack up. `status=0x23` is RM correctly
+   declining to unmap for a dead guest client while live host referrers still
+   hold the mapping. GPU containers return every byte on exit. See
+   `docs/investigations/va-space-leak/FINDINGS.md` §31. The text below is kept
+   for its measurements. Original wording: untouched: not root-caused,
    no fix on any branch.
 3. Guest lock-ordering: the `ext_lock`/`mmap_lock` AB-BA deadlock and the false
    "no caller holds mmap_lock" invariant. Design changes, deliberately skipped.

@@ -93,10 +93,13 @@ with it are superseded — see
 **Is it safe to run untrusted guests?**
 Not yet — treat it as experimental. The ioctl and alloc-class gates are
 default-deny and the guest kernel module is untrusted by design, but the code
-has had no *external* security review. It has had two internal ones, both
-published with their open findings rather than only their fixed ones: the
-[pointer audit](internal/audit-guest-pointers.md) and the
-[boundary audit](internal/audit-boundaries-2026-08-20.md). Read the second
+has had no *external* security review. It has had several internal ones, all
+published with their open findings rather than only their fixed ones — the
+[pointer audit](internal/audit-guest-pointers.md), the
+[boundary audit](internal/audit-boundaries-2026-08-20.md), the
+[broker audit](internal/audit-broker-security-2026-08-27.md) and the
+[2026-08-29 round](audit/README.md) (111 findings, 9 critical, 8 of those
+closed in code). Read the boundary audit
 before deciding: it found that an unprivileged guest could hang the entire VMM
 without corrupting a single byte, which is the kind of thing a "no known memory
 bugs" summary hides. See also
@@ -135,13 +138,25 @@ kernel vulnerability rather than a misconfiguration here. The Docker socket is
 root-equivalent *by design*: anything that can talk to it can start a privileged
 container.
 
-The compose deployment also grants the broker `/dev/udmabuf`. That one is a much
-narrower and less exercised interface; it rides the same `root:kvm 0660` gate,
-which is a reason to allow it rather than a safety proof, and
-[the broker audit](internal/audit-broker-security-2026-08-27.md) records it as an
-accepted risk, not a neutral one. Neither node is ever held by the guest — both
-sit with the VMM and broker, so they are reachable only after an escape out of
-the VM.
+The compose deployment also grants the broker `/dev/udmabuf`. It has **never**
+had a capability check in any kernel version, and in 2024 the dma-buf maintainers
+signed off on unprivileged local access to it — systemd grants it to the active
+seat user on that basis, while refusing the same for dma-heap because dma-heap
+memory is not charged to cgroups. Its own attack surface is small: ~550 lines,
+three ioctls, actively syzkaller-fuzzed, and exactly one exploitable escalation
+in eight years (CVE-2023-2008).
+
+Two reasons we still record it as an **accepted risk rather than a neutral one**.
+First, that sign-off was for a physically-present desktop user, not a container.
+Second, udmabuf pins host memory that **no cgroup accounts for**, and the only
+guardrail — a 64 MB per-buffer cap — was removed upstream in August 2026 on the
+reasoning that a per-buffer limit is pointless when a caller can just make more
+buffers. So a compromised broker can pin unbounded unreclaimable host memory.
+That is a host-DoS primitive, not a path to code execution, and it is the same
+property that got dma-heap refused the access udmabuf was granted.
+
+Neither node is ever held by the guest — both sit with the VMM and broker, so
+they are reachable only after an escape out of the VM.
 
 **Why is my GPU showing as llvmpipe?**
 Two causes, and the second is easy to miss. Either the NVIDIA userspace

@@ -43,8 +43,13 @@ Details: [the isolate model](docs/internal/isolate-model.md) and
 **Guest process → guest process is in scope, with a caveat worth stating.** Each
 guest process gets its own isolate on the host, with its own RM client, so one
 process's GPU objects are not meant to be reachable from another's — and we
-treat a way to reach them as a vulnerability. A recent audit found one and it is
-fixed.
+treat a way to reach them as a vulnerability. **This boundary is not currently
+closed.** Twelve handlers take a guest-supplied `isolate_id`; several carry no
+caller identity on the wire, and the code says so where it happens —
+`nvkvm_isolate_handlers.c:4951` reads *"KNOWN GAP, do not read this as a closed
+boundary"*, and [the audit index](docs/audit/README.md) states plainly that *"the
+cross-isolate boundary is not currently a boundary."* Closing it properly needs a
+caller session id in the protocol, not a patch.
 
 But it **preserves** a boundary rather than creating one. It is meaningful
 between guest processes the guest OS has already separated — different UIDs, or
@@ -107,6 +112,26 @@ We audit our own boundary and publish the results, fixed or not:
   decision (no `RLIMIT_MEMLOCK` on pinning) and one was not re-traced. The
   follow-up round is §8 of that document; it is build-verified only and has not
   been run against a GPU.
+- [The 2026-08-29 round](docs/audit/README.md) — five documents
+  ([isolate](docs/audit/2026-08-29-isolate.md),
+  [vmm](docs/audit/2026-08-29-vmm.md), [guest](docs/audit/2026-08-29-guest.md),
+  [broker](docs/audit/2026-08-29-broker.md),
+  [packaging](docs/audit/2026-08-29-packaging.md)), 111 findings, 9 rated
+  critical. **8 of the 9 criticals are closed in code**; the index page itself
+  predates that and still reads as though none were merged, which is wrong —
+  every remediation branch it names is now an ancestor of `main`. What it is
+  still right about is the cross-isolate boundary, quoted above.
+- [Broker security audit, 2026-08-27](docs/internal/audit-broker-security-2026-08-27.md)
+  — the broker's own threat model treats the VMM feeding it as **untrusted and
+  possibly fully compromised**, which is the correct assumption: the broker is
+  the path from a VM escape to your desktop session. Several medium/low findings
+  there are reported and not fixed (unpaced commits, clipboard type passthrough).
+- [Reconcile pass, 2026-08-24](docs/internal/audit-reconcile-2026-08-24.md) and
+  [full security/reliability, 2026-08-25](docs/internal/audit-full-security-reliability-2026-08-25.md)
+  — the reconcile pass exists because earlier documents claimed fixes the code
+  did not have. Read it before trusting any status line in this tree, including
+  the ones in this file.
+- [Release blockers, 2026-09-02](docs/audit/release-blockers-2026-09-02.md).
 - [Guest pointer audit](docs/internal/audit-guest-pointers.md) — 14 unenforced
   paths against one invariant, **9 since fixed**. The four that remain (U-8,
   U-9, U-11, U-13) are all **medium or unknown severity, and all contained by
@@ -130,16 +155,29 @@ unprivileged guest process could hang the entire VMM without corrupting
 anything. Those two are fixed; the remaining open items are listed by name in
 the audit rather than quietly dropped, each with the reason it is still there.
 
-Two severities in the boundary audit were rated before their mitigations landed
-and read worse than the code now is. **A-8 and A-9 were rated HIGH when the
-round-trip wait was untimed**, i.e. when an unprivileged guest process could
-park the VMM forever. Both are now deadlined, and the reachable path is the
-per-frame *display* round-trip only — the ioctl hot path
-(`NVKVM_REQ_IOCTL_ON_ISOLATE`) is offloaded to a thread pool and never holds the
-BQL. Reaching the deadline additionally requires guest `CAP_SYS_ADMIN` (the
-display node is gated) and a stub that has stopped answering, which guest
-userspace cannot cause — ioctls run on worker threads. Both are **medium** on
-the code as it stands.
+**A-8 and A-9 were rated HIGH when the round-trip wait was untimed**, i.e. when
+an unprivileged guest process could park the VMM forever. A 30 s deadline now
+bounds it, which downgrades "hangs until SIGKILL" to "stalls for up to 30 s and
+then the isolate is declared dead". That is a real improvement and it is the
+whole of the improvement.
+
+**It does not require any privilege in the guest, and it is not display-only.**
+An earlier revision of this file claimed both; the code contradicts it in two
+places, and those comments are worth reading before relying on this section.
+`virtio_nvgpu.c` lists **ten** synchronous isolate commands — `CLOSE_HANDLE`,
+`MMAP`, `MUNMAP`, `POLL`, `UNPOLL`, `COPY_HANDLE`, `SETUP_RING`,
+`PRESENT_EXPORT`, `XISO_IMPORT`, `REALIZE_UVM_FD` — that dispatch **inline with
+the QEMU BQL held**; only `NVKVM_REQ_IOCTL_ON_ISOLATE` and `ENTER_LOOP` are
+offloaded to the thread pool. And `nvkvm_isolate.c:520` states that an
+unprivileged guest process can stall the answering stub *"just by keeping the
+SPSC ring continuously fed, starving the stub's control-socket service edge"*.
+So the trigger is ordinary guest activity, not a gated display path.
+
+Treat these as **open availability findings**, repeatable at will by any guest
+process: the guest can stall the VMM's main loop, QMP, timers and every vCPU for
+up to the deadline. That is consistent with the opening of this document — an
+unprivileged process inside the guest can currently hang the whole VMM — and the
+earlier re-rating should not have been read as retracting it.
 
 Two more read as open but are assessments, not defects. **P-5**: the isolate
 comment claims uid separation that does not exist on the default namespace rung
@@ -329,6 +367,32 @@ params struct for embedded pointers, and check whether an equivalent is already
 allowed under another class id. **An allowlist entry with no handler is worse
 than leaving it out** — `0x70` (`NV_ESC_EXPORT_TO_DMABUF_FD`) was removed from
 the frontend list for exactly that reason.
+
+## The broker is part of the boundary
+
+The compose deployment runs a **broker** that owns the window, the input path and
+the clipboard on your host session. It is the component a VM escape would have to
+go through to reach your desktop, and it is deliberately small: a framebuffer
+handle and input events, not a protocol with attacker-controlled structure. It
+runs `cap_drop: ALL` (plus `SETUID`/`SETGID`, used only to drop), `read_only`,
+`no-new-privileges`, and **`network_mode: none`** — so a fully compromised broker
+has no network namespace to exfiltrate through.
+
+Two caveats. On **Wayland** a compromised broker cannot capture other clients'
+input, because the compositor mediates and there is no global grab; on **X11**
+that protection does not exist and a grab is total. And the broker is granted
+`/dev/udmabuf` alongside `/dev/kvm`; see the FAQ for why that is an accepted
+risk rather than a neutral one.
+
+## One place the allowlist is wider than "default-deny" suggests
+
+The control gate is a 167-row default-deny table, but two rule-based
+passthroughs sit **ahead** of it: `cmd & 0x8000` and the `0x2081` class wildcard.
+Between them they admit a large part of the RM control space without a per-row
+justification. This is recorded in
+[the allowlist reference](docs/reference/allowlists.md) and in the 2026-08-29
+isolate audit; narrowing it needs a GPU to test against and has not been done.
+Read "nine default-deny gates" with that exception in mind.
 
 ## Reporting a vulnerability
 
