@@ -24,6 +24,14 @@ forwarded interface is per-architecture, not per-die — so an untested RTX 4080
 should match the tested RTX 4070. See
 [supported drivers](reference/supported-drivers.md) for the reasoning.
 
+One requirement catches people out at the top of the range: **RTX 50-series
+(Blackwell) and Hopper need the *open* kernel module** — the proprietary one
+cannot bind to them at all. If `nvidia-smi` says `No devices were found` on a
+50-series card, that is this, and it happens before nvkvm is involved: the host
+cannot see the GPU either. `dmesg` carries the real reason
+(`requires use of the NVIDIA open kernel modules`).
+[How to fix it](howto/install.md#rtx-50-series-blackwell-you-need-the-open-kernel-module).
+
 **Which host driver versions are covered?**
 Eight ABI profiles span every published open-driver release; six of them have
 been booted here, including all the ones in common use (535 LTS, 545, 550–565,

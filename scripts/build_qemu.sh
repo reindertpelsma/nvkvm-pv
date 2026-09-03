@@ -200,11 +200,44 @@ if [ "${NVKVM_QEMU_UI:-0}" = "1" ]; then
     NVKVM_UI_DEPS_SUSE="gtk3-devel libSDL2-devel"
 fi
 
+# apt refuses to run while something else holds the dpkg lock, and on Debian
+# and Ubuntu `unattended-upgrades` starts automatically on a freshly
+# provisioned machine -- which is exactly when somebody first runs
+# --install-deps. The raw failure is
+#
+#   E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by
+#      process NNNN (unattended-upgr)
+#
+# and nothing in it says that waiting sixty seconds would fix it. Measured on a
+# rented Ubuntu 22.04 box, 2026-09-03: --install-deps died there and never
+# reached the build. Wait, bounded, and say what is being waited for.
+nvkvm_wait_dpkg_lock() {
+    command -v flock >/dev/null 2>&1 || return 0   # not Debian-ish; nothing to do
+    [ -e /var/lib/dpkg/lock-frontend ] || return 0
+    local waited=0 limit=300
+    while ! flock -n /var/lib/dpkg/lock-frontend -c true 2>/dev/null; do
+        if [ "$waited" -eq 0 ]; then
+            echo "  waiting for another package manager to release the dpkg lock"
+            echo "  (usually unattended-upgrades on a freshly provisioned box; up to ${limit}s)"
+        fi
+        if [ "$waited" -ge "$limit" ]; then
+            echo "ERROR: the dpkg lock was still held after ${limit}s." >&2
+            echo "       Something else is installing packages. Wait for it to finish" >&2
+            echo "       (systemctl status unattended-upgrades) and re-run." >&2
+            return 1
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    [ "$waited" -gt 0 ] && echo "  dpkg lock released after ${waited}s"
+    return 0
+}
+
 MISSING="$(nvkvm_missing)"
 if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ]; then
     echo "  installing:$MISSING"
     case "$(nvkvm_distro)" in
-        *debian*|*ubuntu*) apt-get update -q && apt-get install -y \
+        *debian*|*ubuntu*) nvkvm_wait_dpkg_lock && apt-get update -q && apt-get install -y \
             ninja-build meson libglib2.0-dev libpixman-1-dev python3 \
             python3-venv python3-tomli git libslirp-dev pkg-config \
             libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd \
