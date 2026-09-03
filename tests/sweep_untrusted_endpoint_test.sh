@@ -109,13 +109,25 @@ fi
 
 # ---- 4. the guest ssh forward must be loopback-only ------------------------
 RTV="$DIR/scripts/run_test_vm.sh"
-if grep -q 'hostfwd=tcp:127.0.0.1:' "$RTV"; then
-    echo "ok: the test guest's ssh is bound to loopback"
+# The bind is a variable now, because a container has to reach its own eth0 --
+# see the netdev comment in run_test_vm.sh.  What still must hold is that the
+# DEFAULT is loopback, so a bare host cannot publish ubuntu:ubuntu +
+# NOPASSWD:ALL by omission.
+if grep -qE '^SSH_BIND="\$\{VM_SSH_BIND:-127\.0\.0\.1\}"' "$RTV"; then
+    echo "ok: the test guest's ssh forward defaults to loopback"
 else
-    echo "FAIL: guest ssh forward is not bound to 127.0.0.1 -- it has ubuntu:ubuntu and NOPASSWD:ALL"; rc=1
+    echo "FAIL: SSH_BIND does not default to 127.0.0.1 -- the guest has ubuntu:ubuntu and NOPASSWD:ALL"; rc=1
 fi
 if grep -qE 'hostfwd=tcp::' "$RTV"; then
-    echo "FAIL: an all-interfaces hostfwd remains"; rc=1
+    echo "FAIL: a hardcoded all-interfaces hostfwd remains"; rc=1
+fi
+# The only place allowed to widen it is the container entrypoint, which owns a
+# network namespace; and it must still be overridable rather than forced.
+ENT="$DIR/scripts/container-entrypoint.sh"
+if [ -f "$ENT" ] && grep -q 'VM_SSH_BIND="\${VM_SSH_BIND:-0\.0\.0\.0}"' "$ENT"; then
+    echo "ok: only the container entrypoint widens the bind, and it is overridable"
+elif [ -f "$ENT" ] && grep -q 'VM_SSH_BIND' "$ENT"; then
+    echo "FAIL: container-entrypoint.sh sets VM_SSH_BIND in a form this test does not recognise"; rc=1
 fi
 
 exit $rc

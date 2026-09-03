@@ -84,6 +84,9 @@ fi
 IMG="${VM_IMG:-/opt/nvkvm-guest/ubuntu-24.04.qcow2}"
 SEED="${VM_SEED-/opt/nvkvm-guest/seed.iso}"
 SSH_PORT="${VM_SSH_PORT:-2222}"
+# Loopback unless something that understands its own network namespace says
+# otherwise.  See the netdev line below for why a container must override it.
+SSH_BIND="${VM_SSH_BIND:-127.0.0.1}"
 
 # Validate required files.
 if [ ! -f "$IMG" ]; then
@@ -318,12 +321,21 @@ exec "$QEMU" \
     -drive file="$IMG",format=qcow2,if=virtio \
     $SEED_ARG \
     \
-    `# BIND TO LOOPBACK.  An empty host part means 0.0.0.0, and this guest has
+    `# BIND ADDRESS.  An empty host part means 0.0.0.0, and this guest has
      # ubuntu:ubuntu with ssh_pwauth and NOPASSWD:ALL -- on a rented public-IP
-     # box that published a root shell, with the host GPU forwarded into it, to
-     # anyone who could reach the machine.  The sweep reaches this port as
-     # localhost FROM the box, so loopback costs nothing.` \
-    -netdev user,id=net0,hostfwd=tcp:127.0.0.1:"$SSH_PORT"-:22 \
+     # box that would publish a root shell, with the host GPU forwarded into
+     # it, to anyone who could reach the machine.  So the default is loopback
+     # and it must stay loopback on a bare host: the sweep reaches this port as
+     # localhost FROM the box, so loopback costs it nothing.
+     #
+     # It costs a CONTAINER everything, though, and that assumption is why the
+     # published quickstart could not work.  Docker publishes to the container
+     # eth0; QEMU was listening on the container loopback; docker-proxy
+     # accepted the connection and then reset it.  Inside a container the
+     # network namespace IS the boundary and exposure is set by the -p publish
+     # address, so container-entrypoint.sh sets VM_SSH_BIND to the container
+     # address.  Anyone overriding this on a bare host is on their own.` \
+    -netdev user,id=net0,hostfwd=tcp:"$SSH_BIND":"$SSH_PORT"-:22 \
     -device virtio-net-pci,netdev=net0 \
     \
     `# id= is needed to name this device's console at all.  The emulated VGA is` \

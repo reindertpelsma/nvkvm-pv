@@ -1300,6 +1300,43 @@ verify_host_capable() {
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# verify_host_cuda -- does CUDA work on the BOX ITSELF, before any guest?
+#
+# verify_host_capable() above passes a box with systemd-detect-virt=kvm and a
+# writable /dev/kvm.  That is not sufficient.  Measured 2026-09-03 on a vast
+# RTX 3060 KVM instance: detect-virt=kvm, /dev/kvm writable, nvidia-smi fully
+# healthy (name, driver, memory and utilisation all correct), /dev/nvidia0 and
+# /dev/nvidia-uvm both present, libcuda.so.580.105.08 exactly matching the
+# loaded kernel module -- and cuInit() returning 3 (CUDA_ERROR_NOT_INITIALIZED)
+# on the BARE HOST, and equally inside a plain "docker run --gpus all".
+#
+# Every CUDA check in tests/validate.sh then fails in the guest and the row is
+# recorded as an nvkvm result for that GPU and driver.  It is not one.  Same
+# shape as the "driver predates the silicon" exclusion further down: not our
+# failure, excluded by design, but RECORDED so a reader can see why the cell is
+# empty.
+#
+# Runs entirely on the box; only a fixed token is read back, and it is matched,
+# never evaluated.  A box with no python3 returns "unknown" and is NOT excluded
+# -- a missing probe must never silently drop a row.
+# ---------------------------------------------------------------------------
+HOST_CUDA_DETAIL=""
+verify_host_cuda() {
+    local out
+    HOST_CUDA_DETAIL=""
+    out="$(rsh_t 120 'command -v python3 >/dev/null 2>&1 || { echo CUINIT_RC=unknown; exit 0; }; python3 -c "import ctypes,sys;sys.stdout.write(\"CUINIT_RC=%d\" % ctypes.CDLL(\"libcuda.so.1\").cuInit(0))" 2>/dev/null || echo CUINIT_RC=-1' 2>/dev/null | tr -d '\r')"
+
+    case "$out" in
+        *CUINIT_RC=0*)       info "    host cuInit ok"; return 0 ;;
+        *CUINIT_RC=unknown*) info "    no python3 on the box -- host CUDA unprobed, NOT excluding"; return 0 ;;
+        *CUINIT_RC=-1*)      HOST_CUDA_DETAIL="libcuda.so.1 could not be loaded on the host at all" ;;
+        *CUINIT_RC=*)        HOST_CUDA_DETAIL="cuInit failed on the bare host, rc=${out##*CUINIT_RC=} -- nvidia-smi passes, so this box looks healthy and is not" ;;
+        *)                   info "    host CUDA probe returned nothing -- NOT excluding"; return 0 ;;
+    esac
+    return 1
+}
+
 # --ssh accepts  user@host:port  |  host:port  |  host   (user defaults to root,
 # port to 22).  Both fields go through the SAME validators the vast endpoints
 # do: they end up inside commands that run as root here, and "the operator
@@ -2520,6 +2557,18 @@ sweep_drivers_on_box() {
                         ts "$(date -u +%FT%TZ)")"
                 continue ;;
         esac
+
+        # nvidia-smi passing is NOT enough -- see verify_host_cuda().
+        if ! verify_host_cuda; then
+            warn "    CUDA is broken on the HOST with $actual, before any guest is booted."
+            warn "    Nothing past this point would be measuring nvkvm, so this driver row"
+            warn "    is EXCLUDED rather than counted as an nvkvm failure."
+            emit "$(jrec arch "$arch" gpu "$gpu" driver "$drv" driver_actual "$actual" \
+                    abi_expected "$prof" status "host-cuda-broken" instance "$iid" \
+                    machine "$machine" rationale "$why" \
+                    detail "$HOST_CUDA_DETAIL" ts "$(date -u +%FT%TZ)")"
+            continue
+        fi
 
         boot_and_validate "$actual" "$gpu"
 
