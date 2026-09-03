@@ -18,14 +18,21 @@ body:
     id: env
     attributes:
       label: Environment
-      description: Paste the output of these, please — not a summary of it.
+      description: >
+        Run `scripts/nvkvm-report.sh` and paste the output — on the host, and
+        in the guest too if it gets that far. It reads only; it changes
+        nothing. Read it before you paste it: it names your kernel, GPU and
+        driver versions.
       value: |
         # on the HOST
+        ./scripts/nvkvm-report.sh
+
+        # in the GUEST (if it boots)
+        ./scripts/nvkvm-report.sh
+
+        # if you cannot run the script, these four lines are the minimum:
         nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
         cat /proc/driver/nvidia/version
-        uname -r ; . /etc/os-release ; echo "$PRETTY_NAME"
-
-        # in the GUEST
         uname -r ; . /etc/os-release ; echo "$PRETTY_NAME"
       render: shell
     validations:
@@ -53,6 +60,19 @@ body:
         of the whole report.
     validations:
       required: true
+
+  - type: textarea
+    id: qemu-stderr
+    attributes:
+      label: QEMU stderr
+      description: >
+        `docker compose logs vmm | tail -200`, or the terminal you launched
+        QEMU in. This is the single most useful field in the form and the one
+        most often missing — nvkvm reports things here that appear in no other
+        log. Worth pasting even when everything seemed to work: lines like
+        `nvkvm: KVM_RUN EFAULT cleared after N ms` are absorbed faults we would
+        like to know the frequency of.
+      render: shell
 
   - type: textarea
     id: host-check
