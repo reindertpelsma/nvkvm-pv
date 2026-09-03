@@ -39,6 +39,47 @@ someone changing that code.
 | [Virtio protocol](reference/virtio-protocol.md) | virtqueues, shared memory, request types, GPA windows |
 | [Display broker protocol](reference/broker-protocol.md) | the 40-byte command and 24-byte packet, backpressure, and the rule it enforces |
 
+## Audits
+
+**Published in full, findings open or fixed.** The 2026-08-29 round audited five
+components independently; the summary carries the totals, the criticals, and the
+per-component remediation state.
+
+| | |
+|---|---|
+| [Audit summary and remediation state](audit/README.md) | 111 findings across five components, 9 critical — what each was, and which are closed in code |
+| [Guest kernel module](audit/2026-08-29-guest.md) | 12 findings, 1 critical — the `nvkvm_gem_resolve_fwd()` UAF |
+| [VMM](audit/2026-08-29-vmm.md) | 13 findings, 6 serious |
+| [Isolate](audit/2026-08-29-isolate.md) | 23 findings, 5 critical — the cross-isolate ownership results, and why they matter most |
+| [Broker](audit/2026-08-29-broker.md) | 9 findings, 2 serious |
+| [Packaging, scripts, kata](audit/2026-08-29-packaging.md) | 54 findings, 3 critical — including the sweep coordinator's root RCE |
+| [Release-blocker audit, v0.2.0](audit/release-blockers-2026-09-02.md) | what was checked before tagging, and what was accepted |
+| [Branch triage](audit/branch-triage-2026-08-29.md) | which fix branches carried which findings |
+
+Earlier single-file rounds are listed under [Internal](#internal). All of them
+name **locations, not techniques** — no working bypass procedure appears in any
+of them.
+
+## Investigations
+
+**Root-cause narratives, including the theories that turned out to be wrong.**
+Each of these is a log of an actual hunt: what was measured, what was ruled out,
+and what it finally was. The disproven sections are kept deliberately — knowing
+what a bug *is not* is most of the value when it comes back.
+
+| | |
+|---|---|
+| [Host GPU VA-space exhaustion](investigations/va-space-leak/FINDINGS.md) | the BAR1 "leak" — **resolved, and it was not a leak**: deferred cleanup while live host referrers hold the mapping |
+| [Shared-mapping desync](investigations/shared-mapping-desync/README.md) | registering a shared mapping with CUDA silently desynchronises it |
+| [Nested nvkvm (L2)](investigations/nested-nvkvm-l2/README.md) | an nvkvm guest hosting an nvkvm guest — plus [the zeros, confirmed](investigations/nested-nvkvm-l2/CONFIRMED.md) and [what they actually were](investigations/nested-nvkvm-l2/ZEROS.md) |
+| [Guest deadlock under GPU + I/O load](investigations/guest-deadlock-gpu-under-load/README.md) | **open** |
+| [`cuInit` returned 999 on rented boxes](investigations/cuinit-999-rented-boxes/README.md) | fixed — a regression, bisected to the commit |
+| [`GET_DEV_INFO` returns EBADF](investigations/get-dev-info-ebadf/README.md) | why the guest silently fell back to llvmpipe |
+| [KWin could not drive the nvkvm head](investigations/kwin-atomic-modeset/README.md) | solved; [System Settings wedging on the Wayland GL path](investigations/kwin-atomic-modeset/systemsettings-wayland-hang.md) is still open |
+| [The OOBE gamescope session](investigations/gamescope-oobe/README.md) | why gamescope never reached the display |
+| [register-then-fork `MAP_PRIVATE`](investigations/register-then-fork-private-not-fixed/README.md) | `fork_mapping_semantics.c` fails, and it is not fixed |
+| [Two processes registering the same shared buffer](investigations/shared-registration-two-processes/README.md) | what the second registration does |
+
 ## Internal
 
 **Depth is the point here.** These are mechanism, root-cause narratives and
@@ -61,6 +102,8 @@ page should link here rather than recite them.
 | [Boundary audit, 2026-08-20](internal/audit-boundaries-2026-08-20.md) | 19 findings across all three in-scope trust boundaries; 15 fixed, 4 named as open |
 | [Pre-release audit, 2026-08-21](internal/audit-prerelease-2026-08-21.md) | 12 findings, plus what was suspected and what was checked and found clean. The critical one was in code a day old and is fixed |
 | [Guest pointer audit](internal/audit-guest-pointers.md) | 14 unenforced paths against one invariant, 5 since fixed |
+| [Release readiness, 2026-09-01](internal/release-readiness-2026-09-01.md) | the state of every component the day before tagging |
+| [Sweep plan](internal/sweep-plan.md) | how the rented-hardware matrix is chosen and run |
 
 Both audits name **locations, not techniques**: they contain no working bypass
 procedure. See [`SECURITY.md`](../SECURITY.md) for the threat model they are
@@ -77,6 +120,16 @@ These live under `tests/` because they are outputs of a harness, not prose:
 | [`tests/perf/llm_parity.md`](../tests/perf/llm_parity.md) | vLLM serving parity, both the CUDA-graph and `--enforce-eager` passes |
 | [`tests/perf/results/`](../tests/perf/results/) | dated result sets, each with what was ruled out |
 | [`tests/repro/`](../tests/repro/) | self-validating reproducers — run the same binary on both sides of the boundary |
+
+## The other two repositories
+
+nvkvm-pv is the base: the guest module, the QEMU patches, the isolate. Two
+integration layers build on it, each in its own repository.
+
+| | |
+|---|---|
+| [nvkvm-steamos](https://github.com/reindertpelsma/nvkvm-steamos) | SteamOS in a guest, Game Mode on the host's GPU — the gaming path, with screenshots |
+| [nvkvm-kata](https://github.com/reindertpelsma/nvkvm-kata) | Kata Containers with GPU access through nvkvm |
 
 ## For agents
 
@@ -111,6 +164,8 @@ quotes a comment, the quote is the authority and the doc is the index.
 Several source comments reference documents that are not in this repository:
 `docs/design/command_buffer.md`, `docs/design/virtual_modeset.md`,
 `docs/design/gpa_window_pci_bar.md`, `docs/perf/forwarding_latency_decomposition.md`,
-`docs/audits/*`, `SECURITY_MODEL.md`, `REFACTOR_PLAN.md`,
-`STATE_MACHINE_PLAN.md`, `HARDENING_PLAN.md`. They live in the development tree.
+`SECURITY_MODEL.md`, `REFACTOR_PLAN.md`,
+`STATE_MACHINE_PLAN.md`, `HARDENING_PLAN.md`. (`docs/audits/*`, plural, is also referenced by some comments — the real
+directory is [`docs/audit/`](#audits), singular, indexed above.) They live in
+the development tree.
 Where their content mattered, it has been folded into the pages above.

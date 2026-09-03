@@ -28,7 +28,7 @@ sudo usermod -aG kvm "$USER"    # then log out and back in, or: newgrp kvm
 ```
 
 Containers are fine **provided the device is passed in** — the
-[`docker-compose.yml`](docker-compose.yml) here does exactly that. What does not
+[`docker-compose.yml`](../../docker-compose.yml) here does exactly that. What does not
 work is a container without it, or a VM whose host has nested virtualisation
 switched off.
 
@@ -44,9 +44,9 @@ Three ways in, in the order most people should try them. The container is
 first because it is the only one that does not make you wait for a QEMU build.
 
 Everything below is published from a tag by
-[`.github/workflows/release.yml`](.github/workflows/release.yml) on a
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) on a
 GitHub-hosted runner and carries a
-[build-provenance attestation](#verifying-what-you-downloaded) — so "did this
+[build-provenance attestation](#the-three-ways-in) — so "did this
 come from this repository?" is a question you can answer rather than assume.
 
 ### Docker (start here)
@@ -64,7 +64,7 @@ gives the container `compute,utility`, and the guest then gets a compute-only
 driver with no GL or Vulkan libraries — which does not fail, it silently falls
 back to llvmpipe.
 
-[`docker-compose.yml`](docker-compose.yml) is the same thing with those
+[`docker-compose.yml`](../../docker-compose.yml) is the same thing with those
 capabilities, a tightened `cap_drop`/`cap_add` set, the shared folder and the
 named volume already spelled out, and is the better starting point for anything
 you intend to keep:
@@ -79,14 +79,14 @@ staging step.
 
 - **Requirements:** `/dev/kvm` and, for the GPU, the
   [NVIDIA container runtime](https://github.com/NVIDIA/nvidia-container-toolkit).
-  Both are already in [`docker-compose.yml`](docker-compose.yml). No
+  Both are already in [`docker-compose.yml`](../../docker-compose.yml). No
   `--privileged`, no added capabilities.
 - **The isolation trade differs from a bare host, and is not obviously worse.**
   Containers block user namespaces, so the isolate falls back to UID separation —
   but most of our audit findings target the VMM, which a container confines and a
   bare host does not. Neither is ready for untrusted tenants:
-  [the trade in full](docs/internal/isolate-model.md),
-  [`SECURITY.md`](SECURITY.md).
+  [the trade in full](../internal/isolate-model.md),
+  [`SECURITY.md`](../../SECURITY.md).
 - **The guest survives reboots and `apt upgrade`.** The driver userspace is
   mounted read-only rather than copied in, so nothing in the guest can replace
   it, and a systemd unit rebuilds the module against the running kernel on every
@@ -119,7 +119,7 @@ source for that). It is a real binary built on Ubuntu 24.04, so it needs
 **glibc 2.38 or newer**: on an older host (Ubuntu 22.04 is glibc 2.35) use the
 container, which brings its own userspace. Exact floor and runtime package list
 are in `RELEASE.md` inside the tarball
-([detail](docs/howto/build.md#installing-the-tarball)).
+([detail](build.md#installing-the-tarball)).
 
 **The guest kernel module is not in there and cannot be** — it is compiled
 against *your* guest's kernel. That is why `src/guest/` ships with the tarball:
@@ -134,7 +134,7 @@ sudo NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
 
 Read the banner it prints. A writable export gives guest root a path to host
 root, so the harness is for guests you trust completely — see
-[CONTRIBUTING.md, "The dev VM harness is not a sandbox"](CONTRIBUTING.md#the-dev-vm-harness-is-not-a-sandbox).
+[CONTRIBUTING.md, "The dev VM harness is not a sandbox"](../../CONTRIBUTING.md#the-dev-vm-harness-is-not-a-sandbox).
 Without the flag the VM still boots and the export is read-only; only the
 in-guest module build needs it.
 
@@ -148,11 +148,11 @@ sudo bash scripts/setup_guest.sh            # fetches an Ubuntu 24.04 cloud imag
 
 Most of the wall clock is QEMU. The script is a convenience, not the
 mechanism: everything it changes in upstream QEMU is twelve patch files in
-[`patches/`](patches/) — 2273 lines, applied with `git apply` — plus a copy of the
+[`patches/`](../../patches/) — 2273 lines, applied with `git apply` — plus a copy of the
 device sources into `hw/misc/`.
-[`docs/howto/build.md`](docs/howto/build.md) lists the whole delta and walks the
+[`docs/howto/build.md`](build.md) lists the whole delta and walks the
 same build by hand, command by command, if you would rather not run a script
-over your QEMU tree; [`CONTRIBUTING.md`](CONTRIBUTING.md) has the traps in
+over your QEMU tree; [`CONTRIBUTING.md`](../../CONTRIBUTING.md) has the traps in
 this build, including which changes need a `--force` rebuild.
 
 

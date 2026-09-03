@@ -565,10 +565,16 @@ thing in the tree to a categorical mechanism, and it is not one:
   in QEMU's process; that placement is unchanged.
 - **The SPSC command ring bypasses this path entirely** — see
   [the SPSC ring](#the-residual-control-traffic-and-the-spsc-ring).
-  `ring_exec_one` (`src/stub/nvkvm_stub.c`) consults no allowlist whatsoever.
-  (Its pointer rewrite is no longer `aux_size`-gated — it now writes an explicit
-  0 when there are no inner params — but that closes only the fail-open half;
-  the missing allowlist, U-1, is untouched.)
+  `ring_exec_one` (`src/stub/nvkvm_stub.c`) **is** allowlisted, since
+  2026-08-19: every ring command is gated by `ring_ctrl_must_punt()`
+  (`src/stub/nvkvm_stub.c:2909`, called at `:3016`), which checks it against
+  `nvkvm_ctrl_allowlist.h` and punts anything not covered rather than passing it
+  to the driver. Its pointer rewrite is also no longer `aux_size`-gated — it
+  writes an explicit 0 when there are no inner params.
+  (This paragraph previously read *"consults no allowlist whatsoever ... the
+  missing allowlist, U-1, is untouched"*. That was true when written and was
+  fixed by `f85c84c`; see [correctness.md](docs/reference/correctness.md) for the
+  U-1 entry.)
 
 So the honest statement of the invariant is: *the host side neutralises the
 pointer field of the three highest-traffic ioctls in the common case, and each

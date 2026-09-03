@@ -307,7 +307,7 @@ during the vLLM run:
 > `cudaHostAlloc` path succeeds at 16 MiB. The 304 boundary matches the cap;
 > the 1s at 4–16 MiB are unexplained and were not chased.
 >
-> **Root-caused in [5a-fix](#5a-fix) (2026-08-17).** The `1`s were a genuinely
+> **Root-caused in [5a-fix](#5a-fix-cap-removed--stock-vllm-starts-with-pinned-buffers-enabled) (2026-08-17).** The `1`s were a genuinely
 > separate limit: `remap_pfn_range()` returning `-EINVAL` because it refuses a
 > sub-VMA remap on a copy-on-write mapping. Private memory hit it; the memory
 > behind torch's `cudaHostAlloc` did not, which is exactly why the two probes

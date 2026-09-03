@@ -61,7 +61,7 @@ address spaces sharing the device the same way host processes do.
 **What's the performance cost?**
 Close to nothing on throughput, and a real cost on latency. Sustained compute
 and bandwidth measure at parity (1.00x) on every workload in
-[Tested applications](../README.md#tested-applications), and Geekbench 7 GPU — an
+[the real-application matrix](../tests/perf/realapp_matrix.md), and Geekbench 7 GPU — an
 independent benchmark whose runs are published on Geekbench's own servers —
 scores **98.0–99.9% of bare metal on four machines**
 ([all four](reference/parity.md)): RTX 4070 99.6%, RTX 3050 Laptop 99.9%,

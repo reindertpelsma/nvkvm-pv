@@ -110,7 +110,8 @@ memory, because leaving the driver's mapping in place causes an unrecoverable
 sub-slot, so reads are served and writes become resumable MMIO exits.
 
 **Vulkan compute failed on Hopper** (`vk_compute_dispatch`) *(root-caused
-2026-08-21; the fix is not on `main` today).* An unsized alloc class made nvkvm
+2026-08-21; fixed, accidentally reverted, and **restored by `c9e3875`** —
+verified on `main` 2026-08-31).* An unsized alloc class made nvkvm
 forward a NULL parameter block —
 [the driver sweep, the trace and the fix](#vulkan-compute-on-hopper--root-caused-it-was-ours-and-it-was-never-a-driver-bug).
 

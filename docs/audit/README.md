@@ -1,5 +1,16 @@
 # Pre-release security & reliability audits
 
+> **Read the status before the findings.** The list below is what the audits
+> *found*, written in the present tense as the auditors wrote it. Most of it has
+> since been fixed. Current state:
+> **[8 of the 9 criticals are closed in code](#critical-status-8-of-9-closed--and-two-were-over-rated-see-the-correction-below)**,
+> two of the remaining findings were later shown to be **over-rated**
+> ([correction](#correction-2026-08-29--two-isolate-findings-were-over-rated)),
+> and what is genuinely outstanding is listed under
+> [What is genuinely still open](#what-is-genuinely-still-open). The unfixed
+> items are named, not buried — see [`SECURITY.md`](../../SECURITY.md) for what
+> that means for where you should run this.
+
 Five components, audited independently before release, re-run after every
 substantive change. The gate is that an audit comes back **clean** — not that its
 findings were triaged.
