@@ -174,11 +174,38 @@ gVisor's own nvproxy design document names this as the difficult piece of
 proxying NVIDIA ioctls, and it is worth being precise about why.
 
 `NV_ESC_RM_MAP_MEMORY` does not create a mapping. It *prepares* one: the driver
-records, against a file descriptor, that a subsequent `mmap()` at a particular
-offset should be satisfied by particular GPU pages. The `mmap()` that consumes
-that preparation happens later, on a **different fd**, and may come from a
-different process entirely. A proxy that only sees ioctls sees half a
-transaction. A proxy that also intercepts `mmap` still has the problem that the
+records, against a file descriptor, that a subsequent `mmap()` should be
+satisfied by particular GPU pages. The `mmap()` that consumes that preparation
+happens later, on a **different fd**, and may come from a different process
+entirely. A proxy that only sees ioctls sees half a transaction.
+
+**Why the fd, and not the offset.** The Linux-native way to say *which*
+resource an `mmap()` refers to is the offset: DRM hands out a fake `vm_pgoff`
+from a per-device namespace, and one fd then serves unlimited mappings. RM
+cannot use that on either of its paths. `nvidia_mmap_helper()` **refuses any
+mmap whose `vm_pgoff` is not zero** (`nv-mmap.c:503-513`), so on the RM path the
+offset cannot name anything; and `uvm_mmap()` pins
+`vm_start == (vm_pgoff << PAGE_SHIFT)`, so on the UVM path the offset is
+conscripted to encode the virtual address instead. With the offset banned in
+one case and commandeered in the other, the only per-call state left to carry
+the selection is the **open file description** — which is why `NVOS33.fd` names
+a file rather than an offset.
+
+That context is single-slot and nothing consumes it (only
+`nv_free_file_private()` at close clears it), so arming a second mapping on a
+file that already carries one returns `NV_ERR_STATE_IN_USE` (0x63) — measured
+both ways by `tools/uvm_sysmem_probe.c`: `ctl->ctl x2` fails, `ctl->ctl2`
+works. Every mapping therefore needs its own `open()`, of the *same* device
+node; there is no separate class of "mmap fd". See
+`src/guest/nvkvm_uvm_ext.c:538-547`.
+
+The root cause is that RM's object model — `hClient`/`hDevice`/`hMemory` — is
+portable and self-contained, and predates the conventions Linux graphics
+settled on. The fd is an adapter bolted onto it, carrying a client association
+and one mapping slot; everything that identifies a resource lives in a
+namespace the kernel knows nothing about. That is also why this is the piece
+that does not survive contact with a VM: arming and consumption are joined by a
+`struct file`, a host object with no representation on the guest side. A proxy that also intercepts `mmap` still has the problem that the
 pages it would need to hand out are host pages, and the caller is inside a VM.
 
 This is where the two other public non-vendor attempts stop.
