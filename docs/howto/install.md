@@ -36,46 +36,6 @@ Without `/dev/kvm`, QEMU silently falls back to software emulation (TCG): it
 appears to work and is unusably slow, which is the most expensive way to find
 out.
 
-### RTX 50-series (Blackwell): you need the open kernel module
-
-Blackwell **cannot bind NVIDIA's proprietary kernel module at all**, and the
-symptom is not a message about modules — it is your GPU disappearing:
-
-```
-$ nvidia-smi
-No devices were found
-```
-
-The cause is only visible in the kernel log:
-
-```
-$ dmesg | grep -i NVRM
-NVRM: GPU 0000:00:08.0: RmInitAdapter failed! (0x22:0x56:884)
-NVRM: ... requires use of the NVIDIA open kernel modules.
-```
-
-This is an NVIDIA driver requirement, not an nvkvm one, and it applies before
-nvkvm is involved at all — the *host* cannot see the card either. Install an
-open-module driver at **580 or newer** (Blackwell's floor here):
-
-```bash
-# Debian/Ubuntu. Purge first: the 5xx packages conflict with each other.
-sudo apt-get purge -y '*nvidia*'
-sudo apt-get install -y nvidia-driver-580-open      # or newer
-# or NVIDIA's installer: sh NVIDIA-Linux-x86_64-<ver>.run -m=kernel-open
-```
-
-Confirm the flavour before going further — `Dual MIT/GPL` is the open module,
-`NVIDIA` is the proprietary one:
-
-```bash
-modinfo nvidia | grep '^license:'
-```
-
-Hopper (H100/H200) has the same requirement. Everything from Turing through Ada
-runs on either flavour.
-
-
 ## The three ways in
 
 
@@ -194,6 +154,29 @@ same build by hand, command by command, if you would rather not run a script
 over your QEMU tree; [`CONTRIBUTING.md`](../../CONTRIBUTING.md) has the traps in
 this build, including which changes need a `--force` rebuild.
 
+
+## If `nvidia-smi` says "No devices were found" on an RTX 50-series card
+
+Blackwell (and Hopper) cannot bind NVIDIA's **proprietary** kernel module at
+all. Almost nobody meets this on a working desktop — you would have no display
+either, so anyone rendering on a 50-series card already runs the open module,
+which is what distro `-open` metapackages install by default. It shows up on
+cloud images that ship the wrong flavour, and on headless installs where the
+proprietary metapackage was chosen by hand.
+
+The giveaway is in `dmesg`, not in `nvidia-smi`:
+
+```
+NVRM: GPU 0000:00:08.0: RmInitAdapter failed! (0x22:0x56:884)
+NVRM: ... requires use of the NVIDIA open kernel modules.
+```
+
+`modinfo nvidia | grep '^license:'` tells you which you have: `Dual MIT/GPL` is
+the open module, `NVIDIA` the proprietary one. Install an open-module driver at
+580 or newer (`nvidia-driver-580-open`, or NVIDIA's installer with
+`-m=kernel-open`); the 5xx packages conflict, so purge before installing. This
+is an NVIDIA requirement and applies before nvkvm — the host cannot see the
+card either.
 
 ## See also
 
