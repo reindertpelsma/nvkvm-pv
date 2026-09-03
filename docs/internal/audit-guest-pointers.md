@@ -1247,8 +1247,10 @@ Concretely, in priority order:
    *before* any bespoke rewrite runs: zero every listed offset unconditionally, then let the
    per-ioctl code opt a field back in by pointing it at aux. Default-deny becomes structural — an
    unlisted command with pointers gets them zeroed, and a *new* command added to an allowlist without
-   a schema row fails safe rather than fails open. This is what gVisor's nvproxy does and what the
-   nestrilabs rewrite table does; `ARCHITECTURE.md:373-377` currently frames "nvkvm does something
+   a schema row fails safe rather than fails open. This is what gVisor's nvproxy does, and what the
+   nestrilabs rewrite table *proposes* (checked 2026-09-04: it is a design, not
+   code -- their crates carry no such table; the recommendation stands on
+   nvproxy's implementation alone); `ARCHITECTURE.md:373-377` currently frames "nvkvm does something
    different" as a virtue, and the difference is precisely the coverage gap this report enumerates.
 4. ~~**Add the size-consistency check** (U-5): reject any `RM_CONTROL` where
    `paramsSize != aux_size`, and any `nvos64 RM_ALLOC` where `allocParmsSize > aux_size`. One

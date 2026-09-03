@@ -454,9 +454,15 @@ A VMM cannot dereference a guest userspace pointer. It is a virtual address in
 an address space QEMU does not have, and even if it did, the value is entirely
 attacker-controlled.
 
-`nestrilabs/virtio-nvgpu` solves this with a generated V1→V2 command-rewrite
-table: a per-command description of where the pointers are, produced ahead of
-time. nvkvm does something different.
+`nestrilabs/virtio-nvgpu` **proposes** a generated V1→V2 command-rewrite table:
+a per-command description of where the pointers are, produced ahead of time. It
+is a design, not shipped code — checked 2026-09-04, the crates on `feat/init`
+carry no such table, and `crates/device/src/mmap.rs` says of itself "data
+structure only, no entries are created yet". The shape is nevertheless the one
+gVisor's nvproxy *does* implement, and see
+[`docs/internal/audit-guest-pointers.md`](docs/internal/audit-guest-pointers.md)
+for why that shape fails safe where nvkvm's does not. nvkvm does something
+different.
 
 ### What nvkvm does: aux-slot bounce plus boundary-side overwrite
 
@@ -1231,11 +1237,21 @@ ABI struct definitions come from **NVIDIA open-gpu-kernel-modules** (MIT /
 GPL-2.0), specifically `nvos.h`, `nv-ioctl.h`, `nv-ioctl-numbers.h` and
 `uvm_ioctl.h`.
 
-The largest departures from nvproxy are the three this document is organised
-around: nvproxy runs in a sentry that shares an address space with the
-application, so it never faces the guest-physical-address problem; it has no VM
-boundary to place mmaps across; and it does not need a per-process host isolate,
-because the sentry already is one.
+**Why it was a good donor, and not merely a convenient one.** gVisor has a KVM
+platform, and under it all of the sandbox's userspace memory lives in a single
+VMM process address space — which is QEMU's constraint exactly. So nvproxy's
+decisions about handle ownership, object lifetime and fd translation were
+already made against a restriction nvkvm was going to hit, rather than against
+a container-only one. That is what made deriving from it worth doing instead of
+merely reading it.
+
+The largest departures are the three this document is organised around:
+nvproxy's sentry shares an address space with the application, so it never
+faces the guest-**physical**-address problem — there is no memslot to publish
+host pages through and no guest kernel to land them in; it has no VM boundary
+to place mmaps across; and it does not need a per-process host isolate, because
+the sentry already is one. The single-address-space constraint transfers; the
+guest-physical layer does not, and that layer is where Problem 1 lives.
 
 ## Where to go next
 
