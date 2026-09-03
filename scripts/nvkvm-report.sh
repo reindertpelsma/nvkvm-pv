@@ -111,7 +111,10 @@ if [ "$SIDE" = host ]; then
 	done
 	# nvkvm never binds vfio-pci. If something did, that is the bug.
 	if [ -d /sys/bus/pci/drivers/vfio-pci ]; then
-		v=$(ls /sys/bus/pci/drivers/vfio-pci 2>/dev/null | grep -c ':' )
+		v=0
+		for d in /sys/bus/pci/drivers/vfio-pci/*:*:*.*; do
+			[ -e "$d" ] && v=$((v + 1))
+		done
 		note "vfio-pci : bound to $v device(s) -- nvkvm does not use vfio-pci; a bound GPU here is a misconfiguration"
 	fi
 fi

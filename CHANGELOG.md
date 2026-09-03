@@ -71,8 +71,12 @@ are on either, upgrade — or see the workaround below.
   `tests/sweep_untrusted_endpoint_test.sh` now asserts both halves: the default
   is loopback, and the entrypoint is the only thing that widens it.
 
-  *Workaround if you stay on v0.2.1:* run with `--network host` and drop the
-  `-p` flag, so QEMU's loopback bind is the host's loopback.
+  *Workaround if you stay on v0.2.1:* reach the guest from inside the
+  container's own network namespace, where the forward has always worked —
+  `docker exec -it <container> ssh -p 2222 ubuntu@127.0.0.1` (the image ships
+  an ssh client). Do **not** use `--network host` for this: it would hand the
+  VMM container the host's entire network namespace to work around a
+  one-address bug.
 
 - **The guest password was documented nowhere.** cloud-init logs "no authorized
   SSH keys ... for user ubuntu", the guest offers `publickey,password`, and the
