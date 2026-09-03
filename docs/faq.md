@@ -114,10 +114,34 @@ docker run --gpus all --device /dev/kvm ...
 No `--privileged`, no added capabilities, default seccomp and AppArmor. Rootless
 Docker works on the same terms, as long as your user can open `/dev/kvm`.
 
+Worth contrasting: containerising the *workload* instead does not get this. A
+Proton game needs Steam's own container (pressure-vessel, on bubblewrap), which
+must create a user namespace — and Docker's default seccomp profile denies that.
+So containerised Steam only runs once the outer container is weakened with
+`CAP_SYS_ADMIN` or `seccomp:unconfined`. Putting the VM in the container instead
+avoids the conflict entirely: the guest is a different kernel, so its namespaces
+never touch the host's filter.
+
 This is a useful way to run it today: the isolates are weaker inside a container
 (namespaces are usually blocked, so they fall back to UID separation), but the
 container boundary sits *outside* the VMM, so breaking out of the VMM lands the
 attacker in the container rather than on the host.
+
+**Is `--device /dev/kvm` as dangerous as mounting the Docker socket?**
+No. `/dev/kvm` is designed for unprivileged use — QEMU and libvirt run VMs as
+ordinary users, and systemd ships the node world-accessible on that basis.
+Holding it is not root-equivalent, and an escalation through it would be a Linux
+kernel vulnerability rather than a misconfiguration here. The Docker socket is
+root-equivalent *by design*: anything that can talk to it can start a privileged
+container.
+
+The compose deployment also grants the broker `/dev/udmabuf`. That one is a much
+narrower and less exercised interface; it rides the same `root:kvm 0660` gate,
+which is a reason to allow it rather than a safety proof, and
+[the broker audit](internal/audit-broker-security-2026-08-27.md) records it as an
+accepted risk, not a neutral one. Neither node is ever held by the guest — both
+sit with the VMM and broker, so they are reachable only after an escape out of
+the VM.
 
 **Why is my GPU showing as llvmpipe?**
 Two causes, and the second is easy to miss. Either the NVIDIA userspace
