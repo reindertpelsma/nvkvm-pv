@@ -132,10 +132,10 @@ attacker in the container rather than on the host.
 
 **Is `--device /dev/kvm` as dangerous as mounting the Docker socket?**
 No. `/dev/kvm` is designed for unprivileged use — QEMU and libvirt run VMs as
-ordinary users, and systemd ships the node world-accessible on that basis.
-Holding it is not root-equivalent, and an escalation through it would be a Linux
-kernel vulnerability rather than a misconfiguration here. The Docker socket is
-root-equivalent *by design*: anything that can talk to it can start a privileged
+ordinary users, and systemd's upstream default for the node is `0666`. Holding it
+is not root-equivalent, and an escalation through it would be a kernel
+vulnerability rather than a misconfiguration here. The Docker socket is
+root-equivalent *by design*: anything that can reach it can start a privileged
 container.
 
 The compose deployment also grants the broker `/dev/udmabuf`. It has **never**
@@ -155,27 +155,18 @@ buffers. So a compromised broker can pin unbounded unreclaimable host memory.
 That is a host-DoS primitive, not a path to code execution, and it is the same
 property that got dma-heap refused the access udmabuf was granted.
 
-**We rate that DoS very low, for a structural reason rather than optimism.**
+We rate that DoS very low, for a structural reason rather than optimism.
 `/dev/udmabuf` is granted only for the zero-copy *display* path, so it exists
-only in single-user desktop deployments — the ones where the machine's owner is
-also the only possible victim. A headless deployment has no broker and no
-display, and never receives the device at all. The risk and the deployments
-where host-DoS would matter therefore do not intersect. On top of that it is
-reachable only after the broker is already compromised (which needs a VM escape
-first), it grants no code execution, persistence or data access, and a reboot
-clears it — on a machine that is deliberately giving a game the GPU and most of
-RAM, "something used a lot of memory" is not even a distinctive symptom.
+only in single-user desktop deployments — where the owner is the only possible
+victim — and never reaches a headless one, which has no broker. The risk and the
+deployments where host-DoS would matter do not intersect. It also needs the
+broker compromised first, grants no code execution or persistence, and a reboot
+clears it. If udmabuf is ever wired into a headless path, re-rate it.
 
-**Maintenance guard:** that reasoning depends entirely on udmabuf staying on the
-display path. If it is ever wired into a headless or multi-tenant configuration,
-this assessment stops holding and the pinning primitive has to be re-rated.
-
-On the memory-safety side the case is genuinely reassuring: ~550 lines, three
-ioctls, one exploitable escalation in eight years, and syzkaller carries
-hand-written descriptions for it. Two honest qualifiers: that one escalation
-took nearly four years to notice, and nobody upstream has assessed udmabuf under
-a container threat model. Small and hard to break is supportable; well-audited
-*for this use* is not.
+On memory safety the case is good: ~550 lines, three ioctls, one exploitable
+escalation in eight years, syzkaller descriptions written for it. Two qualifiers:
+that escalation took nearly four years to find, and nobody upstream has assessed
+udmabuf under a container threat model.
 
 Neither node is ever held by the guest — both sit with the VMM and broker, so
 they are reachable only after an escape out of the VM.
