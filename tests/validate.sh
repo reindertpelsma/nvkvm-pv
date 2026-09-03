@@ -371,6 +371,15 @@ WORK="$(mktemp -d /tmp/nvkvm-validate.XXXXXX)" || { echo "cannot mktemp" >&2; ex
 cleanup() { [ "$KEEP_WORKDIR" = 1 ] || rm -rf "$WORK"; }
 trap cleanup EXIT
 
+# Defined here, with the other globals, because it is read at the Vulkan
+# ray-tracing-extension check ~460 lines before its old assignment site. Under
+# `set -u` that aborted the whole run with "REPRO_DIR: unbound variable" --
+# and it aborted it precisely when a check had FAILED, since that branch is
+# only reached when vk_compute_dispatch fails, so the run produced no
+# TOTAL/VERDICT line exactly when someone needed one. Reproduced on an
+# RTX 3060 guest, 2026-09-03.
+REPRO_DIR="${NVKVM_REPRO_DIR:-$(cd "$(dirname "$0")/repro" 2>/dev/null && pwd)}"
+
 CC=""
 for c in cc gcc clang; do
     if command -v "$c" >/dev/null 2>&1; then CC="$c"; break; fi
@@ -2620,7 +2629,8 @@ done
 # bare guest.
 section "host-memory registration invariants"
 
-REPRO_DIR="${NVKVM_REPRO_DIR:-$(cd "$(dirname "$0")/repro" 2>/dev/null && pwd)}"
+# REPRO_DIR is set with the other globals near the top -- it is read long
+# before this point.
 
 reg_invariant() {
     # reg_invariant <check-name> <source.c> <detail-on-pass>

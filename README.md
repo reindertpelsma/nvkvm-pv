@@ -64,9 +64,13 @@ Permissions, containers and nested virt can be found here: [install guide](docs/
 docker run --rm -it --device /dev/kvm --gpus all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \
     -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \
-    ghcr.io/reindertpelsma/nvkvm-pv:v0.2.0
-ssh -p 2222 ubuntu@127.0.0.1    # into the guest -- nvidia-smi already works
+    ghcr.io/reindertpelsma/nvkvm-pv:v0.2.1
+ssh -p 2222 ubuntu@127.0.0.1    # password: ubuntu -- nvidia-smi already works
 ```
+
+Keep the `127.0.0.1:` in the `-p` flag. The guest is `ubuntu:ubuntu` with
+`NOPASSWD:ALL`; published as a bare `-p 2222:2222` it is a root shell with your
+GPU attached, offered to your whole network.
 
 `NVIDIA_DRIVER_CAPABILITIES` is not optional decoration: `--gpus all` alone
 gives the container `compute,utility`, and the guest then gets a compute-only

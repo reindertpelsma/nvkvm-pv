@@ -50,4 +50,17 @@ mkdir -p /data
 chmod 0700 /data 2>/dev/null || true
 export NVKVM_SHARE_DIR=/data
 
+# The guest ssh forward must reach the container's own interface, not the
+# container's loopback: `docker run -p 127.0.0.1:2222:2222` publishes to eth0,
+# and a forward bound to 127.0.0.1 inside the netns is invisible to it -- the
+# connection is accepted by docker-proxy and immediately reset.  That is what
+# made the README quickstart fail on v0.2.0 and v0.2.1.
+#
+# This is NOT a relaxation of the loopback rule that run_test_vm.sh defaults
+# to. The network namespace is the boundary here, and what the guest is exposed
+# to is decided entirely by the address in the -p flag. Publish with
+# `-p 127.0.0.1:2222:2222` as the README does. Publishing with a bare
+# `-p 2222:2222` offers ubuntu:ubuntu with NOPASSWD:ALL to your whole network.
+export VM_SSH_BIND="${VM_SSH_BIND:-0.0.0.0}"
+
 exec bash /opt/nvkvm/scripts/run_test_vm.sh "$@"
