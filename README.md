@@ -22,7 +22,7 @@ layer, not a shared kernel container.
 
 This project fixes the limitations of the alternatives:
 - VFIO gives up the entire card to the VM, you cannot share it with multiple VMs, if you have a display on it then your host desktop is unrenderable
-- vGPU is only for licensed datacenter parts. Even the community attempt vgpu_unlock does not work on most recent nvidia cards. Requires a drastic setup change and license servers, this only requires nvidia access and KVM without any host gpu changes or custom drivers.
+- vGPU is only for licensed datacenter parts. Even the community attempt vgpu_unlock does not work on most recent nvidia cards. This only requires vanilla nvidia access and KVM without any drastic host kernel/OS changes. 
 - cuda containers do not give your a VM, no stock OS, no VM boundary, limited root, no docker-in-docker with GPU, many desktop apps failing.
 
 It provides you
