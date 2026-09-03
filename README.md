@@ -1,6 +1,6 @@
 # nvkvm
 
-Run CUDA, PyTorch and Vulkan inside a KVM guest — on the same GPU your host is
+Run CUDA, PyTorch, Vulkan or a graphical display inside a KVM guest, on the same GPU your host is
 still using.
 
 ![nvkvm booting a guest and driving the host GPU from inside it](docs/img/boot.gif)
@@ -11,72 +11,42 @@ nothing printed was cut. ([asciinema cast](docs/img/boot.cast) ·
 [how it was made](tools/demo/README.md))</sub>
 
 `nvkvm` gives a virtual machine real, driver-level access to an NVIDIA GPU
-without handing the card over to it. The host keeps the GPU. The guest gets
+without handing the card over to it. It feels like a CUDA container upgraded with actual VM support.
+
 `/dev/nvidia0` and friends, backed by a small kernel module that forwards the
-NVIDIA driver's own ioctl interface over virtio to the host driver. Unmodified
+NVIDIA driver's own API interface over virtio to the host driver. Unmodified
 NVIDIA userspace runs inside the guest — not a CUDA shim, not an API remoting
-layer, not a container.
+layer, not a shared kernel container.
 
-## What it buys you
+## Why it exists
 
-- give a VM GPU access **without PCIe passthrough**, so the host keeps the card
-- run **several VMs against one GPU**, and the host desktop alongside them
+This project fixes the limitations of the alternatives:
+- VFIO gives up the entire card to the VM, you cannot share it with multiple VMs, if you have a display on it then your host desktop is unrenderable
+- vGPU is only for licensed datacenter parts. Even the community attempt vgpu_unlock does not work on most recent nvidia cards. Requires a drastic setup change and license servers, this only requires nvidia access and KVM without any host gpu changes or custom drivers.
+- cuda containers do not give your a VM, no stock OS, no VM boundary, limited root, no docker-in-docker with GPU, many desktop apps failing.
+
+It provides you
+- give a VM GPU access without PCIe passthrough, so the host keeps the card.
+- run several VMs against one GPU, and the host desktop alongside them
 - attach a guest to a GPU **in under a second** — no device reset, no
   `vfio-pci` rebind
-- run **consumer GeForce hardware**, with no vGPU licence and no datacenter SKU
-- keep a **real VM boundary** — the guest never receives the physical device,
-  gets no MMIO window to it, and has no DMA path to host memory
-- **keep your container workflow** — `docker run --gpus all` inside the guest
-  behaves as it does on the host
-- **pass several GPUs to one guest** — autodetected and independently usable,
+- run consumer GeForce hardware, with no vGPU licence and no datacenter SKU
+- pass several GPUs to one guest - autodetected and independently usable,
   verified on up to six cards
+- Get the actual GPU accelerated display in the VM on your desktop - zero copy native, no PCIe round trips when not needed.
 
-## Performance
-
-It is fast because the guest is not in a hot path. Control calls are forwarded;
-the work itself is not — launching a kernel is a write to memory the guest
-already has mapped, and nvkvm is not in that path at all.
-
-> **Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of host**, on four
-> machines, published to Geekbench's own servers where neither we nor you can
-> edit them: [RTX 4070 99.6%](https://browser.geekbench.com/v7/gpu/compare/87004?baseline=87011)
-> · [RTX 3050 Laptop 99.9%](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
-> · [H100 PCIe 98.8%](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612)
-> · [A100 80GB 98.0%](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405).
-> The RTX rows are bare metal on both sides; the datacenter rentals' "host" is
-> itself a VM, so those two measure nvkvm nested a level deeper
-> — [why that's still meaningful](docs/reference/parity.md).
-
-A 32B model through vLLM runs at **0.99–1.00x** of host and produces
-token-identical output at temperature 0; fifteen other workloads land at 1.00x.
-Three shapes cost more, all measured: single-stream greedy decode without CUDA
-graphs (0.73–0.82x), tensor-parallel serving (0.89–1.06x, one configuration at
-0.52x), and NVENC encode. [All the numbers](docs/reference/parity.md).
-
-## What it is not
-
-- **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
-  security boundary you should rely on — read [`SECURITY.md`](SECURITY.md)
-  before deciding where to run this. We audit it ourselves and publish what we
-  find, fixed or not. **Do not put untrusted tenants behind it.**
-- **One virtual display, not a multi-monitor setup.** The guest gets a virtual
-  KMS head that needs no monitor on the host — which is what makes a headless
-  cloud GPU usable as a workstation — but only one, and no guest-side mode
-  control. [Known limitations](docs/internal/known-limitations.md).
-- **Not vGPU.** No SR-IOV, no hardware partitioning, no MIG. Sharing is
-  cooperative, at the driver interface.
-- **Not a Windows guest solution.** Linux guests only.
+This project is both intended for compute workload VMs (e.g deep learning) and for graphics VMs (e.g gaming)
 
 ## Requirements
 
 | | |
 |---|---|
-| Host | Linux with **working KVM**, an NVIDIA GPU, and the NVIDIA driver — either module flavour, proprietary or open ([which](docs/reference/supported-drivers.md)) |
+| Host | Linux with working KVM (confirm virtualiziation technology is enabled in BIOS), an NVIDIA GPU, and the NVIDIA driver - either module flavour, proprietary or open ([which](docs/reference/supported-drivers.md)) |
 | Guest | Linux, kernel 5.15 – 7.0 ([guest kernels](docs/reference/guest-kernels.md)) |
-| GPU | Turing or newer — Pascal enumerates but `cuInit` fails |
-| Size | ~16 GB RAM and 4 vCPUs for the guest, ~40 GB disk |
+| GPU | Turing or newer - Volta/Pascal/Maxwell support is in the making |
+| Size | Recommended 16 GB RAM and 4 vCPUs for the guest and 40 GB disk |
 
-**Check you can open `/dev/kvm` before anything else** — not CPU flags, which a
+Check you can open `/dev/kvm` before anything else - not CPU flags, which a
 container inherits from its host:
 
 ```bash
@@ -84,8 +54,8 @@ exec 3<>/dev/kvm && echo "KVM usable" && exec 3>&-
 ```
 
 Without `/dev/kvm`, QEMU silently falls back to software emulation: it appears
-to work and is unusably slow, which is the most expensive way to find out.
-Permissions, containers and nested virt: [install guide](docs/howto/install.md).
+to work and is unusably slow.
+Permissions, containers and nested virt can be found here: [install guide](docs/howto/install.md).
 
 ## Quickstart
 
@@ -123,6 +93,44 @@ bash /mnt/nvkvm/tests/validate.sh
 
 Exits 0 on a full pass, 1 on failure, 2 if anything was skipped. Every `28/28`
 below is this command on that hardware.
+
+## Performance
+
+It is fast because the guest is not in a hot path. Control calls are forwarded;
+the work itself is not - launching a kernel is a write to memory the guest
+already has mapped, and nvkvm is not in that path at all.
+
+> Geekbench 7 GPU (OpenCL) runs at 98.0–99.9% of host, on four
+> machines, published to Geekbench's own servers
+> · [RTX 4070 99.6%](https://browser.geekbench.com/v7/gpu/compare/87004?baseline=87011)
+> · [RTX 3050 Laptop 99.9%](https://browser.geekbench.com/v7/gpu/compare/81189?baseline=79862)
+> · [H100 PCIe 98.8%](https://browser.geekbench.com/v7/gpu/compare/85619?baseline=85612)
+> · [A100 80GB 98.0%](https://browser.geekbench.com/v7/gpu/compare/85389?baseline=85405).
+> The RTX rows are bare metal on both sides; the datacenter rentals' "host" is
+> itself a VM, so those two measure nvkvm nested a level deeper
+> — [why that's still meaningful](docs/reference/parity.md).
+
+A 32B model through vLLM runs at 0.99–1.00x of host and produces
+token-identical output at temperature 0; fifteen other workloads land at 1.00x.
+Three shapes cost more, all measured: single-stream greedy decode without CUDA
+graphs (0.73–0.82x), tensor-parallel serving (0.89–1.06x, one configuration at
+0.52x), and NVENC encode. [All the numbers](docs/reference/parity.md).
+
+## What it is not
+
+- **Not a hardened multi-tenant sandbox.** The guest/host boundary is not yet a
+  security boundary you should rely on - read [`SECURITY.md`](SECURITY.md)
+  before deciding where to run this. The code is intended to become secure against multi tenant use in the future so everything is written defensive,
+  but some issues are still open (to be fixed) and a project with a single author cannot be claimed to be battle tested without external review.
+  **Do not put untrusted tenants behind it.**
+- One virtual display, not a multi-monitor setup. The guest gets a virtual
+  KMS head that needs no monitor on the host - which is what makes a headless
+  cloud GPU usable as a workstation - but only one, and no guest-side mode
+  control. [Known limitations](docs/internal/known-limitations.md).
+- Not vGPU No SR-IOV, no hardware partitioning, no MIG. Sharing is
+  cooperative, at the driver interface.
+- Not a Windows guest solution. Linux guests only.
+- CUDA DMA pinned memory bypasses the VM ram limit. Known limitation, its currently an unbounded DoS target.
 
 ## How it fits together
 
