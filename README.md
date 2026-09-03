@@ -23,7 +23,7 @@ layer, not a shared kernel container.
 This project fixes the limitations of the alternatives:
 - VFIO gives up the entire card to the VM, you cannot share it with multiple VMs, if you have a display on it then your host desktop is unrenderable
 - vGPU is only for licensed datacenter parts. Even the community attempt vgpu_unlock does not work on most recent nvidia cards. This only requires vanilla nvidia access and KVM without any drastic host kernel/OS changes. 
-- cuda containers do not give your a VM, no stock OS, no VM boundary, limited root, no docker-in-docker with GPU, many desktop apps failing.
+- cuda containers do not give your a VM, no stock OS, no VM boundary, limited root, no docker-in-docker with GPU without severely weakining the container, many desktop apps failing.
 
 It provides you
 - give a VM GPU access without PCIe passthrough, so the host keeps the card.
@@ -34,6 +34,7 @@ It provides you
 - pass several GPUs to one guest - autodetected and independently usable,
   verified on up to six cards
 - Get the actual GPU accelerated display in the VM on your desktop - zero copy native, no PCIe round trips when not needed.
+- Run QEMU in a container for additional isolation and environment consistency.
 
 This project is both intended for compute workload VMs (e.g deep learning) and for graphics VMs (e.g gaming)
 
