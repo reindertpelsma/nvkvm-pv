@@ -351,6 +351,15 @@ packages:
   # a software rasteriser in the guest would give validate.sh something to
   # succeed against that is not the GPU.
   - libvulkan1
+  # Headers, not a driver -- so this does not violate the rule above about
+  # never giving validate.sh something to succeed against that is not the GPU.
+  # Without it tests/repro/vk_device_extensions.c cannot compile
+  # ("fatal error: vulkan/vulkan.h: No such file or directory") and
+  # vk_device_rt_extensions -- THE RDR2 REGRESSION CHECK, the acceptance
+  # criterion for whether D3D12/ray-tracing titles work at all -- SKIPS on
+  # every guest. Measured on two hosts (RTX 4070/595.84, RTX 3070/575.51.03):
+  # both reported VERDICT: INCOMPLETE for this one reason and nothing else.
+  - libvulkan-dev
   - libegl1
   # libGLX_nvidia.so.0 -- which IS the NVIDIA Vulkan ICD -- links against
   # libXext.  Minimal cloud images do not all ship it (Debian's does not), and

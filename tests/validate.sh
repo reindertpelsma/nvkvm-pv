@@ -2162,8 +2162,19 @@ fi
 # trace anywhere else, which is exactly why it needs its own check.
 #
 # See tests/repro/vk_device_extensions.c and
-# docs/internal/known-limitations.md ("Seven device extensions fail
-# vkCreateDevice"). Root cause OPEN; this check is the acceptance criterion.
+# docs/internal/known-limitations.md ("Seven device extensions failed
+# vkCreateDevice -- RETRACTED, it was a staging bug").
+#
+# ROOT-CAUSED AND RETRACTED 2026-09-01: the cause was never nvkvm. It was
+# stage_guest_libs.sh failing to place libcuda.so.1 on a guest whose linker
+# path is plain /usr/lib (SteamOS: ID_LIKE=arch matches neither of its two
+# branches). The NVIDIA Vulkan ICD dlopens libcuda inside each of these seven
+# extensions' init paths, got ENOENT, and declined to build the device
+# silently. This paragraph previously read "Root cause OPEN"; it was stale.
+#
+# The check stays, as a permanent regression guard rather than an open bug:
+# confirmed PASS on RTX 4070 / driver 595.84, 2026-09-04, all seven extensions
+# together.
 VK_RT_EXTS="VK_KHR_acceleration_structure VK_KHR_ray_query VK_KHR_ray_tracing_pipeline VK_NV_ray_tracing VK_NV_optical_flow VK_NV_cuda_kernel_launch VK_NVX_binary_import"
 if [ -z "$BUILD_PROBES" ]; then
     if ! command -v "$CC" >/dev/null 2>&1; then
@@ -2172,7 +2183,12 @@ if [ -z "$BUILD_PROBES" ]; then
         record vk_device_rt_extensions SKIP "tests/repro/vk_device_extensions.c not present"
     elif ! "$CC" -O1 -o "$WORK/vk_device_extensions" "$REPRO_DIR/vk_device_extensions.c" -ldl \
             > "$WORK/vk_device_extensions.cc" 2>&1; then
-        record vk_device_rt_extensions SKIP "will not build (see $WORK/vk_device_extensions.cc)"
+        # Quote the compiler's own first error. "will not build" plus a path
+        # into $WORK is not actionable -- nobody cats that file, so a missing
+        # build dependency reads as an unexplained skip forever. This one hid
+        # a missing libvulkan-dev on every guest until 2026-09-04.
+        record vk_device_rt_extensions SKIP \
+            "will not build: $(grep -m1 -E 'error:|fatal error:' "$WORK/vk_device_extensions.cc" 2>/dev/null | sed 's/^[[:space:]]*//' | cut -c1-160), full log at $WORK/vk_device_extensions.cc"
     else
         # Output to a FILE, never a command substitution: these probes can leave
         # a child holding the pipe and the read would never see EOF. See
