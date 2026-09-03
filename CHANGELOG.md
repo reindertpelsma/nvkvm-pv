@@ -27,6 +27,7 @@ see that line, rebuild the guest module from the same tree as QEMU.
 
 | release | `NVKVM_PROTO_VERSION` | rebuild both sides? |
 |---|---|---|
+| v0.2.2 | 3 | no — unchanged |
 | v0.2.1 | 3 | no — unchanged from v0.2.0 |
 | v0.2.0 | 3 | **yes** — bumped 2 → 3 |
 | v0.1.0 | 2 | — |
@@ -41,6 +42,72 @@ replay carries its embedded RM control handle and both RM object handles. See
 `${NVKVM_IMAGE_TAG:-local}`, so the normal path builds locally and no registry
 push can change what you run. If you have set `NVKVM_IMAGE_TAG=latest`, pin it
 to a release tag instead — `latest` moves.
+
+## [v0.2.2] — 2026-09-03
+
+**The quickstart in v0.2.0 and v0.2.1 could not reach its own guest.** If you
+are on either, upgrade — or see the workaround below.
+
+**Fixed**
+
+- **`ssh -p 2222 ubuntu@127.0.0.1` reset the connection**, on both previous
+  releases. QEMU forwarded the guest's ssh to the *container's* loopback, while
+  Docker's `-p 127.0.0.1:2222:2222` bridges the host's loopback to the
+  container's **eth0** — so `docker-proxy` accepted the connection, found
+  nothing listening inside, and dropped it. The guest was healthy the whole
+  time and simply listening on an address Docker never bridges to. Measured:
+
+  ```
+  inside the container netns → 127.0.0.1:2222   →  SSH-2.0-OpenSSH_9.6p1
+  container eth0 172.17.0.2:2222                →  Connection refused
+  ```
+
+  The bind is now `VM_SSH_BIND`. It still defaults to `127.0.0.1`, which is the
+  remediation for the audit finding it came from — guest ssh on `0.0.0.0` with
+  `ubuntu:ubuntu` and `NOPASSWD:ALL` published a root shell on rented
+  public-IP boxes — and only `container-entrypoint.sh`, which owns a network
+  namespace, widens it. In the container case exposure is set by the address in
+  `-p`, so **keep the `127.0.0.1:` in it**.
+  `tests/sweep_untrusted_endpoint_test.sh` now asserts both halves: the default
+  is loopback, and the entrypoint is the only thing that widens it.
+
+  *Workaround if you stay on v0.2.1:* run with `--network host` and drop the
+  `-p` flag, so QEMU's loopback bind is the host's loopback.
+
+- **The guest password was documented nowhere.** cloud-init logs "no authorized
+  SSH keys ... for user ubuntu", the guest offers `publickey,password`, and the
+  credential is `ubuntu:ubuntu`. It is on the ssh line in the README now.
+- **The README pinned `:v0.2.0`**, so every copy-paste ran the previous release
+  — without, among other things, the `DRIVER_SYNCOBJ` fix gamescope needs to
+  drive a connector.
+- **`tests/validate.sh` aborted instead of reporting.** `REPRO_DIR` was read at
+  the Vulkan ray-tracing-extension check and assigned ~460 lines later, so under
+  `set -u` the run died with "REPRO_DIR: unbound variable" before printing
+  TOTAL/VERDICT. That branch is only reached when `vk_compute_dispatch` FAILS,
+  so the suite produced no verdict exactly when one was needed.
+- **12 broken relative links**, 11 of them in `docs/howto/install.md`, which was
+  written as though it sat at the repository root. Repo-wide there are now zero
+  broken links and zero broken anchors.
+
+**Added**
+
+- `scripts/nvkvm-report.sh` — one pass over everything a bug report needs,
+  host or guest, auto-detected. Reports MAXPHYADDR, GPU runtime power state,
+  whether QEMU is actually a patched build, and whether `vfio-pci` has a GPU
+  bound. Points at QEMU's stderr, which nothing else collects.
+- `sweep.sh` verifies **CUDA works on the host** before crediting a row to
+  nvkvm, with its own `host-cuda-broken` status. A rented box can pass
+  `systemd-detect-virt`, `/dev/kvm` and `nvidia-smi` and still fail `cuInit`
+  with rc=3 on the bare host; every CUDA check would then fail in the guest and
+  be recorded as an nvkvm result. Measured on a rented RTX 3060, 2026-09-03.
+- `CHANGELOG.md`, and an index for `docs/audit/` and `docs/investigations/` —
+  18 documents that `docs/README.md` never listed.
+
+**Verified on hardware**: RTX 3070 / driver 575.51.03, rented KVM box, the
+README quickstart run verbatim from the host on a fresh volume —
+`TOTAL 36  PASS 35  FAIL 0  SKIP 1  UNTESTED 0`.
+
+**Compatibility**: none. Protocol unchanged at 3.
 
 ## [v0.2.1] — 2026-09-03
 
