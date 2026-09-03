@@ -1245,13 +1245,22 @@ already made against a restriction nvkvm was going to hit, rather than against
 a container-only one. That is what made deriving from it worth doing instead of
 merely reading it.
 
-The largest departures are the three this document is organised around:
-nvproxy's sentry shares an address space with the application, so it never
-faces the guest-**physical**-address problem — there is no memslot to publish
-host pages through and no guest kernel to land them in; it has no VM boundary
-to place mmaps across; and it does not need a per-process host isolate, because
-the sentry already is one. The single-address-space constraint transfers; the
-guest-physical layer does not, and that layer is where Problem 1 lives.
+The largest departure is narrower than "it has no VM boundary", and worth
+stating precisely, because under the KVM platform the sentry **does** build
+memslots — it must, to run the application as guest ring-3.
+
+The difference is *whose* address space those memslots publish. gVisor's
+publish the sentry's own, and the application's mappings are already inside it,
+because the application runs in that address space. Memslot and page tables are
+two views of one address space the sentry fully owns. nvkvm has to publish host
+pages into a **different operating system's** physical address space, and then
+have **that** kernel — which it does not control and must not trust — install
+them into a userspace process's VMA with `remap_pfn_range`. That third place is
+what is not in nvproxy, and it is where Problem 1 lives.
+
+The other two departures: nvproxy does not need a per-process host isolate,
+because the sentry already is one; and its object bookkeeping never crosses a
+trust boundary it did not define.
 
 ## Where to go next
 
