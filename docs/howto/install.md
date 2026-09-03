@@ -113,6 +113,35 @@ sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
 sudo bash scripts/setup_guest.sh    # fetches an Ubuntu 24.04 cloud image
 ```
 
+**Then stage the guest's NVIDIA userspace, or the guest boots without a GPU.**
+The container does this for you (`scripts/container-entrypoint.sh`); on a bare
+host nothing does, and `run_test_vm.sh` does not go looking for the bundle — it
+exports the share only when `NVKVM_HOSTLIBS_DIR` names it. Skip this and the
+guest comes up healthy, builds its module, and then answers
+`nvidia-smi: command not found`, with `validate.sh` failing its CUDA checks:
+
+```bash
+sudo bash scripts/make_host_bundle.sh          # collects this host's driver
+                                               # userspace -> ./host-libs-<ver>
+```
+
+Pass it to the VM, and stage it once inside the guest:
+
+```bash
+sudo NVKVM_HOSTLIBS_DIR="$PWD/host-libs-<ver>" \
+     NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
+```
+
+```bash
+# inside the guest, once it has booted
+sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh
+```
+
+Both halves must match the host driver exactly or `libcuda` refuses to
+initialise — [`stage-guest-libraries.md`](stage-guest-libraries.md) explains why
+the failures here are silent. Verified end to end on driver 595.84: 23 files
+bundled, 24 staged, and the guest then reports the host's GPU.
+
 x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
 source for that). It is a real binary built on Ubuntu 24.04, so it needs
 **glibc 2.38 or newer**: on an older host (Ubuntu 22.04 is glibc 2.35) use the
@@ -125,11 +154,9 @@ against *your* guest's kernel. That is why `src/guest/` ships with the tarball:
 `scripts/run_test_vm.sh` exports the unpacked directory to the guest over 9p at
 `/mnt/nvkvm`, and cloud-init builds the module there on first boot.
 
-Building it there needs the export to be writable, and that is opt-in:
-
-```bash
-sudo NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
-```
+Building it there needs the export to be writable, and that is opt-in — which
+is why `NVKVM_DEV_HARNESS_INSECURE_RW=1` appears on the `run_test_vm.sh` line
+above.
 
 Read the banner it prints. A writable export gives guest root a path to host
 root, so the harness is for guests you trust completely — see
