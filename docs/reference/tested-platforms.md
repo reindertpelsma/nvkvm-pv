@@ -288,8 +288,10 @@ launch, matmul, byte-exact transfers — and OpenGL renders through the forwarde
 580.126.09, and passed on the bare-metal host on all of them — which is how it
 was identified as nvkvm's bug rather than the driver's, and then fixed
 (`HOPPER_USERMODE_A` was allocated with a NULL parameter block). The 28/28 rows
-above were measured on the tree that carried that fix — **which is not `main`
-today**; it was reverted by `4fece85` and has not been restored. Read
+above were measured on the tree that carried that fix. It was reverted by
+`4fece85` — a single-parent commit that reverted several unrelated things — and
+**restored by `c9e3875`**, verified on `main` 2026-08-31, so these rows may be
+quoted for the tree as it stands. Read
 [the driver sweep, the trace and the fix](correctness.md#vulkan-compute-on-hopper--root-caused-it-was-ours-and-it-was-never-a-driver-bug)
 before quoting a current Hopper number.
 

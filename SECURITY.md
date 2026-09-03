@@ -225,7 +225,7 @@ startup. The exposed window is a machine with a panel but no display server
 running, and it is not specific to containers: an unprivileged local user has
 the same access.
 
-**For nvkvm:** [`docker-compose.yml`](../docker-compose.yml) drops `ALL` and
+**For nvkvm:** [`docker-compose.yml`](docker-compose.yml) drops `ALL` and
 adds back `SETUID`, `SETGID`, `SETPCAP`, `SYS_CHROOT`. None is `CAP_SYS_ADMIN`,
 so an nvkvm container cannot read the host's screen even with `/dev/dri`
 present. **`--privileged` removes this entirely** — the device nodes are not

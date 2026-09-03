@@ -170,8 +170,11 @@ the seams.
 | 595.84 | 580 | **top** of the range — the seam where the struct table and the NVKMS enum table disagree about eras |
 | 610.57.04 | 610 | newest published 610; V610 channel (376 B, `+hHandleVASpace`) |
 
-Blackwell's architecture floor is 570, so `565.57.01` drops out and Blackwell
-still gets five rows. Every other architecture gets six.
+Blackwell's architecture floor is **580** (raised from 570 by `4f3eadb` —
+570.124.06 NULL-derefs and hangs the box), so both `565.57.01` and `570.124.06`
+drop out and Blackwell gets four rows, below `MIN_DRIVERS`. Every other
+architecture gets six. The floor lives in `ARCH_FLOOR`
+(`scripts/sweep_matrix.py:184`).
 
 All six, and every same-profile alternate, were confirmed downloadable from
 NVIDIA on 2026-08-23 (HTTP 200 at one of the two paths `sweep_matrix.py`

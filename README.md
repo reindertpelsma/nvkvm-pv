@@ -127,7 +127,7 @@ graphs (0.73–0.82x), tensor-parallel serving (0.89–1.06x, one configuration 
 - One virtual display, not a multi-monitor setup. The guest gets a virtual
   KMS head that needs no monitor on the host - which is what makes a headless
   cloud GPU usable as a workstation - but only one, and no guest-side mode
-  control. [Known limitations](docs/internal/known-limitations.md).
+  control. [Known limitations: display and graphics](docs/internal/known-limitations.md#display-and-graphics).
 - Not vGPU No SR-IOV, no hardware partitioning, no MIG. Sharing is
   cooperative, at the driver interface.
 - Not a Windows guest solution. Linux guests only.

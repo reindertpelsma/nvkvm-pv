@@ -15,8 +15,12 @@ simultaneously 437 MiB of 12282 MiB used — almost entirely free.
 
 ## Why you should enlarge it
 
-nvkvm leaks BAR1 VA that is reclaimed only by tearing the driver down (see
-`docs/investigations/gamescope-oobe/` and the BAR1 note). At the pre-Resizable-BAR
+BAR1 is simply too small at the old default for a desktop workload — a bare
+Plasma desktop alone sits at 411-423 MiB. It is **not** a leak: what looked like
+one was deferred cleanup, and every byte comes back once the last host referrer
+exits (`docs/investigations/va-space-leak/FINDINGS.md`, resolved 2026-09-03;
+this page previously said *"nvkvm leaks BAR1 VA that is reclaimed only by
+tearing the driver down"*). At the pre-Resizable-BAR
 default of **256 MiB** that becomes a host-wide denial of service quickly: a
 guest whose compositor crash-loops exhausted this box's aperture in an afternoon,
 after which the HOST's own `vulkaninfo` failed with

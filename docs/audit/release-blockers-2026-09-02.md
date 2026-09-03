@@ -8,7 +8,7 @@ written, are there dangling citations for anything security-relevant, and are
 there more instances of the two bug shapes this project hit today (stale
 artefact trusted as current; a check sampling at the wrong instant).
 
-This builds on and verifies `docs/release-readiness-2026-09-01.md` rather than
+This builds on and verifies `docs/internal/release-readiness-2026-09-01.md` rather than
 repeating it. Where that document's own TODOs are now resolved or still open,
 this says so with evidence. Four read-only sub-investigations covered the four
 areas in parallel; every finding below was independently spot-checked against
@@ -124,7 +124,7 @@ maintainer to avoid introducing a second error).
 
 ### B6. `nvkvm-steamos` main still ships the games claim flagged for correction last night — the fix branch was never merged
 
-`docs/release-readiness-2026-09-01.md` §3 records this as already corrected:
+`docs/internal/release-readiness-2026-09-01.md` §3 records this as already corrected:
 *"Row now claims only Tomb Raider and Portal 2... Branch `fix/games-claim`."*
 Checked directly against `/workspace/nvkvm-steamos` (a sibling repo, not
 touched, read-only): `fix/games-claim` (`a9cbb6f`, *"README: only claim the
@@ -209,7 +209,7 @@ fixed and merged (`c0bdf4a`, today), and the `--guest-image` harness bug that
 made the whole guest-kernel axis a no-op for the project's history was fixed
 and merged (`e9fb8be`, today) — with a real verified run on
 `guest_series=questing`, **kernel 6.17.0-40-generic, 35P/0F/0S**
-(`docs/release-readiness-2026-09-01.md` §2.1). Both of these are genuinely
+(`docs/internal/release-readiness-2026-09-01.md` §2.1). Both of these are genuinely
 good, hard-won news (confirmed: both commits are ancestors of `main`,
 resolving TODO items 1 and 2 from last night's readiness doc). Neither shows
 up in `guest-kernels.md`'s "run" table (still only Ubuntu 24.04/6.8 and
@@ -352,7 +352,7 @@ missing."* `scripts/stage_guest_libs.sh:610-626` actually has three outcomes:
 **3** (a CUDA-critical library failed to stage). The doc only documents the
 first two. This is the exact split the project fixed *last night*
 specifically because the old single-exit-code version let `nvkvm-guest.service`
-swallow the fatal case with `|| true` (`docs/release-readiness-2026-09-01.md`
+swallow the fatal case with `|| true` (`docs/internal/release-readiness-2026-09-01.md`
 §4b) — the doc describing the fix wasn't updated to match it.
 
 ---

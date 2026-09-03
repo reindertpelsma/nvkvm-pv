@@ -7,6 +7,22 @@ re-measurement. Each says which it is.
 Compute is not on this list. The CUDA/PyTorch/Vulkan-compute path runs at host
 parity on three GPU architectures; see `tests/perf/realapp_matrix.md`.
 
+**If you came here from the README with one question, jump to it.** This page is
+long because each entry carries its measurement; the sections are independent.
+
+| | |
+|---|---|
+| [Display and graphics](#display-and-graphics) | the single virtual head, compositors, X11/EGL, present paths — most README limitation bullets land here |
+| [Video](#video) | NVENC/NVDEC, including the encode hang that did not reproduce |
+| [Vulkan](#vulkan) | what works, and on which drivers |
+| [Numbers you should not quote](#numbers-you-should-not-quote) | measurements that were retracted or never held; see also [quoting-numbers.md](../reference/quoting-numbers.md) |
+| [Security](#security) | the limits that are intrinsic rather than unfinished — [SECURITY.md](../../SECURITY.md) is the threat model |
+| [Functional gaps worth knowing](#functional-gaps-worth-knowing) | things that simply are not implemented |
+
+Entries are marked in place: **FIXED**, **OPEN**, **RETRACTED**. An entry that
+says FIXED is kept rather than deleted, because the symptom is how you find it
+again if it comes back.
+
 ---
 
 ## Display and graphics
