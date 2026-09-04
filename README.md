@@ -227,4 +227,7 @@ and [`straylight-software/isospin-microvm`](https://github.com/straylight-softwa
 ## Licence
 
 Apache-2.0, except the guest kernel module (`src/guest/`), which is GPL-2.0 as
-required for kernel symbol access. See [`LICENSE`](LICENSE).
+required for kernel symbol access, and the QEMU shipped in release tarballs,
+which is GPL-2.0 and rebuildable from the pinned upstream commit plus
+[`patches/`](patches). See [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE) — the
+latter also carries the trademark and independence statement.

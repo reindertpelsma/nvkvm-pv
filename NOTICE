@@ -1,0 +1,54 @@
+nvkvm
+Copyright 2026 Reindert Pelsma
+
+An independent, non-commercial project, written by one person. Nothing here
+is affiliated with, authorised by, sponsored by or endorsed by NVIDIA
+Corporation. "NVIDIA", "GeForce", "RTX", "CUDA" and "NVENC" are trademarks of
+NVIDIA Corporation; other product and company names are the marks of their
+respective owners. They appear here only to name the hardware and software
+this project interoperates with.
+
+No NVIDIA software is redistributed by this repository or by its release
+artifacts. The guest's NVIDIA userspace is collected from the driver already
+installed on your own machine (scripts/make_host_bundle.sh) and staged into
+your own guest; it never passes through this project.
+
+------------------------------------------------------------------------
+Licensing
+------------------------------------------------------------------------
+
+The Apache License 2.0 (see LICENSE) covers this project, with these
+exceptions:
+
+  src/guest/        The guest kernel module is GPL-2.0, as required for
+                    kernel symbol access. Individual files carry their own
+                    SPDX headers; several are dual "GPL-2.0 OR Apache-2.0".
+
+  qemu-nvkvm/       Release tarballs ship a compiled QEMU. QEMU is GPL-2.0
+  (in release       and is NOT covered by this project's Apache licence.
+   tarballs)        The complete corresponding source is upstream QEMU
+                    v11.1.1 at commit
+                    c3d48b7d1e89604920e5b81b91140c2ad39a1943
+                    (https://gitlab.com/qemu-project/qemu), plus the twelve
+                    patch files in patches/ in this repository, applied in
+                    filename order. scripts/build_qemu.sh does exactly that
+                    and pins the same commit, so the binary is reproducible
+                    from public sources alone.
+
+  qemu-nvkvm/share/qemu/
+                    Firmware images built from edk2, SeaBIOS and iPXE, each
+                    under its own licence; edk2-licenses.txt ships beside
+                    them.
+
+------------------------------------------------------------------------
+Attribution
+------------------------------------------------------------------------
+
+Derived from the nvproxy package in gVisor -- pkg/sentry/devices/nvproxy/
+and pkg/abi/nvgpu/ -- copyright The gVisor Authors, Apache-2.0. The ioctl
+tables, RM object tracking, fd translation and OS-descriptor pinning come
+from there.
+
+Per-file attribution is in CREDITS, which also records the NVIDIA
+open-gpu-kernel-modules headers (dual MIT / GPL-2.0) that the ABI work is
+derived from.
