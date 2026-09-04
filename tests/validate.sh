@@ -2203,6 +2203,50 @@ if [ -z "$BUILD_PROBES" ]; then
         elif [ "$VK_EXT_RC" -eq 0 ]; then
             record vk_device_rt_extensions PASS \
                 "vkCreateDevice succeeded with all 7 ray-tracing/NVX extensions enabled"
+        elif [ "$VK_EXT_RC" -eq 2 ]; then
+            # Exit 2 is "you asked for an extension this device does not
+            # advertise" -- a hardware capability, not a forwarding failure.
+            # VK_NV_optical_flow does not exist on Turing: MEASURED on a
+            # bare-metal RTX 2060 SUPER / 575.51.03 with no VM in the picture,
+            # where vulkaninfo advertises it zero times and the probe reports
+            # "not in advertised set". The other six succeed there, together.
+            # Demanding all seven everywhere turned that into a FAIL on every
+            # Turing box and would have written false regressions into the
+            # sweep matrix.
+            #
+            # So narrow to what the device advertises and test THAT. The point
+            # of this check is extensions that are advertised and still make
+            # vkCreateDevice fail; an extension that was never advertised is
+            # out of its scope, and is named rather than hidden.
+            VK_HAVE=""; VK_MISSING=""
+            for _e in $VK_RT_EXTS; do
+                # Capture the status explicitly. `if cmd; then ... elif [ $? ]`
+                # reads the status of the *condition*, which is a trap worth
+                # not setting for the next reader.
+                "$WORK/vk_device_extensions" "$_e" >/dev/null 2>&1
+                _rc=$?
+                if [ "$_rc" -eq 2 ]; then
+                    VK_MISSING="$VK_MISSING $_e"    # device never advertised it
+                else
+                    VK_HAVE="$VK_HAVE $_e"          # advertised: in scope, pass or fail
+                fi
+            done
+            if [ -z "$VK_HAVE" ]; then
+                record vk_device_rt_extensions SKIP \
+                    "this device advertises none of the 7 (missing:${VK_MISSING})"
+            else
+                # shellcheck disable=SC2086
+                sh_bounded vk_device_rt_extensions "$SHELL_TIMEOUT" \
+                    "$WORK/vk_device_extensions" $VK_HAVE > "$WORK/vk_device_rt2.out" 2>&1
+                VK_EXT_RC2=$?
+                if [ "$VK_EXT_RC2" -eq 0 ]; then
+                    record vk_device_rt_extensions PASS \
+                        "vkCreateDevice succeeded with every advertised extension of the 7 (${VK_HAVE# }); not advertised on this GPU:${VK_MISSING}"
+                else
+                    record vk_device_rt_extensions FAIL \
+                        "vkCreateDevice rejected advertised extensions (${VK_HAVE# }); ray tracing and D3D12 titles will not work"
+                fi
+            fi
         else
             record vk_device_rt_extensions FAIL \
                 "vkCreateDevice rejected the 7 ray-tracing/NVX extensions (${VK_EXT_LINE:-no RESULT line}); ray tracing and D3D12 titles will not work"
