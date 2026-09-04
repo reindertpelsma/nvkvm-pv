@@ -22,11 +22,22 @@
  * enumerating a physical device is cheap and creating a logical one is what
  * breaks. An application cannot tell in advance except by trying.
  *
- * dlopen()s libvulkan rather than linking it, so it builds anywhere a compiler
- * exists and needs no Vulkan headers or loader at build time.
+ * dlopen()s libvulkan rather than linking it, so it needs no Vulkan LOADER at
+ * build or link time.  It does need the HEADERS: VK_NO_PROTOTYPES suppresses
+ * the function declarations, not the types, and this file names 49 of them.
+ * The claim that it "builds anywhere a compiler exists" was wrong and cost
+ * this check its coverage -- guests ship libvulkan1 but not libvulkan-dev, so
+ * it failed to compile and SKIPPED on every guest until 2026-09-04, which is
+ * silent for a check whose whole purpose is to catch a regression.
  *
- * Root cause OPEN as of this commit. This file is the acceptance criterion: when
- * it exits 0 with the seven extensions above, the bug is fixed.
+ * ROOT-CAUSED AND RETRACTED 2026-09-01: it was never nvkvm.  stage_guest_libs.sh
+ * failed to place libcuda.so.1 on a guest whose linker path is plain /usr/lib
+ * (SteamOS: ID_LIKE=arch matched neither of its two branches), and the NVIDIA
+ * Vulkan ICD dlopens libcuda inside each of these seven extensions' init paths.
+ * It got ENOENT and declined to build the device, silently.  See
+ * docs/internal/known-limitations.md.  This file remains the acceptance
+ * criterion and is now a regression guard: it must exit 0 with the seven
+ * extensions above.
  */
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
