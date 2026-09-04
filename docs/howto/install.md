@@ -119,13 +119,18 @@ container does this for you; on a bare host nothing does.
 
 ```bash
 sudo bash scripts/make_host_bundle.sh            # -> ./host-libs-<ver>
-sudo NVKVM_HOSTLIBS_DIR="$PWD/host-libs-<ver>" \
+sudo NVKVM_HOSTLIBS_DIR="$(ls -d "$PWD"/host-libs-* | head -1)" \
      NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
 ```
 
+The guest needs a few minutes past its login prompt — cloud-init installs
+kernel headers, builds the module and stages the libraries. It is done when
+`systemctl status nvkvm-guest.service` reads `active (exited)`. Then, in the
+guest:
+
 ```bash
-sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh   # inside the guest
 nvidia-smi                                         # should name your GPU
+sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh   # only if it does not
 ```
 
 The bundle and the guest must match the host driver exactly or `libcuda`
@@ -161,7 +166,7 @@ in-guest module build needs it.
 
 ```bash
 git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm && cd nvkvm
-bash scripts/build_qemu.sh --install-deps   # builds the isolate stub, then QEMU 11.1 with the nvkvm device
+sudo bash scripts/build_qemu.sh --install-deps   # isolate stub, then QEMU 11.1 with the nvkvm device
 sudo bash scripts/setup_guest.sh            # fetches an Ubuntu 24.04 cloud image and prepares a disk
 sudo bash scripts/make_host_bundle.sh       # this host's driver userspace -> ./host-libs-<ver>
 ```
@@ -170,14 +175,14 @@ Then boot and stage, exactly as the tarball path above — `build_qemu.sh`
 installs to `/opt/qemu-nvkvm`, so `run_test_vm.sh` finds the binary itself.
 
 ```bash
-sudo NVKVM_HOSTLIBS_DIR="$PWD/host-libs-<ver>" \
+sudo NVKVM_HOSTLIBS_DIR="$(ls -d "$PWD"/host-libs-* | head -1)" \
      NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
 ```
 
 ```bash
-# inside the guest, once it has booted
-sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh
-nvidia-smi                                  # the guest should now name your GPU
+# in the guest, once nvkvm-guest.service reads active (exited)
+nvidia-smi                                  # should name your GPU
+sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh   # only if it does not
 ```
 
 Most of the wall clock is QEMU. The script is a convenience, not the

@@ -234,6 +234,16 @@ nvkvm_wait_dpkg_lock() {
 }
 
 MISSING="$(nvkvm_missing)"
+if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ] && [ "$(id -u)" -ne 0 ]; then
+    # --install-deps runs the package manager directly.  Without this the first
+    # thing a reader of install.md sees is a bare "apt-get: Permission denied"
+    # from inside a build script, which reads like the script is broken rather
+    # than under-privileged.  The usage text has always said "(needs root)".
+    echo "ERROR: --install-deps installs packages and must run as root." >&2
+    echo "       Re-run:  sudo bash $0 --install-deps" >&2
+    echo "       Or install these yourself and drop the flag:$MISSING" >&2
+    exit 1
+fi
 if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ]; then
     echo "  installing:$MISSING"
     case "$(nvkvm_distro)" in
