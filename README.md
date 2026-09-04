@@ -92,12 +92,13 @@ bash /mnt/nvkvm/tests/validate.sh
 ```
 
 ```
- TOTAL 28   PASS 28   FAIL 0   SKIP 0
- VERDICT: PASS (all 28 checks passed)
+ TOTAL 36   PASS 36   FAIL 0   SKIP 0
+ VERDICT: PASS (all 36 checks passed)
 ```
 
-Exits 0 on a full pass, 1 on failure, 2 if anything was skipped. Every `28/28`
-below is this command on that hardware.
+Exits 0 on a full pass, 1 on failure, 2 if anything was skipped. Every result
+below is this command on that hardware — the check count has grown over time,
+so older rows record a smaller total than a run today prints.
 
 ## Performance
 

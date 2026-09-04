@@ -140,8 +140,12 @@ host driver upgrade** — the guest re-stages from whatever bundle it is given, 
 a stale one is re-applied on every boot (`cuInit 803`, forever). The container
 compares versions at start-up and rebuilds itself.
 
-x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
-source for that). It is a real binary built on Ubuntu 24.04, so it needs
+x86-64 only, and the QEMU in it is headless. So is the QEMU you get from a
+default source build — a window is **opt-in** and needs
+`NVKVM_QEMU_UI=1 scripts/build_qemu.sh --force` plus the GTK/SDL dev packages
+(`--install-deps` fetches them). Without it QEMU has no GTK or SDL backend at
+all, which is what you want for a compute guest and not what you want for
+SteamOS. It is a real binary built on Ubuntu 24.04, so it needs
 **glibc 2.38 or newer**: on an older host (Ubuntu 22.04 is glibc 2.35) use the
 container, which brings its own userspace. Exact floor and runtime package list
 are in `RELEASE.md` inside the tarball
