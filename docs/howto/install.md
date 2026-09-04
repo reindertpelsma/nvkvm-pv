@@ -101,7 +101,7 @@ From the [releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
 
 ```bash
 # runtime dependencies -- the tarball ships QEMU, not what QEMU links against
-sudo apt install -y libglib2.0-0t64 libpixman-1-0 libslirp0 \
+sudo apt install -y libglib2.0-0t64 libpixman-1-0 libslirp0 libepoxy0 libgbm1 \
                     qemu-utils genisoimage sshpass
 
 tar xzf nvkvm-<version>-linux-x86_64.tar.gz && cd nvkvm-<version>
