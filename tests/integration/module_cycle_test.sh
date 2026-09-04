@@ -57,6 +57,33 @@ fail() { N_FAIL=$((N_FAIL+1)); printf '  FAIL  %-34s %s\n' "$1" "${2:-}"; }
 [ "$(id -u)" -eq 0 ] || { echo "must run as root"; exit 2; }
 
 loaded()   { grep -qw "^$MODULE" /proc/modules; }
+
+# Resolve the .ko ONCE, up front.
+#
+# modprobe only works if the module was installed into /lib/modules and
+# depmod has seen it.  The container image guest does not do that -- it
+# insmod's the module straight from the staged share -- so a modprobe-only
+# test reports "modprobe failed after a clean unload" on cycle 1 and blames
+# nvkvm for what is really a missing modules.dep entry.  (That is exactly
+# what the first run of this test did.)  Find the file, prefer modprobe when
+# it can resolve the name, and fall back to insmod on the path.
+KO=""
+resolve_ko() {
+    [ -n "${NVKVM_KO:-}" ] && { KO="$NVKVM_KO"; return 0; }
+    KO="$(modinfo -n "$MODULE" 2>/dev/null)" && [ -n "$KO" ] && [ -f "$KO" ] && return 0
+    for c in "/lib/modules/$(uname -r)/updates/${MODULE}.ko" \
+             "/mnt/nvkvm/src/guest/${MODULE}.ko" \
+             "/opt/nvkvm/src/guest/${MODULE}.ko"; do
+        [ -f "$c" ] && { KO="$c"; return 0; }
+    done
+    KO=""
+    return 1
+}
+load_module() {
+    modprobe "$MODULE" 2>/dev/null && return 0
+    [ -n "$KO" ] && insmod "$KO" 2>/dev/null && return 0
+    return 1
+}
 slab_kb()  { awk '/^Slab:/ {print $2}' /proc/meminfo; }
 dmesg_len(){ dmesg 2>/dev/null | wc -l; }
 
@@ -75,8 +102,19 @@ grep -qE 'slub_debug|kasan' /proc/cmdline 2>/dev/null \
     || echo "   poisoning: NONE -- reruns with slub_debug=FZP are strictly stronger"
 echo
 
-loaded || modprobe "$MODULE" 2>/dev/null
+resolve_ko
+if [ -n "$KO" ]; then echo "   module file: $KO"
+else echo "   module file: NOT FOUND (modprobe-only; set NVKVM_KO=/path/to/${MODULE}.ko)"; fi
+loaded || load_module
 loaded || { echo "cannot load $MODULE -- nothing to test"; exit 2; }
+
+# A reload we cannot perform is not a failure of the module. Prove up front
+# that this host can put it back, and bail as UNTESTABLE if it cannot.
+if ! modprobe -n "$MODULE" >/dev/null 2>&1 && [ -z "$KO" ]; then
+    echo "cannot RELOAD $MODULE here: modprobe cannot resolve it and no .ko was found."
+    echo "This host cannot run a load/unload cycle -- not a verdict on the module."
+    exit 2
+fi
 
 # ── 1. Honest refusal while an fd is open ────────────────────────────────────
 if [ -e "$CTL_DEV" ]; then
@@ -97,7 +135,7 @@ else
 fi
 
 # ── 2 + 3. Sustained cycles, watching dmesg and slab ─────────────────────────
-loaded || modprobe "$MODULE" 2>/dev/null
+loaded || load_module
 sync; sleep 1
 base_dmesg="$(dmesg_len)"
 base_slab="$(slab_kb)"
@@ -110,8 +148,8 @@ while [ "$i" -lt "$CYCLES" ]; do
         fail "cycle-$i-unload" "rmmod failed with nothing holding it"
         faulted="unload"; break
     fi
-    if ! modprobe "$MODULE" 2>/dev/null; then
-        fail "cycle-$i-load" "modprobe failed after a clean unload"
+    if ! load_module; then
+        fail "cycle-$i-load" "could not reload after a clean unload (modprobe and insmod $KO both failed)"
         faulted="load"; break
     fi
     f="$(new_faults "$base_dmesg")"
