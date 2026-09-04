@@ -22,8 +22,29 @@ fi
 # are not redistributable, so they cannot be baked into the image -- but the
 # NVIDIA container runtime injects them here, so the bundle can be assembled at
 # start-up and handed to the guest over 9p.
-if ! ls -d /opt/nvkvm/host-libs-* >/dev/null 2>&1; then
-    if ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*.* >/dev/null 2>&1; then
+# Rebuild when the bundle does not MATCH the running driver, not merely when
+# none exists.  The bundle is version-named (host-libs-<ver>) and lives on the
+# container's writable layer, so it survives `docker restart` / `docker start`.
+# The guest re-runs stage_guest_libs.sh on every boot (nvkvm-guest.service is
+# WantedBy=multi-user.target), so a stale bundle is not a one-off: the guest
+# faithfully re-stages the OLD libraries every time it boots. After a host
+# driver upgrade that is a version-matched pair no longer matching, and libcuda
+# says so -- "Driver/library version mismatch", cuInit 803 -- with a guest that
+# otherwise looks perfectly healthy.
+#
+# Recreating the container happened to hide this (a fresh writable layer has no
+# bundle); restarting it did not.
+if ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*.* >/dev/null 2>&1; then
+    HOST_DRV="$(ls /usr/lib/x86_64-linux-gnu/libnvidia-ml.so.*.* 2>/dev/null | head -1 \
+                | sed 's#.*/libnvidia-ml\.so\.##')"
+    if [ -n "$HOST_DRV" ] && [ ! -d "/opt/nvkvm/host-libs-$HOST_DRV" ]; then
+        # Drop bundles for other driver versions so run_test_vm.sh cannot pick
+        # one up by glob and export the wrong one.
+        for stale in /opt/nvkvm/host-libs-*; do
+            [ -d "$stale" ] || continue
+            echo "=== host driver is now $HOST_DRV; discarding stale $(basename "$stale") ==="
+            rm -rf -- "$stale"
+        done
         echo "=== assembling the host driver bundle for the guest ==="
         bash /opt/nvkvm/scripts/make_host_bundle.sh
         echo ""

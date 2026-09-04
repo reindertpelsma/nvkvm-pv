@@ -142,6 +142,15 @@ initialise — [`stage-guest-libraries.md`](stage-guest-libraries.md) explains w
 the failures here are silent. Verified end to end on driver 595.84: 23 files
 bundled, 24 staged, and the guest then reports the host's GPU.
 
+**Re-run the bundle after every host driver upgrade.** The pair is
+version-matched, and the guest re-stages from whatever bundle it is given on
+every boot — so a stale `host-libs-<old>` is not a one-off, it is re-applied
+indefinitely. The guest keeps booting and keeps failing with
+`Driver/library version mismatch` / `cuInit 803`. Delete the old directory,
+re-run `make_host_bundle.sh`, and point `NVKVM_HOSTLIBS_DIR` at the new one.
+The container handles this itself: it compares the bundle against the running
+driver at start-up and rebuilds when they differ.
+
 x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
 source for that). It is a real binary built on Ubuntu 24.04, so it needs
 **glibc 2.38 or newer**: on an older host (Ubuntu 22.04 is glibc 2.35) use the
