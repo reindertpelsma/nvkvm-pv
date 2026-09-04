@@ -113,43 +113,27 @@ sudo install -Dm755 src/stub/nvkvm_stub /usr/lib/nvkvm/nvkvm_stub
 sudo bash scripts/setup_guest.sh    # fetches an Ubuntu 24.04 cloud image
 ```
 
-**Then stage the guest's NVIDIA userspace, or the guest boots without a GPU.**
-The container does this for you (`scripts/container-entrypoint.sh`); on a bare
-host nothing does, and `run_test_vm.sh` does not go looking for the bundle — it
-exports the share only when `NVKVM_HOSTLIBS_DIR` names it. Skip this and the
-guest comes up healthy, builds its module, and then answers
-`nvidia-smi: command not found`, with `validate.sh` failing its CUDA checks:
+**Stage the guest's NVIDIA userspace, or the guest boots with no GPU** —
+`nvidia-smi: command not found`, and `validate.sh` failing its CUDA checks. The
+container does this for you; on a bare host nothing does.
 
 ```bash
-sudo bash scripts/make_host_bundle.sh          # collects this host's driver
-                                               # userspace -> ./host-libs-<ver>
-```
-
-Pass it to the VM, and stage it once inside the guest:
-
-```bash
+sudo bash scripts/make_host_bundle.sh            # -> ./host-libs-<ver>
 sudo NVKVM_HOSTLIBS_DIR="$PWD/host-libs-<ver>" \
      NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
 ```
 
 ```bash
-# inside the guest, once it has booted
-sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh
+sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh   # inside the guest
+nvidia-smi                                         # should name your GPU
 ```
 
-Both halves must match the host driver exactly or `libcuda` refuses to
-initialise — [`stage-guest-libraries.md`](stage-guest-libraries.md) explains why
-the failures here are silent. Verified end to end on driver 595.84: 23 files
-bundled, 24 staged, and the guest then reports the host's GPU.
-
-**Re-run the bundle after every host driver upgrade.** The pair is
-version-matched, and the guest re-stages from whatever bundle it is given on
-every boot — so a stale `host-libs-<old>` is not a one-off, it is re-applied
-indefinitely. The guest keeps booting and keeps failing with
-`Driver/library version mismatch` / `cuInit 803`. Delete the old directory,
-re-run `make_host_bundle.sh`, and point `NVKVM_HOSTLIBS_DIR` at the new one.
-The container handles this itself: it compares the bundle against the running
-driver at start-up and rebuilds when they differ.
+The bundle and the guest must match the host driver exactly or `libcuda`
+refuses to initialise; [`stage-guest-libraries.md`](stage-guest-libraries.md)
+covers why those failures are silent. **Re-run `make_host_bundle.sh` after every
+host driver upgrade** — the guest re-stages from whatever bundle it is given, so
+a stale one is re-applied on every boot (`cuInit 803`, forever). The container
+compares versions at start-up and rebuilds itself.
 
 x86-64 only, and the QEMU in it is headless (no GTK/SDL window — build from
 source for that). It is a real binary built on Ubuntu 24.04, so it needs
@@ -182,10 +166,8 @@ sudo bash scripts/setup_guest.sh            # fetches an Ubuntu 24.04 cloud imag
 sudo bash scripts/make_host_bundle.sh       # this host's driver userspace -> ./host-libs-<ver>
 ```
 
-Then boot it and stage the driver userspace inside the guest — the same two
-steps the tarball path needs, and for the same reason: only the **container**
-does this for you. `build_qemu.sh` installs to `/opt/qemu-nvkvm`, so
-`run_test_vm.sh` finds the binary without being told.
+Then boot and stage, exactly as the tarball path above — `build_qemu.sh`
+installs to `/opt/qemu-nvkvm`, so `run_test_vm.sh` finds the binary itself.
 
 ```bash
 sudo NVKVM_HOSTLIBS_DIR="$PWD/host-libs-<ver>" \
@@ -210,26 +192,21 @@ this build, including which changes need a `--force` rebuild.
 
 ## If `nvidia-smi` says "No devices were found" on an RTX 50-series card
 
-Blackwell (and Hopper) cannot bind NVIDIA's **proprietary** kernel module at
-all. Almost nobody meets this on a working desktop — you would have no display
-either, so anyone rendering on a 50-series card already runs the open module,
-which is what distro `-open` metapackages install by default. It shows up on
-cloud images that ship the wrong flavour, and on headless installs where the
-proprietary metapackage was chosen by hand.
-
-The giveaway is in `dmesg`, not in `nvidia-smi`:
+Blackwell and Hopper cannot bind NVIDIA's **proprietary** module at all, so the
+host cannot see the card either — this is an NVIDIA requirement, not an nvkvm
+one. Rare on a working desktop (you would have no display, and distro `-open`
+metapackages are the default); common on cloud images that ship the wrong
+flavour. The reason is in `dmesg`, not `nvidia-smi`:
 
 ```
-NVRM: GPU 0000:00:08.0: RmInitAdapter failed! (0x22:0x56:884)
+NVRM: RmInitAdapter failed! (0x22:0x56:884)
 NVRM: ... requires use of the NVIDIA open kernel modules.
 ```
 
-`modinfo nvidia | grep '^license:'` tells you which you have: `Dual MIT/GPL` is
-the open module, `NVIDIA` the proprietary one. Install an open-module driver at
-580 or newer (`nvidia-driver-580-open`, or NVIDIA's installer with
-`-m=kernel-open`); the 5xx packages conflict, so purge before installing. This
-is an NVIDIA requirement and applies before nvkvm — the host cannot see the
-card either.
+`modinfo nvidia | grep '^license:'` — `Dual MIT/GPL` is the open module,
+`NVIDIA` the proprietary one. Install `nvidia-driver-580-open` or newer (or
+NVIDIA's installer with `-m=kernel-open`); purge first, the 5xx packages
+conflict.
 
 ## See also
 

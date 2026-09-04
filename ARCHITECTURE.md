@@ -191,22 +191,20 @@ one case and commandeered in the other, the only per-call state left to carry
 the selection is the **open file description** — which is why `NVOS33.fd` names
 a file rather than an offset.
 
-That context is single-slot and nothing consumes it (only
-`nv_free_file_private()` at close clears it), so arming a second mapping on a
-file that already carries one returns `NV_ERR_STATE_IN_USE` (0x63) — measured
-both ways by `tools/uvm_sysmem_probe.c`: `ctl->ctl x2` fails, `ctl->ctl2`
-works. Every mapping therefore needs its own `open()`, of the *same* device
-node; there is no separate class of "mmap fd". See
-`src/guest/nvkvm_uvm_ext.c:538-547`.
+That context is single-slot and only `close()` clears it, so arming a second
+mapping on the same file returns `NV_ERR_STATE_IN_USE` (0x63) — measured by
+`tools/uvm_sysmem_probe.c`: `ctl->ctl x2` fails, `ctl->ctl2` works. Every
+mapping needs its own `open()` of the *same* node; there is no separate class
+of "mmap fd" (`src/guest/nvkvm_uvm_ext.c:538-547`).
 
-The root cause is that RM's object model — `hClient`/`hDevice`/`hMemory` — is
-portable and self-contained, and predates the conventions Linux graphics
-settled on. The fd is an adapter bolted onto it, carrying a client association
-and one mapping slot; everything that identifies a resource lives in a
-namespace the kernel knows nothing about. That is also why this is the piece
-that does not survive contact with a VM: arming and consumption are joined by a
-`struct file`, a host object with no representation on the guest side. A proxy that also intercepts `mmap` still has the problem that the
-pages it would need to hand out are host pages, and the caller is inside a VM.
+Underneath: RM's object model is portable and predates Linux graphics
+conventions, so the fd is an adapter carrying a client association and one
+mapping slot, while everything identifying a resource lives in a namespace the
+kernel knows nothing about. Which is why this is the piece that does not
+survive a VM boundary — arming and consumption are joined by a `struct file`,
+a host object with no guest-side representation. A proxy that also intercepts
+`mmap` still has the problem that the pages it would hand out are host pages
+and the caller is inside a VM.
 
 This is where the two other public non-vendor attempts stop.
 `straylight-software/isospin-microvm` states it plainly — mmap not implemented,
@@ -1237,30 +1235,21 @@ ABI struct definitions come from **NVIDIA open-gpu-kernel-modules** (MIT /
 GPL-2.0), specifically `nvos.h`, `nv-ioctl.h`, `nv-ioctl-numbers.h` and
 `uvm_ioctl.h`.
 
-**Why it was a good donor, and not merely a convenient one.** gVisor has a KVM
-platform, and under it all of the sandbox's userspace memory lives in a single
-VMM process address space — which is QEMU's constraint exactly. So nvproxy's
-decisions about handle ownership, object lifetime and fd translation were
-already made against a restriction nvkvm was going to hit, rather than against
-a container-only one. That is what made deriving from it worth doing instead of
-merely reading it.
+**Why it was a good donor.** gVisor has a KVM platform, and under it the
+sandbox's userspace memory lives in a single VMM process address space — QEMU's
+constraint exactly. nvproxy's decisions about handle ownership, object lifetime
+and fd translation were therefore already made against a restriction nvkvm was
+going to hit.
 
-The largest departure is narrower than "it has no VM boundary", and worth
-stating precisely, because under the KVM platform the sentry **does** build
-memslots — it must, to run the application as guest ring-3.
-
-The difference is *whose* address space those memslots publish. gVisor's
-publish the sentry's own, and the application's mappings are already inside it,
-because the application runs in that address space. Memslot and page tables are
-two views of one address space the sentry fully owns. nvkvm has to publish host
-pages into a **different operating system's** physical address space, and then
-have **that** kernel — which it does not control and must not trust — install
-them into a userspace process's VMA with `remap_pfn_range`. That third place is
-what is not in nvproxy, and it is where Problem 1 lives.
-
-The other two departures: nvproxy does not need a per-process host isolate,
-because the sentry already is one; and its object bookkeeping never crosses a
-trust boundary it did not define.
+The departure is narrower than "no VM boundary": under that platform the sentry
+**does** build memslots. The difference is *whose* address space they publish.
+gVisor's publish the sentry's own, and the application already runs inside it —
+memslot and page tables are two views of one address space it owns outright.
+nvkvm publishes host pages into a **different OS's** physical address space and
+relies on that kernel, which it neither controls nor trusts, to install them
+into a process VMA via `remap_pfn_range`. That third place is what is not in
+nvproxy, and it is where Problem 1 lives. nvproxy also needs no per-process
+host isolate, because the sentry already is one.
 
 ## Where to go next
 
