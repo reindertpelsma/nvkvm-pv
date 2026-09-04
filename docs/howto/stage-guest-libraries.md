@@ -26,6 +26,28 @@ configs into `host-libs-<version>/config/`
 (`scripts/make_host_bundle.sh:20-96`). Because the repository root is the 9p
 share, the bundle appears in the guest at `/mnt/nvkvm/host-libs-<version>/`.
 
+**Nothing discovers the bundle for you.** `run_test_vm.sh` exports it over 9p
+only when `NVKVM_HOSTLIBS_DIR` already names the directory
+(`scripts/run_test_vm.sh:117`); it does not glob for one. The container path
+hides this because `container-entrypoint.sh` builds the bundle and exports the
+variable itself, which is why both bare-host install paths shipped without the
+step until 2026-09-04 — the guest boots, builds its module, and then answers
+`nvidia-smi: command not found` with nothing pointing at the cause.
+
+That entrypoint also compares the bundle against the running driver at start-up
+and discards bundles for other versions. It did not, until 2026-09-04: it
+rebuilt only when *no* bundle existed, and the bundle lives on the container's
+writable layer, so `docker restart` after a host driver upgrade kept the old
+one. Since the guest re-runs `stage_guest_libs.sh` on every boot
+(`nvkvm-guest.service` is `WantedBy=multi-user.target`), that is not a one-off:
+the stale libraries are re-applied every boot, and `libcuda` reports
+`Driver/library version mismatch` / `cuInit 803` on a guest that otherwise looks
+healthy. A bare host has no such self-healing — re-run `make_host_bundle.sh`
+after every driver upgrade and repoint `NVKVM_HOSTLIBS_DIR`.
+
+Measured end to end on driver 595.84 (RTX 4070): 23 files bundled on the host,
+24 staged in the guest, after which the guest reports the host's GPU.
+
 The script splits its list three ways.
 
 **Required** (`scripts/make_host_bundle.sh:29`) — absence is a hard failure:
