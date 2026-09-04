@@ -170,6 +170,23 @@ in-guest module build needs it.
 git clone https://github.com/reindertpelsma/nvkvm-pv.git nvkvm && cd nvkvm
 bash scripts/build_qemu.sh --install-deps   # builds the isolate stub, then QEMU 11.1 with the nvkvm device
 sudo bash scripts/setup_guest.sh            # fetches an Ubuntu 24.04 cloud image and prepares a disk
+sudo bash scripts/make_host_bundle.sh       # this host's driver userspace -> ./host-libs-<ver>
+```
+
+Then boot it and stage the driver userspace inside the guest — the same two
+steps the tarball path needs, and for the same reason: only the **container**
+does this for you. `build_qemu.sh` installs to `/opt/qemu-nvkvm`, so
+`run_test_vm.sh` finds the binary without being told.
+
+```bash
+sudo NVKVM_HOSTLIBS_DIR="$PWD/host-libs-<ver>" \
+     NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
+```
+
+```bash
+# inside the guest, once it has booted
+sudo bash /mnt/nvkvm/scripts/stage_guest_libs.sh
+nvidia-smi                                  # the guest should now name your GPU
 ```
 
 Most of the wall clock is QEMU. The script is a convenience, not the
