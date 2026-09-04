@@ -42,6 +42,16 @@
 # and this test reports at the point of the bad access instead of 400 ms
 # downstream.  KASAN is better still if the guest kernel has it.
 #
+# WHERE TO RUN IT.  Both stock guest flavours build the module in a mktemp
+# work dir, insmod it, and delete the .ko on the way out (setup_guest.sh's
+# nvkvm-guest.service traps EXIT).  So a running guest normally has the module
+# LOADED and no module FILE, and nothing can reload it.  Build one that stays:
+#
+#   sudo apt-get install -y build-essential "linux-headers-$(uname -r)"
+#   cp -a /mnt/nvkvm/src/{guest,common,abi} /root/src/
+#   make -C /root/src/guest KDIR=/lib/modules/$(uname -r)/build
+#   sudo NVKVM_KO=/root/src/guest/nvkvm-guest.ko bash module_cycle_test.sh 50
+#
 # Usage:  sudo bash module_cycle_test.sh [cycles]      (default 50)
 set -u
 
@@ -71,10 +81,18 @@ KO=""
 resolve_ko() {
     [ -n "${NVKVM_KO:-}" ] && { KO="$NVKVM_KO"; return 0; }
     KO="$(modinfo -n "$MODULE" 2>/dev/null)" && [ -n "$KO" ] && [ -f "$KO" ] && return 0
-    for c in "/lib/modules/$(uname -r)/updates/${MODULE}.ko" \
-             "/mnt/nvkvm/src/guest/${MODULE}.ko" \
-             "/opt/nvkvm/src/guest/${MODULE}.ko"; do
-        [ -f "$c" ] && { KO="$c"; return 0; }
+    # The FILE is nvkvm-guest.ko; the MODULE is nvkvm_guest. Search both
+    # spellings -- looking only for ${MODULE}.ko finds nothing and the test
+    # then calls a perfectly testable host UNTESTABLE.
+    _alt="$(printf '%s' "$MODULE" | tr '_' '-')"
+    for n in "$MODULE" "$_alt"; do
+        for c in "/lib/modules/$(uname -r)/updates/${n}.ko" \
+                 "/usr/lib/modules/$(uname -r)/updates/${n}.ko" \
+                 "/mnt/nvkvm/src/guest/${n}.ko" \
+                 "/opt/nvkvm/src/guest/${n}.ko" \
+                 "/root/${n}.ko"; do
+            [ -f "$c" ] && { KO="$c"; return 0; }
+        done
     done
     KO=""
     return 1
