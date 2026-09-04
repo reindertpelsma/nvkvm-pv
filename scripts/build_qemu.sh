@@ -194,6 +194,18 @@ NVKVM_UI_DEPS_RPM=""
 NVKVM_UI_DEPS_ARCH=""
 NVKVM_UI_DEPS_SUSE=""
 if [ "${NVKVM_QEMU_UI:-0}" = "1" ]; then
+    # PROBE for them too, not just name the packages.
+    #
+    # MISSING is computed from NVKVM_DEPS below, and the apt block is gated on
+    # `[ -n "$MISSING" ]`.  With gtk/sdl absent from the probe list, a box whose
+    # base deps are already satisfied -- i.e. anyone who followed install.md and
+    # did the headless build first -- produced an EMPTY $MISSING, skipped the
+    # apt block entirely, and never installed libgtk-3-dev/libsdl2-dev.
+    # --install-deps became a silent no-op and meson died with
+    # `Dependency "sdl2" not found`, which is the exact failure the comment
+    # above says these packages exist to prevent.  Reported from a LeaderGPU
+    # box, 2026-09-05, on the second build of the same tree.
+    NVKVM_DEPS="$NVKVM_DEPS pc:gtk+-3.0 pc:sdl2"
     NVKVM_UI_DEPS_DEB="libgtk-3-dev libsdl2-dev"
     NVKVM_UI_DEPS_RPM="gtk3-devel SDL2-devel"
     NVKVM_UI_DEPS_ARCH="gtk3 sdl2"

@@ -84,8 +84,14 @@ required and which merely degrade a capability, are in
 sudo bash scripts/run_test_vm.sh
 ```
 
-The repo 9p export is **read-only** by default. The first-boot module build
-(above) writes to it, so a first boot — and any later in-guest rebuild — needs:
+The repo 9p export is **read-only** by default, and a normal first boot does
+not need that changed: `nvkvm-guest.service` copies the module sources into a
+private temporary directory and builds there (`scripts/setup_guest.sh`), so
+nothing writes to the export. This section previously said a first boot
+required the flag, which contradicted §1 and the code.
+
+You only need it when you want in-guest edits to land back in the repository —
+development, not setup:
 
 ```bash
 sudo NVKVM_DEV_HARNESS_INSECURE_RW=1 bash scripts/run_test_vm.sh
