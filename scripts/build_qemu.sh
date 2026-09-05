@@ -170,11 +170,11 @@ nvkvm_pkg_hint() {
      mesa-libgbm-devel mesa-libEGL-devel libdrm-devel vim-common" ;;
         *arch*)
             echo "pacman -S ninja meson glib2 pixman python git libslirp \\
-     pkgconf attr libepoxy mesa libdrm xxd base-devel" ;;
+     pkgconf attr libepoxy mesa libdrm tinyxxd base-devel" ;;
         *suse*)
             echo "zypper install ninja meson glib2-devel libpixman-1-0-devel \\
      python3 git libslirp-devel pkg-config libattr-devel libepoxy-devel \\
-     Mesa-libgbm-devel Mesa-libEGL-devel libdrm-devel vim" ;;
+     libgbm-devel Mesa-libEGL-devel libdrm-devel vim" ;;
         *)  echo "(unrecognised distro -- install the equivalents of: ninja meson \\
      glib2 pixman slirp epoxy gbm egl libdrm pkg-config python3 git xxd)" ;;
     esac
@@ -209,7 +209,12 @@ if [ "${NVKVM_QEMU_UI:-0}" = "1" ]; then
     NVKVM_UI_DEPS_DEB="libgtk-3-dev libsdl2-dev"
     NVKVM_UI_DEPS_RPM="gtk3-devel SDL2-devel"
     NVKVM_UI_DEPS_ARCH="gtk3 sdl2"
-    NVKVM_UI_DEPS_SUSE="gtk3-devel libSDL2-devel"
+    # openSUSE Tumbleweed has neither libSDL2-devel nor SDL2-devel; the
+    # package providing pkgconfig(sdl2) is sdl2-compat-devel. Measured
+    # 2026-09-05 -- and it matters more than a wrong name usually does,
+    # because zypper aborts the WHOLE transaction on an unresolvable name,
+    # so this one word left the branch installing nothing at all.
+    NVKVM_UI_DEPS_SUSE="gtk3-devel sdl2-compat-devel"
 fi
 
 # apt refuses to run while something else holds the dpkg lock, and on Debian
@@ -264,17 +269,32 @@ if [ -n "$MISSING" ] && [ "$NVKVM_INSTALL_DEPS" -eq 1 ]; then
             python3-venv python3-tomli git libslirp-dev pkg-config \
             libattr1-dev libepoxy-dev libgbm-dev libegl-dev libdrm-dev xxd \
             $NVKVM_UI_DEPS_DEB ;;
+        # MEASURED 2026-09-05, in clean containers, one probe run per distro.
+        # Only the Debian branch had ever been executed; of the other three,
+        # two were wrong:
+        #   arch    -- no package supplies xxd. Debian installs it directly,
+        #              Fedora gets it via vim-common and SUSE via vim; Arch had
+        #              no equivalent, so `cmd:xxd` failed after a "successful"
+        #              --install-deps. xxd is not a package name on Arch; the
+        #              split-out one is tinyxxd.
+        #   suse    -- Mesa-libgbm-devel does not exist (it is libgbm-devel).
+        #              zypper treats an unresolvable name as fatal, so NOTHING
+        #              installed: the probe came back missing every dependency
+        #              including git and ninja, and `rpm -q ninja` confirmed it.
+        #              One wrong word took the whole branch down.
+        # fedora was clean. Re-check with a container and the probe list above,
+        # not by reading -- that is how both of these survived.
         *fedora*|*rhel*|*centos*) dnf install -y \
             ninja-build meson glib2-devel pixman-devel python3 git \
             libslirp-devel pkgconf-pkg-config libattr-devel libepoxy-devel \
             mesa-libgbm-devel mesa-libEGL-devel libdrm-devel vim-common \
             $NVKVM_UI_DEPS_RPM ;;
         *arch*) pacman -S --noconfirm --needed ninja meson glib2 pixman python \
-            git libslirp pkgconf attr libepoxy mesa libdrm base-devel \
+            git libslirp pkgconf attr libepoxy mesa libdrm base-devel tinyxxd \
             $NVKVM_UI_DEPS_ARCH ;;
         *suse*) zypper install -y ninja meson glib2-devel libpixman-1-0-devel \
             python3 git libslirp-devel pkg-config libattr-devel \
-            libepoxy-devel Mesa-libgbm-devel Mesa-libEGL-devel libdrm-devel vim \
+            libepoxy-devel libgbm-devel Mesa-libEGL-devel libdrm-devel vim \
             $NVKVM_UI_DEPS_SUSE ;;
         *) echo "ERROR: --install-deps: unrecognised distro" >&2; exit 1 ;;
     esac
