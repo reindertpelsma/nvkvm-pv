@@ -3891,6 +3891,39 @@ static void wl_close_session(struct nb_session *s)
     free(s);
 }
 
+/*
+ * AUTO must still reach the shm rung when this compositor cannot do dma-buf
+ * at all, matching the ladder documented in nb_common.c (NB_TIER_AUTO: the
+ * guest's own modifier, then LINEAR, then wl_shm -- the default).  This is
+ * the identical bug fixed in nb_session_x11.c for a DRI3-less Xvfb: a missing
+ * capability sent every tier to `goto fail` unconditionally, so AUTO never
+ * reached the one rung that needs neither DRI3 nor a compositor dma-buf
+ * extension.  MEASURED there: AUTO crash-looped on Xvfb (8 DRI3 errors)
+ * while --present-mode=shm on the same server came up with zero.
+ *
+ * The caller only reaches here when nb_tier != NB_TIER_SHM already (that tier
+ * has its own check just above), so this only ever *degrades* AUTO -- an
+ * EXPLICIT --present-mode=native or =linear still fails at the call site,
+ * because the user asked for dma-buf specifically and cannot have it swapped
+ * for a copy path silently.
+ *
+ * Returns true (and switches nb_tier to NB_TIER_SHM) if AUTO could descend;
+ * false if this compositor's wl_shm is unavailable too, in which case the
+ * caller must still fail loudly -- there is nothing left to fall back to.
+ */
+static bool wl_dmabuf_unusable_auto_fallback(struct nb_wl *w, const char *why)
+{
+    if (nb_tier != NB_TIER_AUTO || !w->shm) {
+        return false;
+    }
+    nb_log("AUTO: %s -- descending to the shm tier (wl_shm). Expect lower "
+           "performance than a dma-buf path; pass --present-mode=native or "
+           "=linear to require dma-buf and fail instead of falling back.",
+           why);
+    nb_tier = NB_TIER_SHM;
+    return true;
+}
+
 static int wl_open(struct nb_session *s, const struct nb_config *cfg)
 {
     struct nb_wl *w = s->priv;
@@ -3974,23 +4007,40 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
             goto fail;
         }
     } else {
+        /*
+         * else-if, not three independent ifs: once one of these has decided
+         * to DESCEND (rather than fail), nb_tier is already NB_TIER_SHM and
+         * w->dmabuf/w->dmabuf_ver/w->formats describe a dma-buf path we are
+         * no longer taking -- falling through into the next check would read
+         * them anyway and could bounce a second, spurious failure off
+         * wl_dmabuf_unusable_auto_fallback() now that nb_tier is no longer
+         * NB_TIER_AUTO.
+         */
         if (!w->dmabuf) {
-            nb_err("this compositor does not implement zwp_linux_dmabuf_v1, so "
-                   "it cannot take the guest's buffer without a copy.  Retry "
-                   "with --present-mode shm, which needs no dma-buf at all.");
-            goto fail;
-        }
-        if (w->dmabuf_ver < 2) {
-            nb_err("zwp_linux_dmabuf_v1 version %u has no create_immed; version "
-                   "2 or later is required (universally available since 2016)",
-                   w->dmabuf_ver);
-            goto fail;
-        }
-        if (w->formats.n == 0) {
-            nb_err("the compositor advertised no dma-buf formats at all — "
-                   "nothing could be validated against, so every frame would "
-                   "be rejected");
-            goto fail;
+            if (!wl_dmabuf_unusable_auto_fallback(w,
+                    "this compositor does not implement zwp_linux_dmabuf_v1")) {
+                nb_err("this compositor does not implement zwp_linux_dmabuf_v1, so "
+                       "it cannot take the guest's buffer without a copy.  Retry "
+                       "with --present-mode shm, which needs no dma-buf at all.");
+                goto fail;
+            }
+        } else if (w->dmabuf_ver < 2) {
+            if (!wl_dmabuf_unusable_auto_fallback(w,
+                    "zwp_linux_dmabuf_v1 is present but below version 2, "
+                    "which has no create_immed")) {
+                nb_err("zwp_linux_dmabuf_v1 version %u has no create_immed; version "
+                       "2 or later is required (universally available since 2016)",
+                       w->dmabuf_ver);
+                goto fail;
+            }
+        } else if (w->formats.n == 0) {
+            if (!wl_dmabuf_unusable_auto_fallback(w,
+                    "the compositor advertised no dma-buf formats at all")) {
+                nb_err("the compositor advertised no dma-buf formats at all — "
+                       "nothing could be validated against, so every frame would "
+                       "be rejected");
+                goto fail;
+            }
         }
     }
 
