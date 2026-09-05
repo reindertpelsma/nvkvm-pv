@@ -43,7 +43,7 @@ produced it:
 
 ```bash
 # the image, resolved from the registry
-gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.2.4 \
+gh attestation verify oci://ghcr.io/reindertpelsma/nvkvm-pv:v0.2.5 \
     --repo reindertpelsma/nvkvm-pv \
     --signer-workflow reindertpelsma/nvkvm-pv/.github/workflows/release.yml
 

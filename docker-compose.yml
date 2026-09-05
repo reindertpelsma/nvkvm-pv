@@ -32,7 +32,7 @@ services:
     #                  over-strict on GTX 16xx / RTX 20xx (e002fb5, 4817282).
     #
     # See CHANGELOG.md.
-    image: ghcr.io/reindertpelsma/nvkvm-pv:v0.2.4
+    image: ghcr.io/reindertpelsma/nvkvm-pv:v0.2.5
     build: .
     # Capabilities: drop everything, then add back only what the isolate needs
     # to reach its STRONGEST sandbox rung.  This is not the same as dropping

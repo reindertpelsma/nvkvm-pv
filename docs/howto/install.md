@@ -54,7 +54,7 @@ come from this repository?" is a question you can answer rather than assume.
 docker run --rm -it --device /dev/kvm --gpus all \
     -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics,display,video \
     -p 127.0.0.1:2222:2222 -v nvkvm-guest:/opt/nvkvm-guest \
-    ghcr.io/reindertpelsma/nvkvm-pv:v0.2.4
+    ghcr.io/reindertpelsma/nvkvm-pv:v0.2.5
 ssh -p 2222 ubuntu@127.0.0.1    # password: ubuntu -- nvidia-smi already works
 ```
 
