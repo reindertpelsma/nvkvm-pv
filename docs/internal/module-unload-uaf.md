@@ -40,18 +40,49 @@ Three registers hold `0x6b6b6b6b6b6b6b6b` exactly -- SLUB's `POISON_FREE`
 byte. This is a list walk over drmm-managed objects that have already been
 freed and poisoned.
 
-## What it means
+## Root cause: drmm releases LIFO, and init registers in the wrong order
 
-`nvkvm_exit` calls `unregister_virtio_driver`, which drives
-`nvkvm_virtio_remove` -> `nvkvm_drm_fini` -> `drm_dev_put`. That triggers
-`drm_managed_release`, which walks the drmm resource list and calls
-`drm_mode_config_cleanup`. By then some of those objects are gone.
+`nvkvm_kms_init` (`src/guest/nvkvm_kms.c`) does this, in this order:
 
-`nvkvm_kms_fini` is careful in isolation -- it does `cancel_work_sync` on both
-work items, `hrtimer_cancel` on both timers, then `destroy_workqueue`, in a
-documented order. The defect is not inside it. It is the ORDERING between that
-teardown and drmm's own release: something drmm still owns is freed before
-drmm releases it, so drmm walks poison.
+```c
+ret = drmm_mode_config_init(ddev);            /* registers drm_mode_config_cleanup */
+...
+kms = drmm_kzalloc(ddev, sizeof(*kms), GFP_KERNEL);   /* registers the kms struct */
+```
+
+**drmm releases its actions LIFO.** So at `drm_dev_put` the order is reversed:
+the `kms` allocation is freed and poisoned FIRST, and only then does
+`drm_mode_config_cleanup` run.
+
+And `struct nvkvm_kms` EMBEDS the mode objects:
+
+```c
+struct drm_connector            conn;
+struct drm_simple_display_pipe  pipe;   /* contains crtc, plane, encoder */
+```
+
+`mode_config`'s connector/crtc/plane/encoder lists therefore point INTO the
+struct that was just freed. `drm_mode_config_cleanup` walks those lists and
+dereferences `0x6b6b6b6b6b6b6b6b`. That is the whole bug.
+
+`nvkvm_kms_fini` is not at fault and reading it will not find this. It cancels
+both work items, both timers and the workqueue in a correct, documented order.
+The defect is in `nvkvm_kms_init`, hundreds of lines away from where it
+detonates, and it is invisible until unload.
+
+## The candidate fix (proposed, NOT applied)
+
+Allocate `kms` BEFORE `drmm_mode_config_init`, so drmm frees it AFTER
+`drm_mode_config_cleanup` has finished walking the lists.
+
+Check before applying:
+  - does anything between the two calls need `mode_config` already
+    initialised? (`nvkvm_kms_clamp_mode()` and the `mode_config.*` assignments
+    do -- they must stay after `drmm_mode_config_init`, only the ALLOCATION
+    needs to move earlier)
+  - `drm_vblank_init` sits between them; confirm it does not depend on `kms`
+  - verify with `module_cycle_test.sh` under `slub_debug=FZP`: it faults on
+    the FIRST unload today, so a fix is confirmed or refuted in ~40 seconds
 
 ## Why the reboot workaround is not the fix
 
