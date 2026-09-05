@@ -13,8 +13,40 @@
  *
  * Two RULE-BASED passthroughs are handled in code, NOT this table (they cover
  * future cmds we haven't observed): GSP-legacy mask (cmd & 0x8000) and the
- * NV2081_BINAPI class ((cmd >> 16) == 0x2081) — both GSP-routed, no app
- * pointers. A 1 MiB inner-params size cap is also enforced in code.
+ * NV2081_BINAPI class ((cmd >> 16) == 0x2081).  A 1 MiB inner-params size cap
+ * is also enforced in code.
+ *
+ * "no app pointers" USED TO BE AN ASSERTION HERE.  It is now checked, against
+ * open-gpu-kernel-modules 575.51.03 — audit-guest-pointers.md said the property
+ * "is not verifiable from the open tree", and that was wrong; it is verifiable
+ * and it holds, with one correction to how it must be stated.
+ *
+ * What the open driver does with these two families:
+ *   - both reach rpcRmApiControl_GSP() (vgpu/rpc.c:10359) and the payload move
+ *     is ONE FLAT BYTE COPY -- portMemCopy(rpc_params->params, ...,
+ *     pParamStructPtr, paramsSize) at rpc.c:10526.  Nothing walks the struct.
+ *   - GSS-legacy enters at rmapi_gss_legacy_control.c:39, copy-in is flat at
+ *     :73.  NVIDIA's own comment there (:33-37): "We no longer support these in
+ *     RM ... just forward all of them to GSP and let it deal with what is or
+ *     isn't valid."
+ *   - NV2081 enters at rmapi/binary_api.c:61 and passes pParams->pParams +
+ *     paramsSize straight through (:112-117).  The class has ZERO 0x2081xxxx
+ *     methodIds in the generated nvoc tables: no CPU-RM body exists to walk.
+ *   - the two mechanisms that WOULD walk a params struct both miss these by
+ *     construction: embeddedParamCopyIn() (rmapi/embedded_param_copy.c:214) is
+ *     a whitelist switch with no NV2081 case and falls through NV_OK, and FINN
+ *     serialization covers 25 hardcoded message IDs, none of class 0x2081.
+ *   - bit 15 is NVIDIA's own RM_GSS_LEGACY_MASK (rmapi_deprecated.h:41), routed
+ *     at rmapi_deprecated_control.c:95/:133-136.
+ *
+ * STATE IT AS "NEVER DEREFERENCED BY THE HOST DRIVER", not "impossible by
+ * construction".  The stronger phrasing is a claim about GSP FIRMWARE, which is
+ * not in the open tree and is not checked here.  What is established is the
+ * property this boundary actually needs: the host never follows an address that
+ * came out of these params.  GSP is not even handed the host VA -- it gets the
+ * byte copy above, in a sysmem message-queue element (gpu/gsp/message_queue_cpu.c
+ * :232-233) that it reads by DMA.  Bit 15 by itself means only "RM does not
+ * interpret this", NOT "the params are pointer-free".
  *
  * EXCLUSIONS — rows nvproxy's compUtil set HAS that we deliberately drop.
  * These must not come back on the next regeneration:

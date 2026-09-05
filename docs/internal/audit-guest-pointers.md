@@ -437,20 +437,52 @@ allowlisted it would be a categorical arbitrary-pointer forwarding primitive tha
 per-struct rewriting could contain. The allowlist jumps `0xd2 → 0xd4` around it. This is what
 default-deny is for and it worked here.
 
-The 13 `UNKNOWN` control commands are IDs in `nvkvm_ctrl_allowlist.h` that do not appear anywhere in
+The `UNKNOWN` control commands are IDs in `nvkvm_ctrl_allowlist.h` that do not appear anywhere in
 open-gpu-kernel-modules 575.51.03, in any file, in any padding:
-`0x0080028b 0x20800145 0x20800146 0x20808159 0x20808162 0x2080852e 0x2080852f 0x2080a612
-0x2080a618 0x2080a0d1 0x20810107 0x20810108 0xc36f0101`.
+`0x0080028b 0x20808159 0x20808162 0x2080852e 0x2080852f 0x2080a612
+0x2080a618 0x2080a0d1 0x20810107 0x20810108`.
 These are presumably closed-source/GSP-side commands. Their params layout — and therefore whether
 they carry pointers — cannot be determined from the open tree. They are allowlisted and forwarded.
+
+**CORRECTED 2026-09-05, re-grepped against a COMPLETE 575.51.03 checkout — the original list of 13
+was taken from a sparse one.** Three of it were wrong: `0x20800145` and `0x20800146` *are* in the
+tree (`subdeviceCtrlCmdGpuAcquire/ReleaseComputeModeReservation`, `g_subdevice_nvoc.c:526` and
+`:541`) and both carry `paramSize = 0` — no params struct at all, so no pointer, and neither is a
+bit-15 or `0x2081` command; and `0xc36f0101` does not exist in NVIDIA's tree in any form
+(`0xc36f0108` does, `ctrlc36f.h:79`), so it was a transcription slip. Ten remain UNKNOWN. None of
+the ten aliases onto any of the 25 FINN-serialized (interface, message) pairs, so all forward flat.
 Note `0x20808159`, `0x20808162`, `0x2080852e`, `0x2080852f` also match the
 `cmd & 0x8000` rule-based passthrough, so they would be forwarded even if removed from the table.
 
 The two rule-based passthroughs (`nvkvm_isolate_handlers.c:822-827`) —
 `cmd & 0x8000` and `(cmd >> 16) == 0x2081` — admit an **unbounded** set of control commands, none
-of which can be pointer-audited because the set is not enumerable. The comment justifying them
-(`nvkvm_ctrl_allowlist.h:15-18`) asserts both are "GSP-routed, no app pointers". That assertion is
-not verifiable from the open tree and is not verified here.
+of which can be pointer-audited *individually* because the set is not enumerable.
+
+**CORRECTED 2026-09-05. This paragraph used to end "that assertion is not verifiable from the open
+tree and is not verified here". Both halves were wrong: it is verifiable, and it now is verified** —
+against open-gpu-kernel-modules 575.51.03, and the check does not need the set to be enumerable,
+because it is a property of the *dispatch path* rather than of each command.
+
+Both families reach `rpcRmApiControl_GSP()` (`vgpu/rpc.c:10359`) and the payload move is one flat
+byte copy — `portMemCopy(rpc_params->params, ..., pParamStructPtr, paramsSize)` at `rpc.c:10526`.
+Nothing walks the struct. GSS-legacy enters at `rmapi_gss_legacy_control.c:39` with a flat copy-in at
+`:73`, under NVIDIA's own comment (`:33-37`): *"We no longer support these in RM ... just forward all
+of them to GSP and let it deal with what is or isn't valid."* NV2081 enters at `rmapi/binary_api.c:61`
+and passes `pParams->pParams` + `paramsSize` straight through (`:112-117`); the class has **zero**
+`0x2081xxxx` methodIds in the generated nvoc tables, so no CPU-RM body exists to walk one. The two
+mechanisms that *would* walk a params struct both miss these by construction:
+`embeddedParamCopyIn()` (`rmapi/embedded_param_copy.c:214`) is a whitelist `switch` with no NV2081
+case that falls through `NV_OK`, and FINN serialization covers 25 hardcoded message IDs, none of
+class `0x2081`. Bit 15 is NVIDIA's own `RM_GSS_LEGACY_MASK` (`rmapi_deprecated.h:41`), routed at
+`rmapi_deprecated_control.c:95`/`:133-136`.
+
+**State it as "never dereferenced by the host driver", not "impossible by construction".** The
+stronger phrasing is a claim about GSP *firmware*, which is not in the open tree and is not checked
+here. What is established is the property this boundary needs: the host never follows an address that
+came out of these params. GSP is not handed the host VA at all — it receives the byte copy above in a
+sysmem message-queue element (`gpu/gsp/message_queue_cpu.c:232-233`) that it reads by DMA. Bit 15 by
+itself means only "RM does not interpret this", **not** "the params are pointer-free"; the flat-copy
+dispatch is what carries the argument.
 
 ---
 
