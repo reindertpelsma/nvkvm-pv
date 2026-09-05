@@ -214,6 +214,12 @@ one guest. The largest open item is NVIDIA's X driver; everything else is in
 measurements from hardware this repository has not exercised are welcome — see
 [contributing](CONTRIBUTING.md).
 
+**If it did not build or boot for you, that is worth reporting even when it
+looks like your own setup.** Run `scripts/nvkvm-report.sh` on the host (and in
+the guest if it gets that far) and paste the output into an issue — it reads
+only and collects exactly what is needed. "It worked" is worth sending too: a
+successful install leaves no trace anywhere visible from here.
+
 ## Credits
 
 `nvkvm` derives substantially from **gVisor's `nvproxy`** (Apache-2.0) for the
