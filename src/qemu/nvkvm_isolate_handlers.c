@@ -3399,11 +3399,114 @@ int nvkvm_req_ioctl_on_isolate(VirtIONvgpu *nv,
 			uint32_t fn = 0xffffffffu;
 			if (param_buf && req->param_size >= 12)
 				memcpy(&fn, (char *)param_buf + 8, 4);
-			if (fn != 2 /* NVOS32_FUNCTION_ALLOC_SIZE */) {
+			/*
+			 * ── fn 27 (ALLOC_OS_DESCRIPTOR): ADMITTED, BUT ONLY
+			 *    THROUGH THE SAME CHECK AS hClass 0x71 ──────────
+			 *
+			 * This is how Vulkan's VK_EXT_external_memory_host
+			 * import reaches RM, so denying it outright costs the
+			 * guest every host-pointer import: vkAllocateMemory
+			 * returns VK_ERROR_OUT_OF_DEVICE_MEMORY at ANY size.
+			 * MEASURED 2026-09-05 -- 1 MiB through 512 MiB, on
+			 * RTX 4070/595.84 and RTX 3050 Laptop/580.173.02, two
+			 * trees, an idle box -- and it is why Geekbench 7's
+			 * Vulkan Path Tracer scores 0 while the other ten
+			 * workloads run at ~93% of native.
+			 *
+			 * What made fn 27 dangerous is NOT the function: it is
+			 * forwarding a caller-named address to pin_user_pages()
+			 * in the isolate.  That is the identical hazard A-1
+			 * already solved for NV_ESC_RM_ALLOC_MEMORY /
+			 * hClass 0x71, and the solution transfers verbatim:
+			 * require the range to be covered by mappings THE HOST
+			 * installed and mirrored into this isolate, then
+			 * forward the address QEMU chose rather than the one
+			 * the guest named.  A range the host did not install
+			 * cannot be described, so the arbitrary-pin primitive
+			 * U-3 objected to never comes into existence.
+			 *
+			 * descriptor@64 and limit@72 (limit inclusive) were
+			 * MEASURED, not transcribed: the 144-byte union is
+			 * opaque to this tree, so the AllocOsDesc arm was
+			 * located by dumping it in the guest and correlating
+			 * against a pointer and length the caller controlled.
+			 * A wrong offset here hands RM a wrong pointer to pin,
+			 * so it is not a field to guess at.
+			 *
+			 * ABI-STABLE ACROSS THE SUPPORTED RANGE, verified by
+			 * offsetof() probes compiled against NVIDIA's headers
+			 * (tools/abi_derive.sh, two new permanent fields):
+			 * 535.183.01, 550.90.07, 570.86.16, 580.95.05 and
+			 * 590.48.01 all report descriptor=64, limit=72, and
+			 * 595.84 measures the same.  A driver that moves them
+			 * shows up as a changed abi_derive row instead of as a
+			 * wrong pointer handed to pin_user_pages().
+			 *
+			 * Everything else -- 3 FREE, 5 INFO, 19 HW_ALLOC, 20,
+			 * and any value the driver may add -- stays denied.
+			 */
+			bool vid_heap_deny = false;
+
+			if (fn == 27 /* NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR */) {
+				uint64_t desc = 0, limit = 0, stub_base = 0;
+
+				if (!param_buf || req->param_size < 80) {
+					fprintf(stderr,
+						"nvkvm: DENY RM_VID_HEAP_CONTROL fn=27 "
+						"param_size=%u too short to hold the "
+						"descriptor\n",
+						(unsigned)req->param_size);
+					vid_heap_deny = true;
+				} else {
+					memcpy(&desc,  (char *)param_buf + 64, 8);
+					memcpy(&limit, (char *)param_buf + 72, 8);
+				}
+
+				/* limit is inclusive; limit+1 wraps at U64_MAX. */
+				if (!vid_heap_deny &&
+				    (!desc || !limit || limit == UINT64_MAX)) {
+					fprintf(stderr,
+						"nvkvm: DENY RM_VID_HEAP_CONTROL fn=27 "
+						"descriptor=0x%llx limit=0x%llx\n",
+						(unsigned long long)desc,
+						(unsigned long long)limit);
+					vid_heap_deny = true;
+				}
+				if (!vid_heap_deny &&
+				    !iso_mmap_translate(req->isolate_id, desc,
+							limit + 1, &stub_base)) {
+					fprintf(stderr,
+						"nvkvm: DENY RM_VID_HEAP_CONTROL fn=27 "
+						"range 0x%llx+0x%llx is not covered by "
+						"host-installed mappings of iso=%u\n",
+						(unsigned long long)desc,
+						(unsigned long long)(limit + 1),
+						req->isolate_id);
+					vid_heap_deny = true;
+				}
+				if (!vid_heap_deny) {
+					/* Forward OUR address, never the guest's.
+					 * Same reasoning as the 0x71 rewrite: the
+					 * field is IN-only, so the guest never
+					 * observes the substitution. */
+					memcpy((char *)param_buf + 64, &stub_base, 8);
+					NVKVM_DBG("nvkvm: NVOS32 fn27 gva=0x%llx -> "
+						  "window 0x%llx (+0x%llx) iso=%u\n",
+						  (unsigned long long)desc,
+						  (unsigned long long)stub_base,
+						  (unsigned long long)(limit + 1),
+						  req->isolate_id);
+				}
+			} else if (fn != 2 /* NVOS32_FUNCTION_ALLOC_SIZE */) {
 				fprintf(stderr,
 					"nvkvm: DENY RM_VID_HEAP_CONTROL "
-					"function=%u (only ALLOC_SIZE=2 "
+					"function=%u (only ALLOC_SIZE=2 and "
+					"validated ALLOC_OS_DESCRIPTOR=27 "
 					"allowed, U-3)\n", fn);
+				vid_heap_deny = true;
+			}
+
+			if (vid_heap_deny) {
 				resp->retval     = (uint64_t)(int64_t)(-EACCES);
 				resp->status     = 0;
 				resp->nvstatus   = 0x56; /* NV_ERR_NOT_SUPPORTED */
