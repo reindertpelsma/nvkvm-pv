@@ -51,16 +51,27 @@ else log "egl build failed: $(head -1 /tmp/egl_$TAG.be)"; fi
 log "=== ffmpeg NVENC/NVDEC ==="
 if command -v ffmpeg >/dev/null; then
     SRCMP4="$B/src.mp4"
+    # -pix_fmt yuv420p IS LOAD-BEARING.  testsrc + libx264 defaults produce
+    # yuv444p, and NVDEC accepts 4:2:0 only -- h264_cuvid then refuses the file
+    # with "Codec h264_cuvid is not supported with this chroma format" before
+    # decoding a frame.  That refusal was read as "NVDEC is broken on the host
+    # too", which is why the decode row below was deleted.  MEASURED 2026-09-05.
     [ -s "$SRCMP4" ] || timeout 60 ffmpeg -y -hide_banner -f lavfi -i testsrc=size=1920x1080:rate=30:duration=10 \
-        -c:v libx264 -preset ultrafast "$SRCMP4" >/tmp/ffsrc_$TAG.log 2>&1
+        -c:v libx264 -preset ultrafast -pix_fmt yuv420p "$SRCMP4" >/tmp/ffsrc_$TAG.log 2>&1
     # NVENC encode: synthetic frames -> h264_nvenc.  -benchmark -> "fps=" summary.
     enc=$(timeout 90 ffmpeg -y -hide_banner -benchmark -f lavfi -i testsrc=size=1920x1080:rate=30:duration=20 \
         -c:v h264_nvenc -preset p1 -f null - 2>&1 | grep -oE 'fps= *[0-9.]+' | tail -1 | grep -oE '[0-9.]+')
     [ -n "$enc" ] && { echo "METRIC nvenc_h264_fps $enc"; echo "CHECK nvenc_h264_fps ok"; } || log "nvenc failed/timeout"
-    # NVDEC h264_cuvid decode is EXCLUDED: it produces 0 frames and hangs on the
-    # bare-metal HOST too (broken ffmpeg+cuvid build, rc=124) — no host baseline,
-    # so no parity comparison is possible. Not an nvkvm issue.
-    log "ffmpeg: nvenc=${enc:-?} fps (nvdec/cuvid excluded — broken on host too)"
+    # NVDEC decode.  Excluded for weeks on the belief that cuvid "produces 0
+    # frames and hangs on the bare-metal host too".  It does not: the source was
+    # 4:4:4 and cuvid takes 4:2:0, so it failed FAST (rc=234) rather than
+    # hanging.  MEASURED 2026-09-05, RTX 4070, driver 595.84, same 300-frame
+    # 1080p 4:2:0 source: host h264_cuvid 33.3x, guest 13.3x -- both decoded all
+    # 300 frames.  An excluded row cannot catch a regression, so it is back.
+    dec=$(timeout 90 ffmpeg -y -hide_banner -benchmark -c:v h264_cuvid -i "$SRCMP4" \
+        -f null - 2>&1 | grep -oE 'speed= *[0-9.]+' | tail -1 | grep -oE '[0-9.]+')
+    [ -n "$dec" ] && { echo "METRIC nvdec_h264_speed $dec"; echo "CHECK nvdec_h264_speed ok"; } || log "nvdec failed/timeout"
+    log "ffmpeg: nvenc=${enc:-?} fps  nvdec=${dec:-?}x"
 else log "no ffmpeg"; fi
 
 log "done"
