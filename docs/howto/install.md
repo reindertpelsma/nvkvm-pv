@@ -99,6 +99,23 @@ staging step.
 The bare-host install — stronger isolation than a container, and no QEMU build.
 From the [releases page](https://github.com/reindertpelsma/nvkvm-pv/releases):
 
+**The tarball needs Ubuntu 24.04 or newer.** It is a prebuilt binary from a
+24.04 runner, so it carries that toolchain's floor with it. MEASURED on Ubuntu
+22.04, 2026-09-05, the v0.2.5 tarball:
+
+```
+/opt/qemu-nvkvm/bin/qemu-system-x86_64: /lib/x86_64-linux-gnu/libc.so.6:
+    version `GLIBC_2.38' not found
+/opt/qemu-nvkvm/bin/qemu-system-x86_64: /lib/x86_64-linux-gnu/libslirp.so.0:
+    version `SLIRP_4.7' not found
+```
+
+22.04 ships glibc 2.35 and libslirp 4.6.1, and no package upgrade closes that —
+the binary simply cannot run there. The apt line below is 24.04-named too
+(`libglib2.0-0t64` is the 64-bit-`time_t` rename; 22.04 calls it
+`libglib2.0-0`), so it errors before you get that far. **On an older distro use
+the container above, which brings its own userspace, or build from source.**
+
 ```bash
 # runtime dependencies -- the tarball ships QEMU, not what QEMU links against
 sudo apt install -y libglib2.0-0t64 libpixman-1-0 libslirp0 libepoxy0 libgbm1 \
