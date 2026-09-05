@@ -1248,9 +1248,17 @@ Concretely, in priority order:
    per-ioctl code opt a field back in by pointing it at aux. Default-deny becomes structural — an
    unlisted command with pointers gets them zeroed, and a *new* command added to an allowlist without
    a schema row fails safe rather than fails open. This is what gVisor's nvproxy does, and what the
-   nestrilabs rewrite table *proposes* (checked 2026-09-04: it is a design, not
-   code -- their crates carry no such table; the recommendation stands on
-   nvproxy's implementation alone); `ARCHITECTURE.md:373-377` currently frames "nvkvm does something
+   nestrilabs rewrite table *implements* (CORRECTED 2026-09-05 by its author in
+   issue #1: the 2026-09-04 check looked at `feat/init`.  The table is real code on
+   `libkrunfw` -- nvgpu/gen/nvgpu_v1v2_rewrites.h, c3a31aa, 19 entries generated from
+   driver 595.58.03 by a 1295-line nvgpu_gen.py, dispatched at virtio_gpu_nv.c:662;
+   the VMM half is on nv/libkrun.  Verified against the repository, not taken on
+   report.  Their author volunteers the limit: it has never run against a full CUDA
+   workload, so it evidences the SHAPE this recommendation asks for, not the
+   sufficiency of that shape -- for which nvproxy remains the evidence.  Their
+   GENERATOR may be the more useful artifact: it derives the table from driver
+   headers, where this tree tracks the same ABI drift by hand plus the offsetof
+   probes in tools/abi_derive.sh); `ARCHITECTURE.md:373-377` currently frames "nvkvm does something
    different" as a virtue, and the difference is precisely the coverage gap this report enumerates.
 4. ~~**Add the size-consistency check** (U-5): reject any `RM_CONTROL` where
    `paramsSize != aux_size`, and any `nvos64 RM_ALLOC` where `allocParmsSize > aux_size`. One
