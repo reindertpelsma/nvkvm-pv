@@ -452,12 +452,22 @@ A VMM cannot dereference a guest userspace pointer. It is a virtual address in
 an address space QEMU does not have, and even if it did, the value is entirely
 attacker-controlled.
 
-`nestrilabs/virtio-nvgpu` **proposes** a generated V1→V2 command-rewrite table:
-a per-command description of where the pointers are, produced ahead of time. It
-is a design, not shipped code — checked 2026-09-04, the crates on `feat/init`
-carry no such table, and `crates/device/src/mmap.rs` says of itself "data
-structure only, no entries are created yet". The shape is nevertheless the one
-gVisor's nvproxy *does* implement, and see
+`nestrilabs/virtio-nvgpu` **implements** a generated V1→V2 command-rewrite
+table: a per-command description of where the pointers are, produced ahead of
+time. CORRECTED 2026-09-05 by its author in issue #1 — an earlier revision of
+this paragraph called it "a design, not shipped code" on the strength of a
+2026-09-04 look at `feat/init`, which is the wrong branch. Verified against the
+repo: `nvgpu/gen/nvgpu_v1v2_rewrites.h` on `libkrunfw` (c3a31aa, 2026-04-16),
+19 entries, auto-generated from driver 595.58.03 by the 1295-line
+`nvgpu_gen.py`, `#include`d at `nvgpu/virtio_gpu_nv.c:36` and dispatched via
+`nvgpu_find_v1v2_rewrite()` at :662 inside a 2743-line guest driver; the VMM
+half is on `nv/libkrun` (cb93ff3). The default branch `dev` holds only markdown,
+which is how the earlier check missed it.
+
+Its author is explicit that the table "has never run against a full CUDA
+workload" — they stalled at `vulkaninfo` on the mmap problem — so it is a real
+implementation of the shape, not evidence that the shape suffices. For that,
+the shape is the one gVisor's nvproxy *does* implement at scale, and see
 [`docs/internal/audit-guest-pointers.md`](docs/internal/audit-guest-pointers.md)
 for why that shape fails safe where nvkvm's does not. nvkvm does something
 different.
