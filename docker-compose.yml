@@ -14,12 +14,25 @@ services:
     # `latest` does now exist and tracks the newest release; check
     # https://github.com/reindertpelsma/nvkvm-pv/releases before bumping this.
     #
-    # Do NOT drop this below v0.2.2.  v0.2.0 and v0.2.1 forwarded the guest's
-    # ssh to the CONTAINER's loopback while the `ports:` line below publishes
-    # the host's loopback to the container's eth0, so the guest was
-    # unreachable and `ssh -p 2222` reset -- with the guest healthy the whole
-    # time.  See CHANGELOG.md.
-    image: ghcr.io/reindertpelsma/nvkvm-pv:v0.2.2
+    # Do NOT drop this below v0.2.3, and prefer the pin below.
+    #
+    # v0.2.0 / v0.2.1  forwarded the guest's ssh to the CONTAINER's loopback
+    #                  while the `ports:` line below publishes the host's
+    #                  loopback to the container's eth0, so the guest was
+    #                  unreachable and `ssh -p 2222` reset -- with the guest
+    #                  healthy the whole time.
+    # v0.2.2           rebundled the host driver userspace only when NO bundle
+    #                  existed, never when the host driver CHANGED.  Upgrade the
+    #                  host driver and the guest re-stages the stale bundle on
+    #                  every boot: `Driver/library version mismatch`, cuInit 803,
+    #                  forever, with nothing in the log saying why.  Fixed by
+    #                  b1ff110, first shipped in v0.2.3.
+    #                  Its in-image tests/validate.sh also demanded a Vulkan
+    #                  extension Turing does not advertise, so the suite is
+    #                  over-strict on GTX 16xx / RTX 20xx (e002fb5, 4817282).
+    #
+    # See CHANGELOG.md.
+    image: ghcr.io/reindertpelsma/nvkvm-pv:v0.2.4
     build: .
     # Capabilities: drop everything, then add back only what the isolate needs
     # to reach its STRONGEST sandbox rung.  This is not the same as dropping
