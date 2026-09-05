@@ -509,11 +509,83 @@ int nvkvm_sanitize_ioctl_params(struct nvkvm_fd_ctx *ctx,
 		break;
 	}
 
-	case NV_ESC_RM_VID_HEAP_CONTROL:
-		/* NVOS32: the legacy ALLOC_SIZE path libGLX uses has no embedded
+	case NV_ESC_RM_VID_HEAP_CONTROL: {
+		/*
+		 * NVOS32.  The legacy ALLOC_SIZE path libGLX uses has no embedded
 		 * input pointer (its `address` field is [OUT]-only), so there is
-		 * nothing to translate.  Forward opaquely (status@20, full 184B). */
+		 * nothing to translate and it forwards opaquely.
+		 *
+		 * NVOS32_FUNCTION_ALLOC_OS_DESCRIPTOR (27) is different, and it is
+		 * how Vulkan's VK_EXT_external_memory_host import reaches the
+		 * driver: it names a range of THIS TASK's memory that RM will hand
+		 * to pin_user_pages().  Same problem as hClass 0x71 above -- the
+		 * task doing the pinning is the stub, not the app -- and therefore
+		 * the same remedy: migrate the range onto memfds the stub already
+		 * MAP_FIXEDs, so the pages RM pins alias the app's guest pages.
+		 * The VA is left alone; QEMU translates it to the window address it
+		 * chose, after checking coverage.  Without this the ioctl is refused
+		 * host-side and vkAllocateMemory returns VK_ERROR_OUT_OF_DEVICE_MEMORY
+		 * at ANY size -- MEASURED 2026-09-05, 1 MiB through 512 MiB, on
+		 * RTX 4070/595.84 and RTX 3050 Laptop/580.173.02.
+		 *
+		 * Offsets MEASURED, not transcribed: the 144-byte union is opaque
+		 * to this tree, so the AllocOsDesc arm was located by dumping it and
+		 * correlating against a pointer and length the caller controlled --
+		 * descriptor at data+0x18, limit at data+0x20 (NVOS32 offsets 64 and
+		 * 72), limit inclusive.
+		 *
+		 * ABI-STABLE, VERIFIED ACROSS THE RANGE, not assumed.  The
+		 * offsets were first located empirically (dump the union in the
+		 * guest, correlate against a pointer and length the caller
+		 * controls), then confirmed by compiling offsetof() probes
+		 * against NVIDIA's own headers at five tags via
+		 * tools/abi_derive.sh:
+		 *
+		 *   535.183.01  550.90.07  570.86.16  580.95.05  590.48.01
+		 *   descriptor  64         64         64         64
+		 *   limit       72         72         72         72
+		 *
+		 * plus the 595.84 measurement above -- 535 through 595, one
+		 * layout.  The two probes are now permanent fields in
+		 * abi_derive.sh, so a future driver that moves them shows up as
+		 * a changed row rather than as a wrong pointer handed to
+		 * pin_user_pages().
+		 *
+		 * This is a courtesy, not the enforcement: the guest is untrusted,
+		 * so QEMU re-derives coverage itself and refuses anything it did not
+		 * install.  Skipping it here only makes the call fail, never unsafe.
+		 */
+		struct nvos32_parameters *p = buf;
+
+		if (p->function == 27) {
+			__u64 desc = 0, limit = 0;
+			int mret;
+
+			memcpy(&desc,  p->data + 0x18, sizeof(desc));
+			memcpy(&limit, p->data + 0x20, sizeof(limit));
+
+			if (desc && limit) {
+				/* limit is inclusive; limit+1 wraps at U64_MAX,
+				 * which would migrate nothing and then forward a
+				 * raw guest VA.  Same refusal as the 0x71 path. */
+				if (limit == U64_MAX) {
+					pr_warn_ratelimited("nvkvm: NVOS32 fn27 limit=U64_MAX overflows the length computation — refusing\n");
+					return -EINVAL;
+				}
+				mret = nvkvm_cpu_pages_migrate_range(
+					ctx, desc, limit + 1,
+					0x1 | 0x2 /* PROT_READ | PROT_WRITE */);
+				if (mret) {
+					pr_warn("nvkvm: NVOS32 fn27 migrate %llx+%llx failed: %d\n",
+						(unsigned long long)desc,
+						(unsigned long long)limit + 1,
+						mret);
+					return mret;
+				}
+			}
+		}
 		break;
+	}
 
 	case NV_ESC_RM_IDLE_CHANNELS: {
 		struct nv_ioctl_idle_channels *p = buf;

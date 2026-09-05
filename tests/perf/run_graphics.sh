@@ -53,6 +53,7 @@ echo "── OpenGL (headless) ──"
 row "offscreen render"   egl_gl_Mtri_s
 echo "── Video engines ──"
 row "NVENC h264 encode"  nvenc_h264_fps
+row "NVDEC h264 decode"  nvdec_h264_speed
 echo "----------------------------------------------------------"
 echo "PASS: $PASS   FAIL: $FAIL   DID-NOT-RUN: $NORUN   (gate guest/host >= $GATE; correctness must pass)"
 [ "$NORUN" != 0 ] && echo "RESULT: INCOMPLETE — $NORUN workload(s) produced no metric on either side"

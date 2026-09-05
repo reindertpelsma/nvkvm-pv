@@ -1619,7 +1619,7 @@ fi
 # =============================================================================
 section "3. Vulkan (enumeration + compute dispatch)"
 
-VK_CHECKS="vk_loader vk_instance vk_physical_device vk_device_is_nvidia vk_compute_dispatch"
+VK_CHECKS="vk_loader vk_instance vk_physical_device vk_device_is_nvidia vk_compute_dispatch vk_import_host_ptr"
 
 # SPIR-V for:
 #   #version 450
@@ -1720,6 +1720,9 @@ typedef struct { uint32_t sType; const void *pNext; uint32_t flags; VkDeviceSize
                  uint32_t sharingMode; uint32_t queueFamilyIndexCount; const uint32_t *pQueueFamilyIndices; } VkBufferCreateInfo;
 typedef struct { VkDeviceSize size; VkDeviceSize alignment; uint32_t memoryTypeBits; } VkMemoryRequirements;
 typedef struct { uint32_t sType; const void *pNext; VkDeviceSize allocationSize; uint32_t memoryTypeIndex; } VkMemoryAllocateInfo;
+typedef struct { uint32_t sType; const void *pNext; uint32_t handleType; void *pHostPointer; } VkImportMemoryHostPointerInfoEXT;
+typedef struct { uint32_t sType; void *pNext; uint32_t memoryTypeBits; } VkMemoryHostPointerPropertiesEXT;
+typedef struct { char extensionName[256]; uint32_t specVersion; } VkExtensionProperties;
 typedef struct { uint32_t binding; uint32_t descriptorType; uint32_t descriptorCount; uint32_t stageFlags;
                  const void *pImmutableSamplers; } VkDescriptorSetLayoutBinding;
 typedef struct { uint32_t sType; const void *pNext; uint32_t flags; uint32_t bindingCount;
@@ -1764,6 +1767,11 @@ typedef struct { uint32_t sType; const void *pNext; uint32_t flags; } VkFenceCre
 #define ST_PSSCI          18
 #define ST_COMPUTE_PIPE_CI 29
 #define ST_PIPELAYOUT_CI  30
+/* VK_EXT_external_memory_host.  Values read out of vulkan_core.h, not
+ * remembered: extension 179 -> structure types 1000178000/1. */
+#define ST_IMPORT_HOSTPTR_INFO 1000178000
+#define ST_MEM_HOSTPTR_PROPS   1000178001
+#define EXT_MEM_HANDLE_HOST_ALLOC 0x00000080u
 #define ST_DSL_CI         32
 #define ST_DPOOL_CI       33
 #define ST_DSET_ALLOC     34
@@ -1781,7 +1789,8 @@ typedef struct { uint32_t sType; const void *pNext; uint32_t flags; } VkFenceCre
 #define VK_MEMORY_PROPERTY_HOST_COHERENT_BIT 0x04
 
 static const char *ALL_CHECKS[] = { "vk_loader", "vk_instance", "vk_physical_device",
-                                    "vk_device_is_nvidia", "vk_compute_dispatch", NULL };
+                                    "vk_device_is_nvidia", "vk_compute_dispatch",
+                                    "vk_import_host_ptr", NULL };
 static int reported[16];
 static void emit(const char *name, const char *status, const char *fmt, ...) {
     char buf[1024]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
@@ -1839,8 +1848,14 @@ static int probe_main(int argc, char **argv) {
     VkResult (*vkCreateFence)(VkDevice, const VkFenceCreateInfo *, const void *, VkFence *);
     VkResult (*vkQueueSubmit)(VkQueue, uint32_t, const VkSubmitInfo *, VkFence);
     VkResult (*vkWaitForFences)(VkDevice, uint32_t, const VkFence *, uint32_t, uint64_t);
+    VkResult (*vkEnumerateDeviceExtensionProperties)(VkPhysicalDevice, const char *, uint32_t *, VkExtensionProperties *);
+    void (*vkFreeMemory)(VkDevice, VkDeviceMemory, const void *);
+    void *(*vkGetDeviceProcAddr)(VkDevice, const char *);
 
     VKSYM(vkCreateInstance, "vkCreateInstance");
+    VKSYM(vkEnumerateDeviceExtensionProperties, "vkEnumerateDeviceExtensionProperties");
+    VKSYM(vkFreeMemory, "vkFreeMemory");
+    VKSYM(vkGetDeviceProcAddr, "vkGetDeviceProcAddr");
     VKSYM(vkEnumeratePhysicalDevices, "vkEnumeratePhysicalDevices");
     VKSYM(vkGetPhysicalDeviceProperties, "vkGetPhysicalDeviceProperties");
     VKSYM(vkGetPhysicalDeviceQueueFamilyProperties, "vkGetPhysicalDeviceQueueFamilyProperties");
@@ -1988,10 +2003,98 @@ static int probe_main(int argc, char **argv) {
     VkDeviceCreateInfo dci; memset(&dci, 0, sizeof dci);
     dci.sType = ST_DEVICE_CI; dci.queueCreateInfoCount = 1; dci.pQueueCreateInfos = &qci;
 
+    /* VK_EXT_external_memory_host, enabled ONLY if the driver advertises it.
+     * Asking for an absent extension makes vkCreateDevice fail, which would
+     * turn a missing feature into a spurious vk_compute_dispatch failure. */
+    static const char *EMH = "VK_EXT_external_memory_host";
+    int have_emh = 0;
+    if (vkEnumerateDeviceExtensionProperties) {
+        uint32_t ne = 0;
+        if (vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, NULL) == VK_SUCCESS && ne) {
+            VkExtensionProperties *ep = calloc(ne, sizeof *ep);
+            if (ep && vkEnumerateDeviceExtensionProperties(pd, NULL, &ne, ep) == VK_SUCCESS)
+                for (i = 0; i < ne; i++)
+                    if (!strcmp(ep[i].extensionName, EMH)) { have_emh = 1; break; }
+            free(ep);
+        }
+    }
+    if (have_emh) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &EMH; }
+
     VkDevice dev = NULL;
     r = vkCreateDevice(pd, &dci, NULL, &dev);
     if (r != VK_SUCCESS) { emit("vk_compute_dispatch", "FAIL", "vkCreateDevice rc=%d", r); finish("no device"); return 1; }
     VkQueue q = NULL; vkGetDeviceQueue(dev, (uint32_t)qfi, 0, &q);
+
+    /*
+     * vk_import_host_ptr -- import application memory (VK_EXT_external_memory_host).
+     *
+     * This is a ONE-CALL check for a bug that otherwise only shows up as a
+     * benchmark scoring badly.  nvkvm denied the ioctl this import rides on
+     * (NV_ESC_RM_VID_HEAP_CONTROL, NVOS32 function 27 ALLOC_OS_DESCRIPTOR), so
+     * vkAllocateMemory returned VK_ERROR_OUT_OF_DEVICE_MEMORY at EVERY size --
+     * 1 MiB through 512 MiB, on RTX 4070/595.84 and RTX 3050 Laptop/580.173.02.
+     * Geekbench 7's Vulkan suite scored 0 on one workload of eleven and ~30% of
+     * native overall; every other workload, and all of OpenCL, was unaffected.
+     * A composite score is a terrible regression detector, so: check the call.
+     *
+     * 2 MiB, 2 MiB-aligned.  allocationSize must be a multiple of
+     * minImportedHostPointerAlignment and the pointer must be aligned to it;
+     * over-aligning is always legal, so this holds for any realistic value
+     * (measured 0x1000 on both sides) without a second properties query.
+     */
+    if (!have_emh) {
+        emit("vk_import_host_ptr", "SKIP", "%s not advertised by this driver", EMH);
+    } else {
+        VkResult (*getHostPtrProps)(VkDevice, uint32_t, const void *, VkMemoryHostPointerPropertiesEXT *) = NULL;
+        if (vkGetDeviceProcAddr)
+            *(void **)(&getHostPtrProps) = vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
+        if (!getHostPtrProps) {
+            emit("vk_import_host_ptr", "FAIL", "%s advertised but vkGetMemoryHostPointerPropertiesEXT did not resolve", EMH);
+        } else {
+            size_t align = 2u * 1024 * 1024, sz = align;
+            void *hp = NULL;
+            if (posix_memalign(&hp, align, sz) != 0 || !hp) {
+                emit("vk_import_host_ptr", "SKIP", "posix_memalign(%zu) failed on the guest", sz);
+            } else {
+                VkMemoryHostPointerPropertiesEXT hpp; memset(&hpp, 0, sizeof hpp);
+                hpp.sType = ST_MEM_HOSTPTR_PROPS;
+                memset(hp, 0, sz);
+                r = getHostPtrProps(dev, EXT_MEM_HANDLE_HOST_ALLOC, hp, &hpp);
+                if (r != VK_SUCCESS) {
+                    emit("vk_import_host_ptr", "FAIL", "vkGetMemoryHostPointerPropertiesEXT rc=%d", r);
+                } else {
+                    VkPhysicalDeviceMemoryProperties hmp; memset(&hmp, 0, sizeof hmp);
+                    vkGetPhysicalDeviceMemoryProperties(pd, &hmp);
+                    int hti = -1;
+                    for (i = 0; i < hmp.memoryTypeCount; i++)
+                        if ((hpp.memoryTypeBits & (1u << i)) &&
+                            (hmp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { hti = (int)i; break; }
+                    if (hti < 0) {
+                        emit("vk_import_host_ptr", "FAIL", "no HOST_VISIBLE type accepts an imported pointer (typeBits=0x%X)", hpp.memoryTypeBits);
+                    } else {
+                        VkImportMemoryHostPointerInfoEXT imp; memset(&imp, 0, sizeof imp);
+                        imp.sType = ST_IMPORT_HOSTPTR_INFO;
+                        imp.handleType = EXT_MEM_HANDLE_HOST_ALLOC;
+                        imp.pHostPointer = hp;
+                        VkMemoryAllocateInfo hmai; memset(&hmai, 0, sizeof hmai);
+                        hmai.sType = ST_MEMALLOC_INFO; hmai.pNext = &imp;
+                        hmai.allocationSize = sz; hmai.memoryTypeIndex = (uint32_t)hti;
+                        VkDeviceMemory hmem = 0;
+                        r = vkAllocateMemory(dev, &hmai, NULL, &hmem);
+                        if (r == VK_SUCCESS) {
+                            emit("vk_import_host_ptr", "PASS", "imported %zu MiB of host memory (type %d)", sz / (1024 * 1024), hti);
+                            if (vkFreeMemory) vkFreeMemory(dev, hmem, NULL);
+                        } else {
+                            emit("vk_import_host_ptr", "FAIL", "vkAllocateMemory(import %zu MiB) rc=%d%s",
+                                 sz / (1024 * 1024), r,
+                                 r == -2 ? " (VK_ERROR_OUT_OF_DEVICE_MEMORY -- NVOS32 fn27 denied?)" : "");
+                        }
+                    }
+                }
+                free(hp);
+            }
+        }
+    }
 
     const uint32_t N = 4096;
     VkDeviceSize bytes = (VkDeviceSize)N * 4;

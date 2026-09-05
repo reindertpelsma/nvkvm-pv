@@ -149,6 +149,8 @@ mem_alloc_size|nvtypes.h,nvos.h|sizeof(NV_MEMORY_ALLOCATION_PARAMS)
 nv00de_alloc_size|nvtypes.h,nvos.h,class/cl00de.h|sizeof(NV00DE_ALLOC_PARAMETERS)
 nvos46_size|nvtypes.h,nvos.h|sizeof(NVOS46_PARAMETERS)
 nvos46_status_off|nvtypes.h,nvos.h|offsetof(NVOS46_PARAMETERS, status)
+nvos32_osdesc_desc_off|nvtypes.h,nvos.h|offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.descriptor)
+nvos32_osdesc_limit_off|nvtypes.h,nvos.h|offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.limit)
 F
 FIELD_NAMES=$(cut -d'|' -f1 "$FIELDS_FILE" | tr '\n' ' ')
 

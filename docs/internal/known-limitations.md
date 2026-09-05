@@ -741,6 +741,25 @@ non-locally when a driver branch moves.
 
 ## Video
 
+### NVENC — the hang did not reproduce a SECOND time, on different hardware (2026-09-05)
+
+MEASURED on an RTX 4070, host driver 595.84, guest ffmpeg 6.1.1 — a different
+GPU, driver and guest from the 2026-08-20 attempt below:
+
+| | guest | host (ffmpeg 8.0.1) |
+|---|---|---|
+| `h264_nvenc` 1080p30, `-preset p1` | **fps=156, speed=5.2x** | fps=444, speed=14.8x |
+| the original repro: 5 s 720p solid colour to a file | **rc=0, 10429 bytes** | rc=0, 10431 bytes |
+
+The exact command the original entry says "never completes" completes, and
+writes a valid file. Again the fps figures are **not** a parity ratio — the two
+sides ran different ffmpeg builds.
+
+That is now two independent non-reproductions on two different GPUs and two
+driver branches. It is still not a root cause: nobody has explained what the
+original `cuMemcpy2D` wedge was, so this stays OPEN rather than FIXED, and the
+detail below is what to compare against if it returns.
+
 ### NVENC — the 575.51.03 hang DID NOT REPRODUCE (2026-08-20)
 
 **Re-tested on an RTX 3060, driver 575.51.03 — the same driver this entry was
@@ -785,9 +804,41 @@ not been reproduced. Reproduce the current state with
 `tests/perf/run_graphics.sh`; the NVENC row now fails one-sided rather than
 vanishing from the table.
 
-NVDEC (`h264_cuvid`) has no baseline at all: it decodes 0 frames and hangs on
-the bare-metal host too, on the ffmpeg build used
-(`tests/perf/realapp_matrix.md`).
+### NVDEC — "no baseline, hangs on the host too" was WRONG, it was the test source (2026-09-05)
+
+**The decoder was never broken. The test fed it a format NVDEC cannot accept.**
+
+`testsrc` piped through `libx264` with default settings produces **yuv444p**, and
+NVDEC accepts 4:2:0 only. `h264_cuvid` therefore refused the file before
+decoding a frame:
+
+```
+[h264_cuvid] Codec h264_cuvid is not supported with this chroma format.
+rc=234        <- fails fast; NOT the rc=124 timeout that was reported
+```
+
+Add `-pix_fmt yuv420p` to the source and it decodes. MEASURED 2026-09-05, RTX
+4070, host driver 595.84, one 300-frame 1080p 4:2:0 clip:
+
+| | `h264_cuvid` | `-hwaccel cuda` |
+|---|---|---|
+| host, ffmpeg 8.0.1 | 300 frames, 33.3x | 58.2x |
+| nvkvm guest, ffmpeg 6.1.1 | **300 frames, 13.3x** | **300 frames, 9.12x** |
+
+The speeds are **not** a parity ratio: the two sides ran different ffmpeg builds,
+which is a confound this measurement did not control. What it establishes is
+pass/fail — both sides decode every frame — not a forwarding cost.
+
+The cost of the wrong diagnosis was not the wrong sentence. It was that
+`graphics_remote.sh` *deleted the NVDEC row* on the strength of it, so there was
+no decode coverage at all and a real regression could not have been caught. The
+row is restored and the source is now generated as 4:2:0.
+
+Superseded text, kept so the reasoning is visible:
+
+> NVDEC (`h264_cuvid`) has no baseline at all: it decodes 0 frames and hangs on
+> the bare-metal host too, on the ffmpeg build used
+> (`tests/perf/realapp_matrix.md`).
 
 ---
 
