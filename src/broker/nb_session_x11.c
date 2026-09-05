@@ -1796,6 +1796,30 @@ static int x11_open(struct nb_session *s, const struct nb_config *cfg)
     /* DRI3 >= 1.0 is required at all; >= 1.2 buys explicit modifiers. */
     ext = xcb_get_extension_data(x->c, &xcb_dri3_id);
     if (!ext || !ext->present) {
+        /*
+         * AUTO is documented (nb_common.c) as walking guest-modifier -> LINEAR
+         * -> shm until one works, but this check used to `goto fail` no matter
+         * which tier asked -- so on a DRI3-less server AUTO never reached its
+         * own lowest, always-available rung.
+         *
+         * MEASURED on Xvfb :1 -screen 0 1920x1080x24 (headless, no DRI3):
+         *   auto (default)      -> crash-loop, 8 "no DRI3 extension" errors
+         *   --present-mode=shm  -> up, 0 DRI3 errors
+         * Same server, same missing extension; only AUTO's path to the rung
+         * that already works was missing.  An EXPLICIT --present-mode=native
+         * or =linear must still fail here -- the user asked for dma-buf
+         * specifically and cannot have it silently swapped for a copy path.
+         */
+        if (nb_tier == NB_TIER_AUTO) {
+            nb_log("AUTO: this X server has no DRI3 extension, so it cannot "
+                   "take a dma-buf at all -- descending to the shm tier "
+                   "(shared memory + core PutImage). Expect lower performance "
+                   "than a dma-buf path; pass --present-mode=native or "
+                   "=linear to require dma-buf and fail instead of falling "
+                   "back.");
+            nb_tier = NB_TIER_SHM;
+            goto skip_dmabuf_extensions;
+        }
         nb_err("the X server has no DRI3 extension, so it cannot take a "
                "dma-buf at all.  There is no fallback here on purpose: a copy "
                "path would need a GL context in the privileged process, which "

@@ -2122,8 +2122,10 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 		 * every same-vendor host it is yes and being briefly wrong costs
 		 * a round trip of frames rather than a permanently wrong mode.
 		 */
-		if (nvkvm_display_relay_format_verdict(req->format,
-						       req->modifier) == 0 &&
+		bool cannot_show = nvkvm_display_relay_format_verdict(
+					   req->format, req->modifier) == 0;
+
+		if (cannot_show &&
 		    nvkvm_present_submit_readback(nv, dmabuf_fd, iso_id,
 						  req->stub_handle,
 						  req->width, req->height,
@@ -2131,6 +2133,33 @@ int nvkvm_req_present(VirtIONvgpu *nv,
 						  req->modifier)) {
 			resp->status = 0;
 			return 0;      /* readback owns the fd now */
+		}
+		/*
+		 * A CONFIRMED "NO" MUST NOT FALL THROUGH TO ZERO-COPY BELOW.
+		 *
+		 * MEASURED (field report, headless X11 box): the broker
+		 * answered QUERY_FORMAT XR24 modifier 0x0300000000606014
+		 * (NVIDIA) -> NO, and this function used to reach the
+		 * zero-copy branch anyway -- attaching the EXACT pair the
+		 * broker had just refused.  5 queries, 3 attach failures,
+		 * always the same buffer: the verdict was known and ignored.
+		 *
+		 * submit_readback() above is the only substitute buffer this
+		 * VMM knows how to make (detile through the guest's own GPU
+		 * into a LINEAR/shm udmabuf; see nvkvm_present_egl.c).  If
+		 * THAT failed too -- no /dev/udmabuf, or no present context
+		 * yet -- there is no buffer left this display can take, so
+		 * the frame is dropped instead of repeating an ATTACH already
+		 * known to fail.  The relay retains the newest frame (see
+		 * relay_frame_retain()), so a display that later becomes able
+		 * to import -- a reconnect, or udmabuf appearing -- still
+		 * paints immediately.  Same pattern as the unconditional
+		 * "BROKER MODE IS TERMINAL" drop a few lines down.
+		 */
+		if (cannot_show) {
+			close(dmabuf_fd);
+			resp->status = 0;
+			return 0;
 		}
 		/*
 		 * ZERO-COPY: the host compositor will read the GUEST's buffer
