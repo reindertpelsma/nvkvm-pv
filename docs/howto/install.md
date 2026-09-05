@@ -217,6 +217,27 @@ NVRM: ... requires use of the NVIDIA open kernel modules.
 NVIDIA's installer with `-m=kernel-open`); purge first, the 5xx packages
 conflict.
 
+## If it did not work
+
+Report it, even when it looks like your own setup. Install-path bugs are the
+ones this project most needs and least hears about: three of the four
+documented paths have shipped broken at some point, every one of them found by
+someone walking the steps rather than by a report.
+
+```bash
+./scripts/nvkvm-report.sh          # on the host
+./scripts/nvkvm-report.sh          # and in the guest, if it boots that far
+```
+
+It reads only and changes nothing, and it collects what a bug report needs:
+kernel, GPU, driver version and module flavour, ABI profile, and what the
+isolate negotiated. Read it before you paste it — it names your hardware.
+Then open an issue: <https://github.com/reindertpelsma/nvkvm-pv/issues/new/choose>
+
+"It worked" is worth sending too. Successes are the report nobody files and
+the one that is hardest to obtain, because a working install leaves no trace
+anywhere the maintainer can see.
+
 ## See also
 
 - [`build.md`](build.md) — the full QEMU delta, built by hand, and how to
