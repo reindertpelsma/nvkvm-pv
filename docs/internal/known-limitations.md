@@ -741,6 +741,27 @@ non-locally when a driver branch moves.
 
 ## Video
 
+### NVENC — a THIRD non-reproduction, on the original driver, through the published container (2026-09-06)
+
+MEASURED on an RTX 3070, host driver **575.51.03** — the driver this entry was
+written against — running the **published `ghcr.io/…:v0.2.5` container** pulled
+from the registry rather than any local build, guest ffmpeg 6.1.1:
+
+| | result |
+|---|---|
+| the original repro: 5 s 720p solid colour to a file | **rc=0, 10429 bytes** |
+| `h264_nvenc` 1080p30, `-preset p1` | **fps=112, speed=3.71x** |
+
+That is the exact command this entry says "never completes", completing, on the
+driver it was reported against, in the artifact users actually install.
+
+**It still does not close the entry, and the reason has not changed.** Nobody has
+explained the original `cuMemcpy2D` wedge. Three non-reproductions across three
+GPUs (3060, 3070, 4070) and two driver branches now stand against one
+observation that nobody can reproduce — which is grounds for saying so plainly,
+not grounds for calling it fixed. If it returns, the detail below is still what
+to compare against.
+
 ### NVENC — the hang did not reproduce a SECOND time, on different hardware (2026-09-05)
 
 MEASURED on an RTX 4070, host driver 595.84, guest ffmpeg 6.1.1 — a different
