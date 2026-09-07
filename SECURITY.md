@@ -46,7 +46,7 @@ process's GPU objects are not meant to be reachable from another's — and we
 treat a way to reach them as a vulnerability. **This boundary is not currently
 closed.** Twelve handlers take a guest-supplied `isolate_id`; several carry no
 caller identity on the wire, and the code says so where it happens —
-`nvkvm_isolate_handlers.c:4951` reads *"KNOWN GAP, do not read this as a closed
+`nvkvm_isolate_handlers.c:5054` reads *"KNOWN GAP, do not read this as a closed
 boundary"*, and [the audit index](docs/audit/README.md) states plainly that *"the
 cross-isolate boundary is not currently a boundary."* Closing it properly needs a
 caller session id in the protocol, not a patch.
