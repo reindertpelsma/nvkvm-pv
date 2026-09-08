@@ -7,6 +7,31 @@ No. There is no hardware partitioning and no vendor licence. nvkvm forwards the
 driver's ioctl interface, so it runs on consumer cards that have no vGPU support
 at all.
 
+**Why not VFIO passthrough?**
+VFIO hands the whole card to one guest. The host loses it, including your
+display if that card drives one, and no second VM can have it. Attaching also
+means a device reset and a `vfio-pci` rebind, so it is not something you do
+casually. nvkvm leaves the card bound to the host's NVIDIA driver and forwards
+the driver interface instead, so the host desktop keeps running, several guests
+can share one card, and attaching takes under a second. What you give up is the
+isolation VFIO gets from the IOMMU: nvkvm's boundary is software, and it is not
+yet hardened against hostile guests (see *Is it safe to run untrusted guests?*
+below).
+
+**Why not virtio-gpu (Venus, virgl, or a native context)?**
+Venus and virgl forward a *graphics API*. Venus carries Vulkan, virgl carries
+OpenGL, and a host-side userspace driver re-issues the calls. If rendering is all
+you need they are a good answer, and they already ship in Mesa. They give the
+guest no NVIDIA driver, though, so CUDA, NVENC/NVDEC, `nvidia-smi` and anything
+else that opens `/dev/nvidiactl` are simply absent.
+
+virtio-gpu *native context* is much closer in shape: it forwards one driver's own
+UAPI rather than an API, which is what nvkvm does too. The native contexts that
+exist upstream are for open drivers (amdgpu, freedreno, Intel), where the
+guest-side driver lives in Mesa and can be taught the protocol. NVIDIA's
+proprietary userspace cannot be, so nvkvm forwards NVIDIA's kernel ABI and runs
+NVIDIA's own unmodified userspace inside the guest.
+
 **So how are resources divided between guests?**
 They are not. Nothing is partitioned: guests share VRAM, SMs and bandwidth
 dynamically, exactly as GPU containers on one card do today. There is no

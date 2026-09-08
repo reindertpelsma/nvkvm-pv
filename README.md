@@ -23,7 +23,7 @@ layer, not a shared kernel container.
 This project fixes the limitations of the alternatives:
 - VFIO gives up the entire card to the VM, you cannot share it with multiple VMs, if you have a display on it then your host desktop is unrenderable
 - vGPU is only for licensed datacenter parts. Even the community attempt vgpu_unlock does not work on most recent nvidia cards. This only requires vanilla nvidia access and KVM without any drastic host kernel/OS changes. 
-- cuda containers do not give your a VM, no stock OS, no VM boundary, limited root, no docker-in-docker with GPU without severely weakining the container, many desktop apps failing.
+- cuda containers do not give you a VM, no stock OS, no VM boundary, limited root, no docker-in-docker with GPU without severely weakining the container, many desktop apps failing.
 
 It provides you
 - give a VM GPU access without PCIe passthrough, so the host keeps the card.
@@ -92,8 +92,8 @@ bash /mnt/nvkvm/tests/validate.sh
 ```
 
 ```
- TOTAL 36   PASS 36   FAIL 0   SKIP 0
- VERDICT: PASS (all 36 checks passed)
+ TOTAL 37   PASS 37   FAIL 0   SKIP 0
+ VERDICT: PASS (all 37 checks passed)
 ```
 
 Exits 0 on a full pass, 1 on failure, 2 if anything was skipped. Every result
@@ -184,7 +184,7 @@ hardware not listed are wanted, and a **failure** is worth more than a success.
   about the *host's* physical displays. Ordinary desktops are unaffected.
 - **One rare crash is unexplained.** A GL client took a guest down once and has
   not reproduced since; treat it as open rather than fixed.
-- **`28/28` is not proof your workload is correct.** A real correctness bug has
+- **`37/37` is not proof your workload is correct.** A real correctness bug has
   passed it before — check against a host run
   ([what that bug was](docs/reference/correctness.md)).
 - **Frameworks that pin large host buffers pay a penalty** (250–350 MB/s vs
