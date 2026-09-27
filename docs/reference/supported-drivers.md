@@ -46,7 +46,7 @@ source and cannot be probed at all.
 | `NVKVM_ABI_570` | 570 – 579 (incl. 575) | 570.86.15, 570.172.08, 570.211.01, 575.51.02, 575.64.05 | **yes** — 575.51.03 |
 | `NVKVM_ABI_580` | 580 – 595 | 580.65.06, 580.95.05, 580.178.04, 590.44.01, 590.48.01, 595.44.02, 595.91.07 | **yes** — 580.95.05 and 595.84 |
 | `NVKVM_ABI_610` | 610 – 614 | 610.43.02, 610.43.03, 610.57.04 | **yes** — 610.43.02 |
-| `NVKVM_ABI_615` | 615+ | 615.71.09 | pending |
+| `NVKVM_ABI_615` | 615+ | 615.71.09 | **yes** — 615.71.09 |
 
 Two of those ranges split **inside** a branch, which is why selection takes the
 full `major.minor.patch` and not just the major
@@ -113,6 +113,7 @@ kernel launch.
 | RTX 4070 | Ada AD104 | 8.9 | 535.309.01 | 535 |
 | RTX 4070 | Ada AD104 | 8.9 | 580.105.08 | 580 |
 | RTX 4070 | Ada AD104 | 8.9 | 610.43.02 | 610 |
+| RTX 3060 | Ampere GA106 | 8.6 | 615.71.09 | 615 |
 
 The 580.95.05 Turing row cleared the expanded 30-check suite, including three
 managed allocations and three verified CPU↔GPU coherence cycles. A current
@@ -137,6 +138,41 @@ framebuffer objects came back `GL_FRAMEBUFFER_UNSUPPORTED` on 595.84 and
 cmdType allowlist, captured on a 575-era session, denied the `cmdType=60` that
 branches 595+ issue per offscreen surface. With 60 allowed both branches pass
 `gl_draw_pixel_check` and 610.43.02 is a clean 28/28.
+
+**2026-09-27 — `NVKVM_ABI_615` booted, on branch `fix/ogkm-615-tsg-alloc`
+(tree `7f1e77e`), RTX 3060 (Ampere GA106), vast.ai KVM rental.**
+`NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS` (`KEPLER_CHANNEL_GROUP_A`, class
+`0xa06c`) grew 20 → 28 bytes at 615.71.09 (`+reserved`, `+internalFlags`); the
+guest used to forward `sizeof()` of its 20-byte mirror struct regardless of
+host driver, so a 615 host got `alloc_parms_size=20` instead of 28.
+**Reproduction on the parent commit (`origin/main` @ `beaeeb2`) did NOT show a
+functional failure**: `validate.sh --expect-driver 615.71.09` passed **37 PASS
+/ 0 FAIL / 0 SKIP**, `nvkvm: host driver 615.71.09 → ABI profile 610` (the
+pre-fix header has no 615 row, so it falls through to 610), host `cuInit` ok,
+and no `NV_ERR_INVALID_*`/TSG-related denial in guest or host logs — the
+truncated params buffer did not surface as an observable break on this
+hardware/driver/test combination, most likely because RM zero-fills rather
+than strictly rejects a shorter-than-current `KEPLER_CHANNEL_GROUP_A` alloc.
+**Say this plainly: the fix is a real, measured ABI correctness fix (the
+struct-size table now matches what `tools/abi_derive.sh` measures against
+OGKM 615.71.09, see `tests/abi_parity/ogkm_abi_sweep_20260927.tsv`, 220 tags),
+not the resolution of an observed crash.** On the fix branch, the same box
+selected `nvkvm: host driver 615.71.09 → ABI profile 615` and passed the same
+**37 PASS / 0 FAIL / 0 SKIP**, with the same benign early-warning `DENY ctrl
+cmd` lines as the pre-fix run plus two additional denied codes
+(`0x20802a0c`, `0x00003d0f`) not seen on older drivers — consistent with 615's
+known-and-out-of-scope UVM dma-buf ioctls 82–85, which nvkvm does not forward;
+no other 615-specific break was found. A same-box, same-branch regression
+across the five older profile rows this fix touches (`NVKVM_ABI_610`,
+`NVKVM_ABI_580`, `NVKVM_ABI_570`, `NVKVM_ABI_550`, `NVKVM_ABI_535`) held at
+610.57.04, 595.91.07, 570.124.06, 550.135 and 535.161.07: every row **37 PASS
+/ 0 FAIL / 0 SKIP**, every selected profile matched the header (535.161.07
+additionally logged a pre-existing, non-fatal `AUDIT param_size MISMATCH`
+line for an unrelated class, ×101, same as before this change). The 37-check
+total is this repository's current `validate.sh` (grown since the 30-check
+count quoted above); it was constant across every driver in this run, so the
+comparison is apples-to-apples. See `docs/reference/supported-drivers.md`'s
+git history and the `fix/ogkm-615-tsg-alloc` branch for the raw sweep logs.
 
 ## Turing is the floor, and we are not moving it
 
