@@ -45,7 +45,8 @@ source and cannot be probed at all.
 | `NVKVM_ABI_550` | 550.40.53 – 565 | 550.40.53 … 550.163.01, 555.58.02, 560.35.03, 565.57.01, 565.77 | **yes** — 550.54.14 |
 | `NVKVM_ABI_570` | 570 – 579 (incl. 575) | 570.86.15, 570.172.08, 570.211.01, 575.51.02, 575.64.05 | **yes** — 575.51.03 |
 | `NVKVM_ABI_580` | 580 – 595 | 580.65.06, 580.95.05, 580.178.04, 590.44.01, 590.48.01, 595.44.02, 595.91.07 | **yes** — 580.95.05 and 595.84 |
-| `NVKVM_ABI_610` | 610+ | 610.43.02, 610.43.03, 610.57.04 | **yes** — 610.43.02 |
+| `NVKVM_ABI_610` | 610 – 614 | 610.43.02, 610.43.03, 610.57.04 | **yes** — 610.43.02 |
+| `NVKVM_ABI_615` | 615+ | 615.71.09 | pending |
 
 Two of those ranges split **inside** a branch, which is why selection takes the
 full `major.minor.patch` and not just the major

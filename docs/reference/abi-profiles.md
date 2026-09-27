@@ -13,8 +13,8 @@ version, consulted by every site whose layout is version-variant.
 
 ## The table
 
-`src/common/nvkvm_abi.h:113-235`. Eight rows, one per distinct layout measured
-across every published OGKM branch (515 → 610):
+`src/common/nvkvm_abi.h:113-235`. Nine rows, one per distinct layout measured
+across every published OGKM branch (515 → 615):
 
 | id | covers | selected when |
 |---|---|---|
@@ -25,7 +25,8 @@ across every published OGKM branch (515 → 610):
 | `NVKVM_ABI_550` | V550 UVM (9264 B), V545 mem/nv00de, base channel | 550.40.53 … 565 |
 | `NVKVM_ABI_570` | == 575 layouts: V550 UVM, V570 channel, pre-580 | 566 ≤ major ≤ 579 |
 | `NVKVM_ABI_580` | V580 VASPACE + V580 NVOS46 (each +8 bytes) | 580 ≤ major ≤ 595 |
-| `NVKVM_ABI_610` | V610 channel (376 B, `+hHandleVASpace`) | major ≥ 610 |
+| `NVKVM_ABI_610` | V610 channel (376 B, `+hHandleVASpace`) | 610 ≤ major < 615 |
+| `NVKVM_ABI_615` | V615 TSG alloc (28 B, `+reserved`, `+internalFlags`) | major ≥ 615 |
 
 Selection is `nvkvm_abi_id_for_version(major, minor, patch)`
 (`src/common/nvkvm_abi.h:311-382`). It takes the full version because **two
@@ -232,7 +233,14 @@ Two notes on the boundaries:
 - **610 is byte-identical to 580** — checked against the vendor tree
   (`610.43.02`, `610.57.04`), not assumed. Assuming was how the original bug
   survived.
-- Anything above **610.57.04** is extrapolation. Read the new branch's header
+- **615 grew a struct the table did not track.** `NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS`
+  (`KEPLER_CHANNEL_GROUP_A`) went 20 → 28 bytes at 615.71.09. The guest forwarded
+  `sizeof` of its own 20-byte mirror, so every probed profile field agreed and the
+  sweep stayed green while a 615 host received a truncated TSG alloc. It is now the
+  `tsg_alloc_size` profile field, and `abi_derive.sh` measures it at every tag. The
+  lesson: a class whose alloc size is a `sizeof` in the guest is invisible to this
+  table; before adding a branch, also diff every struct the guest sizes directly.
+- Anything above **615.71.09** is extrapolation. Read the new branch's header
   and add a row.
 
 **How the mistake presented, in both directions.** The handler writes two

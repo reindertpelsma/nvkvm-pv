@@ -79,7 +79,8 @@ enum nvkvm_abi_id {
 	NVKVM_ABI_550 = 550,   /* 550.40.53..565: V550 UVM (9264B)                */
 	NVKVM_ABI_570 = 570,   /* == 575 layouts: V550 UVM, V570 channel, pre-580 */
 	NVKVM_ABI_580 = 580,   /* 580..595: V580 VASPACE + V580 NVOS46 (each +8)  */
-	NVKVM_ABI_610 = 610,   /* 610+: V610 channel (+hHandleVASpace, 376)       */
+	NVKVM_ABI_610 = 610,   /* 610: V610 channel (+hHandleVASpace, 376)        */
+	NVKVM_ABI_615 = 615,   /* 615+: V615 TSG alloc (+reserved,internalFlags)  */
 };
 
 /* UVM_REGISTER_GPU_PARAMS is invariant across every published OGKM tag nvkvm
@@ -129,6 +130,10 @@ struct nvkvm_abi_profile {
 	unsigned vaspace_alloc_size; /* FERMI_VASPACE_A                           */
 	unsigned mem_alloc_size;     /* NV50_MEMORY_VIRTUAL / LOCAL_USER / SYSTEM */
 	unsigned nv00de_alloc_size;  /* RM_USER_SHARED_DATA                       */
+	unsigned tsg_alloc_size;     /* KEPLER_CHANNEL_GROUP_A: V615 appended
+				      * reserved + internalFlags (20 -> 28).  Not
+				      * a profile field before 615 was measured,
+				      * so a 615 host got a truncated 20 bytes. */
 
 	/* Frontend NVOS46 (NV_ESC_RM_MAP_MEMORY_DMA, NR 0x57): V580 grew it by 8
 	 * (Flags2 + KindOverride), moving the status field. */
@@ -160,6 +165,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 48,
 		.mem_alloc_size = 120,
 		.nv00de_alloc_size = 0,    /* class absent pre-525, see above */
+		.tsg_alloc_size = 20,
 		.nvos46_size = 56,         .nvos46_status_off = 48,
 	},
 	{
@@ -174,6 +180,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 48,
 		.mem_alloc_size = 120,
 		.nv00de_alloc_size = 4,
+		.tsg_alloc_size = 20,
 		.nvos46_size = 56,         .nvos46_status_off = 48,
 	},
 	{
@@ -190,6 +197,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 48,
 		.mem_alloc_size = 120,
 		.nv00de_alloc_size = 4,
+		.tsg_alloc_size = 20,
 		.nvos46_size = 56,         .nvos46_status_off = 48,
 	},
 	{
@@ -206,6 +214,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 48,
 		.mem_alloc_size = 128,
 		.nv00de_alloc_size = 8,
+		.tsg_alloc_size = 20,
 		.nvos46_size = 56,         .nvos46_status_off = 48,
 	},
 	{
@@ -221,6 +230,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 48,
 		.mem_alloc_size = 128,
 		.nv00de_alloc_size = 8,
+		.tsg_alloc_size = 20,
 		.nvos46_size = 56,         .nvos46_status_off = 48,
 	},
 	{
@@ -234,6 +244,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 48,
 		.mem_alloc_size = 128,     /* NV_MEMORY_ALLOCATION_PARAMS_V545 */
 		.nv00de_alloc_size = 8,
+		.tsg_alloc_size = 20,
 		.nvos46_size = 56,         .nvos46_status_off = 48,
 	},
 	{
@@ -249,6 +260,7 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 56,  /* NV_VASPACE_ALLOCATION_PARAMETERS_V580 (+Pasid) */
 		.mem_alloc_size = 128,
 		.nv00de_alloc_size = 8,
+		.tsg_alloc_size = 20,
 		.nvos46_size = 64,         .nvos46_status_off = 56, /* NVOS46_V580 (+Flags2,KindOverride) */
 	},
 	{
@@ -262,6 +274,21 @@ static const struct nvkvm_abi_profile nvkvm_abi_profiles[] = {
 		.vaspace_alloc_size = 56,
 		.mem_alloc_size = 128,
 		.nv00de_alloc_size = 8,
+		.tsg_alloc_size = 20,
+		.nvos46_size = 64,         .nvos46_status_off = 56,
+	},
+	{
+		/* 615.71.09 — measured.  NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS
+		 * gained reserved + internalFlags (20 -> 28); every other field
+		 * is identical to the 610 row. */
+		.id = NVKVM_ABI_615,
+		.uvm_map_ext_size = 9264,  .uvm_map_ext_fd_off = 9248,
+		.uvm_sem_pool_size = 9248,
+		.chan_alloc_size = 376,
+		.vaspace_alloc_size = 56,
+		.mem_alloc_size = 128,
+		.nv00de_alloc_size = 8,
+		.tsg_alloc_size = 28,      /* NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS_V615 */
 		.nvos46_size = 64,         .nvos46_status_off = 56,
 	},
 };
@@ -406,11 +433,16 @@ static inline unsigned nvkvm_abi_id_for_version(unsigned major, unsigned minor,
 	if (major < 610)
 		return NVKVM_ABI_580;
 
-	/* 610.57.04 measured.  Anything ABOVE 610 is an EXTRAPOLATION — NVIDIA
-	 * guarantees no ABI stability across releases, and this table has been
-	 * wrong in exactly this way before.  Re-run tools/abi_derive.sh when a new
-	 * branch appears and add a row rather than trusting this fallthrough. */
-	return NVKVM_ABI_610;
+	/* 610.43.02 .. 610.57.04 measured. */
+	if (major < 615)
+		return NVKVM_ABI_610;
+
+	/* 615.71.09 measured (TSG alloc 20 -> 28).  Anything ABOVE 615 is an
+	 * EXTRAPOLATION — NVIDIA guarantees no ABI stability across releases, and
+	 * this table has been wrong in exactly this way twice (610, then 615).
+	 * Re-run tools/abi_derive.sh when a new branch appears and add a row
+	 * rather than trusting this fallthrough. */
+	return NVKVM_ABI_615;
 }
 
 /* Major-only selection, kept for callers that genuinely have nothing else.

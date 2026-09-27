@@ -9,7 +9,7 @@ package abi_parity
 // #include "common/nvkvm_abi.h"
 // #include <stdlib.h>
 //
-// // Fill a 9-slot array in the same field order the test uses.
+// // Fill a 10-slot array in the same field order the test uses.
 // static void profile_for_version(const char *vs, unsigned *out) {
 //     const struct nvkvm_abi_profile *p = nvkvm_abi_for_version(vs);
 //     out[0] = p->uvm_map_ext_size;
@@ -21,6 +21,7 @@ package abi_parity
 //     out[6] = p->nv00de_alloc_size;
 //     out[7] = p->nvos46_size;
 //     out[8] = p->nvos46_status_off;
+//     out[9] = p->tsg_alloc_size;
 // }
 //
 // static unsigned profile_id_for_version(const char *vs) {
@@ -39,16 +40,16 @@ import "C"
 
 import "unsafe"
 
-// ProfileForVersion returns the nine profile fields nvkvm would use for a host
+// ProfileForVersion returns the ten profile fields nvkvm would use for a host
 // driver reporting the given version string, in the order named by fieldNames.
-func ProfileForVersion(version string) [9]uint32 {
+func ProfileForVersion(version string) [10]uint32 {
 	cs := C.CString(version)
 	defer C.free(unsafe.Pointer(cs))
 
-	var buf [9]C.uint
+	var buf [10]C.uint
 	C.profile_for_version(cs, &buf[0])
 
-	var out [9]uint32
+	var out [10]uint32
 	for i := range buf {
 		out[i] = uint32(buf[i])
 	}

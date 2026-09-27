@@ -2514,7 +2514,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 				ap_size = nvkvm_prof()->mem_alloc_size;     /* #81 */
 				break;
 			case KEPLER_CHANNEL_GROUP_A:
-				ap_size = sizeof(struct nv_channel_group_allocation_parameters);
+				ap_size = nvkvm_prof()->tsg_alloc_size;     /* V615: 20 -> 28 */
 				break;
 			case FERMI_CONTEXT_SHARE_A:
 				ap_size = sizeof(struct nv_ctxshare_allocation_parameters);
@@ -2673,7 +2673,7 @@ static long nvkvm_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 					ap_size = nvkvm_prof()->mem_alloc_size;     /* #81 */
 					break;
 				case KEPLER_CHANNEL_GROUP_A:
-					ap_size = sizeof(struct nv_channel_group_allocation_parameters);
+					ap_size = nvkvm_prof()->tsg_alloc_size;     /* V615: 20 -> 28 */
 					break;
 				case FERMI_CONTEXT_SHARE_A:
 					ap_size = sizeof(struct nv_ctxshare_allocation_parameters);

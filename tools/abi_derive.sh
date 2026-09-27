@@ -25,7 +25,7 @@
 #   tools/abi_derive.sh --jobs 4            # parallel tags (default: nproc, max 8)
 #   tools/abi_derive.sh --work DIR --keep   # keep the clones + probe errors
 #   tools/abi_derive.sh --reference-check   # only the 5 rows nvkvm_abi.h cites
-#   tools/abi_derive.sh --all-published-supported # every numeric 515..610 tag
+#   tools/abi_derive.sh --all-published-supported # every numeric 515..615 tag
 #
 # Env equivalents: OGKM_TAGS, OGKM_WORK, OGKM_JOBS.
 set -uo pipefail
@@ -57,6 +57,7 @@ DEFAULT_TAGS="
 590.44.01 590.48.01
 595.44.02 595.91.07
 610.43.02 610.57.04
+615.71.09
 "
 
 # The five rows nvkvm_abi.h says it was built from.  --reference-check re-derives
@@ -93,10 +94,10 @@ if [ "$ALL_PUBLISHED_SUPPORTED" -eq 1 ]; then
 	TAGS=$(printf '%s\n' "$remote_tags" |
 		awk '{ sub("refs/tags/", "", $2); print $2 }' |
 		grep -E '^[0-9]+(\.[0-9]+){1,2}$' |
-		awk -F. '$1 >= 515 && $1 <= 610' |
+		awk -F. '$1 >= 515 && $1 <= 615' |
 		sort -V)
 	[ -n "$TAGS" ] || {
-		echo "abi_derive.sh: official tag query returned no numeric 515..610 tags" >&2
+		echo "abi_derive.sh: official tag query returned no numeric 515..615 tags" >&2
 		exit 1
 	}
 fi
@@ -149,6 +150,7 @@ mem_alloc_size|nvtypes.h,nvos.h|sizeof(NV_MEMORY_ALLOCATION_PARAMS)
 nv00de_alloc_size|nvtypes.h,nvos.h,class/cl00de.h|sizeof(NV00DE_ALLOC_PARAMETERS)
 nvos46_size|nvtypes.h,nvos.h|sizeof(NVOS46_PARAMETERS)
 nvos46_status_off|nvtypes.h,nvos.h|offsetof(NVOS46_PARAMETERS, status)
+tsg_alloc_size|nvtypes.h,nvos.h|sizeof(NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS)
 nvos32_osdesc_desc_off|nvtypes.h,nvos.h|offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.descriptor)
 nvos32_osdesc_limit_off|nvtypes.h,nvos.h|offsetof(NVOS32_PARAMETERS, data.AllocOsDesc.limit)
 F
