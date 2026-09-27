@@ -236,7 +236,11 @@ Two notes on the boundaries:
 - **615 grew a struct the table did not track.** `NV_CHANNEL_GROUP_ALLOCATION_PARAMETERS`
   (`KEPLER_CHANNEL_GROUP_A`) went 20 → 28 bytes at 615.71.09. The guest forwarded
   `sizeof` of its own 20-byte mirror, so every probed profile field agreed and the
-  sweep stayed green while a 615 host received a truncated TSG alloc. It is now the
+  sweep stayed green while a 615 host received a truncated TSG alloc. The
+  truncation was **latent, not observed**: on 2026-09-27 unfixed main passed
+  validate.sh 37/37 on 615.71.09 (RTX 3060), most likely because the two
+  appended fields are zero on the paths the suite exercises (mechanism not
+  traced). It is now the
   `tsg_alloc_size` profile field, and `abi_derive.sh` measures it at every tag. The
   lesson: a class whose alloc size is a `sizeof` in the guest is invisible to this
   table; before adding a branch, also diff every struct the guest sizes directly.
