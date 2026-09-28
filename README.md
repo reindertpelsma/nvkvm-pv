@@ -228,7 +228,7 @@ ioctl allowlist model, object tracking and frontend handling, and from
 attribution is in [`CREDITS`](CREDITS).
 
 Two other public non-vendor efforts at driver-level NVIDIA GPU virtualization
-are worth reading: [`nestrilabs/virtio-nvgpu`](https://github.com/nestrilabs/virtio-nvgpu)
+are worth reading: [`nestrilabs/virtio-nvgpu`](https://github.com/nestrilabs/virtio-nvgpu), [`UniStuttgart-IKR/Leandro`](https://github.com/UniStuttgart-IKR/Leandro)
 and [`straylight-software/isospin-microvm`](https://github.com/straylight-software/isospin-microvm).
 
 ## Licence
