@@ -32,6 +32,14 @@
  *     p <0|1>                     pointer leave/enter
  *     c                           complete the current clipboard fetch
  *     s                           attempt a cancelled client's stale fetch
+ *     d <major> <minor> <flags>   the display moved to another DRM device
+ *                                 (flags = NVKVM_BROKER_DEVICE_F_*); a real
+ *                                 backend learns this from the compositor
+ *
+ * The guest cursor is "shown" by logging exactly what a real backend would
+ * put up -- size, hot spot, generation and a hash of the pixels -- or that it
+ * would show none, which is what a test needs to tell "applied" from
+ * "refused" from "coalesced away".
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -65,7 +73,40 @@ struct nb_test {
     bool     fetch_pending;
     uint64_t fetch_generation;
     uint64_t stale_fetch_generation;
+    /* The core's cursor state, as a real backend keeps the pointer to it. */
+    const struct nb_cursor *cursor;
 };
+
+/*
+ * Log what a real backend would now show over the guest's picture.  The
+ * decision is the SHARED one (nb_cursor_wanted) with this backend's own grab
+ * state, which is exactly the call the Wayland and X11 backends make -- so the
+ * selftest exercises the policy they run, not a copy of it.
+ */
+static void test_cursor_show(struct nb_test *t)
+{
+    const struct nb_cursor *c = t->cursor;
+
+    if (!c) {
+        return;
+    }
+    if (nb_cursor_wanted(c, t->grabbed)) {
+        nb_log("TEST cursor: shown %ux%u hot %u,%u gen %u hash 0x%08x",
+               c->w, c->h, c->hot_x, c->hot_y, c->gen, nb_cursor_hash(c));
+    } else {
+        nb_log("TEST cursor: none (%s)",
+               !c->defined ? "no image" :
+               !c->visible ? "hidden" : "grabbed");
+    }
+}
+
+static void test_cursor(struct nb_session *s, const struct nb_cursor *cur)
+{
+    struct nb_test *t = s->priv;
+
+    t->cursor = cur;
+    test_cursor_show(t);
+}
 
 static int test_pollfds(struct nb_session *s, struct pollfd *out, int max)
 {
@@ -120,10 +161,10 @@ static void test_finish_stale_fetch(struct nb_test *t, struct nb_sink *sink)
 static void test_line(struct nb_session *s, struct nb_sink *sink,
                       const char *line)
 {
-    int a = 0, b = 0;
+    int a = 0, b = 0, f = 0;
     char c = 0;
 
-    if (sscanf(line, " %c %d %d", &c, &a, &b) < 1) {
+    if (sscanf(line, " %c %d %d %d", &c, &a, &b, &f) < 1) {
         return;
     }
     switch (c) {
@@ -136,6 +177,12 @@ static void test_line(struct nb_session *s, struct nb_sink *sink,
     case 'p': nb_sink_pointer(sink, a != 0); break;
     case 'c': test_finish_fetch(s->priv, sink, (unsigned)a); break;
     case 's': test_finish_stale_fetch(s->priv, sink); break;
+    case 'd':
+        s->dev_flags = (uint32_t)f;
+        s->dev_major = (uint32_t)a;
+        s->dev_minor = (uint32_t)b;
+        nb_sink_device_changed(sink);
+        break;
     default: break;
     }
 }
@@ -229,6 +276,9 @@ static int test_set_grab(struct nb_session *s, bool on)
     struct nb_test *t = s->priv;
 
     t->grabbed = on;
+    /* The grab hides the guest's cursor and its end restores it; say which,
+     * so the selftest can see the transition the real backends make. */
+    test_cursor_show(t);
     return 0;
 }
 
@@ -301,7 +351,10 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
               NVKVM_BROKER_CAP_REL_POINTER | NVKVM_BROKER_CAP_POINTER_LOCK |
               NVKVM_BROKER_CAP_TOTAL_GRAB | NVKVM_BROKER_CAP_FOCUS_EVENTS |
               NVKVM_BROKER_CAP_FULLSCREEN | NVKVM_BROKER_CAP_DMABUF |
-              NVKVM_BROKER_CAP_MODIFIERS | NVKVM_BROKER_CAP_RELEASE;
+              NVKVM_BROKER_CAP_MODIFIERS | NVKVM_BROKER_CAP_RELEASE |
+              NVKVM_BROKER_CAP_CURSOR;
+    /* No display, so no device: "unknown" until a `d` line says otherwise,
+     * which is a valid EV_DEVICE answer in its own right. */
     snprintf(s->grab_caveat, sizeof(s->grab_caveat),
              "THIS IS THE TEST BACKEND: nothing is displayed and no real input "
              "is captured");
@@ -327,6 +380,7 @@ static const struct nb_session_ops test_ops = {
     .client_detach = test_client_detach,
     .set_clipboard = test_set_clipboard,
     .fetch_clipboard = test_fetch_clipboard,
+    .cursor = test_cursor,
 };
 
 struct nb_session *nb_session_test(const struct nb_config *cfg)

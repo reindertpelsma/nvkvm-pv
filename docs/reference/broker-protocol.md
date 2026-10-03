@@ -21,8 +21,8 @@ contain a bug conditional on it.
 
 | offset | field | notes |
 |---|---|---|
-| 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3 |
-| 2 | `uint16 reserved0` | must be 0 |
+| 0 | `uint16 type` | `ATTACH` 1, `COMMIT` 2, `WINDOW` 3, `CLIPBOARD` 4, `CAPS` 5, `QUERY_FORMAT` 6, `CURSOR` 7 |
+| 2 | `uint16 flags` | was `reserved0`; `ATTACH` may set `F_SHM` (bit 0), every other bit and every other command must leave it 0 |
 | 4 | `uint32 width` | |
 | 8 | `uint32 height` | |
 | 12 | `uint32 stride` | bytes per row of plane 0 |
@@ -42,6 +42,13 @@ contain a bug conditional on it.
 - **`WINDOW`** asks for a window of `width`×`height` on guest resolution
   change. It is a request: the window manager may ignore it, and the size that
   actually took effect comes back as `EV_SURFACE`.
+- **`CLIPBOARD`**, **`CAPS`** and **`QUERY_FORMAT`** are described in full in
+  `src/common/nvkvm_broker_proto.h`; `CLIPBOARD` overlays its own layout on the
+  40 bytes (`struct nvkvm_broker_clip_cmd`).
+- **`CURSOR`** (7) overlays `struct nvkvm_broker_cursor_cmd`; see
+  [The guest cursor](#the-guest-cursor-cmd_cursor-7) below. Send it only when
+  `HELLO` advertised `CAP_CURSOR`: a broker that did not is entitled to treat
+  it as the unknown command it is to an older one, and hangs up.
 
 Single-plane only, on purpose: the nvkvm guest head advertises XRGB8888 and
 ARGB8888 (`src/guest/nvkvm_kms.c`), both single-plane, so multi-plane support
@@ -67,13 +74,125 @@ rejected as an unadvertised fourcc.
 | `FOCUS` 11 | `x` = 1 active / 0 inactive. While 0 no input at all is sent. |
 | `POINTER` 12 | `x` = 1 pointer over the window |
 | `BYE` 13 | `x` = reason (0 shutdown, 1 display lost, 2 protocol) |
+| `CLOSE` 14 | the user closed the display; `x` = 0 powerdown, 1 force. Policy is the VMM's. |
+| `CLIPBOARD` 15 | one chunk of host clipboard text (`struct nvkvm_broker_clip_pkt`) |
+| `FORMAT` 16 | `x` = 1 displayable / 0 not, `y` = fourcc, `w0`,`w1` = modifier low/high. The answer to `QUERY_FORMAT` -- **and also sent unsolicited with `x` = 0** when the display refuses an import it had advertised; see below. |
+| `DEVICE` 17 | `x` = `DEVICE_F_*`, `y` = 0, `w0`:`w1` = the display's DRM device major:minor. See below. |
 
 `flags` mirrors grab and focus state on **every** packet, so the client can
 never disagree with the broker about it whatever it did with the `GRAB` event.
 
-Capability bits in `HELLO.w1`: `KEYBOARD`, `ABS_POINTER`, `REL_POINTER`,
-`POINTER_LOCK`, `TOTAL_GRAB`, `FOCUS_EVENTS`, `FULLSCREEN`, `DMABUF`,
-`MODIFIERS`, `RELEASE`.
+Capability bits in `HELLO.w1`: `KEYBOARD` (bit 0), `ABS_POINTER` (1),
+`REL_POINTER` (2), `POINTER_LOCK` (3), `TOTAL_GRAB` (4), `FOCUS_EVENTS` (5),
+`FULLSCREEN` (6), `DMABUF` (7), `MODIFIERS` (8), `RELEASE` (9), `CURSOR` (10),
+`DEVICE` (11).
+
+### The handshake, in order
+
+`HELLO`, `SURFACE`, `FOCUS`, `GRAB`, `FRAME` -- then, from a broker that sets
+`CAP_DEVICE`, `DEVICE`. The first five are byte-for-byte what every earlier
+version sent, so a client that reads exactly five packets and starts drawing
+keeps working; `DEVICE` is appended, not inserted. All six are written in one
+burst at attach, so a relay that wants the device before its first frame reads
+what is already buffered before acting on the `FRAME`.
+
+### The guest cursor (`CMD_CURSOR`, 7)
+
+Advertised by `CAP_CURSOR`. The guest's pointer image, shown as the **host**
+pointer while the pointer hovers over the guest's picture and the input is
+**not** grabbed. Under grab the broker hides it whatever the VMM sent -- the
+pointer is locked and the guest's pointer moves by relative motion, so the VMM
+composes the cursor into the frame (it knows grab state from `EV_GRAB` and from
+`F_GRABBED` on every packet). The broker keeps the image and puts it back the
+moment the grab ends. An XOR cursor cannot be expressed in ARGB; the VMM
+composes that one into the frame and sends `HIDE`.
+
+`struct nvkvm_broker_cursor_cmd`, exactly 40 bytes, little-endian. The buffer
+description sits at the same offsets as `ATTACH`'s (asserted in the header):
+
+| offset | field | `SET` | `HIDE` / `SHOW` |
+|---|---|---|---|
+| 0 | `uint16 type` | 7 | 7 |
+| 2 | `uint16 flags` | 0 | 0 |
+| 4 | `uint32 width` | 1..256 | 0 |
+| 8 | `uint32 height` | 1..256 | 0 |
+| 12 | `uint32 stride` | `width*4` .. 1024, bytes | 0 |
+| 16 | `uint32 offset` | byte offset of row 0 in the memfd | 0 |
+| 20 | `uint32 fourcc` | `DRM_FORMAT_ARGB8888` (`'AR24'`, 0x34325241) only | 0 |
+| 24 | `uint32 hot_x` | `< width` | 0 |
+| 28 | `uint32 hot_y` | `< height` | 0 |
+| 32 | `uint32 op` | `SET` = 1 | `HIDE` = 2, `SHOW` = 3 |
+| 36 | `uint32 reserved1` | 0 | 0 |
+
+- **`SET`** carries exactly one fd as `SCM_RIGHTS`: a **memfd** (any shmem
+  file; it is proved with `fstatfs` == `TMPFS_MAGIC` *and* `F_GET_SEALS`
+  succeeding, because `/dev` is devtmpfs and reports `TMPFS_MAGIC` too). The
+  broker requires `offset + stride*(height-1) + width*4 <= st_size`, computed
+  in 64 bits -- the last row needs only its pixels, not a whole stride --
+  **copies those rows out with `pread(2)`**, and closes its copy of the fd. It
+  never maps the fd, so no seal is demanded: a memfd truncated under the read
+  is a short read and a refused cursor, never a `SIGBUS`. The compositor is
+  never handed the VMM's fd; it gets the broker's scaled copy. `SET` also
+  makes the cursor visible.
+- **`HIDE`**: no host pointer over the picture -- exactly the state before any
+  `CURSOR` was sent. **`SHOW`**: the last `SET` image again; before any `SET` on
+  this connection it changes nothing visible.
+- **Pixels**: 32-bit little-endian words, A in bits 31..24, R 23..16, G 15..8,
+  B 7..0 (so B,G,R,A in memory), **premultiplied** alpha -- DRM's default
+  "Pre-multiplied" blend mode, which is what a KMS cursor plane buffer already
+  holds. The broker clamps every colour channel to its alpha while copying, so
+  a non-premultiplied image costs wrong colours, never a malformed buffer in
+  the compositor.
+- **Scaled with the frame**: image and hot spot are scaled by the factor the
+  broker applies to the guest's frame in the window (rounded to nearest, at
+  least 1 pixel, at most 512 per edge with the aspect kept), so the cursor is
+  exactly as large relative to the guest's picture as the guest drew it.
+- **Refused, not fatal**: a `SET` whose content is wrong -- fourcc, size, hot
+  spot, stride, an extent past the fd's end, an fd that is not shmem -- is
+  dropped, counted and logged (rate-limited), the previous cursor stays, and
+  the connection lives: the geometry comes from the guest, and a guest flipping
+  nonsense must not kill the display of a VMM that is behaving.
+- **Violations**: unknown `op`, non-zero `flags` or `reserved1`, a `SET`
+  without an fd, an fd on `HIDE`/`SHOW`, any non-zero image field on
+  `HIDE`/`SHOW`, more than one fd -- `BYE` reason 2 and the connection is
+  closed, as for every other framing error.
+- **Paced**: a changed cursor reaches the display server at most once per
+  8 ms, latest wins, and the latest is always applied. A burst of `SET`s is
+  legal and costs the display a bounded number of uploads.
+- **Connection state**: forgotten on detach, so a `--persist` broker never
+  shows one VM's pointer over the next VM's picture or over the placeholder.
+
+### `EV_DEVICE` (17)
+
+Advertised by `CAP_DEVICE`, which every backend of a broker that knows the
+type sets -- so *"too old to say"* (no bit) and *"could not tell"* (`x` = 0)
+are different answers.
+
+| field | meaning |
+|---|---|
+| `x` | `DEVICE_F_KNOWN` (bit 0): `w0`:`w1` are meaningful. `DEVICE_F_RENDER` (bit 1): they name a **render node** (`renderD*`), as the display reported it or as the broker resolved the reported node through `/sys/dev/char/M:m/device/drm`. `KNOWN` without `RENDER` means it could not be resolved -- compare with care. |
+| `y` | 0. Deliberately not "where it came from": that would name the backend, and the VMM must not be able to tell Wayland from X11. |
+| `w0`, `w1` | major, minor of the DRM character device |
+
+Where it comes from: Wayland -- `zwp_linux_dmabuf_feedback_v1.main_device` from
+a second `zwp_linux_dmabuf_v1` object bound at version 4 (the one the validator
+uses stays at 3, because version 4 stops the format/modifier events); X11 --
+`fstat` of the fd `DRI3Open` hands back, closed at once. Re-sent, unsolicited,
+whenever the display server reports a different device. A hint for choosing a
+present path, never a gate: every `ATTACH` is validated as if it had not been
+sent. It discloses the host compositor's DRM device number to the VMM -- a
+deliberate, small disclosure, recorded in
+[`../internal/broker-design.md`](../internal/broker-design.md) §3.
+
+### An unsolicited `EV_FORMAT` `x` = 0 takes a yes back
+
+Both backends send one when the display refuses to import a pair it had
+advertised: Wayland when the asynchronous probe answers `failed`, X11 when
+`DRI3PixmapFromBuffer(s)` answers with an X error. From then on `QUERY_FORMAT`
+for that pair answers `x` = 0 as well -- on X11 for both alpha twins, since DRI3
+imports XR24 and AR24 identically. A relay must accept a **later** `x` = 0 for
+a pair it holds `x` = 1 for, and must never treat an unsolicited `x` = 1 as an
+upgrade.
 
 ### Backpressure, and the rule it enforces
 

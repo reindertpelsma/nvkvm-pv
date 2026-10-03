@@ -43,6 +43,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/sysmacros.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #include "nvkvm_broker.h"
@@ -170,6 +172,24 @@ struct nb_wl_buf {
 #define NB_FOURCC_AR24_LOCAL 0x34325241u
 
 #define NB_PROVEN_SLOTS 4
+
+/*
+ * THE GUEST'S CURSOR, double-buffered.  Two slots of one broker-owned shm pool,
+ * each big enough for the largest scaled cursor, so a new image is drawn into
+ * the slot the compositor is NOT reading while the other stays on screen.
+ * The broker never hands the compositor the VMM's memfd: these pixels are the
+ * core's validated copy, scaled here.
+ */
+#define NB_GC_SLOTS     2
+#define NB_GC_SLOT_PX   ((size_t)NB_CURSOR_SCALED_MAX * NB_CURSOR_SCALED_MAX)
+#define NB_GC_SLOT_BYTES (NB_GC_SLOT_PX * 4u)
+
+struct nb_wl;
+struct nb_wl_gcslot {
+    struct nb_wl     *w;
+    struct wl_buffer *buf;
+    bool              busy;     /* committed and not yet released */
+};
 
 struct nb_wl {
     struct wl_display    *dpy;
@@ -430,6 +450,35 @@ struct nb_wl {
 
     struct nb_formats formats;
 
+    /*
+     * THE GUEST'S CURSOR (CMD_CURSOR), shown as OUR pointer image over the
+     * content surface in hover mode.  `gcur` is the core's state (see
+     * struct nb_cursor); everything else here is what we last rendered from
+     * it, so a frame whose scale did not change costs one comparison.
+     */
+    const struct nb_cursor *gcur;
+    struct wl_surface      *gc_surf;
+    struct wl_shm_pool     *gc_pool;
+    uint32_t               *gc_px;      /* NB_GC_SLOTS slots, mapped      */
+    struct nb_wl_gcslot     gc_slot[NB_GC_SLOTS];
+    bool                    gc_valid;   /* gc_surf holds gc_gen at gc_geom */
+    uint32_t                gc_gen;
+    struct nb_cursor_geom   gc_geom;
+    bool                    gc_on;      /* the content's cursor IS gc_surf */
+    bool                    gc_starved; /* a re-render waits on a release  */
+    bool                    gc_broken;  /* allocation failed: show none    */
+
+    /*
+     * EV_DEVICE.  A SECOND zwp_linux_dmabuf_v1 object, bound at version 4,
+     * used for nothing but get_default_feedback's main_device: the first
+     * object stays at version 3 because version 4 stops the format/modifier
+     * events the whole validator is built on (see reg_global()).
+     */
+    struct zwp_linux_dmabuf_v1          *dmabuf_fb_obj;
+    struct zwp_linux_dmabuf_feedback_v1 *dmabuf_fb;
+    dev_t                                fb_dev;
+    bool                                 fb_have_dev;
+
     /* The sink is not reachable from Wayland callbacks otherwise.  NULL until
      * the first dispatch(), so every callback must tolerate that. */
     struct nb_sink *sink;
@@ -485,6 +534,9 @@ static void tb_update(struct nb_wl *w, int width);
 static void cur_build(struct nb_wl *w);
 /* Forward: hide or show the host cursor over the content, per what is on it. */
 static void cur_apply(struct nb_wl *w, uint32_t serial);
+/* Forward: re-run cur_apply() only if what the content's cursor should be has
+ * changed -- the guest's image, the frame's scale, or the grab. */
+static void gc_refresh(struct nb_wl *w);
 /* Forward: the clipboard notice needs a clock and lives with the clipboard. */
 static uint64_t nb_now_ms_wl(void);
 /* Forward: the invisible resize borders, laid out on every size change. */
@@ -535,6 +587,10 @@ static void wl_buf_destroy(struct nb_wl *w, int i)
 
 /* ── ops: format policy ──────────────────────────────────────────────────── */
 
+/* Forward: the proven/refused table lives with the import code below. */
+static int wl_pair_slot(struct nb_wl *w, uint32_t fourcc, uint64_t mod,
+                        bool create);
+
 static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
 {
     struct nb_wl *w = s->priv;
@@ -548,6 +604,21 @@ static bool wl_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
     if (!(s->caps & NVKVM_BROKER_CAP_MODIFIERS)) {
         return mod == NB_DRM_FORMAT_MOD_INVALID &&
                nb_formats_has(&w->formats, fourcc, NB_DRM_FORMAT_MOD_INVALID);
+    }
+    /*
+     * ADVERTISED, THEN REFUSED, IS NO.  Once the probe has proved the display
+     * cannot bind this pair, wl_attach() rejects every frame in it -- so
+     * QUERY_FORMAT must say no as well, or "x=1 is the same judgement ATTACH
+     * would make" stops being true for exactly the pair the VMM most needs an
+     * honest answer about.  Before this, a relay that re-asked after the
+     * unsolicited x=0 was told yes again.
+     */
+    {
+        int i = wl_pair_slot(w, fourcc, mod, false);
+
+        if (i >= 0 && w->proven[i].state == -1) {
+            return false;
+        }
     }
     return nb_formats_has(&w->formats, fourcc, mod);
 }
@@ -1155,6 +1226,12 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
     }
     w->current = w->pending;
     w->pending = -1;
+    /*
+     * The guest's cursor is scaled by the same factor as the frame, so a frame
+     * whose size or destination changed may need it redrawn.  One comparison
+     * when nothing did, which is every frame of a steady stream.
+     */
+    gc_refresh(w);
     /*
      * RECORD WHAT WE PRESENTED.  DO NOT REPORT IT.
      *
@@ -1918,6 +1995,240 @@ static const struct wp_fractional_scale_v1_listener frac_listener = {
     .preferred_scale = frac_scale,
 };
 
+/* ── the guest's cursor (CMD_CURSOR) ─────────────────────────────────────── */
+
+/*
+ * The frame's scale, as the cursor must follow it: the viewport destination
+ * over the guest's buffer.  1:1 without a viewport, where the surface IS the
+ * buffer.  Both sides are in the same logical units the cursor surface is
+ * measured in, so the guest's pointer comes out exactly as large, relative to
+ * the guest's picture, as the guest drew it.
+ */
+static void gc_geom_now(const struct nb_wl *w, struct nb_cursor_geom *g)
+{
+    uint32_t nx = 1, dx = 1, ny = 1, dy = 1;
+
+    if (w->viewport && w->buf_w > 0 && w->buf_h > 0 &&
+        w->fit_w > 0 && w->fit_h > 0) {
+        nx = (uint32_t)w->fit_w;
+        dx = (uint32_t)w->buf_w;
+        ny = (uint32_t)w->fit_h;
+        dy = (uint32_t)w->buf_h;
+    }
+    nb_cursor_scaled_geom(w->gcur, nx, dx, ny, dy, NB_CURSOR_SCALED_MAX, g);
+}
+
+static bool gc_up_to_date(const struct nb_wl *w,
+                          const struct nb_cursor_geom *g)
+{
+    return w->gc_valid && w->gcur && w->gc_gen == w->gcur->gen &&
+           w->gc_geom.w == g->w && w->gc_geom.h == g->h &&
+           w->gc_geom.hot_x == g->hot_x && w->gc_geom.hot_y == g->hot_y;
+}
+
+static void gc_buf_release(void *data, struct wl_buffer *b)
+{
+    struct nb_wl_gcslot *slot = data;
+    struct nb_wl *w = slot->w;
+
+    (void)b;
+    slot->busy = false;
+    /* A newer image was waiting for exactly this.  Re-run the decision now
+     * rather than at the next frame, which on an idle guest may be never. */
+    if (w->gc_starved) {
+        w->gc_starved = false;
+        gc_refresh(w);
+    }
+}
+static const struct wl_buffer_listener gc_buf_listener = {
+    .release = gc_buf_release,
+};
+
+/* One shm pool of NB_GC_SLOTS slots and the surface they are shown on,
+ * allocated the first time a guest cursor is actually shown. */
+static bool gc_ensure(struct nb_wl *w)
+{
+    const size_t sz = NB_GC_SLOTS * NB_GC_SLOT_BYTES;
+    uint32_t *px;
+    int fd, i;
+
+    if (w->gc_pool) {
+        return true;
+    }
+    if (w->gc_broken || !w->shm || !w->comp) {
+        return false;
+    }
+    fd = memfd_create("nvkvm-broker-guest-cursor", MFD_CLOEXEC);
+    if (fd < 0) {
+        goto broken;
+    }
+    if (ftruncate(fd, (off_t)sz) < 0) {
+        close(fd);
+        goto broken;
+    }
+    px = mmap(NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) {
+        close(fd);
+        goto broken;
+    }
+    w->gc_pool = wl_shm_create_pool(w->shm, fd, (int32_t)sz);
+    close(fd);
+    if (!w->gc_pool) {
+        munmap(px, sz);
+        goto broken;
+    }
+    w->gc_surf = wl_compositor_create_surface(w->comp);
+    if (!w->gc_surf) {
+        wl_shm_pool_destroy(w->gc_pool);
+        w->gc_pool = NULL;
+        munmap(px, sz);
+        goto broken;
+    }
+    w->gc_px = px;
+    for (i = 0; i < NB_GC_SLOTS; i++) {
+        w->gc_slot[i].w = w;
+    }
+    return true;
+
+broken:
+    /*
+     * Once, and then stop trying: a broker that cannot allocate 2 MiB will
+     * not manage it on the next pointer motion either, and retrying per event
+     * is a log flood for nothing.  The fallback is the old behaviour -- no
+     * host pointer over the picture -- which the VMM covers by composing.
+     */
+    nb_err("guest cursor: could not allocate its shared-memory buffer (%s); "
+           "the guest's pointer will not be shown as the host's",
+           strerror(errno));
+    w->gc_broken = true;
+    return false;
+}
+
+/*
+ * Make gc_surf hold the guest's image at the frame's current scale.  True when
+ * it does -- freshly drawn, already drawn, or (both slots still held by the
+ * compositor) the previous image, which a release will replace.
+ */
+static bool gc_render(struct nb_wl *w)
+{
+    const struct nb_cursor *c = w->gcur;
+    struct nb_cursor_geom g;
+    struct wl_buffer *buf;
+    uint32_t *px;
+    int i, slot = -1;
+
+    if (!c || !c->defined) {
+        return false;
+    }
+    gc_geom_now(w, &g);
+    if (gc_up_to_date(w, &g)) {
+        return true;
+    }
+    if (!gc_ensure(w)) {
+        return false;
+    }
+    for (i = 0; i < NB_GC_SLOTS; i++) {
+        if (!w->gc_slot[i].busy) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        /* Never draw into a buffer the compositor may still be reading. */
+        w->gc_starved = true;
+        return w->gc_valid;
+    }
+    if (w->gc_slot[slot].buf) {
+        wl_buffer_destroy(w->gc_slot[slot].buf);
+        w->gc_slot[slot].buf = NULL;
+    }
+    /* g.w, g.h <= NB_CURSOR_SCALED_MAX, so this fits the slot by construction
+     * (nb_cursor_scaled_geom() guarantees it; test_cursor.c checks it) -- and
+     * is checked again here, where the write is, so no later change to the
+     * geometry code can make it a write past the slot. */
+    if (g.w == 0 || g.h == 0 || (size_t)g.w * g.h > NB_GC_SLOT_PX) {
+        return w->gc_valid;
+    }
+    px = w->gc_px + (size_t)slot * NB_GC_SLOT_PX;
+    nb_cursor_scale(c, px, g.w, g.h);
+    buf = wl_shm_pool_create_buffer(w->gc_pool,
+                                    (int32_t)((size_t)slot * NB_GC_SLOT_BYTES),
+                                    (int32_t)g.w, (int32_t)g.h,
+                                    (int32_t)(g.w * 4u),
+                                    WL_SHM_FORMAT_ARGB8888);
+    if (!buf) {
+        return w->gc_valid;
+    }
+    wl_buffer_add_listener(buf, &gc_buf_listener, &w->gc_slot[slot]);
+    w->gc_slot[slot].buf = buf;
+    w->gc_slot[slot].busy = true;
+    wl_surface_attach(w->gc_surf, buf, 0, 0);
+    wl_surface_damage_buffer(w->gc_surf, 0, 0, (int32_t)g.w, (int32_t)g.h);
+    wl_surface_commit(w->gc_surf);
+    w->gc_valid = true;
+    w->gc_gen = c->gen;
+    w->gc_geom = g;
+    return true;
+}
+
+static void gc_refresh(struct nb_wl *w)
+{
+    bool want;
+
+    if (!w->ptr || !w->ptr_on_content) {
+        return;     /* not our pointer to set; ptr_enter will decide */
+    }
+    want = !w->dlg_open && w->current >= 0 &&
+           nb_cursor_wanted(w->gcur, w->grabbed);
+    if (!want && !w->gc_on) {
+        return;     /* nothing of ours is up and nothing should be */
+    }
+    if (want && w->gc_on) {
+        struct nb_cursor_geom g;
+
+        gc_geom_now(w, &g);
+        if (gc_up_to_date(w, &g)) {
+            return;
+        }
+    }
+    cur_apply(w, w->last_serial);
+}
+
+static void wl_cursor_op(struct nb_session *s, const struct nb_cursor *cur)
+{
+    struct nb_wl *w = s->priv;
+
+    w->gcur = cur;
+    gc_refresh(w);
+}
+
+static void gc_drop(struct nb_wl *w)
+{
+    int i;
+
+    for (i = 0; i < NB_GC_SLOTS; i++) {
+        if (w->gc_slot[i].buf) {
+            wl_buffer_destroy(w->gc_slot[i].buf);
+            w->gc_slot[i].buf = NULL;
+        }
+        w->gc_slot[i].busy = false;
+    }
+    if (w->gc_pool) {
+        wl_shm_pool_destroy(w->gc_pool);
+        w->gc_pool = NULL;
+    }
+    if (w->gc_surf) {
+        wl_surface_destroy(w->gc_surf);
+        w->gc_surf = NULL;
+    }
+    if (w->gc_px) {
+        munmap(w->gc_px, NB_GC_SLOTS * NB_GC_SLOT_BYTES);
+        w->gc_px = NULL;
+    }
+    w->gc_valid = false;
+    w->gc_on = false;
+}
+
 /*
  * The host cursor over the CONTENT surface, hidden or shown by what is
  * actually on it.  Called on pointer entry and again whenever the content
@@ -1931,6 +2242,7 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
         return;
     }
     cur_build(w);
+    w->gc_on = false;
     if (w->dlg_open) {
         /*
          * THE DIALOG IS HOST UI AND ALWAYS HAS A POINTER, exactly like the
@@ -1941,8 +2253,23 @@ static void cur_apply(struct nb_wl *w, uint32_t serial)
          */
         wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
     } else if (w->current >= 0) {
-        /* Guest content: it composites its own cursor, so ours must go. */
-        wl_pointer_set_cursor(w->ptr, serial, NULL, 0, 0);
+        /*
+         * Guest content.  THE GUEST'S OWN IMAGE when the VMM has sent one
+         * (CMD_CURSOR) and the input is not grabbed: hover mode, where the
+         * host pointer and the guest's absolute pointer are the same point,
+         * so drawing the guest's shape there is drawing it where the guest
+         * would.  Otherwise none: the guest -- or, under grab, the VMM --
+         * composites the cursor into the frame, and a host pointer as well
+         * would be two cursors a few pixels apart.
+         */
+        if (nb_cursor_wanted(w->gcur, w->grabbed) && gc_render(w)) {
+            wl_pointer_set_cursor(w->ptr, serial, w->gc_surf,
+                                  (int32_t)w->gc_geom.hot_x,
+                                  (int32_t)w->gc_geom.hot_y);
+            w->gc_on = true;
+        } else {
+            wl_pointer_set_cursor(w->ptr, serial, NULL, 0, 0);
+        }
     } else {
         /* The placeholder.  Nothing is drawing a cursor into it. */
         wl_pointer_set_cursor(w->ptr, serial, w->cur_surf[NB_CUR_ARROW], 0, 0);
@@ -2696,6 +3023,7 @@ static void ptr_leave(void *d, struct wl_pointer *p, uint32_t serial,
     struct nb_wl *w = d;
 
     w->ptr_on_content = false;
+    w->gc_on = false;           /* the pointer left; the surface is not ours */
 
     if (bd_index(w, s) >= 0) {
         w->bd_hot = -1;
@@ -3079,6 +3407,7 @@ static void top_configure(void *d, struct xdg_toplevel *t, int32_t wd,
      * with the surface we just committed. */
     tb_update(w, w->win_w);
     bd_layout(w);
+    gc_refresh(w);              /* the frame's scale may just have changed */
     wl_display_flush(w->dpy);
     if (w->current < 0 && w->idle_wanted) {
         wl_show_idle(w->sess);  /* repaint the placeholder at the new size */
@@ -3533,6 +3862,87 @@ static const struct zxdg_toplevel_decoration_v1_listener deco_listener = {
 
 /* ── registry ────────────────────────────────────────────────────────────── */
 
+/* ── which GPU the compositor is on (EV_DEVICE) ──────────────────────────── */
+#ifdef ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION
+/*
+ * Default dma-buf feedback, consumed for ONE field.  The compositor sends the
+ * whole set -- main_device, a format table fd, tranches -- and then `done`;
+ * main_device is "the device the server prefers to use when direct scan-out
+ * isn't possible", i.e. where it composites and therefore where it imports.
+ *
+ * Every other event is drained and dropped, and the format table's fd is
+ * CLOSED: it arrives whether or not anyone wants it, and an fd per feedback
+ * update left open is a slow leak in a long-lived process.
+ */
+static void fb_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
+{
+    struct nb_wl *w = d;
+    struct nb_session *s = w->sess;
+    uint32_t flags, maj, min;
+
+    (void)f;
+    if (!w->fb_have_dev) {
+        return;
+    }
+    w->fb_have_dev = false;
+    nb_drm_device_resolve(major(w->fb_dev), minor(w->fb_dev), &flags, &maj,
+                          &min);
+    if (flags == s->dev_flags && maj == s->dev_major && min == s->dev_minor) {
+        return;     /* a re-sent batch that changed something else */
+    }
+    s->dev_flags = flags;
+    s->dev_major = maj;
+    s->dev_minor = min;
+    if (s->sink) {
+        nb_sink_device_changed(s->sink);
+    } else {
+        nb_log("the compositor imports on DRM device %u:%u%s", maj, min,
+               (flags & NVKVM_BROKER_DEVICE_F_RENDER) ? " (render node)" : "");
+    }
+}
+static void fb_format_table(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                            int32_t fd, uint32_t size)
+{
+    (void)d; (void)f; (void)size;
+    close(fd);
+}
+static void fb_main_device(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                           struct wl_array *dev)
+{
+    struct nb_wl *w = d;
+
+    (void)f;
+    /* The protocol says the array holds exactly one dev_t.  The compositor is
+     * the user's own session and not the adversary here, but a size we did not
+     * check is a size we would copy, so it is checked. */
+    if (!dev || dev->size != sizeof(dev_t)) {
+        return;
+    }
+    memcpy(&w->fb_dev, dev->data, sizeof(dev_t));
+    w->fb_have_dev = true;
+}
+static void fb_tranche_done(void *d, struct zwp_linux_dmabuf_feedback_v1 *f)
+{ (void)d; (void)f; }
+static void fb_tranche_target(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                              struct wl_array *dev)
+{ (void)d; (void)f; (void)dev; }
+static void fb_tranche_formats(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                               struct wl_array *idx)
+{ (void)d; (void)f; (void)idx; }
+static void fb_tranche_flags(void *d, struct zwp_linux_dmabuf_feedback_v1 *f,
+                             uint32_t flags)
+{ (void)d; (void)f; (void)flags; }
+static const struct zwp_linux_dmabuf_feedback_v1_listener fb_listener = {
+    .done = fb_done,
+    .format_table = fb_format_table,
+    .main_device = fb_main_device,
+    .tranche_done = fb_tranche_done,
+    .tranche_target_device = fb_tranche_target,
+    .tranche_formats = fb_tranche_formats,
+    .tranche_flags = fb_tranche_flags,
+};
+#endif
+
 static void reg_global(void *data, struct wl_registry *r, uint32_t name,
                        const char *iface, uint32_t ver)
 {
@@ -3573,6 +3983,28 @@ static void reg_global(void *data, struct wl_registry *r, uint32_t name,
         w->dmabuf = wl_registry_bind(r, name, &zwp_linux_dmabuf_v1_interface,
                                      w->dmabuf_ver);
         zwp_linux_dmabuf_v1_add_listener(w->dmabuf, &dmabuf_listener, w);
+#ifdef ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION
+        /*
+         * AND A SECOND OBJECT AT VERSION 4, for the device only.  Binding a
+         * global twice is ordinary Wayland -- each bind is its own object --
+         * and it is the only way to have both the v3 format/modifier events
+         * the validator needs and the v4 feedback that names the GPU.  The
+         * feedback arrives in the roundtrip wl_open() already makes for the
+         * format burst.
+         */
+        if (ver >= 4 && !w->dmabuf_fb_obj) {
+            w->dmabuf_fb_obj = wl_registry_bind(
+                r, name, &zwp_linux_dmabuf_v1_interface, 4);
+            if (w->dmabuf_fb_obj) {
+                w->dmabuf_fb = zwp_linux_dmabuf_v1_get_default_feedback(
+                    w->dmabuf_fb_obj);
+                if (w->dmabuf_fb) {
+                    zwp_linux_dmabuf_feedback_v1_add_listener(
+                        w->dmabuf_fb, &fb_listener, w);
+                }
+            }
+        }
+#endif
     } else if (!strcmp(iface,
                zwp_keyboard_shortcuts_inhibit_manager_v1_interface.name)) {
         w->inhibit_mgr =
@@ -3772,6 +4204,9 @@ static int wl_set_grab(struct nb_session *s, bool on)
         }
     }
     w->grabbed = on;
+    /* The guest's cursor goes with the grab and comes back with its end: under
+     * grab the VMM composes it into the frame instead. */
+    gc_refresh(w);
     /* The bar is the only thing on screen that can say how to get out. */
     tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
     /*
@@ -3836,6 +4271,17 @@ static void wl_close_session(struct nb_session *s)
     }
     wl_idle_drop(w);
     tb_drop(w);
+    gc_drop(w);
+#ifdef ZWP_LINUX_DMABUF_V1_GET_DEFAULT_FEEDBACK_SINCE_VERSION
+    if (w->dmabuf_fb) {
+        zwp_linux_dmabuf_feedback_v1_destroy(w->dmabuf_fb);
+        w->dmabuf_fb = NULL;
+    }
+#endif
+    if (w->dmabuf_fb_obj) {
+        zwp_linux_dmabuf_v1_destroy(w->dmabuf_fb_obj);
+        w->dmabuf_fb_obj = NULL;
+    }
     for (i = 0; i < NB_CUR_N; i++) {
         if (w->cur_buf[i]) {
             wl_buffer_destroy(w->cur_buf[i]);
@@ -4187,6 +4633,18 @@ static int wl_open(struct nb_session *s, const struct nb_config *cfg)
     } else {
         missing++;
     }
+    /* The guest's cursor needs nothing optional: wl_shm and a surface are core
+     * Wayland, and wl_pointer.set_cursor is how every client sets a pointer. */
+    if (w->shm && w->comp) {
+        s->caps |= NVKVM_BROKER_CAP_CURSOR;
+    }
+    if (!(s->dev_flags & NVKVM_BROKER_DEVICE_F_KNOWN)) {
+        nb_log("the compositor did not say which GPU it imports on (%s); "
+               "EV_DEVICE will report 'unknown'",
+               !w->dmabuf ? "it offers no zwp_linux_dmabuf_v1"
+               : w->dmabuf_fb_obj ? "its dma-buf feedback named no main device"
+                                  : "zwp_linux_dmabuf_v1 is below version 4");
+    }
 
     /* Say exactly what is missing, at startup, in one line. */
     if (missing) {
@@ -4255,6 +4713,7 @@ static const struct nb_session_ops wl_ops = {
     .resync = wl_resync,
     .notify_clipboard = wl_notify_clipboard,
     .fetch_clipboard = wl_fetch_clipboard,
+    .cursor = wl_cursor_op,
 };
 
 struct nb_session *nb_session_wayland(const struct nb_config *cfg)

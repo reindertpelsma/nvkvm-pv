@@ -46,6 +46,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #include "nvkvm_broker.h"
 
@@ -152,14 +154,36 @@ struct nb_x11 {
 #ifdef NB_HAVE_XCB_RENDER
     xcb_render_pictformat_t pict_fmt;   /* depth-24 format, 0 = no render */
     xcb_render_picture_t    dst_pic;    /* the content window as a Picture */
+    /* The standard ARGB32 format: what RenderCreateCursor needs for a cursor
+     * with real alpha.  0 = this server cannot show the guest's cursor, and
+     * NVKVM_BROKER_CAP_CURSOR is not advertised. */
+    xcb_render_pictformat_t argb_fmt;
+    xcb_gcontext_t          gc32;       /* PutImage into depth-32 pixmaps  */
 #endif
+    /*
+     * THE GUEST'S CURSOR (CMD_CURSOR).  `gcur` is the core's state; gc_cursor
+     * is the X cursor last built from it, and gc_gen/gc_geom say from what,
+     * so the per-frame policy call costs one comparison when nothing moved.
+     */
+    const struct nb_cursor *gcur;
+    xcb_cursor_t          gc_cursor;
+    uint32_t              gc_gen;
+    struct nb_cursor_geom gc_geom;
+    /*
+     * Pairs DRI3 refused to import after the server advertised them.  Kept so
+     * a known-bad pair costs no further blocking round trip, and so
+     * QUERY_FORMAT answers it honestly -- the Wayland backend's `proven`
+     * table, for this backend.
+     */
+    struct nb_refused     refused;
     bool      idle_shown;
     bool      client_attached;  /* a VMM is connected, frames or not      */
     uint64_t  last_frame_ms;    /* shm tier: when we last paced the VMM   */
     xcb_window_t dlg;           /* close-confirmation child, 0 = never made */
     bool      dlg_mapped;
     int       dlg_hot;          /* hovered row, -1 = none                 */
-    bool      cursor_hidden;    /* what the content window currently shows */
+    xcb_cursor_t content_cursor; /* the content window's CW_CURSOR now: NONE,
+                                   * blank_cursor, or gc_cursor              */
 };
 
 /* Clipboard: defined below the presentation code, used from the event loop. */
@@ -177,6 +201,8 @@ static int  x11_dlg_hit(int px, int py);
 static void x11_cursor_policy(struct nb_x11 *x);
 static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
                      const uint32_t *px, int w, int h);
+static void x11_put_image(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
+                          const uint32_t *px, int w, int h, uint8_t depth);
 static void x11_clip_serve(struct nb_x11 *x,
                            const xcb_selection_request_event_t *rq);
 static void x11_clip_receive(struct nb_x11 *x, struct nb_sink *sink,
@@ -224,6 +250,11 @@ static bool x11_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
 {
     struct nb_x11 *x = s->priv;
 
+    /* Advertised and then refused by DRI3 is NO, for QUERY_FORMAT and for
+     * ATTACH alike -- see x11_attach(). */
+    if (nb_refused_has(&x->refused, fourcc, mod)) {
+        return false;
+    }
     return nb_formats_has(&x->formats, fourcc, mod);
 }
 
@@ -520,9 +551,33 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
      */
     err = xcb_request_check(x->c, ck);
     if (err) {
-        nb_err("DRI3 pixmap import refused: X error %u (major %u minor %u)",
-               err->error_code, err->major_code, err->minor_code);
+        nb_err("DRI3 pixmap import refused: X error %u (major %u minor %u); "
+               "the VMM is being told %.4s modifier 0x%016llx is unusable here "
+               "so it can send something else",
+               err->error_code, err->major_code, err->minor_code,
+               (const char *)&d->fourcc, (unsigned long long)d->modifier);
         free(err);
+        /*
+         * SAY SO, the way the Wayland backend does when its probe fails.
+         *
+         * Until now this was a log line on OUR stderr and nothing on the
+         * wire: the VMM, which had been told x=1 by QUERY_FORMAT, kept
+         * sending the same pair and every frame went into the same refusal --
+         * a black window whose only explanation was somewhere the VMM never
+         * reads.  An unsolicited EV_FORMAT x=0 is the protocol's way of
+         * taking a yes back.
+         *
+         * BOTH alpha twins are remembered: DRI3 takes no fourcc at all (XR24
+         * and AR24 are both imported as depth 24 / 32 bpp, see the header),
+         * so a refusal of one IS a refusal of the other.  The verdict is sent
+         * for the fourcc the client used, which is the slot its question is
+         * filed under.
+         */
+        nb_refused_add(&x->refused, NB_FCC_XR24, d->modifier);
+        nb_refused_add(&x->refused, NB_FCC_AR24, d->modifier);
+        if (s->sink) {
+            nb_sink_format_verdict(s->sink, d->fourcc, d->modifier, false);
+        }
         return -EINVAL;
     }
 
@@ -1332,6 +1387,88 @@ static void x11_cursor_init(struct nb_x11 *x)
 }
 
 /*
+ * THE GUEST'S CURSOR AS AN X CURSOR.  Built with RenderCreateCursor from a
+ * depth-32 ARGB picture, so it keeps real alpha (a core-protocol cursor is
+ * 1-bit), and scaled by the same factor as the frame: the content window's
+ * size over the guest's buffer -- the XRender scaler's factor when it is
+ * scaling, exactly 1 on the 1:1 Present and shm paths.
+ *
+ * Every request here is fire-and-forget: no reply is awaited, so building a
+ * cursor is never a round trip.  It is bounded by the core's pacing (a new
+ * image at most every NB_CURSOR_MIN_MS) and by NB_CURSOR_SCALED_MAX.
+ *
+ * Returns true when gc_cursor holds the current image at the current scale.
+ */
+static bool x11_gc_build(struct nb_x11 *x)
+{
+#ifdef NB_HAVE_XCB_RENDER
+    /* static: 1 MiB, single-threaded broker, rebuilt only on change. */
+    static uint32_t px[NB_CURSOR_SCALED_MAX * NB_CURSOR_SCALED_MAX];
+    const struct nb_cursor *c = x->gcur;
+    struct nb_cursor_geom g;
+    uint32_t nx = 1, dx = 1, ny = 1, dy = 1;
+    xcb_pixmap_t pix;
+    xcb_render_picture_t pic;
+    xcb_cursor_t cur;
+
+    if (!x->argb_fmt || !c || !c->defined) {
+        return false;
+    }
+    if (x->current >= 0 && x->bufs[x->current].valid &&
+        x->bufs[x->current].w > 0 && x->bufs[x->current].h > 0 &&
+        x->con_w > 0 && x->con_h > 0) {
+        nx = (uint32_t)x->con_w;
+        dx = x->bufs[x->current].w;
+        ny = (uint32_t)x->con_h;
+        dy = x->bufs[x->current].h;
+    }
+    nb_cursor_scaled_geom(c, nx, dx, ny, dy, NB_CURSOR_SCALED_MAX, &g);
+    if (x->gc_cursor && x->gc_gen == c->gen && x->gc_geom.w == g.w &&
+        x->gc_geom.h == g.h && x->gc_geom.hot_x == g.hot_x &&
+        x->gc_geom.hot_y == g.hot_y) {
+        return true;
+    }
+    /* Bounded by nb_cursor_scaled_geom(); restated where the write is. */
+    if (g.w == 0 || g.h == 0 ||
+        (size_t)g.w * g.h > sizeof px / sizeof px[0]) {
+        return false;
+    }
+    nb_cursor_scale(c, px, g.w, g.h);
+    pix = xcb_generate_id(x->c);
+    xcb_create_pixmap(x->c, 32, pix, x->screen->root, (uint16_t)g.w,
+                      (uint16_t)g.h);
+    if (!x->gc32) {
+        /* A GC is usable with any drawable of its root and depth, so one
+         * made against the first depth-32 pixmap serves every later one. */
+        x->gc32 = xcb_generate_id(x->c);
+        xcb_create_gc(x->c, x->gc32, pix, 0, NULL);
+    }
+    x11_put_image(x, pix, x->gc32, px, (int)g.w, (int)g.h, 32);
+    pic = xcb_generate_id(x->c);
+    xcb_render_create_picture(x->c, pic, pix, x->argb_fmt, 0, NULL);
+    cur = xcb_generate_id(x->c);
+    /* hot < size <= 512 by nb_cursor_scaled_geom(): inside the picture, which
+     * is what RenderCreateCursor requires (BadMatch otherwise). */
+    xcb_render_create_cursor(x->c, cur, pic, (uint16_t)g.hot_x,
+                             (uint16_t)g.hot_y);
+    xcb_render_free_picture(x->c, pic);
+    xcb_free_pixmap(x->c, pix);
+    /* Freeing the old one while a window still shows it is safe: the server
+     * keeps it until the attribute changes, which the caller does next. */
+    if (x->gc_cursor) {
+        xcb_free_cursor(x->c, x->gc_cursor);
+    }
+    x->gc_cursor = cur;
+    x->gc_gen = c->gen;
+    x->gc_geom = g;
+    return true;
+#else
+    (void)x;
+    return false;
+#endif
+}
+
+/*
  * WHO OWNS THE POINTER, decided in one place.
  *
  * The blank cursor is an attribute of the CONTENT window, so X applies it
@@ -1347,23 +1484,56 @@ static void x11_cursor_init(struct nb_x11 *x)
  * Visible again for the placeholder (no guest, no guest cursor) and for the
  * close dialog (the user is being asked a question and has to answer it).
  */
-static void x11_cursor_policy(struct nb_x11 *x)
+/*
+ * `grabbed` is passed rather than read, because x11_set_grab() has to settle
+ * the pointer BEFORE it asks for the grab (see there) -- at which point
+ * x->grabbed still says the old thing.
+ */
+static void x11_cursor_policy_as(struct nb_x11 *x, bool grabbed)
 {
-    bool hide = x->current >= 0 && !x->idle_shown && !x->dlg_mapped;
-    uint32_t v;
+    bool guest_up = x->current >= 0 && !x->idle_shown && !x->dlg_mapped;
+    xcb_cursor_t want = XCB_CURSOR_NONE;
 
-    if (!x->blank_cursor || hide == x->cursor_hidden) {
+    if (!x->blank_cursor) {
+        return;
+    }
+    if (guest_up) {
+        /*
+         * Over the guest's picture: the GUEST'S OWN IMAGE in hover mode when
+         * the VMM sent one (CMD_CURSOR), where the host pointer and the
+         * guest's absolute pointer are the same point; otherwise blank,
+         * because the guest -- or under grab the VMM -- composites the cursor
+         * into the frame and a host pointer too would be a second cursor.
+         */
+        want = x->blank_cursor;
+        if (nb_cursor_wanted(x->gcur, grabbed) && x11_gc_build(x)) {
+            want = x->gc_cursor;
+        }
+    }
+    if (want == x->content_cursor) {
         return;                 /* idempotent: this runs on every frame */
     }
-    x->cursor_hidden = hide;
-    v = hide ? x->blank_cursor : XCB_CURSOR_NONE;
-    xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &v);
+    x->content_cursor = want;
+    xcb_change_window_attributes(x->c, x->content, XCB_CW_CURSOR, &want);
     xcb_flush(x->c);
 }
 
+static void x11_cursor_policy(struct nb_x11 *x)
+{
+    x11_cursor_policy_as(x, x->grabbed);
+}
+
+/* `show` is "not grabbed": the grab is the only caller that hides it. */
 static void x11_show_cursor(struct nb_x11 *x, bool show)
 {
-    (void)show;
+    x11_cursor_policy_as(x, !show);
+}
+
+static void x11_cursor_op(struct nb_session *s, const struct nb_cursor *cur)
+{
+    struct nb_x11 *x = s->priv;
+
+    x->gcur = cur;
     x11_cursor_policy(x);
 }
 
@@ -1375,8 +1545,8 @@ static void x11_show_cursor(struct nb_x11 *x, bool show)
  * bands that fit is the whole trick; there is no shm here on purpose, because
  * the placeholder and the dialog are drawn once per event, not per frame.
  */
-static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
-                     const uint32_t *px, int w, int h)
+static void x11_put_image(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
+                          const uint32_t *px, int w, int h, uint8_t depth)
 {
     uint32_t maxreq = xcb_get_maximum_request_length(x->c);   /* in 4-byte units */
     int rows = (int)((maxreq > 4096 ? maxreq - 4096 : 1024) / (uint32_t)(w > 0 ? w : 1));
@@ -1387,9 +1557,15 @@ static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
         int n = h - y < rows ? h - y : rows;
 
         xcb_put_image(x->c, XCB_IMAGE_FORMAT_Z_PIXMAP, d, gc,
-                      (uint16_t)w, (uint16_t)n, 0, (int16_t)y, 0, 24,
+                      (uint16_t)w, (uint16_t)n, 0, (int16_t)y, 0, depth,
                       (uint32_t)(w * n * 4), (const uint8_t *)(px + (size_t)y * w));
     }
+}
+
+static void x11_blit(struct nb_x11 *x, xcb_drawable_t d, xcb_gcontext_t gc,
+                     const uint32_t *px, int w, int h)
+{
+    x11_put_image(x, d, gc, px, w, h, 24);
 }
 
 /* ── close dialog ────────────────────────────────────────────────────────── */
@@ -1639,6 +1815,9 @@ static int x11_set_grab(struct nb_session *s, bool on)
     }
     xcb_flush(x->c);
     x->grabbed = on;
+    /* Settled already, above, for the state we were about to enter; this is
+     * the same decision taken again now that x->grabbed agrees with it. */
+    x11_cursor_policy(x);
     return 0;
 }
 
@@ -1689,6 +1868,16 @@ static void x11_close(struct nb_session *s)
         for (i = 0; i < NB_MAX_BUFS; i++) {
             x11_buf_free(x, i);
         }
+        if (x->gc_cursor) {
+            xcb_free_cursor(x->c, x->gc_cursor);
+            x->gc_cursor = 0;
+        }
+#ifdef NB_HAVE_XCB_RENDER
+        if (x->gc32) {
+            xcb_free_gc(x->c, x->gc32);
+            x->gc32 = 0;
+        }
+#endif
         xcb_flush(x->c);
     }
     if (x->c) {
@@ -1697,6 +1886,55 @@ static void x11_close(struct nb_session *s)
     free(x);
     s->priv = NULL;
     free(s);
+}
+
+/*
+ * EV_DEVICE: which GPU the X server renders on.  DRI3Open is the X server
+ * handing a client the DRM device it would use for it -- the same node a GL
+ * client would get -- so its st_rdev is the answer.  The fd is fstat()ed and
+ * closed at once: the broker has no use for a DRM device, and holding one
+ * would be a capability the privileged process does not need.
+ *
+ * One round trip, at startup, before any client exists.  Skipped entirely on a
+ * server without DRI3 (asking an absent extension tears the connection down;
+ * see x11_open()), which leaves the device "unknown" -- a valid answer.
+ */
+static void x11_query_device(struct nb_x11 *x, struct nb_session *s)
+{
+    const xcb_query_extension_reply_t *ext;
+    xcb_dri3_open_reply_t *r;
+    int *fds, i;
+    struct stat st;
+
+    ext = xcb_get_extension_data(x->c, &xcb_dri3_id);
+    if (!ext || !ext->present) {
+        nb_log("no DRI3: EV_DEVICE will report the display's GPU as unknown");
+        return;
+    }
+    r = xcb_dri3_open_reply(x->c, xcb_dri3_open(x->c, x->screen->root, 0),
+                            NULL);
+    if (!r) {
+        nb_log("DRI3Open refused: EV_DEVICE will report the display's GPU as "
+               "unknown");
+        return;
+    }
+    fds = xcb_dri3_open_reply_fds(x->c, r);
+    if (r->nfd == 1 && fstat(fds[0], &st) == 0 && S_ISCHR(st.st_mode)) {
+        nb_drm_device_resolve(major(st.st_rdev), minor(st.st_rdev),
+                              &s->dev_flags, &s->dev_major, &s->dev_minor);
+        nb_log("the X server renders on DRM device %u:%u%s", s->dev_major,
+               s->dev_minor,
+               (s->dev_flags & NVKVM_BROKER_DEVICE_F_RENDER)
+                   ? " (render node)" : "");
+    } else {
+        nb_log("DRI3Open did not hand back a DRM device: EV_DEVICE will "
+               "report the display's GPU as unknown");
+    }
+    /* Every fd the reply carried, whatever it was: none of them is kept. */
+    for (i = 0; i < r->nfd; i++) {
+        close(fds[i]);
+    }
+    free(r);
 }
 
 static int x11_open(struct nb_session *s, const struct nb_config *cfg)
@@ -1917,10 +2155,26 @@ skip_dmabuf_extensions:
                 xcb_render_query_pict_formats_formats_iterator(pf);
 
             for (; it.rem; xcb_render_pictforminfo_next(&it)) {
-                if (it.data->depth == 24 &&
-                    it.data->type == XCB_RENDER_PICT_TYPE_DIRECT) {
+                const xcb_render_directformat_t *df = &it.data->direct;
+
+                if (it.data->type != XCB_RENDER_PICT_TYPE_DIRECT) {
+                    continue;
+                }
+                if (it.data->depth == 24 && !x->pict_fmt) {
                     x->pict_fmt = it.data->id;
-                    break;
+                }
+                /*
+                 * PictStandardARGB32, matched by its layout rather than by
+                 * position in the list: A in 31..24, R 23..16, G 15..8, B
+                 * 7..0 -- byte for byte the premultiplied ARGB8888 the core
+                 * holds, so the cursor needs no conversion on the way.
+                 */
+                if (it.data->depth == 32 && !x->argb_fmt &&
+                    df->alpha_shift == 24 && df->alpha_mask == 0xff &&
+                    df->red_shift == 16 && df->red_mask == 0xff &&
+                    df->green_shift == 8 && df->green_mask == 0xff &&
+                    df->blue_shift == 0 && df->blue_mask == 0xff) {
+                    x->argb_fmt = it.data->id;
                 }
             }
             free(pf);
@@ -1928,6 +2182,11 @@ skip_dmabuf_extensions:
         nb_log("scaling: %s", x->pict_fmt
                ? "XRender (the window fills even when the guest's mode differs)"
                : "NONE - no usable XRender format; frames stay 1:1 and letterboxed");
+        if (!x->argb_fmt) {
+            nb_log("guest cursor: NONE - no XRender ARGB32 format, so the "
+                   "guest's pointer cannot be shown as the host's (the VMM "
+                   "keeps composing it into the frame)");
+        }
     }
 #else
     nb_log("scaling: NONE - built without xcb-render; frames stay 1:1");
@@ -2025,6 +2284,12 @@ formats_done:
     if (have_mods) {
         s->caps |= NVKVM_BROKER_CAP_MODIFIERS;
     }
+#ifdef NB_HAVE_XCB_RENDER
+    if (x->argb_fmt) {
+        s->caps |= NVKVM_BROKER_CAP_CURSOR;
+    }
+#endif
+    x11_query_device(x, s);
 
 #ifdef NB_HAVE_XCB_XINPUT
     ext = xcb_get_extension_data(x->c, &xcb_input_id);
@@ -2463,6 +2728,7 @@ static const struct nb_session_ops x11_ops = {
     .set_clipboard = x11_set_clipboard,
     .fetch_clipboard = x11_fetch_clipboard,
     .client_detach = x11_client_detach_clip,
+    .cursor = x11_cursor_op,
 };
 
 struct nb_session *nb_session_x11(const struct nb_config *cfg)

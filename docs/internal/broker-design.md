@@ -71,7 +71,8 @@ also runs as you and is also outside the sandbox. So a lie the broker believes
 is a bug in an unsandboxed process, which is the whole thing we were trying to
 avoid.
 
-Seven rules, all in `nvkvm_broker.c`, all exercised by `selftest.sh`:
+Eight rules, all in `nvkvm_broker.c` (the eighth's pure half in `nb_cursor.c`),
+all exercised by `selftest.sh` or by `test/test_cursor.{c,py}`:
 
 1. **Declared geometry is validated against the REAL buffer size.**
    `lseek(fd, 0, SEEK_END)` measures the dma-buf; the frame is accepted only if
@@ -111,6 +112,56 @@ Seven rules, all in `nvkvm_broker.c`, all exercised by `selftest.sh`:
    `AF_UNIX` `SOCK_STREAM`; `--no-peercred` is refused for adopted descriptors,
    because configured mode bits were never applied to them and prove nothing.
 
+8. **The guest cursor's fd is COPIED, never mapped and never handed on**
+   (`CMD_CURSOR`, added 2026-10-03; `nb_cmd_cursor()` / `nb_cursor_read()` in
+   `nvkvm_broker.c`, the pure rules in `nb_cursor.c`). It is the second command
+   that carries an fd, and it gets the same treatment as `ATTACH` plus one
+   stronger rule:
+   - **the record is classified before the fd is touched** --
+     `nb_cursor_check()`: framing errors (unknown `op`, non-zero
+     `flags`/`reserved1`, an fd where none belongs or none where one does,
+     image fields on `HIDE`/`SHOW`) disconnect; content errors (fourcc, size
+     past 256, hot spot outside the image, stride outside
+     `width*4 .. 1024`) refuse the cursor and keep the connection, because the
+     image comes from the guest;
+   - **the fd must be shmem**: `fstatfs` == `TMPFS_MAGIC` **and**
+     `F_GET_SEALS` succeeding. The second half is not decoration -- `/dev` is
+     devtmpfs and reports `TMPFS_MAGIC`, so `/dev/tty` or a FUSE device node
+     would pass the first test alone, and a read of either can block the thread
+     that holds the keyboard grab. (A device node also has `st_size` 0 and
+     fails the extent check below; `test/test_cursor.py` measured that
+     `/dev/zero` is refused even with the shmem proof deleted, so the two are
+     overlapping layers and both stay);
+   - **the extent is measured, in 64 bits**: `offset + stride*(h-1) + w*4 <=
+     st_size` (`fstat`, not `lseek`, so validation does not move the client's
+     file offset);
+   - **the rows are copied with `pread(2)` into a fixed 256 KiB static buffer
+     and the fd is closed.** No mmap, so no seal is demanded: a client that
+     truncates the memfd under the read gets a short read and a refused
+     cursor, never a `SIGBUS` in the privileged process -- the hazard the shm
+     tier needs `F_SEAL_SHRINK` for, removed by construction instead of by a
+     precondition. The compositor never receives the client's fd: the backend
+     re-uploads the core's copy, scaled, from broker-owned memory (Wayland: a
+     2-slot 2 MiB shm pool, allocated once; X11: `RenderCreateCursor` from a
+     depth-32 pixmap);
+   - **the pixels are normalised on the way in** (every colour channel clamped
+     to its alpha), so whatever the client sends, the compositor gets valid
+     premultiplied ARGB;
+   - **application is paced**, not per command: at most one cursor change per
+     8 ms reaches the display server, latest wins, and the latest is always
+     applied (`nb_sink_tick()`). The read itself is charged to the per-wakeup
+     work budget like any frame copy. So a flood of `SET`s -- or an honest relay
+     forwarding a guest that animates its pointer as fast as it can -- costs
+     bounded CPU per wakeup and bounded display traffic per second, and never
+     a disconnect of an honest VMM;
+   - **it is connection state**: forgotten on every attach and detach, so a
+     `--persist` broker never shows one VM's pointer over the next VM's picture
+     or over the placeholder.
+
+   The image is shown only in **hover mode**. Under grab the broker hides it
+   whatever the VMM sent: the pointer is locked and a host cursor at the lock
+   position would point at the wrong place.
+
 Two more properties that are policy rather than parsing:
 
 - **A rejected frame is not a disconnect.** The descriptor originates in the
@@ -119,6 +170,30 @@ Two more properties that are policy rather than parsing:
   the connection lives. Only *protocol* violations disconnect.
 - **One client at a time, and the incumbent is never displaced.** A second
   allowed-uid process cannot steal the display out from under a running VM.
+
+And two things the broker now TELLS the VMM, written down so they are
+decisions rather than leaks (2026-10-03):
+
+- **`EV_DEVICE` discloses the host compositor's DRM device number**
+  (major:minor, resolved to the render node through sysfs where possible). It
+  says which of the host's GPUs draws the desktop and nothing about what is on
+  it, and it lets a relay pick a same-GPU or a cross-GPU present path up front
+  instead of discovering a hybrid laptop by having every `ATTACH` refused. It
+  is a hint the VMM may use to choose, never something the broker relies on:
+  `ATTACH` is validated as if it had not been sent. It deliberately does NOT
+  say which backend produced it, because the VMM must not be able to tell
+  Wayland from X11.
+- **An unsolicited `EV_FORMAT` x=0 now comes from X11 too** when DRI3 refuses an
+  import the server advertised, matching what the Wayland probe already did,
+  and on both backends `QUERY_FORMAT` then answers no for that pair. The X11
+  memory of refusals (`struct nb_refused`, 4 slots, oldest forgotten) and the
+  Wayland `proven` table both outlive a client. That is a property a hostile
+  VMM can use: by sending a buffer the display refuses, it can make a pair read
+  as unusable for the NEXT VM on a `--persist` broker, which then takes a
+  slower present path. It degrades speed, never correctness or isolation, and
+  it is the same property the Wayland probe has had since it was added; it is
+  recorded here rather than fixed because per-connection memory would make the
+  two backends disagree, which is the one thing the wire must not do.
 
 The broker also drops what it does not need: `PR_SET_DUMPABLE 0`,
 `PR_SET_NO_NEW_PRIVS`, and `--drop-user` (it retains no capabilities — the
@@ -256,6 +331,47 @@ found**; each is described where it lives:
 - The Wayland backend's connect/registry/roundtrip path runs against headless
   `weston` with the pixman renderer and fails at the intended gate with the
   intended message (no GPU ⇒ no `zwp_linux_dmabuf_v1`).
+
+### The guest cursor and `EV_DEVICE`, verified headlessly (2026-10-03)
+
+No GPU on the machine this was written on, so what is claimed is exactly what
+was run:
+
+- **Offline, in CI** (`make check`, and again under `make check-sanitize`):
+  `test/test_cursor.c` -- every boundary of every `CMD_CURSOR` rule from both
+  sides, arithmetic chosen to wrap 32 bits if anything were computed in 32
+  bits, and a 300 000-record deterministic sweep asserting what the backends
+  rely on (an accepted record's extent is inside the protocol bounds, a scaled
+  cursor fits a 512x512 slot, its hot spot is inside it, every pixel is
+  premultiplied). `test/test_cursor.py` -- the same rules over the real socket
+  against `--backend test`, with the image hash recomputed from the bytes sent
+  (so it proves the RIGHT rows were copied from the RIGHT offset), 14 refusals
+  that keep the connection, 9 violations that end it, 60 back-to-back `SET`s
+  reaching the display as 2 uploads with the last one on screen, the grab
+  hiding and restoring the image, detach forgetting it, and the six-packet
+  handshake with `EV_DEVICE` appended after the unchanged five.
+- **X11, real server**: `Xvfb` (no DRI3, so `--present-mode=shm`, 1:1). XFixes
+  `GetCursorImage` over the content window read back the guest's 32x32 /
+  40x30 / 60x40 / 120x80 / 180x120 test cursors with hot spot 1,1 and the
+  exact premultiplied pixels sent (border `0xff000000`, centre `0x80808080`);
+  `HIDE` and `CTRL+ALT+G` both turned it into the 1x1 blank, ungrab restored
+  it, and the X server's default came back after the client detached. No X
+  error in the log; ASAN+UBSAN with leak checking clean across three clients.
+  The XRender-scaled path needs a DRI3 pixmap and is NOT run here.
+- **Wayland, real compositor**: weston 14 (pixman) nested in that `Xvfb`, kiosk
+  shell, shm frames 320x240 in a 1024x768 fullscreen window -- a 3.2x scale.
+  `WAYLAND_DEBUG` shows the cursor buffer created at **128x96** and
+  `set_cursor(..., 3, 3)` for a 40x30 image with hot spot 1,1; a screenshot of
+  the X root shows the black border's bounding box at exactly 128x96 with its
+  corner 3 px up-left of the pointer, and the 50 % centre composited over the
+  guest's green as `0x80ff80`. `CTRL+ALT+G` issued `set_cursor(nil)` with the
+  pointer lock, ungrab put the same surface back without a re-render. ASAN +
+  UBSAN clean (leak checking off: the Wayland backend's pre-existing shutdown
+  path never destroys its registry globals, unrelated to this change).
+- **Not run anywhere**: the X11 DRI3-refusal verdict (needs a server with
+  DRI3 that refuses an import), and `EV_DEVICE` with a real answer (needs a
+  render node: weston's pixman renderer offers no dma-buf feedback and `Xvfb`
+  no DRI3, so both reported `unknown`, as designed).
 
 ### Verified on hardware (RTX 3090, 580.105.08)
 

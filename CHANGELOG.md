@@ -44,6 +44,28 @@ replay carries its embedded RM control handle and both RM object handles. See
 push can change what you run. If you have set `NVKVM_IMAGE_TAG=latest`, pin it
 to a release tag instead — `latest` moves.
 
+## [Unreleased]
+
+**Display broker: protocol v2, append-only.** Nothing a working setup depends
+on changes: an older relay keeps working against this broker, and this relay
+against an older broker. What a relay can now use:
+
+- **The guest's cursor as the host pointer** (`CMD_CURSOR`, advertised by
+  `CAP_CURSOR`): an ARGB8888 premultiplied image of at most 256x256 in a memfd,
+  plus `HIDE`/`SHOW`. Shown while hovering, hidden under grab, scaled with the
+  frame, applied at most every 8 ms. The broker copies the rows with `pread`
+  and never maps or forwards the fd. nvkvm-pv's own VMM sends none yet.
+- **Which GPU the display is on** (`EV_DEVICE`, advertised by `CAP_DEVICE`):
+  the compositor's / X server's DRM device major:minor, resolved to the render
+  node where sysfs allows, so a relay can tell same-GPU from cross-GPU. It is
+  APPENDED to the handshake after the priming `FRAME`; the first five packets
+  are unchanged.
+- **X11 now takes a "yes" back** with an unsolicited `EV_FORMAT` x=0 when DRI3
+  refuses an import it advertised, as the Wayland backend already did -- and on
+  both backends `QUERY_FORMAT` then answers no for that pair.
+
+Wire layout: [`docs/reference/broker-protocol.md`](docs/reference/broker-protocol.md).
+
 ## [v0.2.5] — 2026-09-05
 
 **Every Vulkan host-pointer import failed in the guest.** If you run any Vulkan

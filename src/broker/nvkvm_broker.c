@@ -178,6 +178,27 @@ static void nb_client_state_reset(struct nb_sink *s)
     memset(s->key_down, 0, sizeof(s->key_down));
     memset(s->consumed, 0, sizeof(s->consumed));
     s->n_attach = s->n_commit = s->n_reject = 0;
+    /*
+     * THE GUEST'S CURSOR IS CONNECTION STATE.  A --persist broker must not
+     * show the previous VM's pointer image over the next VM's picture, or over
+     * the placeholder.  The image bytes are left in place (they are the next
+     * SET's to overwrite, and `defined` is what every reader checks); `gen`
+     * moves so no backend mistakes a later image for one it already rendered.
+     *
+     * Told to the backend NOW rather than through the pacing in
+     * nb_sink_tick(): forgetting is not a flood risk, and a stale image
+     * surviving the VM it belonged to for even one interval is the wrong
+     * picture on screen.
+     */
+    s->cursor.defined = false;
+    s->cursor.visible = false;
+    s->cursor.gen++;
+    s->cursor_dirty = false;
+    s->cursor_applied_ms = 0;
+    s->n_cursor = s->n_cursor_reject = 0;
+    if (s->sess && s->sess->ops->cursor) {
+        s->sess->ops->cursor(s->sess, &s->cursor);
+    }
 }
 
 bool nb_sink_want_write(const struct nb_sink *s)
@@ -400,8 +421,11 @@ int nb_sink_attach(struct nb_sink *s, int fd)
     }
     s->client_fd = fd;
 
+    /* CAP_DEVICE is the CORE's promise, not a backend's: the EV_DEVICE below
+     * is sent on every backend, carrying "unknown" where the backend could
+     * not find out. */
     p = nb_pkt(s, NVKVM_BROKER_EV_HELLO, 0, 0,
-               NVKVM_BROKER_PROTO_VERSION, ss->caps);
+               NVKVM_BROKER_PROTO_VERSION, ss->caps | NVKVM_BROKER_CAP_DEVICE);
     r = nb_send_now(fd, &p);
     if (r == 0) {
         p = nb_pkt(s, NVKVM_BROKER_EV_SURFACE,
@@ -423,6 +447,18 @@ int nb_sink_attach(struct nb_sink *s, int fd)
         p = nb_pkt(s, NVKVM_BROKER_EV_FRAME, 0, 0, 0, 0);
         r = nb_send_now(fd, &p);
     }
+    if (r == 0) {
+        /*
+         * AFTER the FRAME, deliberately: the five packets above are the
+         * handshake every existing client was written against, byte for byte,
+         * and a client that reads exactly five and then starts drawing still
+         * does.  A relay that wants the device before its first frame reads
+         * what is already buffered -- all six leave here in one burst.
+         */
+        p = nb_pkt(s, NVKVM_BROKER_EV_DEVICE, (int)ss->dev_flags, 0,
+                   ss->dev_major, ss->dev_minor);
+        r = nb_send_now(fd, &p);
+    }
     if (r != 0) {
         nb_err("handshake failed: %s", strerror(-r));
         s->client_fd = -1;
@@ -431,8 +467,13 @@ int nb_sink_attach(struct nb_sink *s, int fd)
         return r;
     }
 
-    nb_log("client attached: window %ux%u, capabilities 0x%x",
-           ss->width, ss->height, ss->caps);
+    nb_log("client attached: window %ux%u, capabilities 0x%x, display device "
+           "%s%u:%u", ss->width, ss->height, ss->caps | NVKVM_BROKER_CAP_DEVICE,
+           (ss->dev_flags & NVKVM_BROKER_DEVICE_F_KNOWN)
+               ? ((ss->dev_flags & NVKVM_BROKER_DEVICE_F_RENDER)
+                      ? "render node " : "node ")
+               : "unknown ",
+           ss->dev_major, ss->dev_minor);
     nb_log("grab: CTRL+ALT+G toggles, CTRL+ALT+F fullscreen. %s",
            ss->grab_caveat[0] ? ss->grab_caveat
                               : "all keyboard input is captured under grab.");
@@ -468,10 +509,13 @@ void nb_sink_detach(struct nb_sink *s, const char *why)
         s->sess->ops->dismiss_dialog(s->sess);
     }
     nb_log("client detached: %s "
-           "(%llu attach, %llu commit, %llu rejected)", why,
+           "(%llu attach, %llu commit, %llu rejected; %llu cursor, "
+           "%llu cursor refused)", why,
            (unsigned long long)s->n_attach,
            (unsigned long long)s->n_commit,
-           (unsigned long long)s->n_reject);
+           (unsigned long long)s->n_reject,
+           (unsigned long long)s->n_cursor,
+           (unsigned long long)s->n_cursor_reject);
     s->client_pid = 0;
     s->client_generation++;
     nb_client_state_reset(s);
@@ -1497,6 +1541,242 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     return 0;
 }
 
+/* ── CMD_CURSOR: the fd half ─────────────────────────────────────────────── */
+
+/*
+ * How often a CHANGED cursor reaches the backend: 125 Hz.  An animated guest
+ * pointer (a busy spinner) changes at 10-60 Hz, so an honest client never sees
+ * this; what it bounds is the display-server traffic a client can cause, at
+ * <= 125 uploads of <= NB_CURSOR_SCALED_MAX^2 pixels a second whatever it
+ * sends.  Latest wins, and the latest is always applied -- see nb_sink_tick().
+ */
+#define NB_CURSOR_MIN_MS 8u
+
+int nb_sink_tick(struct nb_sink *s)
+{
+    uint64_t now, since;
+
+    if (!s->cursor_dirty) {
+        return -1;
+    }
+    now = nb_now_ms();
+    since = now - s->cursor_applied_ms;
+    if (s->cursor_applied_ms != 0 && since < NB_CURSOR_MIN_MS) {
+        return (int)(NB_CURSOR_MIN_MS - since);
+    }
+    s->cursor_dirty = false;
+    s->cursor_applied_ms = now;
+    if (s->sess->ops->cursor) {
+        s->sess->ops->cursor(s->sess, &s->cursor);
+    }
+    return -1;
+}
+
+static void nb_cursor_changed(struct nb_sink *s)
+{
+    s->cursor_dirty = true;
+    /* At once if the interval allows -- the first change after a quiet spell
+     * is the common case and should cost no latency.  Otherwise the main
+     * loop's poll timeout brings us back exactly when it does. */
+    (void)nb_sink_tick(s);
+}
+
+/*
+ * Copy a SET's rows out of the client's fd.  Every field has already passed
+ * nb_cursor_check(); this proves the FD, measures it, and reads it.
+ *
+ * pread, NEVER mmap.  The fd stays the client's, and it can ftruncate() a
+ * memfd it did not seal the instant after we measure it.  A mapping read past
+ * the new end is SIGBUS in the privileged process -- the shm tier needs
+ * F_SEAL_SHRINK precisely because it maps (see nb_validate_desc()).  A read
+ * past the new end is a SHORT READ, which is just a refused cursor.  So no
+ * seal is demanded here: copying makes the measurement not matter for safety,
+ * only for whether the image is complete.
+ *
+ * And it is the BROKER's copy the compositor sees, never the client's fd: the
+ * image is scaled and re-uploaded by the backend from s->cursor, so nothing the
+ * client does to its memfd afterwards reaches the display server.
+ *
+ * Returns 0, or -EINVAL after logging (throttled) which rule failed.  On
+ * failure s->cursor is untouched: a refused SET leaves the previous cursor
+ * up, as a refused ATTACH leaves the previous frame.
+ */
+static int nb_cursor_read(struct nb_sink *s,
+                          const struct nvkvm_broker_cursor_cmd *c, int fd)
+{
+    /* static: 256 KiB does not belong on the stack, and the broker is
+     * single-threaded.  Sized by the protocol's own bounds, which is what
+     * nb_cursor_check() enforced on the record before we got here. */
+    static uint8_t staging[NVKVM_BROKER_CURSOR_MAX_STRIDE *
+                           NVKVM_BROKER_CURSOR_MAX_DIM];
+    struct statfs sfs;
+    struct stat st;
+    uint32_t span;
+    size_t got = 0;
+
+    memset(&st, 0, sizeof st);  /* logged below even when fstat fails */
+    /*
+     * SHMEM ONLY.  The read below happens on the thread that holds the
+     * keyboard grab, so the fd must be one whose read cannot block on someone
+     * else: a FUSE file, a FIFO, a socket, a tty or a device all could, and a
+     * client choosing the fd type would be choosing when the broker stalls.
+     * tmpfs pages are memory; a read of them returns.
+     *
+     * F_GET_SEALS succeeding is the memfd/shmem proof rather than a seal
+     * demand -- see above for why no particular seal is required.
+     */
+    if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC ||
+        fcntl(fd, F_GET_SEALS) < 0) {
+        if (nb_reject_log(s)) {
+            nb_err("CURSOR SET: the fd is not a memfd; refused (the previous "
+                   "cursor stays)");
+        }
+        return -EINVAL;
+    }
+    span = nb_cursor_span(c->width, c->height, c->stride);
+    /*
+     * nb_cursor_check() has already bounded every term of the span to the
+     * protocol's maxima, which is exactly what `staging` is sized from.  The
+     * copy below writes `span` bytes into it, so that bound is restated HERE,
+     * where the write is: a later change to the check must not be able to turn
+     * this into an overflow of a static buffer in the privileged process.
+     */
+    if (span == 0 || span > sizeof staging) {
+        nb_err("CURSOR SET: span %u outside 1..%zu -- the record check and "
+               "this buffer disagree; refused", span, sizeof staging);
+        return -EINVAL;
+    }
+    /*
+     * fstat, not lseek(SEEK_END): the fd shares its open file description
+     * with the client, and moving the client's file offset is a side effect
+     * of validation nobody asked for.  A memfd reports its size here; a
+     * dma-buf would not, which is why ATTACH measures differently.
+     */
+    if (fstat(fd, &st) < 0 || st.st_size <= 0 ||
+        !nb_cursor_fits(c->offset, span, (uint64_t)st.st_size)) {
+        if (nb_reject_log(s)) {
+            nb_err("CURSOR SET: %ux%u stride=%u offset=%u needs %llu bytes but "
+                   "the memfd is %lld; refused (the previous cursor stays)",
+                   c->width, c->height, c->stride, c->offset,
+                   (unsigned long long)c->offset + span,
+                   (long long)st.st_size);
+        }
+        return -EINVAL;
+    }
+    while (got < span) {
+        ssize_t n = pread(fd, staging + got, span - got,
+                          (off_t)c->offset + (off_t)got);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    if (got != span) {
+        if (nb_reject_log(s)) {
+            nb_err("CURSOR SET: read %zu of %u bytes -- the memfd shrank or "
+                   "failed under the read; refused (the previous cursor "
+                   "stays)", got, span);
+        }
+        return -EINVAL;
+    }
+    nb_cursor_load(&s->cursor, staging, c->width, c->height, c->stride,
+                   c->hot_x, c->hot_y);
+    /* What it cost, so a flood of SETs yields the loop like a flood of
+     * frames does (see NB_WORK_BUDGET_BYTES). */
+    nb_sink_charge_work(s, (uint64_t)span +
+                           (uint64_t)c->width * c->height * 4u);
+    return 0;
+}
+
+static void nb_cmd_cursor(struct nb_sink *s, const struct nvkvm_broker_cmd *raw,
+                          int fd)
+{
+    struct nb_session *ss = s->sess;
+    struct nvkvm_broker_cursor_cmd c;
+    const char *why = "";
+    int verdict;
+
+    /* A COPY, NOT A CAST -- the same strict-aliasing reason as CLIPBOARD.
+     * Both types are NVKVM_BROKER_CMD_SIZE, asserted in the protocol header. */
+    memcpy(&c, raw, sizeof c);
+
+    /*
+     * A broker that did not ADVERTISE the type treats it exactly as one that
+     * does not KNOW it: as an unknown command.  The client was told in HELLO;
+     * a client that sends it anyway is not reading HELLO, and the rule for
+     * that is the same everywhere.
+     */
+    if (!ss->ops->cursor || !(ss->caps & NVKVM_BROKER_CAP_CURSOR)) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        nb_violation(s, "CURSOR on a session that did not advertise "
+                        "CAP_CURSOR");
+        return;
+    }
+    verdict = nb_cursor_check(&c, fd >= 0, &why);
+    if (verdict == NB_CURSOR_VIOLATION) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        nb_violation(s, why);
+        return;
+    }
+    s->n_cursor++;
+    if (verdict == NB_CURSOR_REJECT) {
+        if (fd >= 0) {
+            close(fd);
+        }
+        s->n_cursor_reject++;
+        if (nb_reject_log(s)) {
+            nb_err("%s (%ux%u stride=%u offset=%u hot %u,%u); refused (the "
+                   "previous cursor stays)", why, c.width, c.height,
+                   c.stride, c.offset, c.hot_x, c.hot_y);
+        }
+        return;
+    }
+    switch (c.op) {
+    case NVKVM_BROKER_CURSOR_SET: {
+        int r = nb_cursor_read(s, &c, fd);
+
+        close(fd);      /* copied or refused; either way we are done with it */
+        if (r != 0) {
+            s->n_cursor_reject++;
+            return;
+        }
+        break;
+    }
+    case NVKVM_BROKER_CURSOR_HIDE:
+        s->cursor.visible = false;
+        break;
+    case NVKVM_BROKER_CURSOR_SHOW:
+        s->cursor.visible = true;
+        break;
+    default:
+        /* nb_cursor_check() returned a violation for anything else. */
+        return;
+    }
+    nb_cursor_changed(s);
+}
+
+void nb_sink_device_changed(struct nb_sink *s)
+{
+    struct nb_session *ss = s->sess;
+
+    nb_log("the display reports a different device: %s%u:%u",
+           (ss->dev_flags & NVKVM_BROKER_DEVICE_F_KNOWN)
+               ? ((ss->dev_flags & NVKVM_BROKER_DEVICE_F_RENDER)
+                      ? "render node " : "node ")
+               : "unknown ",
+           ss->dev_major, ss->dev_minor);
+    nb_emit(s, NVKVM_BROKER_EV_DEVICE, (int)ss->dev_flags, 0,
+            ss->dev_major, ss->dev_minor);
+}
+
 /*
  * Act on one fully received command.  `fd` is -1 unless the client attached
  * one; this function always takes ownership of it.
@@ -1897,6 +2177,12 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             nb_log("the guest changed resolution to %ux%u: keeping the window "
                    "and rescaling into it", c->width, c->height);
         }
+        return;
+
+    case NVKVM_BROKER_CMD_CURSOR:
+        /* Its own layout and its own reserved/flags rules: see
+         * nb_cursor_check().  Takes ownership of `fd`. */
+        nb_cmd_cursor(s, c, fd);
         return;
 
     default:
@@ -3111,7 +3397,16 @@ int main(int argc, char **argv)
     }
 
     for (;;) {
-        int n = 0, nsess, r, tmo;
+        int n = 0, nsess, r, tmo, ctmo;
+
+        /*
+         * Core clock work FIRST, before the backend builds its poll set:
+         * whatever it hands the backend (a paced cursor update) is then
+         * flushed to the display server by that backend's pollfds() in this
+         * same iteration, instead of sitting queued until something else
+         * wakes the loop.
+         */
+        ctmo = nb_sink_tick(&sink);
 
         pfd[n].fd = sigfd;      pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
         pfd[n].fd = listen_fd;  pfd[n].events = POLLIN; pfd[n].revents = 0; n++;
@@ -3129,6 +3424,9 @@ int main(int argc, char **argv)
 
         /* -1 unless a backend has clock-driven work pending; see ops->tick. */
         tmo = sess->ops->tick ? sess->ops->tick(sess) : -1;
+        if (ctmo >= 0 && (tmo < 0 || ctmo < tmo)) {
+            tmo = ctmo;
+        }
 
         if (poll(pfd, (nfds_t)(n + nsess), tmo) < 0) {
             if (errno == EINTR) {

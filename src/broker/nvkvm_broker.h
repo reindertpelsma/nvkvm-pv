@@ -182,6 +182,88 @@ struct nb_buf_desc {
                                  * nothing else.                              */
 };
 
+/* ── the guest's cursor (CMD_CURSOR) ─────────────────────────────────────── */
+
+/*
+ * The core's copy of the guest's pointer image.  Filled ONLY by nb_cursor_load()
+ * from rows the core read out of a validated memfd, so every invariant below
+ * holds whatever the client sent:
+ *
+ *   - when `defined`: 1 <= w,h <= NVKVM_BROKER_CURSOR_MAX_DIM, hot_x < w,
+ *     hot_y < h, and px[0 .. w*h) is the image, packed (row pitch == w);
+ *   - every pixel is premultiplied ARGB with each colour channel <= alpha.
+ *
+ * Backends read it (never write it) and must copy what they render: the core
+ * overwrites px on the next SET.  `gen` changes on every change of the image
+ * and never repeats within a process, so "have I already rendered this?" is
+ * one comparison, across reconnects too.
+ */
+struct nb_cursor {
+    uint32_t gen;
+    bool     defined;           /* an image was SET on this connection        */
+    bool     visible;           /* SET/SHOW since the last HIDE               */
+    uint32_t w, h, hot_x, hot_y;
+    uint32_t px[NVKVM_BROKER_CURSOR_MAX_DIM * NVKVM_BROKER_CURSOR_MAX_DIM];
+};
+
+/*
+ * The most a backend scales a cursor to, per edge.  A guest cursor of 256 over
+ * a 2x-scaled frame is 512; anything larger is shrunk with its aspect kept,
+ * which bounds what the broker renders per cursor change at 1 MiB whatever
+ * window, mode or scale the user picked.
+ */
+#define NB_CURSOR_SCALED_MAX 512u
+
+/* What a scaled cursor measures: image size and hot spot, all in OUTPUT pixels.
+ * Guaranteed by nb_cursor_scaled_geom(): 1 <= w,h <= the max asked for,
+ * hot_x < w, hot_y < h. */
+struct nb_cursor_geom {
+    uint32_t w, h, hot_x, hot_y;
+};
+
+/* nb_cursor_check() verdicts. */
+#define NB_CURSOR_OK        0
+#define NB_CURSOR_REJECT    1   /* well-formed, but this image is refused   */
+#define NB_CURSOR_VIOLATION 2   /* framing error: hang up                   */
+
+/*
+ * Classify one CURSOR record from its fields alone, before any fd is touched.
+ * `*why` names the rule that failed.  Pure, so test/test_cursor.c can drive it
+ * through every boundary without a socket (nb_cursor.c).
+ */
+int  nb_cursor_check(const struct nvkvm_broker_cursor_cmd *c, bool has_fd,
+                     const char **why);
+/* Bytes a valid SET covers, from row 0's first byte to the last row's last
+ * pixel byte: stride*(h-1) + w*4.  Only meaningful for a record
+ * nb_cursor_check() accepted; at most MAX_STRIDE * MAX_DIM. */
+uint32_t nb_cursor_span(uint32_t w, uint32_t h, uint32_t stride);
+/* offset + span <= size, in 64 bits so no operand can wrap the sum. */
+bool nb_cursor_fits(uint32_t offset, uint32_t span, uint64_t size);
+/* Copy a validated image out of `src` (span bytes, row 0 first) into `dst`,
+ * clamping colour to alpha, and bump dst->gen.  Sets defined and visible. */
+void nb_cursor_load(struct nb_cursor *dst, const uint8_t *src, uint32_t w,
+                    uint32_t h, uint32_t stride, uint32_t hot_x,
+                    uint32_t hot_y);
+/*
+ * The cursor's size and hot spot after scaling by num_x/den_x horizontally and
+ * num_y/den_y vertically -- the same factors the frame is scaled by -- rounded
+ * to nearest, each edge at least 1 and at most `max`.  A zero numerator or
+ * denominator means 1:1.  `c` must be defined.
+ */
+void nb_cursor_scaled_geom(const struct nb_cursor *c, uint32_t num_x,
+                           uint32_t den_x, uint32_t num_y, uint32_t den_y,
+                           uint32_t max, struct nb_cursor_geom *out);
+/* Nearest-neighbour scale of the defined image into dst[0 .. dw*dh), packed.
+ * dw, dh must be >= 1. */
+void nb_cursor_scale(const struct nb_cursor *c, uint32_t *dst, uint32_t dw,
+                     uint32_t dh);
+/* Whether the host pointer over the guest's picture should BE the guest's
+ * image: one is defined and visible, and the input is not grabbed. */
+bool nb_cursor_wanted(const struct nb_cursor *c, bool grabbed);
+/* FNV-1a over the packed pixels -- the test backend's way of saying exactly
+ * which image it was handed. */
+uint32_t nb_cursor_hash(const struct nb_cursor *c);
+
 /* ── the policy core ─────────────────────────────────────────────────────── */
 struct nb_session;
 
@@ -291,6 +373,22 @@ struct nb_sink {
 
     /* Counters, for the one-line status the broker logs on detach. */
     uint64_t n_attach, n_commit, n_reject;
+
+    /*
+     * THE GUEST'S CURSOR.  Connection state: forgotten on every attach and
+     * detach, like everything else a VMM supplied.
+     *
+     * Applying it is PACED, not per command: a changed cursor reaches the
+     * backend at most once per NB_CURSOR_MIN_MS, latest wins, via
+     * nb_sink_tick().  So however fast a client (or a guest animating its
+     * pointer behind an honest client) sends SETs, the display server sees a
+     * bounded number of cursor uploads per second -- and the last one sent is
+     * always the one that ends up on screen.
+     */
+    struct nb_cursor cursor;
+    bool     cursor_dirty;      /* changed since the backend last saw it   */
+    uint64_t cursor_applied_ms; /* when the backend last saw it            */
+    uint64_t n_cursor, n_cursor_reject;
 };
 
 void nb_sink_init(struct nb_sink *s, struct nb_session *sess);
@@ -302,6 +400,18 @@ int  nb_sink_flush(struct nb_sink *s);
 bool nb_sink_want_write(const struct nb_sink *s);
 /* Drain and act on whatever the client sent.  Disconnects on any violation. */
 void nb_sink_readable(struct nb_sink *s);
+/*
+ * Clock-driven core work: today, handing a changed guest cursor to the backend
+ * once its pacing interval has passed.  Called at the top of every main-loop
+ * iteration, BEFORE the backend computes its poll fds, so anything it queues
+ * on the display connection is flushed by that same iteration.  Returns the
+ * milliseconds until it next has work, or -1 for none.
+ */
+int  nb_sink_tick(struct nb_sink *s);
+/* The backend learned a different display device (sess->dev_*).  Re-sends
+ * EV_DEVICE to a connected client; a no-op with nobody connected, since the
+ * handshake carries the current value anyway. */
+void nb_sink_device_changed(struct nb_sink *s);
 
 /*
  * WHAT THAT COMMAND COST, reported by the backend that paid it.  Both of these
@@ -471,6 +581,20 @@ struct nb_session_ops {
      * nb_sink_clip_finish() with the same generation. */
     int  (*fetch_clipboard)(struct nb_session *s, struct nb_sink *sink,
                             uint64_t generation);
+    /*
+     * The guest's cursor changed: a new image, HIDE/SHOW, or forgotten on a
+     * detach.  OPTIONAL, and paired with NVKVM_BROKER_CAP_CURSOR: a backend
+     * leaves this NULL exactly when it does not set that bit, and the core
+     * then treats CMD_CURSOR as the violation an older broker would.
+     *
+     * `cur` is the core's own state and stays valid for the life of the
+     * process; the backend may keep the pointer and re-read it whenever it
+     * needs to re-render (a resize changing the frame's scale, the grab
+     * ending).  It must not block, and it decides what is actually shown:
+     * nb_cursor_wanted() with the backend's OWN grab state, which is the
+     * truth earlier than the core's during a grab transition.
+     */
+    void (*cursor)(struct nb_session *s, const struct nb_cursor *cur);
 };
 
 #define NB_SESSION_CLIP_G2H (1u << 0)
@@ -520,6 +644,14 @@ struct nb_session {
     /* One line, printed at startup and again at connect, naming exactly what
      * this stack cannot capture.  Empty string means "everything". */
     char     grab_caveat[256];
+    /*
+     * The DRM device the display server renders/imports on, for EV_DEVICE.
+     * Filled by the backend from the display server's own answer (never from
+     * anything a client sent); all zero means "unknown", which is a valid
+     * answer and is sent as such.
+     */
+    uint32_t dev_flags;         /* NVKVM_BROKER_DEVICE_F_*                    */
+    uint32_t dev_major, dev_minor;
 };
 
 /* Backend constructors.  Each returns NULL (after logging) when its stack is
@@ -576,6 +708,32 @@ struct nb_formats {
 void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier);
 bool nb_formats_has(const struct nb_formats *f, uint32_t fourcc, uint64_t mod);
 void nb_formats_log(const struct nb_formats *f, const char *what);
+
+/*
+ * PAIRS THE DISPLAY REFUSED TO IMPORT after advertising them.  The X11
+ * backend's memory of DRI3 refusals (the Wayland backend keeps the same fact
+ * in its `proven` table).  Fixed capacity: a client chooses which pairs to try,
+ * so it must not choose how much this remembers; when full, the oldest entry
+ * is forgotten, which costs at most one more refused import of it.
+ */
+#define NB_REFUSED_SLOTS 4
+struct nb_refused {
+    struct { uint32_t fourcc; uint64_t modifier; } e[NB_REFUSED_SLOTS];
+    unsigned n, next;
+};
+void nb_refused_add(struct nb_refused *r, uint32_t fourcc, uint64_t modifier);
+bool nb_refused_has(const struct nb_refused *r, uint32_t fourcc,
+                    uint64_t modifier);
+
+/*
+ * Resolve a DRM character device to the RENDER node of the same GPU through
+ * sysfs (/sys/dev/char/M:m/device/drm/renderD*), so EV_DEVICE names the node
+ * a relay compares against whichever node the display server happened to
+ * report.  Fills *flags with NVKVM_BROKER_DEVICE_F_* and the resolved (or, if
+ * resolution failed, the original) numbers.  Reads only the host's sysfs.
+ */
+void nb_drm_device_resolve(uint32_t major, uint32_t minor, uint32_t *flags,
+                           uint32_t *out_major, uint32_t *out_minor);
 
 /*
  * Paint the idle placeholder into a 32-bit XRGB/ARGB buffer (nb_placeholder.c).

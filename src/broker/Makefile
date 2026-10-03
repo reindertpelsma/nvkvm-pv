@@ -18,7 +18,8 @@
 # Debian/Ubuntu build deps:
 #   Wayland backend : libwayland-dev wayland-protocols
 #   X11 backend     : libxcb1-dev libxcb-dri3-dev libxcb-present-dev
-#   X11 scaling     : libxcb-render0-dev     (optional; without it, 1:1 only)
+#   X11 scaling     : libxcb-render0-dev     (optional; without it, 1:1 only,
+#                                             and no guest cursor on X11)
 #   X11 rel. motion : libxcb-xinput-dev      (optional; see the report below)
 
 PKG_CONFIG ?= pkg-config
@@ -35,8 +36,8 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -I. -I../common
 LDFLAGS += -Wl,-z,relro,-z,now
 
-OBJS = nvkvm_broker.o nb_common.o nb_placeholder.o nb_session_x11.o \
-       nb_session_wl.o nb_session_test.o
+OBJS = nvkvm_broker.o nb_common.o nb_cursor.o nb_placeholder.o \
+       nb_session_x11.o nb_session_wl.o nb_session_test.o
 
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
 # DRI3 is what lets a dma-buf become an X pixmap without a GL context, and
@@ -124,7 +125,7 @@ report:
 	@echo "nvkvm-display-broker backends:"
 	@echo "  dma-buf test source : $(if $(HAVE_GBM),yes (libgbm),NO - apt install libgbm-dev)"
 	@echo "  wayland : $(if $(HAVE_WL),yes,NO - install libwayland-dev wayland-protocols)"
-	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling, NO SCALING: install libxcb-render0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
+	@echo "  x11     : $(if $(HAVE_X11),yes (dri3+present$(if $(HAVE_XRENDER), +xrender scaling and guest cursor, NO SCALING OR GUEST CURSOR: install libxcb-render0-dev)),NO - install libxcb1-dev libxcb-dri3-dev libxcb-present-dev)$(if $(HAVE_X11),$(if $(HAVE_XI), + xi2 raw motion, - NO relative motion under grab: install libxcb-xinput-dev),)"
 	@echo "  test    : yes (always)"
 
 $(BIN): $(OBJS)
@@ -179,12 +180,20 @@ test/utf8_extracted.inc: nvkvm_broker.c
 test-utf8: test/utf8_extracted.inc test/test_utf8.c
 	$(CC) $(CFLAGS) -I test -o $@ test/test_utf8.c
 
-check: all test-utf8
+# The cursor record's validator and scaler, linked from the SAME object the
+# broker links -- nb_cursor.c is pure, so there is nothing to extract or stub.
+test-cursor: test/test_cursor.c nb_cursor.c nvkvm_broker.h \
+             ../common/nvkvm_broker_proto.h
+	$(CC) $(CFLAGS) -o $@ test/test_cursor.c nb_cursor.c $(LDFLAGS)
+
+check: all test-utf8 test-cursor
 	./test-utf8
+	./test-cursor
 	bash selftest.sh
 	python3 test/test_adopted_socket.py ./$(BIN)
 	python3 test/test_clipboard.py ./$(BIN)
 	python3 test/test_lifecycle.py ./$(BIN)
+	python3 test/test_cursor.py ./$(BIN)
 
 # Keep the sanitizer invocation reproducible locally and in CI.  A clean
 # rebuild matters here: mixing instrumented and ordinary objects links fine
@@ -200,4 +209,5 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) *.o *.d \
-	      *-client-protocol.h *-protocol.c test-utf8 test/utf8_extracted.inc
+	      *-client-protocol.h *-protocol.c test-utf8 test-cursor \
+	      test/utf8_extracted.inc

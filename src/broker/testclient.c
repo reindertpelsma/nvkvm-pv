@@ -36,9 +36,14 @@
  *   --bad-reserved     set a reserved field
  *   --bad-commit-fd    attach an fd to a COMMIT
  *   --window WxH       send a WINDOW resize request
+ *   --cursor WxH       after the first frame, send CMD_CURSOR SET with a WxH
+ *                      test pointer (hot spot 1,1) -- for watching a real
+ *                      backend put the guest's cursor up as the host's
+ *   --cursor-hide      ...and then CMD_CURSOR HIDE, one second later
  */
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +79,7 @@ static const char *evname(int t)
     case NVKVM_BROKER_EV_POINTER: return "POINTER";
     case NVKVM_BROKER_EV_BYE:     return "BYE";
     case NVKVM_BROKER_EV_FORMAT:  return "FORMAT";
+    case NVKVM_BROKER_EV_DEVICE:  return "DEVICE";
     default:                      return "?";
     }
 }
@@ -178,6 +184,46 @@ static int make_buffer(unsigned w, unsigned h, unsigned *stride_out)
     return fd;
 }
 
+/*
+ * A test pointer for --cursor: a white square with a black border and a
+ * translucent middle, PREMULTIPLIED, packed in a sealed memfd exactly as the
+ * protocol header describes a SET.  Returns the fd, or -1.
+ */
+static int make_cursor(unsigned w, unsigned h)
+{
+    size_t size = (size_t)w * 4 * h;
+    int fd = memfd_create("nvkvm-broker-testcursor",
+                          MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    uint32_t *px;
+    unsigned x, y;
+
+    if (fd < 0 || ftruncate(fd, (off_t)size) < 0) {
+        perror("cursor memfd");
+        if (fd >= 0) {
+            close(fd);
+        }
+        return -1;
+    }
+    px = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (px == MAP_FAILED) {
+        perror("cursor mmap");
+        close(fd);
+        return -1;
+    }
+    for (y = 0; y < h; y++) {
+        for (x = 0; x < w; x++) {
+            bool edge = x == 0 || y == 0 || x + 1 == w || y + 1 == h;
+            bool mid = x > w / 3 && x < 2 * w / 3 && y > h / 3 && y < 2 * h / 3;
+
+            px[(size_t)y * w + x] = edge ? 0xff000000u
+                                  : mid  ? 0x80808080u   /* 50% white, premult */
+                                         : 0xffffffffu;
+        }
+    }
+    munmap(px, size);
+    return fd;
+}
+
 int main(int argc, char **argv)
 {
     struct sockaddr_un sa;
@@ -197,6 +243,8 @@ int main(int argc, char **argv)
     struct nvkvm_broker_cmd tc_attach;
     int bad_two = 0, bad_reserved = 0, bad_commit_fd = 0;
     int quiet_after = 0, caps_clipboard = 0;
+    unsigned cur_w = 0, cur_h = 0;
+    int cur_hide = 0;
 
     /* Line-buffered: this tool is normally watched live and normally ended
      * with Ctrl-C or timeout(1), and a fully buffered pipe would throw away
@@ -233,6 +281,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--bad-reserved")) { bad_reserved = 1; }
         else if (!strcmp(a, "--bad-commit-fd")){ bad_commit_fd = 1; }
         else if (!strcmp(a, "--caps-clipboard")){ caps_clipboard = 1; }
+        else if (!strcmp(a, "--cursor") && v)  { sscanf(v, "%ux%u", &cur_w, &cur_h); i++; }
+        else if (!strcmp(a, "--cursor-hide")) { cur_hide = 1; }
         else { fprintf(stderr, "unknown option %s\n", a); return 2; }
     }
     if (!pw) { pw = 640; }
@@ -278,6 +328,12 @@ int main(int argc, char **argv)
                (p.flags & NVKVM_BROKER_F_FOCUSED) ? "F" : "-",
                p.x, p.y, p.w0, p.w1);
 
+        if (p.type == NVKVM_BROKER_EV_DEVICE) {
+            printf("  DISPLAY DEVICE: %s %u:%u%s\n",
+                   (p.x & NVKVM_BROKER_DEVICE_F_KNOWN) ? "known" : "unknown",
+                   p.w0, p.w1,
+                   (p.x & NVKVM_BROKER_DEVICE_F_RENDER) ? " (render node)" : "");
+        }
         if (p.type == NVKVM_BROKER_EV_FORMAT) {
             uint64_t m = (uint64_t)p.w0 | ((uint64_t)p.w1 << 32);
             printf("  FORMAT ANSWER: fourcc=%.4s modifier=0x%016llx -> %s\n",
@@ -288,7 +344,7 @@ int main(int argc, char **argv)
         if (p.type == NVKVM_BROKER_EV_HELLO) {
             printf("  proto v%u caps 0x%x: kbd=%d abs=%d rel=%d lock=%d "
                    "total-grab=%d focus=%d fs=%d dmabuf=%d modifiers=%d "
-                   "release=%d\n", p.w0, p.w1,
+                   "release=%d cursor=%d device=%d\n", p.w0, p.w1,
                    !!(p.w1 & NVKVM_BROKER_CAP_KEYBOARD),
                    !!(p.w1 & NVKVM_BROKER_CAP_ABS_POINTER),
                    !!(p.w1 & NVKVM_BROKER_CAP_REL_POINTER),
@@ -298,7 +354,9 @@ int main(int argc, char **argv)
                    !!(p.w1 & NVKVM_BROKER_CAP_FULLSCREEN),
                    !!(p.w1 & NVKVM_BROKER_CAP_DMABUF),
                    !!(p.w1 & NVKVM_BROKER_CAP_MODIFIERS),
-                   !!(p.w1 & NVKVM_BROKER_CAP_RELEASE));
+                   !!(p.w1 & NVKVM_BROKER_CAP_RELEASE),
+                   !!(p.w1 & NVKVM_BROKER_CAP_CURSOR),
+                   !!(p.w1 & NVKVM_BROKER_CAP_DEVICE));
             if (p.w0 != NVKVM_BROKER_PROTO_VERSION) {
                 fprintf(stderr, "protocol version mismatch: broker %u, this "
                         "client %u\n", p.w0, NVKVM_BROKER_PROTO_VERSION);
@@ -487,6 +545,34 @@ int main(int argc, char **argv)
                 }
                 close(tc_keep_fd);
                 tc_keep_fd = -1;
+            }
+            if (cur_w && cur_h) {
+                struct nvkvm_broker_cursor_cmd cc = {
+                    .type = NVKVM_BROKER_CMD_CURSOR,
+                    .op = NVKVM_BROKER_CURSOR_SET,
+                    .width = cur_w, .height = cur_h, .stride = cur_w * 4,
+                    .fourcc = FOURCC('A', 'R', '2', '4'),
+                    .hot_x = 1, .hot_y = 1,
+                };
+                int cfd = make_cursor(cur_w, cur_h);
+
+                if (cfd >= 0) {
+                    printf("  -> CURSOR SET %ux%u hot 1,1\n", cur_w, cur_h);
+                    send_cmd(sock, (const struct nvkvm_broker_cmd *)(void *)&cc,
+                             &cfd, 1, sizeof cc);
+                    close(cfd);
+                }
+                if (cur_hide) {
+                    struct nvkvm_broker_cursor_cmd hc = {
+                        .type = NVKVM_BROKER_CMD_CURSOR,
+                        .op = NVKVM_BROKER_CURSOR_HIDE,
+                    };
+
+                    sleep(1);
+                    printf("  -> CURSOR HIDE\n");
+                    send_cmd(sock, (const struct nvkvm_broker_cmd *)(void *)&hc,
+                             NULL, 0, sizeof hc);
+                }
             }
             if (hold_s > 0) {
                 printf("  -> holding the connection open for %ds\n", hold_s);

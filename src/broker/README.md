@@ -232,6 +232,16 @@ compositor's call, and it will not tell you.
   taken from the wire.
 - **No cursor plane.** The guest head has none (`drm_simple_display_pipe_init`
   creates only the primary) and the supported guest composites its own cursor
-  into the scanout buffer.
-- **No reverse channel beyond the three commands.** Every field the privileged
-  side reads is listed in §4, and that list is meant to stay short.
+  into the scanout buffer. ~~The broker has no cursor path at all~~ -- since
+  2026-10-03 it **can** show a guest cursor that a VMM sends as `CMD_CURSOR`
+  (advertised by `CAP_CURSOR`): an ARGB image of at most 256x256, copied out of
+  a memfd, scaled with the frame, shown as the host pointer while hovering and
+  hidden under grab. nvkvm-pv's own VMM sends none yet, so with it nothing
+  changes; the path exists for a VMM whose guest does have a cursor plane.
+- **No reverse channel beyond the commands in the protocol header.** Every
+  field the privileged side reads is listed in
+  [`docs/reference/broker-protocol.md`](../../docs/reference/broker-protocol.md),
+  and that list is meant to stay short. (This line used to say "the three
+  commands"; there are seven now -- `ATTACH`, `COMMIT`, `WINDOW`, `CLIPBOARD`,
+  `CAPS`, `QUERY_FORMAT`, `CURSOR` -- each fixed-size, and only `ATTACH` and
+  `CURSOR`'s `SET` carry an fd.)

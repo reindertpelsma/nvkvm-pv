@@ -3,7 +3,9 @@
  * nb_common.c — backend selection, the fourcc table, and the advertised-format
  * set every backend fills and the validator consults.
  */
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -286,6 +288,99 @@ void nb_formats_log(const struct nb_formats *f, const char *what)
                (unsigned long long)f->e[i].modifier,
                nb_modifier_vendor(f->e[i].modifier));
     }
+}
+
+/* ── pairs refused after being advertised ────────────────────────────────── */
+
+void nb_refused_add(struct nb_refused *r, uint32_t fourcc, uint64_t modifier)
+{
+    if (nb_refused_has(r, fourcc, modifier)) {
+        return;
+    }
+    /* A ring, not a growing list: the oldest refusal is the one forgotten. */
+    r->e[r->next].fourcc = fourcc;
+    r->e[r->next].modifier = modifier;
+    r->next = (r->next + 1u) % NB_REFUSED_SLOTS;
+    if (r->n < NB_REFUSED_SLOTS) {
+        r->n++;
+    }
+}
+
+bool nb_refused_has(const struct nb_refused *r, uint32_t fourcc,
+                    uint64_t modifier)
+{
+    unsigned i;
+
+    for (i = 0; i < r->n && i < NB_REFUSED_SLOTS; i++) {
+        if (r->e[i].fourcc == fourcc && r->e[i].modifier == modifier) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* ── which GPU the display is on (EV_DEVICE) ─────────────────────────────── */
+
+/*
+ * The display server answers with whichever node it opened: Mutter and
+ * wlroots report a render node through dmabuf feedback, an X server's DRI3Open
+ * may hand back the primary node.  A relay comparing that against its own
+ * render node would read the same GPU as a different one and pick a copy path
+ * it did not need -- safe, but exactly the waste EV_DEVICE exists to avoid.
+ *
+ * Both nodes of one GPU hang off the same parent device in sysfs, so the
+ * render node is one directory listing away.  Everything read here is the
+ * HOST's own sysfs; no client value reaches a path (major and minor come from
+ * the display server, and are printed as unsigned numbers).
+ */
+void nb_drm_device_resolve(uint32_t major, uint32_t minor, uint32_t *flags,
+                           uint32_t *out_major, uint32_t *out_minor)
+{
+    char dir[96];
+    DIR *d;
+    struct dirent *de;
+
+    *flags = NVKVM_BROKER_DEVICE_F_KNOWN;
+    *out_major = major;
+    *out_minor = minor;
+
+    snprintf(dir, sizeof dir, "/sys/dev/char/%u:%u/device/drm", major, minor);
+    d = opendir(dir);
+    if (!d) {
+        return;     /* KNOWN, not RENDER: the reported node as reported */
+    }
+    while ((de = readdir(d)) != NULL) {
+        char path[sizeof dir + 300], buf[32];
+        unsigned rmaj, rmin;
+        ssize_t n;
+        int fd, w;
+
+        if (strncmp(de->d_name, "renderD", 7) != 0) {
+            continue;
+        }
+        w = snprintf(path, sizeof path, "%s/%s/dev", dir, de->d_name);
+        if (w < 0 || (size_t)w >= sizeof path) {
+            continue;
+        }
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            continue;
+        }
+        n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n <= 0) {
+            continue;
+        }
+        buf[n] = '\0';
+        if (sscanf(buf, "%u:%u", &rmaj, &rmin) != 2) {
+            continue;
+        }
+        *out_major = rmaj;
+        *out_minor = rmin;
+        *flags |= NVKVM_BROKER_DEVICE_F_RENDER;
+        break;
+    }
+    closedir(d);
 }
 
 /* ── backend selection ───────────────────────────────────────────────────── */

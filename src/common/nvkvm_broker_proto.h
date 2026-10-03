@@ -16,9 +16,10 @@
  *                  fds, no lengths and nothing the broker has to be careful
  *                  about.
  *
- *   VMM → broker   fixed-size COMMAND records, one of which carries a single
- *                  dma-buf fd as SCM_RIGHTS ancillary data.  THIS is the
- *                  attack surface.  Everything in it is validated by the
+ *   VMM → broker   fixed-size COMMAND records, two of which carry a single
+ *                  fd as SCM_RIGHTS ancillary data: ATTACH (a dma-buf, or a
+ *                  memfd on the shm tier) and CURSOR's SET (a memfd).  THIS is
+ *                  the attack surface.  Everything in it is validated by the
  *                  privileged side against the real buffer and against what
  *                  the GPU actually advertises — see src/broker/README.md §3.
  *
@@ -36,6 +37,7 @@
 #ifndef NVKVM_BROKER_PROTO_H
 #define NVKVM_BROKER_PROTO_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #define NVKVM_BROKER_PROTO_VERSION 2u
@@ -108,10 +110,53 @@ enum {
      * x=1 is the same judgement ATTACH would make, taken through the same code
      * path -- including the opaque-twin substitution -- so an accepted answer
      * cannot be followed by a rejected frame.
+     *
+     * ALSO SENT UNSOLICITED, with x=0, when the display refuses an import of a
+     * pair it had advertised (Wayland: the asynchronous probe's `failed`; X11:
+     * DRI3 answering the import with an error).  A relay must therefore accept
+     * a LATER x=0 for a pair it already holds x=1 for -- a downgrade is news --
+     * and must never treat an unsolicited x=1 as an upgrade.  After the
+     * refusal, QUERY_FORMAT for that pair answers x=0 too.
      */
     NVKVM_BROKER_EV_FORMAT    = 16,
+    /*
+     * EV_DEVICE — WHICH GPU THE DISPLAY RENDERS ON.  Advertised by
+     * NVKVM_BROKER_CAP_DEVICE.  Sent once at attach, as the packet AFTER the
+     * priming FRAME (so the five-packet handshake prefix an older client reads
+     * is byte-for-byte what it always was), and again, unsolicited, whenever
+     * the display server reports a different device.
+     *
+     *     x  = NVKVM_BROKER_DEVICE_F_* (0 = the broker does not know)
+     *     y  = 0, reserved.  Deliberately NOT "where the answer came from":
+     *          that would name the backend, and the rule at the top of this
+     *          file is that the VMM cannot tell Wayland from X11.
+     *     w0 = major, w1 = minor of the DRM character device
+     *
+     * WHY.  A relay that can tell "the compositor imports on the same GPU the
+     * guest renders on" from "it scans out on another one" can choose its
+     * present path up front instead of discovering a cross-GPU host by having
+     * every ATTACH refused.  It is a HINT for choosing, never a gate the
+     * broker relies on: every ATTACH is still validated as if it were not
+     * sent.
+     *
+     * It discloses the host compositor's DRM device number to the VMM.  That
+     * is deliberate and small -- a major:minor names which of the host's GPUs
+     * draws the desktop, nothing about what is on it -- and it is written down
+     * in docs/internal/broker-design.md §3 so it is a decision, not a leak.
+     */
+    NVKVM_BROKER_EV_DEVICE    = 17,
 };
 
+/* EV_DEVICE.x */
+#define NVKVM_BROKER_DEVICE_F_KNOWN  (1u << 0) /* w0:w1 are meaningful       */
+#define NVKVM_BROKER_DEVICE_F_RENDER (1u << 1) /* w0:w1 is a RENDER node
+                                                * (renderD*), either as the
+                                                * display reported it or as
+                                                * the broker resolved the
+                                                * reported node through
+                                                * sysfs.  Clear with KNOWN set
+                                                * means it could not be
+                                                * resolved; compare with care */
 /* ── Clipboard framing ───────────────────────────────────────────────────── *
  *
  * Clipboard content is the first VARIABLE-LENGTH thing this protocol carries,
@@ -199,6 +244,22 @@ enum {
                                                  * (implicit) is accepted      */
 #define NVKVM_BROKER_CAP_RELEASE      (1u << 9) /* EV_RELEASE is real, not
                                                  * synthesised                 */
+#define NVKVM_BROKER_CAP_CURSOR       (1u << 10)/* CMD_CURSOR is understood and
+                                                 * this backend can show the
+                                                 * guest's cursor as the host
+                                                 * pointer.  Clear ⇒ sending
+                                                 * CMD_CURSOR is a protocol
+                                                 * violation (an older broker
+                                                 * does not know the type), and
+                                                 * the VMM must keep composing
+                                                 * the cursor into the frame   */
+#define NVKVM_BROKER_CAP_DEVICE       (1u << 11)/* an EV_DEVICE follows the
+                                                 * handshake's FRAME.  Set by
+                                                 * every backend of a broker
+                                                 * that knows the type, even
+                                                 * when its answer is "unknown"
+                                                 * -- so "too old to say" and
+                                                 * "could not tell" differ     */
 
 /* BYE reason codes. */
 enum {
@@ -327,7 +388,63 @@ enum {
      * Asked once per mode change, never per frame.
      */
     NVKVM_BROKER_CMD_QUERY_FORMAT = 6,
+
+    /*
+     * CURSOR — the guest's pointer image, shown as the HOST pointer while the
+     * pointer hovers over the guest's picture and the input is NOT grabbed.
+     * Only valid when HELLO advertised NVKVM_BROKER_CAP_CURSOR.  Laid out as
+     * struct nvkvm_broker_cursor_cmd, below; `op` says which of three it is:
+     *
+     *   SET   defines the image AND shows it.  SCM_RIGHTS carries exactly one
+     *         fd, which must be shmem-backed (a memfd): the broker MEASURES
+     *         it, COPIES the declared rows out with pread(2) -- never mmap,
+     *         so a client that truncates it afterwards gets a refused cursor
+     *         rather than a SIGBUS in the privileged process -- and closes it.
+     *         The compositor is never handed the client's fd.
+     *   HIDE  the guest has no visible cursor (or the VMM will compose it into
+     *         the frame itself -- an XOR cursor, say).  No fd, every other
+     *         field zero.  The host pointer over the picture is then NONE,
+     *         which is exactly what it is before any CURSOR was ever sent.
+     *   SHOW  show the last SET image again.  No fd, every other field zero.
+     *         Before any SET on this connection it changes nothing visible.
+     *
+     * UNDER GRAB THE BROKER HIDES IT REGARDLESS.  The pointer is locked and
+     * the guest's own pointer moves by relative motion, so a host cursor at
+     * the lock position would point at the wrong place.  The VMM composes
+     * the cursor into the frame while grabbed (it learns grab state from
+     * EV_GRAB and from F_GRABBED on every packet); the broker keeps the image
+     * and puts it back the moment the grab ends.
+     *
+     * SCALED WITH THE FRAME.  The image and hot spot are scaled by the same
+     * factor the broker applies to the guest's frame in the window, so a
+     * cursor over a 2x-scaled guest is twice the size, exactly as the guest
+     * drew it relative to its own content.
+     *
+     * A SET whose fields do not describe its fd is REFUSED and the connection
+     * lives, exactly like a rejected ATTACH: the geometry originates in the
+     * guest, and a guest flipping nonsense must not kill the display of a VMM
+     * that is behaving.  Framing errors -- unknown op, flags or reserved1 not
+     * zero, an fd where none belongs or none where one does, a non-zero field
+     * on HIDE/SHOW -- are violations, like everywhere else.
+     */
+    NVKVM_BROKER_CMD_CURSOR = 7,
 };
+
+/* NVKVM_BROKER_CMD_CURSOR `op`. */
+#define NVKVM_BROKER_CURSOR_SET  1u
+#define NVKVM_BROKER_CURSOR_HIDE 2u
+#define NVKVM_BROKER_CURSOR_SHOW 3u
+
+/*
+ * Cursor bounds.  256x256 is the largest cursor plane any KMS driver this
+ * project meets exposes (NVIDIA's, and amdgpu/i915 stop at 256 too), so it is
+ * the largest image a guest can have.  The stride bound lets a small image sit
+ * in a cursor buffer of the full 256-pixel width -- a 64x64 cursor in a
+ * 256x256 plane buffer has a 1024-byte pitch -- and no wider: with both, the
+ * most the broker ever copies for one SET is 256 rows of 1 KiB.
+ */
+#define NVKVM_BROKER_CURSOR_MAX_DIM    256u
+#define NVKVM_BROKER_CURSOR_MAX_STRIDE (4u * NVKVM_BROKER_CURSOR_MAX_DIM)
 
 /*
  * ATTACH flags.
@@ -381,6 +498,46 @@ struct nvkvm_broker_clip_cmd {
 };
 
 /*
+ * CMD_CURSOR laid over the standard command record: same 40 bytes, and
+ * type/flags/width/height/stride/offset/fourcc at the same offsets as ATTACH,
+ * so the two describe a buffer the same way.  The 8 bytes ATTACH spends on a
+ * modifier carry the hot spot instead (a cursor is always linear); `op` sits
+ * where ATTACH keeps its advisory seq.
+ *
+ * PIXELS: DRM_FORMAT_ARGB8888 only -- 32-bit little-endian words, A in bits
+ * 31..24, R 23..16, G 15..8, B 7..0, so B,G,R,A in memory -- with PREMULTIPLIED
+ * alpha, which is what DRM's default "Pre-multiplied" blend mode means and what
+ * a KMS cursor plane buffer already holds.  The broker copies the image anyway
+ * (to scale it) and clamps every colour channel to its alpha on the way, so a
+ * non-premultiplied image costs the sender wrong colours, never a malformed
+ * buffer in the compositor.
+ *
+ * SET (fd required):
+ *   width, height  1..NVKVM_BROKER_CURSOR_MAX_DIM
+ *   stride         width*4 .. NVKVM_BROKER_CURSOR_MAX_STRIDE, in bytes
+ *   offset         byte offset of row 0 within the memfd
+ *   fourcc         DRM_FORMAT_ARGB8888 ('AR24'), nothing else
+ *   hot_x, hot_y   < width, < height, in image pixels
+ *   and offset + stride*(height-1) + width*4 <= the memfd's real size,
+ *   computed in 64 bits.
+ * HIDE / SHOW: no fd; width..hot_y all zero.
+ * Every op: flags == 0, reserved1 == 0.
+ */
+struct nvkvm_broker_cursor_cmd {
+    uint16_t type;      /* NVKVM_BROKER_CMD_CURSOR                  offset  0 */
+    uint16_t flags;     /* must be 0                                        2 */
+    uint32_t width;     /*                                                  4 */
+    uint32_t height;    /*                                                  8 */
+    uint32_t stride;    /* bytes per row                                   12 */
+    uint32_t offset;    /* byte offset of row 0 within the memfd           16 */
+    uint32_t fourcc;    /* DRM_FORMAT_ARGB8888                             20 */
+    uint32_t hot_x;     /*                                                 24 */
+    uint32_t hot_y;     /*                                                 28 */
+    uint32_t op;        /* NVKVM_BROKER_CURSOR_*                           32 */
+    uint32_t reserved1; /* must be 0                                       36 */
+};
+
+/*
  * Single-plane only, on purpose.  The nvkvm guest head advertises XRGB8888 and
  * ARGB8888 (src/guest/nvkvm_kms.c nvkvm_pipe_formats[]) — both single-plane —
  * so multi-plane support would be untested code on the privileged side of the
@@ -411,6 +568,21 @@ _Static_assert(sizeof(struct nvkvm_broker_clip_pkt) == NVKVM_BROKER_PKT_SIZE,
                "clip_pkt must be exactly the event packet size");
 _Static_assert(sizeof(struct nvkvm_broker_clip_cmd) == NVKVM_BROKER_CMD_SIZE,
                "clip_cmd must be exactly the command size");
+_Static_assert(sizeof(struct nvkvm_broker_cursor_cmd) == NVKVM_BROKER_CMD_SIZE,
+               "cursor_cmd must be exactly the command size");
+/* The cursor overlay deliberately shares ATTACH's buffer description.  If a
+ * field ever moves, a reader that knows one layout misreads the other. */
+_Static_assert(offsetof(struct nvkvm_broker_cursor_cmd, fourcc) ==
+               offsetof(struct nvkvm_broker_cmd, fourcc) &&
+               offsetof(struct nvkvm_broker_cursor_cmd, stride) ==
+               offsetof(struct nvkvm_broker_cmd, stride) &&
+               offsetof(struct nvkvm_broker_cursor_cmd, reserved1) ==
+               offsetof(struct nvkvm_broker_cmd, reserved1),
+               "cursor_cmd must overlay the command record field for field");
+/* The largest SET copies MAX_STRIDE * MAX_DIM bytes; that must fit an int. */
+_Static_assert((unsigned long long)NVKVM_BROKER_CURSOR_MAX_STRIDE *
+               NVKVM_BROKER_CURSOR_MAX_DIM <= 0x7fffffffull,
+               "cursor copy span must fit an int");
 _Static_assert(NVKVM_BROKER_CLIP_PKT_BYTES <= 0x1fu &&
                NVKVM_BROKER_CLIP_CMD_BYTES <= 0x1fu,
                "chunk payload must fit the 5-bit nbytes field");

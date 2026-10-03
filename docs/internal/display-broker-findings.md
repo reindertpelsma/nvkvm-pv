@@ -238,6 +238,10 @@ Checked, and it holds:
   implemented* — `docs/internal/mint-guest-desktop.md` records that the
   supported path is weston, which "composites its own cursor and needs no cursor
   plane". The pointer is already inside the scanout buffer.
+  *(2026-10-03: the broker has since gained `CMD_CURSOR`, which shows a cursor
+  image the VMM sends as the host pointer -- for a VMM whose guest DOES have a
+  cursor plane. Nothing in this tree's VMM sends it, so for nvkvm-pv the
+  statement above still holds. See `docs/reference/broker-protocol.md`.)*
 - **No damage tracking, scaling or format conversion.** Whole frames are
   presented. The one memcpy in the path (`nvkvm_present_publish`) exists solely
   to feed QEMU's 2D console and disappears with it.
