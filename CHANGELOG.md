@@ -61,8 +61,35 @@ against an older broker. What a relay can now use:
   APPENDED to the handshake after the priming `FRAME`; the first five packets
   are unchanged.
 - **X11 now takes a "yes" back** with an unsolicited `EV_FORMAT` x=0 when DRI3
-  refuses an import it advertised, as the Wayland backend already did -- and on
-  both backends `QUERY_FORMAT` then answers no for that pair.
+  refuses an import it advertised, as the Wayland backend already did -- for
+  BOTH alpha twins, since DRI3 imports XR24 and AR24 identically -- and on both
+  backends `QUERY_FORMAT` then answers no for that pair. **The refusal lasts for
+  the connection that provoked it**, on both backends: a new connection starts
+  from what the display advertises (one dropped probe frame on Wayland, one
+  bounded round trip on X11, per refused pair). Before this, a `--persist`
+  broker carried one VM's refusals into the next VM's session. And an `ATTACH`
+  dropped for its format is now answered with `EV_FORMAT` x=0 for the pair it
+  named (once per pair per connection), so a dropped frame is never silent --
+  before, a Wayland probe refusal named the opaque twin the broker imported,
+  and a relay that had sent AR24 never heard about it.
+
+Behaviour fixed before release, found by review (no wire change):
+
+- **A FUSE fd could stall the broker.** The fd checks asked the fd's
+  filesystem (`fstatfs`) before proving what it was, and closing a refused fd
+  ran FUSE's `FLUSH` -- an uninterruptible wait on a daemon the sender may
+  control, on the thread holding the keyboard grab. Identity is now proved
+  in-kernel first (`F_GET_SEALS`; `/proc/self/fdinfo`'s `exp_name:` for a
+  dma-buf), and an fd that is neither shmem nor a dma-buf is closed on a helper
+  thread. The broker needs a readable `/proc/self/fdinfo` to accept dma-buf
+  frames.
+- **Cursor pacing was bypassed** whenever a backend re-rendered on its own
+  (a frame commit, a resize); backends now only ever see the paced snapshot.
+- **The scaled cursor's hot spot** was one pixel off at non-integer scales; it
+  now lands on the pixel showing the guest's hot pixel. On a HiDPI Wayland
+  output the cursor is rendered at device resolution (with `wp_viewporter`),
+  and a cursor the compositor has not released buffers for is hidden rather
+  than shown stale.
 
 Wire layout: [`docs/reference/broker-protocol.md`](docs/reference/broker-protocol.md).
 

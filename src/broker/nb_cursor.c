@@ -160,12 +160,45 @@ void nb_cursor_load(struct nb_cursor *dst, const uint8_t *src, uint32_t w,
     dst->gen++;
 }
 
-void nb_cursor_scaled_geom(const struct nb_cursor *c, uint32_t num_x,
-                           uint32_t den_x, uint32_t num_y, uint32_t den_y,
-                           uint32_t max, struct nb_cursor_geom *out)
+void nb_cursor_copy(struct nb_cursor *dst, const struct nb_cursor *src)
+{
+    size_t n = 0;
+
+    if (dst == src) {
+        return;
+    }
+    dst->gen = src->gen;
+    dst->defined = src->defined;
+    dst->visible = src->visible;
+    dst->w = src->w;
+    dst->h = src->h;
+    dst->hot_x = src->hot_x;
+    dst->hot_y = src->hot_y;
+    /*
+     * Only the pixels the image has.  Bounded by the array, not by w*h alone:
+     * a struct nobody loaded through nb_cursor_load() must not make this a
+     * copy past the end of either buffer.
+     */
+    if (src->defined) {
+        n = (size_t)src->w * src->h;
+        if (n > sizeof src->px / sizeof src->px[0]) {
+            n = sizeof src->px / sizeof src->px[0];
+        }
+        memcpy(dst->px, src->px, n * sizeof src->px[0]);
+    }
+}
+
+/*
+ * The scaled cursor's geometry from 64-bit factors.  Every caller bounds them
+ * (see the two wrappers below) so that w * num stays under 2^63: w <= 256 is
+ * 2^8, and the largest numerator either wrapper can form is under 2^44.
+ */
+static void nb_cursor_geom64(const struct nb_cursor *c, uint64_t num_x,
+                             uint64_t den_x, uint64_t num_y, uint64_t den_y,
+                             uint32_t max, struct nb_cursor_geom *out)
 {
     uint64_t w = c->w ? c->w : 1u, h = c->h ? c->h : 1u;
-    uint64_t dw, dh;
+    uint64_t dw, dh, hx, hy;
 
     if (num_x == 0 || den_x == 0) {
         num_x = den_x = 1;
@@ -176,16 +209,24 @@ void nb_cursor_scaled_geom(const struct nb_cursor *c, uint32_t num_x,
     if (max == 0) {
         max = 1;
     }
-    /* w <= 256 and num <= 2^32-1: the product is < 2^41. */
     dw = (w * num_x + den_x / 2u) / den_x;
     dh = (h * num_y + den_y / 2u) / den_y;
     if (dw < 1) { dw = 1; }
     if (dh < 1) { dh = 1; }
     /*
      * Past the bound, shrink BOTH edges by the same factor, so a clamped
-     * cursor is a smaller cursor rather than a distorted one.
+     * cursor is a smaller cursor rather than a distorted one.  The product
+     * below is formed from edges first brought under 2^24 (a ratio of two
+     * numbers that large keeps far more precision than a <= max result can
+     * show), so it stays under 2^56 whatever max is.
      */
     if (dw > max || dh > max) {
+        while (dw > (1ull << 24) || dh > (1ull << 24)) {
+            dw >>= 1;
+            dh >>= 1;
+        }
+        if (dw < 1) { dw = 1; }
+        if (dh < 1) { dh = 1; }
         if (dw >= dh) {
             dh = dh * max / dw;
             dw = max;
@@ -199,14 +240,69 @@ void nb_cursor_scaled_geom(const struct nb_cursor *c, uint32_t num_x,
     out->w = (uint32_t)dw;
     out->h = (uint32_t)dh;
     /*
-     * hot < w  ⇒  hot*dw/w < dw, so the scaled hot spot is inside the scaled
-     * image by construction -- and the min() below makes that true even for a
+     * THE HOT SPOT IS THE OUTPUT PIXEL THAT SHOWS THE GUEST'S HOT PIXEL.
+     *
+     * nb_cursor_scale() fills output x from source floor(x * w / dw).  The
+     * first x whose source reaches hot is ceil(hot * dw / w): x * w / dw >=
+     * hot exactly when x >= hot * dw / w.  When the cursor is not shrunk
+     * (dw >= w) that x samples hot itself, every time; when it is shrunk and
+     * hot is a pixel the scaler skips, it samples the nearest pixel after it.
+     *
+     * This used to be floor(hot * dw / w) -- "the same scale as the image" --
+     * which at 1.5x puts a 32-pixel cursor's hot spot 3 on output pixel 4,
+     * and output pixel 4 shows source pixel 2: a pointer that clicks one
+     * pixel left of where its arrow's tip is drawn, or on a transparent
+     * pixel beside it.  Computed in 64 bits: hot < 256, dw <= max.
+     *
+     * The clamp is reached only by a shrunk cursor whose hot pixel lies past
+     * the last sampled one -- and makes "inside the image" hold even for an
      * nb_cursor nobody loaded through nb_cursor_load().
      */
-    out->hot_x = (uint32_t)((uint64_t)c->hot_x * dw / w);
-    out->hot_y = (uint32_t)((uint64_t)c->hot_y * dh / h);
-    if (out->hot_x >= out->w) { out->hot_x = out->w - 1u; }
-    if (out->hot_y >= out->h) { out->hot_y = out->h - 1u; }
+    hx = ((uint64_t)c->hot_x * dw + w - 1u) / w;
+    hy = ((uint64_t)c->hot_y * dh + h - 1u) / h;
+    out->hot_x = hx >= dw ? (uint32_t)dw - 1u : (uint32_t)hx;
+    out->hot_y = hy >= dh ? (uint32_t)dh - 1u : (uint32_t)hy;
+}
+
+void nb_cursor_scaled_geom(const struct nb_cursor *c, uint32_t num_x,
+                           uint32_t den_x, uint32_t num_y, uint32_t den_y,
+                           uint32_t max, struct nb_cursor_geom *out)
+{
+    /* w <= 256 and num <= 2^32-1: the product is < 2^41. */
+    nb_cursor_geom64(c, num_x, den_x, num_y, den_y, max, out);
+}
+
+/* The largest output scale nb_cursor_device_geom() honours: 16x, which is
+ * past any real display and keeps every product below 2^44. */
+#define NB_CURSOR_MAX_SCALE_120 (16u * 120u)
+
+void nb_cursor_device_geom(const struct nb_cursor *c, uint32_t num_x,
+                           uint32_t den_x, uint32_t num_y, uint32_t den_y,
+                           uint32_t scale_120, uint32_t max,
+                           struct nb_cursor_geom *out)
+{
+    uint64_t s = scale_120;
+
+    /*
+     * Below 1 is not a reason to render FEWER pixels than the logical size --
+     * the compositor can shrink -- and 0 is "unknown".  Both are 1:1.
+     */
+    if (s < 120u) {
+        s = 120u;
+    }
+    if (s > NB_CURSOR_MAX_SCALE_120) {
+        s = NB_CURSOR_MAX_SCALE_120;
+    }
+    if (num_x == 0 || den_x == 0) {
+        num_x = den_x = 1;
+    }
+    if (num_y == 0 || den_y == 0) {
+        num_y = den_y = 1;
+    }
+    /* num * s < 2^32 * 2^11 = 2^43; den * 120 < 2^39.  Times w <= 2^8: no
+     * product reaches 2^52. */
+    nb_cursor_geom64(c, (uint64_t)num_x * s, (uint64_t)den_x * 120u,
+                     (uint64_t)num_y * s, (uint64_t)den_y * 120u, max, out);
 }
 
 void nb_cursor_scale(const struct nb_cursor *c, uint32_t *dst, uint32_t dw,

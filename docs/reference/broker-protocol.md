@@ -34,7 +34,12 @@ contain a bug conditional on it.
 
 - **`ATTACH`** carries exactly one fd as `SCM_RIGHTS`, which must be a dma-buf.
   The descriptor fields describe it. The broker validates (§3), imports, and
-  closes its copy; the buffer stays alive through the `wl_buffer`/pixmap.
+  closes its copy; the buffer stays alive through the `wl_buffer`/pixmap. The
+  broker proves the fd is a dma-buf from `/proc/self/fdinfo` (the `exp_name:`
+  line only a dma-buf's fdinfo carries) before it asks the fd's filesystem
+  anything (`fstatfs` == `DMA_BUF_MAGIC`), so it needs a readable
+  `/proc/self/fdinfo` to accept dma-buf frames; without one every dma-buf frame
+  is refused and the reason logged.
 - **`COMMIT`** presents the most recently attached buffer. No fd, and every
   descriptor field must be zero. Split from `ATTACH` because a compositor
   distinguishes "the content changed" from "the frame is finished", and
@@ -76,7 +81,7 @@ rejected as an unadvertised fourcc.
 | `BYE` 13 | `x` = reason (0 shutdown, 1 display lost, 2 protocol) |
 | `CLOSE` 14 | the user closed the display; `x` = 0 powerdown, 1 force. Policy is the VMM's. |
 | `CLIPBOARD` 15 | one chunk of host clipboard text (`struct nvkvm_broker_clip_pkt`) |
-| `FORMAT` 16 | `x` = 1 displayable / 0 not, `y` = fourcc, `w0`,`w1` = modifier low/high. The answer to `QUERY_FORMAT` -- **and also sent unsolicited with `x` = 0** when the display refuses an import it had advertised; see below. |
+| `FORMAT` 16 | `x` = 1 displayable / 0 not, `y` = fourcc, `w0`,`w1` = modifier low/high. The answer to `QUERY_FORMAT` -- **and also sent unsolicited with `x` = 0** when the display refuses an import it had advertised, or when an `ATTACH` is dropped for its format; see below. |
 | `DEVICE` 17 | `x` = `DEVICE_F_*`, `y` = 0, `w0`:`w1` = the display's DRM device major:minor. See below. |
 
 `flags` mirrors grab and focus state on **every** packet, so the client can
@@ -125,8 +130,12 @@ description sits at the same offsets as `ATTACH`'s (asserted in the header):
 | 36 | `uint32 reserved1` | 0 | 0 |
 
 - **`SET`** carries exactly one fd as `SCM_RIGHTS`: a **memfd** (any shmem
-  file; it is proved with `fstatfs` == `TMPFS_MAGIC` *and* `F_GET_SEALS`
-  succeeding, because `/dev` is devtmpfs and reports `TMPFS_MAGIC` too). The
+  file; it is proved with `F_GET_SEALS` succeeding and **then** `fstatfs` ==
+  `TMPFS_MAGIC` -- in that order, because `F_GET_SEALS` is answered from the
+  file's mapping without calling into any filesystem, while `fstatfs` on a FUSE
+  file is a request to its daemon; and both, because `/dev` is devtmpfs and
+  reports `TMPFS_MAGIC` too). An fd that is not shmem is refused without the
+  broker asking its filesystem anything, and closed off the main thread. The
   broker requires `offset + stride*(height-1) + width*4 <= st_size`, computed
   in 64 bits -- the last row needs only its pixels, not a whole stride --
   **copies those rows out with `pread(2)`**, and closes its copy of the fd. It
@@ -143,10 +152,17 @@ description sits at the same offsets as `ATTACH`'s (asserted in the header):
   holds. The broker clamps every colour channel to its alpha while copying, so
   a non-premultiplied image costs wrong colours, never a malformed buffer in
   the compositor.
-- **Scaled with the frame**: image and hot spot are scaled by the factor the
-  broker applies to the guest's frame in the window (rounded to nearest, at
-  least 1 pixel, at most 512 per edge with the aspect kept), so the cursor is
-  exactly as large relative to the guest's picture as the guest drew it.
+- **Scaled with the frame**: the image is scaled by the factor the broker
+  applies to the guest's frame in the window (size rounded to nearest, at least
+  1 pixel, at most 512 per edge with the aspect kept), so the cursor is exactly
+  as large relative to the guest's picture as the guest drew it. The **hot
+  spot** is the scaled pixel that shows the guest's hot pixel
+  (`ceil(hot * scaled / size)`, the first output pixel nearest-neighbour
+  sampling maps onto it) -- exact at every scale that does not shrink the
+  cursor. On a Wayland output with a fractional or integer scale above 1 the
+  image is rendered at device resolution and brought to its logical size with
+  a viewport (when the compositor offers `wp_viewporter`); the hot spot itself
+  is a logical-pixel integer, which is all `wl_pointer.set_cursor` can carry.
 - **Refused, not fatal**: a `SET` whose content is wrong -- fourcc, size, hot
   spot, stride, an extent past the fd's end, an fd that is not shmem -- is
   dropped, counted and logged (rate-limited), the previous cursor stays, and
@@ -158,7 +174,10 @@ description sits at the same offsets as `ATTACH`'s (asserted in the header):
   closed, as for every other framing error.
 - **Paced**: a changed cursor reaches the display server at most once per
   8 ms, latest wins, and the latest is always applied. A burst of `SET`s is
-  legal and costs the display a bounded number of uploads.
+  legal and costs the display a bounded number of uploads. The interval holds
+  across everything that makes a backend re-render on its own (a frame
+  `COMMIT`, a window resize, the grab ending): backends only ever see the image
+  the interval has released.
 - **Connection state**: forgotten on detach, so a `--persist` broker never
   shows one VM's pointer over the next VM's picture or over the placeholder.
 
@@ -188,11 +207,33 @@ deliberate, small disclosure, recorded in
 
 Both backends send one when the display refuses to import a pair it had
 advertised: Wayland when the asynchronous probe answers `failed`, X11 when
-`DRI3PixmapFromBuffer(s)` answers with an X error. From then on `QUERY_FORMAT`
-for that pair answers `x` = 0 as well -- on X11 for both alpha twins, since DRI3
-imports XR24 and AR24 identically. A relay must accept a **later** `x` = 0 for
-a pair it holds `x` = 1 for, and must never treat an unsolicited `x` = 1 as an
-upgrade.
+`DRI3PixmapFromBuffer(s)` answers with an X error. On X11 it is sent for **both
+alpha twins** -- one `EV_FORMAT` for XR24 and one for AR24, same modifier --
+since DRI3 imports the two identically and a refusal of one is a refusal of the
+other. From then on `QUERY_FORMAT` for the refused pair(s) answers `x` = 0 as
+well, and an `ATTACH` in them is rejected without another import attempt. A
+relay must accept a **later** `x` = 0 for a pair it holds `x` = 1 for, and must
+never treat an unsolicited `x` = 1 as an upgrade.
+
+The broker also sends one **whenever an `ATTACH` is dropped at the format
+gate** -- for the (fourcc, modifier) that `ATTACH` named, once per pair per
+connection. So a dropped frame is never silent on the wire, whatever made the
+pair unusable: never advertised, refused earlier on this connection, or
+refused under its opaque twin (a Wayland probe imports, and so reports, the
+twin the broker substituted -- XR24 for an AR24 frame -- and a relay that sent
+AR24 would otherwise have kept its yes). A relay that never asked about the
+pair may simply record it.
+
+**Connection state**, on both backends: the refusal is forgotten when the
+client detaches, so a new connection is answered from what the display
+advertises, and learns of a refusal again the same way (on Wayland at the cost
+of one dropped probe frame). A refusal is caused by a buffer the guest chose;
+on a `--persist` broker it must not decide the next VM's present path.
+
+What a relay does next is its own choice; the broker offers no fallback of its
+own. On X11, shared-memory (`F_SHM`) frames are presented only in the shm tier
+(`--present-mode=shm`, or `auto` on a server without DRI3), so a relay whose
+only advertised pair was refused there has nothing left to send.
 
 ### Backpressure, and the rule it enforces
 

@@ -124,15 +124,22 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # fuse3 is for test/test_cursor.py's stalling filesystem
+      # (test/stall_fuse.py): a client fd on FUSE must never make the broker
+      # wait on its daemon.  NB_REQUIRE_FUSE turns "FUSE unusable here" from a
+      # printed SKIP into a failure, so the case cannot quietly stop running.
       - name: install display protocol build dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             libgbm-dev libwayland-dev wayland-protocols \
-            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-xinput-dev
+            libxcb1-dev libxcb-dri3-dev libxcb-present-dev libxcb-xinput-dev \
+            fuse3
 
       - name: clean build and hostile-client regression tests
         working-directory: src/broker
+        env:
+          NB_REQUIRE_FUSE: "1"
         run: make clean check
 
       - name: ASAN + UBSAN clean rebuild and regression tests
@@ -140,6 +147,7 @@ jobs:
         env:
           ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          NB_REQUIRE_FUSE: "1"
         run: make check-sanitize
 
   qemu-syntax:

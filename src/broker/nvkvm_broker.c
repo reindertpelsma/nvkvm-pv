@@ -42,12 +42,14 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <limits.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <sys/syscall.h>
 #include <linux/capability.h>
 #include "nvkvm_uidmap.h"
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +128,9 @@ static void bit_set(unsigned char *m, unsigned b, bool v)
     }
 }
 
+/* Forward: closing a client's fd is a filesystem call; see nb_fd_drop(). */
+static void nb_fd_drop(int fd);
+
 void nb_sink_init(struct nb_sink *s, struct nb_session *sess)
 {
     memset(s, 0, sizeof(*s));
@@ -148,7 +153,7 @@ static void nb_client_state_reset(struct nb_sink *s)
     s->tx_partial = 0;
     s->rxlen = 0;
     if (s->rxfd >= 0) {
-        close(s->rxfd);
+        nb_fd_drop(s->rxfd);
         s->rxfd = -1;
     }
     s->window_established = false;
@@ -188,17 +193,23 @@ static void nb_client_state_reset(struct nb_sink *s)
      * Told to the backend NOW rather than through the pacing in
      * nb_sink_tick(): forgetting is not a flood risk, and a stale image
      * surviving the VM it belonged to for even one interval is the wrong
-     * picture on screen.
+     * picture on screen.  BOTH copies are forgotten: the published one is
+     * what the backend holds a pointer to, and the pending one must never be
+     * published later on the next client's behalf.
      */
     s->cursor.defined = false;
     s->cursor.visible = false;
     s->cursor.gen++;
+    nb_cursor_copy(&s->cursor_pub, &s->cursor);
     s->cursor_dirty = false;
     s->cursor_applied_ms = 0;
     s->n_cursor = s->n_cursor_reject = 0;
     if (s->sess && s->sess->ops->cursor) {
-        s->sess->ops->cursor(s->sess, &s->cursor);
+        s->sess->ops->cursor(s->sess, &s->cursor_pub);
     }
+    /* The previous client's buffers provoked these: see fmt_refused. */
+    memset(&s->fmt_refused, 0, sizeof s->fmt_refused);
+    memset(&s->fmt_told, 0, sizeof s->fmt_told);
 }
 
 bool nb_sink_want_write(const struct nb_sink *s)
@@ -753,6 +764,59 @@ void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
             (uint32_t)(mod & 0xffffffffu), (uint32_t)(mod >> 32));
 }
 
+/*
+ * Tell the client x=0 for a pair, unless it has already been told on this
+ * connection.  Every x=0 the broker volunteers goes through here.
+ */
+static void nb_format_tell_no(struct nb_sink *s, uint32_t fourcc,
+                              uint64_t mod)
+{
+    if (nb_refused_has(&s->fmt_told, fourcc, mod)) {
+        return;
+    }
+    nb_refused_add(&s->fmt_told, fourcc, mod);
+    nb_sink_format_verdict(s, fourcc, mod, false);
+}
+
+void nb_sink_format_refused(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
+                            bool both_twins)
+{
+    /*
+     * The other member of an alpha pair, whichever one was used: AR24's twin
+     * is XR24 and XR24's is AR24.  nb_fourcc_opaque_twin() only answers the
+     * alpha -> opaque direction, so the reverse is found by asking it about
+     * each candidate.
+     */
+    static const uint32_t alpha[] = {
+        0x34325241u,    /* AR24 */
+        0x34324241u,    /* AB24 */
+    };
+    uint32_t twin = 0;
+    unsigned i;
+
+    nb_refused_add(&s->fmt_refused, fourcc, mod);
+    nb_format_tell_no(s, fourcc, mod);
+    if (!both_twins) {
+        return;
+    }
+    twin = nb_fourcc_opaque_twin(fourcc);
+    for (i = 0; !twin && i < sizeof alpha / sizeof alpha[0]; i++) {
+        if (nb_fourcc_opaque_twin(alpha[i]) == fourcc) {
+            twin = alpha[i];
+        }
+    }
+    if (twin) {
+        /*
+         * AND SAY SO FOR THE TWIN TOO.  Remembering it without announcing it
+         * is the bug this exists to prevent: a relay that was told x=1 for
+         * the twin keeps sending it, the resolver refuses every frame, and
+         * nothing on the wire says why -- a black window.
+         */
+        nb_refused_add(&s->fmt_refused, twin, mod);
+        nb_format_tell_no(s, twin, mod);
+    }
+}
+
 void nb_sink_pointer(struct nb_sink *s, bool inside)
 {
     if (s->pointer_in == inside) {
@@ -1148,6 +1212,49 @@ void nb_sink_bye(struct nb_sink *s, int reason)
  * The TEST backend also takes tmpfs (memfd), because it has no import path at
  * all and exists precisely so the accept side of this validator can be
  * exercised without a GPU.  It is unreachable from --backend auto.
+ *
+ * ── AND NOTHING THAT ASKS THE FD'S FILESYSTEM GOES FIRST ──────────────────
+ *
+ * fstatfs() is not a neutral question.  It calls the superblock's ->statfs,
+ * and on FUSE that is a FUSE_STATFS request to the daemon behind the mount
+ * (fs/fuse/inode.c fuse_statfs(), whenever fuse_allow_current_process()
+ * passes -- which it does for a broker running as the uid that mounted it,
+ * the podman keep-id deployment src/broker/README.md describes).  The wait
+ * for the answer is wait_event_interruptible then wait_event_killable
+ * (fs/fuse/dev.c request_wait_answer()), and this process blocks its signals
+ * for signalfd -- so a daemon that never answers parks the thread that holds
+ * the keyboard grab until something sends SIGKILL.  fstat() and lseek() reach
+ * FUSE the same way (GETATTR), and so does close() -- the one no check can
+ * avoid, handled by nb_fd_drop() instead.  A client choosing the fd type must
+ * not be choosing when the broker stalls, so every fd from a client is first
+ * put through a check that never leaves the kernel's own code, and only an fd
+ * that passes it is ever fstatfs()ed, fstat()ed or measured:
+ *
+ *   - "is it shmem?" -- fcntl(F_GET_SEALS).  do_fcntl() -> memfd_fcntl() ->
+ *     memfd_file_seals_ptr() (mm/memfd.c): a pointer comparison on
+ *     file->f_mapping->a_ops (shmem_aops) or f_op (hugetlbfs), else EINVAL,
+ *     with no filesystem method called.  Measured: a memfd answers 0x0 or
+ *     0x1, an fd to a /dev/shm file 0x1 (F_SEAL_SEAL, which mm/shmem.c sets
+ *     on every inode memfd_create(MFD_ALLOW_SEALING) did not make), and
+ *     /dev/null, a tmpfs FIFO and a file on disk EINVAL.  It also answers for
+ *     hugetlbfs, which the fstatfs() that follows -- now on a filesystem whose
+ *     ->statfs is kernel code -- rules out.
+ *   - "is it a dma-buf?" -- /proc/self/fdinfo/N carrying an `exp_name:` line.
+ *     fs/proc/fd.c seq_show() prints pos/flags/mnt_id/ino and the inode's
+ *     lock list, then calls the file's own ->show_fdinfo, which a FUSE file
+ *     does not have (fuse_dev_show_fdinfo is /dev/fuse's, not a mounted
+ *     file's); only drivers/dma-buf/dma-buf.c dma_buf_show_fdinfo() prints
+ *     `exp_name:`, and it arrived in Linux 5.3 together with the dmabuf
+ *     filesystem DMA_BUF_MAGIC names, so no kernel this check already accepts
+ *     lacks it.  NOT readlink("/proc/self/fd/N"): a dma-buf reads as
+ *     "/dmabuf:<name>" there, but for any other file the text is a PATH, and
+ *     paths are chosen by whoever mounts things -- not an identity the
+ *     sender cannot shape.
+ *
+ * The one exception found in the kernel source: a Coda file mmapped from a
+ * container file on tmpfs shares that file's mapping (fs/coda/file.c), so it
+ * passes F_GET_SEALS and its fstatfs() is an upcall to Venus.  Coda is not
+ * FS_USERNS_MOUNT -- only root can mount it -- and its upcalls time out.
  */
 #define NB_FOURCC_XR24 0x34325258u
 #define NB_FOURCC_AR24 0x34325241u
@@ -1192,20 +1299,216 @@ static bool nb_reject_log(struct nb_sink *s)
     return true;
 }
 
-static bool nb_fd_is_dmabuf(int fd, bool allow_memfd)
+/*
+ * Is `fd` shmem (a memfd, or any other tmpfs file), proved without asking the
+ * fd's filesystem anything -- see HARDENING 4.  F_GET_SEALS first, and only
+ * then fstatfs(): it narrows "shmem or hugetlbfs" to tmpfs, and by then the
+ * ->statfs it calls is the kernel's own.  Returns the seals, or -1.
+ */
+static int nb_fd_shmem_seals(int fd)
 {
     struct statfs sfs;
+    int seals = fcntl(fd, F_GET_SEALS);
 
-    if (fstatfs(fd, &sfs) < 0) {
+    if (seals < 0) {
+        return -1;
+    }
+    if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC) {
+        return -1;
+    }
+    return seals;
+}
+
+/*
+ * Does /proc/self/fdinfo/<fd> carry the line only a dma-buf's fdinfo has?
+ * 1 yes, 0 no, -errno when it could not be read (no /proc): see HARDENING 4.
+ * Bounded: 4 KiB is far past a dma-buf's six lines; a file whose lock list
+ * pushes the line past it is refused, which only an fd's own sender can cause.
+ */
+static int nb_fd_fdinfo_is_dmabuf(int fd)
+{
+    char path[48];
+    char buf[4096 + 1];
+    size_t got = 0;
+    int pfd;
+
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    pfd = open(path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+    if (pfd < 0) {
+        return -errno;
+    }
+    while (got < sizeof buf - 1) {
+        ssize_t n = read(pfd, buf + got, sizeof buf - 1 - got);
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            break;
+        }
+        got += (size_t)n;
+    }
+    close(pfd);
+    buf[got] = '\0';
+    /* Never the first line (pos: is), so a line start is always "\n". */
+    return strstr(buf, "\nexp_name:\t") != NULL;
+}
+
+/* 1 a dma-buf (or, with allow_memfd, shmem), 0 neither, -errno when the
+ * in-kernel proof could not be read -- the caller refuses that too. */
+static int nb_fd_is_dmabuf(int fd, bool allow_memfd)
+{
+    struct statfs sfs;
+    int r = nb_fd_fdinfo_is_dmabuf(fd);
+
+    if (r < 0) {
+        return r;
+    }
+    if (r > 0) {
+        /* Only now is fstatfs() a question the kernel answers itself. */
+        return fstatfs(fd, &sfs) == 0 && sfs.f_type == DMA_BUF_MAGIC;
+    }
+    return allow_memfd && nb_fd_shmem_seals(fd) >= 0;
+}
+
+/* ── closing a client's fd ───────────────────────────────────────────────── */
+
+/*
+ * CLOSING IS A FILESYSTEM CALL TOO.  close(2) runs the file's ->flush
+ * (fs/open.c filp_flush()), and FUSE's is a FUSE_FLUSH request to the daemon
+ * sent with args.force set (fs/fuse/file.c fuse_flush()) -- which makes
+ * request_wait_answer() end in a plain, UNINTERRUPTIBLE wait_event() once the
+ * interruptible phase passes, and with this process's signals blocked for
+ * signalfd nothing interrupts that phase.  Unlike the fstatfs() HARDENING 4
+ * moves out of the way, FLUSH is sent whatever the caller's credentials.  So
+ * the moment the broker had refused a FUSE fd without asking it anything, the
+ * close that followed handed the same daemon the same thread -- the one
+ * holding the keyboard grab -- in D state, until the daemon answered or died.
+ * Nothing about the fd can be checked first that removes this: the fd is in
+ * our table from the moment recvmsg() returns, and every way out of the table
+ * (close, dup2 over it, close_range, process exit) flushes.
+ *
+ * So a client's fd is closed HERE only when it is proved -- in-kernel, as in
+ * HARDENING 4 -- to be a type whose file_operations have no ->flush: shmem and
+ * hugetlbfs (F_GET_SEALS answers; shmem_file_operations,
+ * hugetlbfs_file_operations and SysV shm's have none) or a dma-buf (dma_buf_fops
+ * has none).  Every other fd -- the ones the validators refuse -- goes to a
+ * reaper thread that closes it, and if a filesystem makes that close wait,
+ * the reaper waits instead of the broker.  An honest client never reaches it:
+ * it sends only dma-bufs and memfds.
+ *
+ * The thread is started lazily, on the first such fd, so a broker that never
+ * meets one stays single-threaded -- and is always started after --drop-user,
+ * because glibc's setuid() must interrupt every thread and cannot interrupt
+ * one stuck in D state.  It blocks every signal: signalfd in the main thread
+ * stays the only consumer.  The queue is a pipe of fd numbers; while a close
+ * is stuck the numbers wait there and their fds stay open, bounded by
+ * RLIMIT_NOFILE -- past which recvmsg() itself drops what it cannot install
+ * (MSG_CTRUNC, a violation), so the cost of a stuck reaper is fds, never the
+ * main loop.  If even the pipe is full the fd is HELD, deliberately leaked,
+ * rather than closed here.
+ */
+static int nb_reap_wr = -1;
+static unsigned long long nb_reap_held;
+
+static void *nb_reaper(void *arg)
+{
+    int rd = (int)(intptr_t)arg;
+
+    for (;;) {
+        int fd;
+        ssize_t n = read(rd, &fd, sizeof fd);
+
+        if (n == (ssize_t)sizeof fd) {
+            close(fd);
+            continue;
+        }
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        break;          /* EOF or error: nothing more will ever be queued */
+    }
+    close(rd);
+    return NULL;
+}
+
+static bool nb_reaper_start(void)
+{
+    static bool failed;
+    pthread_attr_t attr;
+    pthread_t tid;
+    sigset_t all, old;
+    int p[2], r;
+
+    if (nb_reap_wr >= 0) {
+        return true;
+    }
+    if (failed) {
         return false;
     }
-    if (sfs.f_type == DMA_BUF_MAGIC) {
-        return true;
+    if (pipe2(p, O_CLOEXEC) < 0) {
+        failed = true;
+        return false;
     }
-    if (allow_memfd && sfs.f_type == TMPFS_MAGIC) {
-        return true;
+    /* Never block the main thread on the queue either. */
+    if (fcntl(p[1], F_SETFL, O_NONBLOCK) < 0) {
+        close(p[0]);
+        close(p[1]);
+        failed = true;
+        return false;
     }
-    return false;
+    sigfillset(&all);
+    pthread_sigmask(SIG_SETMASK, &all, &old);
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 64u * 1024u);
+    r = pthread_create(&tid, &attr, nb_reaper, (void *)(intptr_t)p[0]);
+    pthread_attr_destroy(&attr);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (r != 0) {
+        close(p[0]);
+        close(p[1]);
+        failed = true;
+        return false;
+    }
+    nb_reap_wr = p[1];
+    nb_log("a client sent an fd that is neither a dma-buf nor shared memory; "
+           "fds like it are closed on a separate thread from now on, so a "
+           "filesystem that makes close() wait cannot stall the broker");
+    return true;
+}
+
+/* Does this fd's close() stay in the kernel's own code?  See above. */
+static bool nb_fd_close_is_local(int fd)
+{
+    return fcntl(fd, F_GET_SEALS) >= 0 || nb_fd_fdinfo_is_dmabuf(fd) > 0;
+}
+
+static void nb_fd_drop(int fd)
+{
+    if (fd < 0) {
+        return;
+    }
+    if (nb_fd_close_is_local(fd)) {
+        close(fd);
+        return;
+    }
+    if (nb_reaper_start()) {
+        ssize_t n;
+
+        do {
+            n = write(nb_reap_wr, &fd, sizeof fd);
+        } while (n < 0 && errno == EINTR);
+        if (n == (ssize_t)sizeof fd) {
+            return;
+        }
+    }
+    if (nb_reap_held++ == 0) {
+        nb_err("a client's fd could not be handed to the closing thread (it "
+               "is stuck on an earlier close, or could not start); HOLDING it "
+               "open rather than closing it here, where a filesystem could "
+               "stall the broker.  Every further such fd is held too.");
+    }
 }
 
 static void nb_violation(struct nb_sink *s, const char *why)
@@ -1213,6 +1516,23 @@ static void nb_violation(struct nb_sink *s, const char *why)
     nb_err("protocol violation from pid %d: %s", (int)s->client_pid, why);
     nb_sink_bye(s, NVKVM_BROKER_BYE_PROTOCOL);
     nb_sink_detach(s, "protocol violation");
+}
+
+/*
+ * Is the pair usable at all: advertised by the display, AND not refused by it
+ * since on this connection (nb_sink_format_refused()).  The refusal is checked
+ * HERE, in the core, so that ATTACH and QUERY_FORMAT cannot disagree about it
+ * on any backend that reports refusals.
+ */
+static bool nb_format_usable(struct nb_sink *s, uint32_t fourcc,
+                             uint64_t modifier)
+{
+    struct nb_session *ss = s->sess;
+
+    if (nb_refused_has(&s->fmt_refused, fourcc, modifier)) {
+        return false;
+    }
+    return ss->ops->format_ok(ss, fourcc, modifier);
 }
 
 /*
@@ -1227,10 +1547,10 @@ static void nb_violation(struct nb_sink *s, const char *why)
  * Returns true and writes the fourcc to USE (possibly the opaque twin) to
  * *use_fourcc; false means no description of this buffer is displayable.
  */
-static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
+static bool nb_format_resolve(struct nb_sink *s, uint32_t fourcc,
                               uint64_t modifier, uint32_t *use_fourcc)
 {
-    if (ss->ops->format_ok(ss, fourcc, modifier)) {
+    if (nb_format_usable(s, fourcc, modifier)) {
         *use_fourcc = fourcc;
         return true;
     }
@@ -1250,7 +1570,7 @@ static bool nb_format_resolve(struct nb_session *ss, uint32_t fourcc,
      */
     uint32_t twin = nb_fourcc_opaque_twin(fourcc);
 
-    if (twin && ss->ops->format_ok(ss, twin, modifier)) {
+    if (twin && nb_format_usable(s, twin, modifier)) {
         *use_fourcc = twin;
         return true;
     }
@@ -1302,7 +1622,6 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
      */
     d->is_shm = (c->flags & NVKVM_BROKER_CMD_F_SHM) != 0;
     if (d->is_shm) {
-        struct statfs sfs;
         int seals;
 
         if (!ss->accept_shm) {
@@ -1312,7 +1631,9 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             return -EINVAL;
         }
-        if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC) {
+        /* Shmem, proved without asking the fd's filesystem: HARDENING 4. */
+        seals = nb_fd_shmem_seals(fd);
+        if (seals < 0) {
             if (nb_reject_log(s)) {
                 nb_err("ATTACH: F_SHM was set but the fd is not a memfd");
             }
@@ -1331,12 +1652,17 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
          * what makes the measurement mean something for longer than a line of
          * code; it is exactly why udmabuf demands it of the same memfd one
          * process out (src/qemu/nvkvm_udmabuf.c), so an honest VMM already
-         * carries it.  F_GET_SEALS also fails outright on a plain tmpfs file,
-         * which is how an fd to /dev/shm/... -- also TMPFS_MAGIC, and not a
-         * memfd at all -- is refused here rather than mapped.
+         * carries it.
+         *
+         * An fd to a plain tmpfs file (/dev/shm/...) is refused HERE, by the
+         * seal, and not -- as this comment used to say -- by F_GET_SEALS
+         * failing.  It does not fail: MEASURED, it answers 0x1, F_SEAL_SEAL,
+         * which mm/shmem.c puts on every inode memfd_create(MFD_ALLOW_SEALING)
+         * did not create.  F_SEAL_SEAL forbids adding F_SEAL_SHRINK (F_ADD_SEALS
+         * answers EPERM), so such a file can never carry the seal required
+         * here.  test/test_cursor.py sends one.
          */
-        seals = fcntl(fd, F_GET_SEALS);
-        if (seals < 0 || !(seals & F_SEAL_SHRINK)) {
+        if (!(seals & F_SEAL_SHRINK)) {
             if (nb_reject_log(s)) {
                 nb_err("ATTACH: an F_SHM buffer must be a memfd sealed with "
                        "F_SEAL_SHRINK; without it the size measured here can be "
@@ -1344,11 +1670,22 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             return -EINVAL;
         }
-    } else if (!nb_fd_is_dmabuf(fd, ss->accept_memfd)) {
-        if (nb_reject_log(s)) {
-            nb_err("ATTACH: the fd is not a dma-buf");
+    } else {
+        int r = nb_fd_is_dmabuf(fd, ss->accept_memfd);
+
+        if (r <= 0) {
+            if (nb_reject_log(s)) {
+                if (r < 0) {
+                    nb_err("ATTACH: cannot read /proc/self/fdinfo (%s), so "
+                           "the fd cannot be proved to be a dma-buf without "
+                           "asking its filesystem -- which a hostile sender "
+                           "can make block; refused", strerror(-r));
+                } else {
+                    nb_err("ATTACH: the fd is not a dma-buf");
+                }
+            }
+            return -EINVAL;
         }
-        return -EINVAL;
     }
     /* HARDENING 2: same bound as NVKVM_PRESENT_MAX_DIM in the VMM, restated
      * here because the VMM is the attacker in this model. */
@@ -1394,8 +1731,31 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
             }
             return -EINVAL;
         }
-    } else if (!nb_format_resolve(ss, c->fourcc, c->modifier, &fourcc)) {
+    } else if (!nb_format_resolve(s, c->fourcc, c->modifier, &fourcc)) {
+        /*
+         * AND SAY SO ON THE WIRE, for the pair the client SENT -- whatever
+         * the reason, and before the log budget can return early.  A frame
+         * dropped here is otherwise dropped in silence, and a relay that
+         * holds x=1 for the pair (told so earlier, or never asked) keeps
+         * sending it into a black window.  The backend's own x=0 does not
+         * always cover it: it names the pair the backend IMPORTED, which for
+         * an alpha format resolved through its opaque twin is not the pair
+         * the client named -- on Wayland a refused probe of XR24 used to
+         * leave a relay sending AR24 holding its yes forever.  Once per pair
+         * per connection (fmt_told), so a refused stream costs one packet.
+         */
+        nb_format_tell_no(s, c->fourcc, c->modifier);
         if (!nb_reject_log(s)) {
+            return -EINVAL;
+        }
+        if (nb_refused_has(&s->fmt_refused, c->fourcc, c->modifier)) {
+            /* Advertised, and then refused on this connection: "not
+             * advertised" would send the reader looking for the wrong fault. */
+            nb_err("ATTACH: fourcc %s modifier 0x%016llx was refused by this "
+                   "display earlier on this connection (the VMM was sent "
+                   "EV_FORMAT x=0 for it); rejected without asking again",
+                   nb_fourcc_name(c->fourcc, fcc),
+                   (unsigned long long)c->modifier);
             return -EINVAL;
         }
         /*
@@ -1566,8 +1926,15 @@ int nb_sink_tick(struct nb_sink *s)
     }
     s->cursor_dirty = false;
     s->cursor_applied_ms = now;
+    /*
+     * PUBLISH.  This copy is the only way a SET reaches what the backend can
+     * see -- the backend holds a pointer to cursor_pub and re-renders from it
+     * whenever it likes, so the interval above bounds THAT too, not merely
+     * how often ->cursor() is called.
+     */
+    nb_cursor_copy(&s->cursor_pub, &s->cursor);
     if (s->sess->ops->cursor) {
-        s->sess->ops->cursor(s->sess, &s->cursor);
+        s->sess->ops->cursor(s->sess, &s->cursor_pub);
     }
     return -1;
 }
@@ -1594,8 +1961,9 @@ static void nb_cursor_changed(struct nb_sink *s)
  * only for whether the image is complete.
  *
  * And it is the BROKER's copy the compositor sees, never the client's fd: the
- * image is scaled and re-uploaded by the backend from s->cursor, so nothing the
- * client does to its memfd afterwards reaches the display server.
+ * image lands in s->cursor, is published to s->cursor_pub when the pacing
+ * allows, and is scaled and re-uploaded by the backend from that, so nothing
+ * the client does to its memfd afterwards reaches the display server.
  *
  * Returns 0, or -EINVAL after logging (throttled) which rule failed.  On
  * failure s->cursor is untouched: a refused SET leaves the previous cursor
@@ -1609,7 +1977,6 @@ static int nb_cursor_read(struct nb_sink *s,
      * nb_cursor_check() enforced on the record before we got here. */
     static uint8_t staging[NVKVM_BROKER_CURSOR_MAX_STRIDE *
                            NVKVM_BROKER_CURSOR_MAX_DIM];
-    struct statfs sfs;
     struct stat st;
     uint32_t span;
     size_t got = 0;
@@ -1622,11 +1989,16 @@ static int nb_cursor_read(struct nb_sink *s,
      * client choosing the fd type would be choosing when the broker stalls.
      * tmpfs pages are memory; a read of them returns.
      *
-     * F_GET_SEALS succeeding is the memfd/shmem proof rather than a seal
-     * demand -- see above for why no particular seal is required.
+     * AND THE PROOF ITSELF MUST NOT BLOCK.  This used to call fstatfs()
+     * first, which on a FUSE file is a request to the daemon behind it --
+     * the very stall the rule exists to prevent, reached one syscall early.
+     * nb_fd_shmem_seals() asks F_GET_SEALS first, answered from the file's
+     * mapping without calling into any filesystem, and fstatfs()es only what
+     * that proved is shmem (HARDENING 4 has the kernel-source detail).  Its
+     * success is the shmem proof, not a seal demand: no particular seal is
+     * required, because the rows are copied, never mapped.
      */
-    if (fstatfs(fd, &sfs) < 0 || sfs.f_type != TMPFS_MAGIC ||
-        fcntl(fd, F_GET_SEALS) < 0) {
+    if (nb_fd_shmem_seals(fd) < 0) {
         if (nb_reject_log(s)) {
             nb_err("CURSOR SET: the fd is not a memfd; refused (the previous "
                    "cursor stays)");
@@ -1712,7 +2084,7 @@ static void nb_cmd_cursor(struct nb_sink *s, const struct nvkvm_broker_cmd *raw,
      */
     if (!ss->ops->cursor || !(ss->caps & NVKVM_BROKER_CAP_CURSOR)) {
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
         }
         nb_violation(s, "CURSOR on a session that did not advertise "
                         "CAP_CURSOR");
@@ -1721,7 +2093,7 @@ static void nb_cmd_cursor(struct nb_sink *s, const struct nvkvm_broker_cmd *raw,
     verdict = nb_cursor_check(&c, fd >= 0, &why);
     if (verdict == NB_CURSOR_VIOLATION) {
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
         }
         nb_violation(s, why);
         return;
@@ -1729,7 +2101,7 @@ static void nb_cmd_cursor(struct nb_sink *s, const struct nvkvm_broker_cmd *raw,
     s->n_cursor++;
     if (verdict == NB_CURSOR_REJECT) {
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
         }
         s->n_cursor_reject++;
         if (nb_reject_log(s)) {
@@ -1743,7 +2115,14 @@ static void nb_cmd_cursor(struct nb_sink *s, const struct nvkvm_broker_cmd *raw,
     case NVKVM_BROKER_CURSOR_SET: {
         int r = nb_cursor_read(s, &c, fd);
 
-        close(fd);      /* copied or refused; either way we are done with it */
+        /* Copied or refused; either way we are done with it.  Copied means
+         * proved shmem, whose close is the kernel's own; refused may be
+         * anything, so it goes the way every unproven fd goes. */
+        if (r == 0) {
+            close(fd);
+        } else {
+            nb_fd_drop(fd);
+        }
         if (r != 0) {
             s->n_cursor_reject++;
             return;
@@ -1811,7 +2190,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
      */
     if ((c->flags & ~(uint16_t)NVKVM_BROKER_CMD_F_ALL) != 0) {
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
         }
         nb_violation(s, "unknown bits set in the command flags");
         return;
@@ -1821,7 +2200,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     case NVKVM_BROKER_CMD_ATTACH:
         if (c->reserved1 != 0) {
             if (fd >= 0) {
-                close(fd);
+                nb_fd_drop(fd);
             }
             nb_violation(s, "ATTACH reserved1 is not zero");
             return;
@@ -1832,13 +2211,13 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         }
         s->n_attach++;
         if (!(ss->caps & NVKVM_BROKER_CAP_DMABUF)) {
-            close(fd);
+            nb_fd_drop(fd);
             s->n_reject++;
             nb_err("ATTACH: this session cannot accept dma-buf buffers");
             return;
         }
         if (nb_validate_desc(s, c, fd, &d) != 0) {
-            close(fd);
+            nb_fd_drop(fd);
             s->n_reject++;
             /*
              * A rejected buffer is NOT a disconnect.  The descriptor comes
@@ -1852,7 +2231,10 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         r = ss->ops->attach(ss, &d);
         close(fd);          /* the backend imported it or it failed; either
                              * way our copy is done — HARDENING 5, fd intake
-                             * is bounded at one in flight by construction */
+                             * is bounded at one in flight by construction.
+                             * A plain close: nb_validate_desc() proved it a
+                             * dma-buf or shmem, neither of which has a
+                             * ->flush to wait on (see nb_fd_drop()). */
         if (r != 0) {
             s->n_reject++;
             if (nb_reject_log(s)) {
@@ -1882,15 +2264,15 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 
         if (c->reserved1 != 0) {
             if (fd >= 0) {
-                close(fd);
+                nb_fd_drop(fd);
             }
             nb_violation(s, "QUERY_FORMAT reserved1 is not zero");
             return;
         }
         if (fd >= 0) {
-            close(fd);          /* a query carries no buffer; drop any fd */
+            nb_fd_drop(fd);          /* a query carries no buffer; drop any fd */
         }
-        ok = nb_format_resolve(ss, c->fourcc, c->modifier, &use);
+        ok = nb_format_resolve(s, c->fourcc, c->modifier, &use);
         /* Asked once per mode change by an honest client -- and once per
          * command by a hostile one, so it shares the reject budget. */
         if (nb_reject_log(s)) {
@@ -1911,13 +2293,13 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     case NVKVM_BROKER_CMD_COMMIT:
         if (c->reserved1 != 0) {
             if (fd >= 0) {
-                close(fd);
+                nb_fd_drop(fd);
             }
             nb_violation(s, "COMMIT reserved1 is not zero");
             return;
         }
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
             nb_violation(s, "COMMIT carried an fd");
             return;
         }
@@ -1952,7 +2334,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         memcpy(&ccbuf, c, sizeof ccbuf);
 
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
             nb_violation(s, "CLIPBOARD carried an fd");
             return;
         }
@@ -2102,13 +2484,13 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     case NVKVM_BROKER_CMD_CAPS:
         if (c->reserved1 != 0) {
             if (fd >= 0) {
-                close(fd);
+                nb_fd_drop(fd);
             }
             nb_violation(s, "CAPS reserved1 is not zero");
             return;
         }
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
             nb_violation(s, "CAPS carried an fd");
             return;
         }
@@ -2127,13 +2509,13 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
     case NVKVM_BROKER_CMD_WINDOW:
         if (c->reserved1 != 0) {
             if (fd >= 0) {
-                close(fd);
+                nb_fd_drop(fd);
             }
             nb_violation(s, "WINDOW reserved1 is not zero");
             return;
         }
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
             nb_violation(s, "WINDOW carried an fd");
             return;
         }
@@ -2187,7 +2569,7 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 
     default:
         if (fd >= 0) {
-            close(fd);
+            nb_fd_drop(fd);
         }
         nb_violation(s, "unknown command type");
         return;
@@ -2380,7 +2762,7 @@ void nb_sink_readable(struct nb_sink *s)
                     if (s->rxfd < 0) {
                         s->rxfd = got;
                     } else {
-                        close(got);
+                        nb_fd_drop(got);
                     }
                 }
             }
@@ -2404,7 +2786,7 @@ void nb_sink_readable(struct nb_sink *s)
             s->rxfd = -1;
             if (nb_rate_exceeded(s)) {
                 if (fd >= 0) {
-                    close(fd);
+                    nb_fd_drop(fd);
                 }
                 nb_violation(s, "command rate far beyond anything a display "
                                 "needs; treating it as an attempt to burn the "

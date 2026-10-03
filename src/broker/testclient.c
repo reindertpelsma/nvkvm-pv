@@ -186,8 +186,12 @@ static int make_buffer(unsigned w, unsigned h, unsigned *stride_out)
 
 /*
  * A test pointer for --cursor: a white square with a black border and a
- * translucent middle, PREMULTIPLIED, packed in a sealed memfd exactly as the
- * protocol header describes a SET.  Returns the fd, or -1.
+ * translucent middle, PREMULTIPLIED, packed (stride == width*4) in a memfd as
+ * the protocol header describes a SET.  The memfd is deliberately NOT sealed
+ * -- this comment used to say it was, and it never has been: the protocol
+ * demands no seal of a cursor, because the broker copies the rows with pread
+ * rather than mapping them, so --cursor exercises exactly the unsealed case a
+ * relay is allowed to send.  Returns the fd, or -1.
  */
 static int make_cursor(unsigned w, unsigned h)
 {

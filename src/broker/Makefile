@@ -39,6 +39,12 @@ LDFLAGS += -Wl,-z,relro,-z,now
 OBJS = nvkvm_broker.o nb_common.o nb_cursor.o nb_placeholder.o \
        nb_session_x11.o nb_session_wl.o nb_session_test.o
 
+# The broker -- and only the broker -- may start one helper thread: the one
+# that closes a client fd whose close() could wait on its filesystem
+# (nb_fd_drop() in nvkvm_broker.c).  Not added to the relay's or the test
+# client's link lines, which stay libc-only.
+LIBS += -pthread
+
 # ── X11 backend: xcb + DRI3 + Present ─────────────────────────────────────
 # DRI3 is what lets a dma-buf become an X pixmap without a GL context, and
 # Present is what puts that pixmap on screen and reports back when it is done
@@ -186,6 +192,10 @@ test-cursor: test/test_cursor.c nb_cursor.c nvkvm_broker.h \
              ../common/nvkvm_broker_proto.h
 	$(CC) $(CFLAGS) -o $@ test/test_cursor.c nb_cursor.c $(LDFLAGS)
 
+# test/test_cursor.py mounts a FUSE filesystem that never answers the broker
+# (test/stall_fuse.py: mount(2) as root, fusermount3 otherwise -- package
+# fuse3).  Where FUSE is unusable that case prints SKIP; NB_REQUIRE_FUSE=1,
+# as CI sets it, makes that a failure instead.
 check: all test-utf8 test-cursor
 	./test-utf8
 	./test-cursor

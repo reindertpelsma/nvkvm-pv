@@ -167,15 +167,16 @@ struct nb_x11 {
      */
     const struct nb_cursor *gcur;
     xcb_cursor_t          gc_cursor;
-    uint32_t              gc_gen;
+    uint64_t              gc_gen;
     struct nb_cursor_geom gc_geom;
     /*
-     * Pairs DRI3 refused to import after the server advertised them.  Kept so
-     * a known-bad pair costs no further blocking round trip, and so
-     * QUERY_FORMAT answers it honestly -- the Wayland backend's `proven`
-     * table, for this backend.
+     * (Pairs DRI3 refused to import after the server advertised them used to
+     * be remembered HERE, for the life of the process.  They are now the
+     * core's connection state -- nb_sink.fmt_refused, filled by
+     * nb_sink_format_refused() below -- so they are forgotten with the client
+     * that provoked them, and checked by the one resolver ATTACH and
+     * QUERY_FORMAT share.)
      */
-    struct nb_refused     refused;
     bool      idle_shown;
     bool      client_attached;  /* a VMM is connected, frames or not      */
     uint64_t  last_frame_ms;    /* shm tier: when we last paced the VMM   */
@@ -251,10 +252,8 @@ static bool x11_format_ok(struct nb_session *s, uint32_t fourcc, uint64_t mod)
     struct nb_x11 *x = s->priv;
 
     /* Advertised and then refused by DRI3 is NO, for QUERY_FORMAT and for
-     * ATTACH alike -- see x11_attach(). */
-    if (nb_refused_has(&x->refused, fourcc, mod)) {
-        return false;
-    }
+     * ATTACH alike -- the core checks that before asking here; see
+     * x11_attach() and nb_sink_format_refused(). */
     return nb_formats_has(&x->formats, fourcc, mod);
 }
 
@@ -551,9 +550,20 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
      */
     err = xcb_request_check(x->c, ck);
     if (err) {
-        nb_err("DRI3 pixmap import refused: X error %u (major %u minor %u); "
-               "the VMM is being told %.4s modifier 0x%016llx is unusable here "
-               "so it can send something else",
+        /*
+         * WHAT HAPPENS NEXT, AND NO MORE.  This line used to end "so it can
+         * send something else", which reads as a fallback this backend does
+         * not have: a relay told x=0 for its only pair drops to F_SHM, and
+         * outside the shm tier this backend refuses F_SHM too (accept_shm is
+         * set only there).  So say what is true -- the pair is withdrawn, and
+         * any other advertised pair is the only way forward in this mode.
+         */
+        nb_err("DRI3 pixmap import refused: X error %u (major %u minor %u). "
+               "%.4s modifier 0x%016llx is withdrawn for this connection "
+               "(EV_FORMAT x=0, both alpha twins).  Frames still need another "
+               "advertised pair: this X11 session is on a dma-buf tier, where "
+               "shared-memory frames are refused as well (only the shm "
+               "tier, --present-mode=shm, takes them)",
                err->error_code, err->major_code, err->minor_code,
                (const char *)&d->fourcc, (unsigned long long)d->modifier);
         free(err);
@@ -567,16 +577,17 @@ static int x11_attach(struct nb_session *s, const struct nb_buf_desc *d)
          * reads.  An unsolicited EV_FORMAT x=0 is the protocol's way of
          * taking a yes back.
          *
-         * BOTH alpha twins are remembered: DRI3 takes no fourcc at all (XR24
-         * and AR24 are both imported as depth 24 / 32 bpp, see the header),
-         * so a refusal of one IS a refusal of the other.  The verdict is sent
-         * for the fourcc the client used, which is the slot its question is
-         * filed under.
+         * BOTH alpha twins are remembered AND announced: DRI3 takes no fourcc
+         * at all (XR24 and AR24 are both imported as depth 24 / 32 bpp, see
+         * the header), so a refusal of one IS a refusal of the other.  The
+         * verdict used to be sent only for the fourcc this frame used, while
+         * both were remembered -- so a relay holding x=1 for the other twin
+         * kept sending it, the core refused every such frame, and nothing on
+         * the wire said why: a black window.  The core does both halves, in
+         * the one place test/test_cursor.py can reach without a GPU.
          */
-        nb_refused_add(&x->refused, NB_FCC_XR24, d->modifier);
-        nb_refused_add(&x->refused, NB_FCC_AR24, d->modifier);
         if (s->sink) {
-            nb_sink_format_verdict(s->sink, d->fourcc, d->modifier, false);
+            nb_sink_format_refused(s->sink, d->fourcc, d->modifier, true);
         }
         return -EINVAL;
     }

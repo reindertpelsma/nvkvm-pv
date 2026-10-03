@@ -207,11 +207,21 @@ static void test_load(void)
         /* row 1 */
         0x00, 0x00, 0x00, 0x00,  0x40, 0x40, 0x40, 0x40,
     };
-    uint32_t gen0 = cur.gen;
+    uint64_t gen0 = cur.gen;
 
     nb_cursor_load(&cur, src, 2, 2, 12, 1, 0);
     CHECK(cur.defined && cur.visible, "a load defines and shows");
     CHECK(cur.gen != gen0, "a load moves gen");
+    /*
+     * "Never repeats within a process" is a property of the WIDTH: a 32-bit
+     * counter wraps to a value a backend may still hold as "already rendered"
+     * (a cursor change every 8 ms reaches 2^32 in about a year).  Start one
+     * load short of 2^32 and require the next to be 2^32, not 0.
+     */
+    cur.gen = 0xffffffffull;
+    nb_cursor_load(&cur, src, 2, 2, 12, 1, 0);
+    CHECK(cur.gen == 0x100000000ull, "gen does not wrap at 32 bits "
+          "(0x%llx)", (unsigned long long)cur.gen);
     CHECK(cur.w == 2 && cur.h == 2 && cur.hot_x == 1 && cur.hot_y == 0,
           "geometry copied");
     CHECK(cur.px[0] == 0xff030201u, "opaque pixel unchanged: 0x%08x",
@@ -247,9 +257,11 @@ static void test_geom(void)
     nb_cursor_scaled_geom(&cur, 3840, 1920, 2160, 1080, 512, &g);
     CHECK(g.w == 64 && g.h == 64 && g.hot_x == 6 && g.hot_y == 8,
           "a 2x-scaled frame doubles the cursor and its hot spot");
+    /* Halved, hot 3 is a source column the scaler skips (it samples 0, 2,
+     * 4...); the hot spot is the output pixel showing the next one, 4. */
     nb_cursor_scaled_geom(&cur, 960, 1920, 540, 1080, 512, &g);
-    CHECK(g.w == 16 && g.h == 16 && g.hot_x == 1 && g.hot_y == 2,
-          "a half-size frame halves it");
+    CHECK(g.w == 16 && g.h == 16 && g.hot_x == 2 && g.hot_y == 2,
+          "a half-size frame halves it (hot %u,%u)", g.hot_x, g.hot_y);
     nb_cursor_scaled_geom(&cur, 3, 1, 1, 1, 512, &g);
     CHECK(g.w == 96 && g.h == 32, "stretch scales the axes separately");
     nb_cursor_scaled_geom(&cur, 1, 1000, 1, 1000, 512, &g);
@@ -291,6 +303,210 @@ static void test_scale_pixels(void)
     }
     CHECK(ok, "nearest-neighbour 2x");
     CHECK(out[16] == 0x5a5a5a5au, "scale wrote past dw*dh");
+}
+
+/* The scaler's own sampling rule, restated: output index x shows source
+ * floor(x * in / out). */
+static uint32_t sample_of(uint32_t x, uint32_t in, uint32_t out)
+{
+    return (uint32_t)((uint64_t)x * in / out);
+}
+
+/*
+ * THE HOT SPOT LANDS ON THE GUEST'S HOT PIXEL (finding 6, 2026-10-03).
+ *
+ * First the case the review measured: 32 px at 1.5x with hot spot 3.  An image
+ * whose ONLY opaque pixel is the hot pixel is scaled exactly as a backend
+ * scales it, and the pixel under the scaled hot spot must be that pixel.
+ * floor(hot * out / in) -- the old rule -- put it on output 4, which shows
+ * source 2: transparent.
+ */
+static void test_hot_pixel(void)
+{
+    static uint8_t src[32 * 4 * 32];
+    static uint32_t out[NB_CURSOR_SCALED_MAX * NB_CURSOR_SCALED_MAX];
+    struct nb_cursor_geom g;
+
+    memset(src, 0, sizeof src);
+    src[3 * 128 + 3 * 4 + 3] = 0xff;            /* (3,3): alpha 255 */
+    nb_cursor_load(&cur, src, 32, 32, 128, 3, 3);
+    nb_cursor_scaled_geom(&cur, 3, 2, 3, 2, NB_CURSOR_SCALED_MAX, &g);
+    CHECK(g.w == 48 && g.h == 48, "1.5x of 32 is 48 (%ux%u)", g.w, g.h);
+    CHECK(g.hot_x == 5 && g.hot_y == 5, "1.5x: hot 3,3 -> 5,5 (got %u,%u)",
+          g.hot_x, g.hot_y);
+    nb_cursor_scale(&cur, out, g.w, g.h);
+    CHECK((out[(size_t)g.hot_y * g.w + g.hot_x] >> 24) == 0xff,
+          "1.5x: the pixel under the hot spot is the guest's hot pixel");
+}
+
+/*
+ * ...and then every scale a window can plausibly produce, every width up to
+ * 64 and the protocol's largest, and every hot spot in each: the hot spot must
+ * be EXACTLY the first output index whose sample reaches the hot pixel
+ * (clamped to the last), and whenever the cursor is not shrunk that index must
+ * sample the hot pixel itself -- checked on real scaled pixels, not just on
+ * the arithmetic.
+ */
+static void test_hot_sweep(void)
+{
+    static const uint32_t f[][2] = {
+        {1, 1}, {3, 2}, {2, 1}, {5, 4}, {7, 5}, {4, 3}, {9, 4}, {3, 1},
+        {5, 3}, {1, 2}, {2, 3}, {4, 5}, {1, 3}, {7, 3}, {11, 8}, {2560, 1920},
+        {1920, 1280}, {3840, 2560}, {1366, 1024}, {1000, 999}, {999, 1000},
+    };
+    static uint8_t row[256 * 4];
+    static uint32_t out[NB_CURSOR_SCALED_MAX * NB_CURSOR_SCALED_MAX];
+    unsigned fi, bad = 0, exact = 0, pixel_bad = 0;
+    uint32_t w, hot;
+
+    for (fi = 0; fi < sizeof f / sizeof f[0]; fi++) {
+        /* 1..64 one by one, then 128 and 256 (the protocol maximum). */
+        for (w = 1; w <= 256; w = (w < 64) ? w + 1 : w * 2) {
+            const uint32_t ww = w;
+
+            for (hot = 0; hot < ww; hot++) {
+                struct nb_cursor_geom g;
+                uint32_t want, x;
+
+                /* A ww x 1 image, opaque only at the hot pixel: the scaler is
+                 * separable, so one row tests the x rule completely; the same
+                 * call with the axes swapped tests y. */
+                memset(row, 0, (size_t)ww * 4);
+                row[hot * 4 + 3] = 0xff;
+                nb_cursor_load(&cur, row, ww, 1, ww * 4, hot, 0);
+                nb_cursor_scaled_geom(&cur, f[fi][0], f[fi][1], 1, 1,
+                                      NB_CURSOR_SCALED_MAX, &g);
+                want = (uint32_t)(((uint64_t)hot * g.w + ww - 1) / ww);
+                if (want >= g.w) {
+                    want = g.w - 1;
+                }
+                if (g.hot_x != want) {
+                    bad++;
+                }
+                /* The first index at or past the hot pixel, by the scaler's
+                 * own rule: no earlier index reaches it. */
+                for (x = 0; x < g.hot_x; x++) {
+                    if (sample_of(x, ww, g.w) >= hot) {
+                        bad++;
+                        break;
+                    }
+                }
+                /* And, independently of the two arithmetic checks above, on
+                 * the scaled pixels themselves. */
+                if (g.w >= ww) {
+                    exact++;
+                    nb_cursor_scale(&cur, out, g.w, g.h);
+                    if (sample_of(g.hot_x, ww, g.w) != hot ||
+                        (out[g.hot_x] >> 24) != 0xff) {
+                        pixel_bad++;
+                    }
+                }
+                /* The y axis: the same image as a column. */
+                nb_cursor_load(&cur, row, 1, ww, 4, 0, hot);
+                nb_cursor_scaled_geom(&cur, 1, 1, f[fi][0], f[fi][1],
+                                      NB_CURSOR_SCALED_MAX, &g);
+                want = (uint32_t)(((uint64_t)hot * g.h + ww - 1) / ww);
+                if (want >= g.h) {
+                    want = g.h - 1;
+                }
+                if (g.hot_y != want) {
+                    bad++;
+                }
+                if (g.h >= ww) {
+                    nb_cursor_scale(&cur, out, g.w, g.h);
+                    if ((out[(size_t)g.hot_y * g.w] >> 24) != 0xff) {
+                        pixel_bad++;
+                    }
+                }
+            }
+        }
+    }
+    CHECK(exact > 10000, "the sweep reached the not-shrunk case (%u)", exact);
+    CHECK(bad == 0, "%u hot spots off the first index that shows the hot "
+          "pixel", bad);
+    CHECK(pixel_bad == 0, "%u unshrunk cursors whose hot spot is not on the "
+          "guest's hot pixel", pixel_bad);
+}
+
+/*
+ * HiDPI (finding 7): the buffer a backend renders is the cursor in DEVICE
+ * pixels.  A 32x32 guest cursor over a 3840-wide guest frame shown in a
+ * 1920-logical window on a scale-2 output is 16 logical pixels -- and 32
+ * device pixels, i.e. the guest's own, so nothing is lost to magnification.
+ */
+static void test_device_geom(void)
+{
+    static const uint8_t white[256 * 1024];
+    struct nb_cursor_geom g, b;
+    unsigned i, bad = 0;
+
+    memset(&b, 0, sizeof b);
+    nb_cursor_load(&cur, white, 32, 32, 128, 3, 4);
+    nb_cursor_scaled_geom(&cur, 1920, 3840, 1080, 2160, 512, &g);
+    nb_cursor_device_geom(&cur, 1920, 3840, 1080, 2160, 240, 512, &b);
+    CHECK(g.w == 16 && g.h == 16, "logical: 16x16 (%ux%u)", g.w, g.h);
+    CHECK(b.w == 32 && b.h == 32 && b.hot_x == 3 && b.hot_y == 4,
+          "scale 2: the buffer is the guest's own 32x32, hot 3,4 "
+          "(%ux%u hot %u,%u)", b.w, b.h, b.hot_x, b.hot_y);
+    nb_cursor_device_geom(&cur, 1920, 3840, 1080, 2160, 180, 512, &b);
+    CHECK(b.w == 24 && b.h == 24, "scale 1.5: 24x24 (%ux%u)", b.w, b.h);
+    nb_cursor_device_geom(&cur, 1920, 3840, 1080, 2160, 120, 512, &b);
+    CHECK(b.w == g.w && b.h == g.h && b.hot_x == g.hot_x &&
+          b.hot_y == g.hot_y, "scale 1: the buffer is the logical cursor");
+    nb_cursor_device_geom(&cur, 1920, 3840, 1080, 2160, 0, 512, &b);
+    CHECK(b.w == g.w && b.h == g.h, "scale unknown (0): 1:1");
+    nb_cursor_device_geom(&cur, 1920, 3840, 1080, 2160, 60, 512, &b);
+    CHECK(b.w == g.w && b.h == g.h, "scale below 1: never fewer pixels "
+          "than logical");
+    nb_cursor_device_geom(&cur, 1, 1, 1, 1, 0xffffffffu, 512, &b);
+    CHECK(b.w == 512 && b.h == 512 && b.hot_x < 512 && b.hot_y < 512,
+          "an absurd scale is clamped (16x of 32 = 512)");
+    nb_cursor_device_geom(&cur, 0xffffffffu, 1, 0xffffffffu, 1, 0xffffffffu,
+                          512, &b);
+    CHECK(b.w == 512 && b.h == 512 && b.hot_x < 512 && b.hot_y < 512,
+          "absurd factor AND scale: clamped, not wrapped");
+    /* Whatever the inputs, the buffer fits a slot and its hot spot is in it. */
+    for (i = 0; i < 20000; i++) {
+        uint32_t sw = 1 + (i * 2654435761u) % 256u;
+        uint32_t sh = 1 + (i * 40503u) % 256u;
+
+        nb_cursor_load(&cur, white, sw, sh, sw * 4, (i * 7u) % sw,
+                       (i * 13u) % sh);
+        nb_cursor_device_geom(&cur, 1 + (i * 977u) % 8192u,
+                              1 + (i * 331u) % 8192u, 1 + (i * 619u) % 8192u,
+                              1 + (i * 113u) % 8192u, (i * 37u) % 4000u,
+                              NB_CURSOR_SCALED_MAX, &b);
+        if (b.w < 1 || b.w > NB_CURSOR_SCALED_MAX || b.h < 1 ||
+            b.h > NB_CURSOR_SCALED_MAX || b.hot_x >= b.w || b.hot_y >= b.h) {
+            bad++;
+        }
+    }
+    CHECK(bad == 0, "%u device geometries outside a slot", bad);
+}
+
+/*
+ * PUBLISHING (finding 3) is a copy: the published cursor must be the image as
+ * it was, unaffected by the next load into the pending one -- which is the
+ * whole point of having two.
+ */
+static void test_copy(void)
+{
+    static struct nb_cursor pub;
+    static const uint8_t red[] = { 0, 0, 0xff, 0xff,  0, 0, 0xff, 0xff };
+    static const uint8_t blue[] = { 0xff, 0, 0, 0xff,  0xff, 0, 0, 0xff };
+
+    nb_cursor_load(&cur, red, 2, 1, 8, 1, 0);
+    nb_cursor_copy(&pub, &cur);
+    CHECK(pub.defined && pub.visible && pub.gen == cur.gen && pub.w == 2 &&
+          pub.h == 1 && pub.hot_x == 1 && pub.px[0] == 0xffff0000u &&
+          pub.px[1] == 0xffff0000u, "a copy is the image, field for field");
+    nb_cursor_load(&cur, blue, 2, 1, 8, 0, 0);
+    CHECK(pub.px[0] == 0xffff0000u && pub.hot_x == 1 && pub.gen != cur.gen,
+          "a later load does not reach the published copy");
+    cur.defined = false;
+    cur.gen++;
+    nb_cursor_copy(&pub, &cur);
+    CHECK(!pub.defined && pub.gen == cur.gen, "forgetting is published too");
 }
 
 static void test_wanted(void)
@@ -423,6 +639,10 @@ int main(void)
     test_load();
     test_geom();
     test_scale_pixels();
+    test_hot_pixel();
+    test_hot_sweep();
+    test_device_geom();
+    test_copy();
     test_wanted();
     test_fuzz();
     printf("test_cursor: %u checks, %u failed\n", n_checks, n_fail);

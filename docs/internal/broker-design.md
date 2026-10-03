@@ -97,6 +97,48 @@ all exercised by `selftest.sh` or by `test/test_cursor.{c,py}`:
    `fstatfs(fd).f_type == DMA_BUF_MAGIC`. A memfd, a pipe, a socket, a file on
    your disk — all rejected. (`--backend test` also accepts a memfd; that is
    why it is unreachable from `--backend auto` and prints a banner.)
+   **And nothing that asks the fd's filesystem runs before the fd's type is
+   proved in-kernel** (2026-10-03, review finding). `fstatfs` calls the
+   superblock's `->statfs`, which on FUSE is a `FUSE_STATFS` request to the
+   daemon behind the mount (`fs/fuse/inode.c` `fuse_statfs()`), waited for
+   with this process's signals blocked for `signalfd` -- a stall of the thread
+   holding the keyboard grab, chosen by whoever chose the fd. So:
+   - a dma-buf is recognised first by the `exp_name:` line of
+     `/proc/self/fdinfo/N`, which only `dma_buf_show_fdinfo()` prints
+     (`fs/proc/fd.c` `seq_show()` prints the generic lines and the lock list,
+     then the file's own `->show_fdinfo`, which a FUSE file does not have; the
+     line arrived in Linux 5.3 with the `dmabuf` filesystem `DMA_BUF_MAGIC`
+     names). Only then is it `fstatfs`ed. **Not** `readlink("/proc/self/fd/N")`:
+     for anything but a pseudo-file that text is a path, and paths are chosen
+     by whoever mounts things -- so it is not an identity the sender cannot
+     shape. A broker without a readable `/proc/self/fdinfo` refuses every
+     dma-buf frame and says why;
+   - shmem (the shm tier, the cursor, the test backend's memfd) is recognised
+     first by `fcntl(F_GET_SEALS)` succeeding, which `mm/memfd.c` answers from
+     the file's mapping (`shmem_aops`) or `f_op` (hugetlbfs) without calling
+     into any filesystem; `fstatfs` then rules out hugetlbfs. The one exception
+     the kernel source shows is a Coda file mmapped from a container file on
+     tmpfs, which shares that file's mapping -- and Coda can only be mounted
+     by root, and its upcalls time out;
+   - **closing** a client's fd is a filesystem call as well: `close(2)` runs
+     `->flush` (`fs/open.c` `filp_flush()`), FUSE's is a `FUSE_FLUSH` sent
+     with `force` set, and that makes the wait end in an UNINTERRUPTIBLE
+     `wait_event()` -- whatever the caller's credentials, unlike `STATFS`. No
+     check run first can avoid it: the fd is in the table from the moment
+     `recvmsg` returns, and every way out of the table flushes. So an fd is
+     closed on the main thread only when it is proved, as above, to be shmem,
+     hugetlbfs or a dma-buf (none of whose `file_operations` has a `->flush`);
+     any other -- only ever one the validators refuse -- is handed to a helper
+     thread that closes it (`nb_fd_drop()`), started lazily on the first such
+     fd, after `--drop-user`, with every signal blocked. A close stuck there
+     costs one fd per queued fd, bounded by `RLIMIT_NOFILE`, past which
+     `recvmsg` drops what it cannot install (`MSG_CTRUNC`, a violation); never
+     the main loop. A broker that never meets such an fd stays single-threaded.
+   `test/test_cursor.py` mounts a FUSE filesystem whose daemon answers nobody
+   but the test (`test/stall_fuse.py`, no libfuse) and sends a file on it as a
+   cursor, an `F_SHM` frame and a dma-buf frame: each must be refused while the
+   broker keeps answering, with no request from the main thread reaching the
+   daemon and the close arriving as a `FLUSH` from the helper thread.
 5. **Fd intake is bounded.** Exactly one fd may accompany one command; a second
    is a protocol violation. Imported buffers live in a fixed 8-slot table and
    the least recently used is **destroyed and closed** on eviction, never the
@@ -124,14 +166,19 @@ all exercised by `selftest.sh` or by `test/test_cursor.{c,py}`:
      past 256, hot spot outside the image, stride outside
      `width*4 .. 1024`) refuse the cursor and keep the connection, because the
      image comes from the guest;
-   - **the fd must be shmem**: `fstatfs` == `TMPFS_MAGIC` **and**
-     `F_GET_SEALS` succeeding. The second half is not decoration -- `/dev` is
+   - **the fd must be shmem**: `F_GET_SEALS` succeeding, **then** `fstatfs`
+     == `TMPFS_MAGIC` -- in that order, see rule 4: the first version called
+     `fstatfs` first, which on a FUSE file is the very stall the rule exists to
+     prevent, reached one syscall early. Both halves are needed -- `/dev` is
      devtmpfs and reports `TMPFS_MAGIC`, so `/dev/tty` or a FUSE device node
-     would pass the first test alone, and a read of either can block the thread
-     that holds the keyboard grab. (A device node also has `st_size` 0 and
-     fails the extent check below; `test/test_cursor.py` measured that
-     `/dev/zero` is refused even with the shmem proof deleted, so the two are
-     overlapping layers and both stay);
+     would pass the `fstatfs` test alone, and a read of either can block the
+     thread that holds the keyboard grab. A device node also has `st_size` 0
+     and fails the extent check below, and so does every other non-shmem fd
+     the suite used to send -- so deleting the shmem proof left the whole suite
+     green (review finding, 2026-10-03). `test/test_cursor.py` now also sends
+     an fd to a 4 KiB regular file on a disk filesystem, which passes the
+     extent check and reads fine: only the shmem proof refuses it, and the
+     suite goes red without it (measured);
    - **the extent is measured, in 64 bits**: `offset + stride*(h-1) + w*4 <=
      st_size` (`fstat`, not `lseek`, so validation does not move the client's
      file offset);
@@ -153,7 +200,18 @@ all exercised by `selftest.sh` or by `test/test_cursor.{c,py}`:
      work budget like any frame copy. So a flood of `SET`s -- or an honest relay
      forwarding a guest that animates its pointer as fast as it can -- costs
      bounded CPU per wakeup and bounded display traffic per second, and never
-     a disconnect of an honest VMM;
+     a disconnect of an honest VMM. **The core keeps two copies** to make that
+     true: a `SET` lands in `nb_sink.cursor`, and backends are only ever handed
+     `nb_sink.cursor_pub`, which `nb_sink_tick()` copies over when the interval
+     allows. The first version handed backends the live copy, so the pacing
+     bounded the core's `->cursor()` calls and nothing else: every backend also
+     re-renders on its own schedule (Wayland on every frame commit, configure,
+     buffer release and grab change; X11 on every commit), and each re-read the
+     newest image straight past the interval (review finding, 2026-10-03). The
+     test backend now re-renders on every `COMMIT` the same way, and
+     `test/test_cursor.py` interleaves `SET`s with frame commits and requires
+     no two images to reach the backend closer than half the interval (the bug
+     showed them sub-millisecond apart);
    - **it is connection state**: forgotten on every attach and detach, so a
      `--persist` broker never shows one VM's pointer over the next VM's picture
      or over the placeholder.
@@ -185,15 +243,43 @@ decisions rather than leaks (2026-10-03):
   Wayland from X11.
 - **An unsolicited `EV_FORMAT` x=0 now comes from X11 too** when DRI3 refuses an
   import the server advertised, matching what the Wayland probe already did,
-  and on both backends `QUERY_FORMAT` then answers no for that pair. The X11
-  memory of refusals (`struct nb_refused`, 4 slots, oldest forgotten) and the
-  Wayland `proven` table both outlive a client. That is a property a hostile
-  VMM can use: by sending a buffer the display refuses, it can make a pair read
-  as unusable for the NEXT VM on a `--persist` broker, which then takes a
-  slower present path. It degrades speed, never correctness or isolation, and
-  it is the same property the Wayland probe has had since it was added; it is
-  recorded here rather than fixed because per-connection memory would make the
-  two backends disagree, which is the one thing the wire must not do.
+  and on both backends `QUERY_FORMAT` then answers no for that pair. On X11 the
+  x=0 is sent for **both alpha twins**: DRI3 imports XR24 and AR24 identically,
+  so both are refused -- and the first version remembered both but announced
+  only the one the frame used, so a relay holding x=1 for the other kept
+  sending it into a refusal nothing on the wire explained (review finding,
+  2026-10-03). The X11 memory now lives in the core (`nb_sink.fmt_refused`,
+  filled by `nb_sink_format_refused()`, 8 slots -- four refused modifiers --
+  oldest forgotten) and is checked by the one resolver `ATTACH` and
+  `QUERY_FORMAT` share.
+  **Both backends forget refusals when the client detaches.** ~~Recorded rather
+  than fixed, because per-connection memory would make the two backends
+  disagree~~ -- that reason held only while ONE backend would change; the
+  same review asked for a consistent decision, and the decision is
+  per-connection on both (`nb_client_state_reset()` clears the core's table;
+  `wl_client_detach()` clears the Wayland `proven` table, keeping only the
+  in-flight probe flag that attributes its answer). Why per-connection: a
+  refusal is triggered by a buffer the GUEST chose, so on a `--persist` broker
+  a memory that outlived the client let one VM make a pair read as unusable
+  for the next VM, which then took a slower present path -- the same rule that
+  makes the cursor connection state. The price is re-learning, bounded and
+  cheap: on Wayland one dropped probe frame per refused pair per connection
+  (a first buffer always goes through the asynchronous probe, so re-learning
+  can never be the fatal `create_immed` error the table was added to avoid);
+  on X11 one blocking round trip per refused pair per connection, inside the
+  per-wakeup round-trip allowance. `test/test_cursor.py` drives the core's
+  half through the test backend, which advertises a modifier for both twins
+  and refuses it at import exactly as `x11_attach()` does.
+- **A frame dropped at the format gate is never dropped in silence.** The core
+  sends `EV_FORMAT` x=0 for the pair the `ATTACH` named, once per pair per
+  connection (`nb_sink.fmt_told`). Found while fixing the X11 twins: the same
+  hole existed on Wayland, where the probe reports the fourcc it IMPORTED --
+  the opaque twin the resolver substituted -- so a relay that sent AR24 and was
+  told x=0 for XR24 kept its yes for AR24 and every frame after was refused
+  with nothing on the wire. Closing it in the core covers that, the X11 twins,
+  and any future backend's version of the same mistake; the Wayland probe's
+  verdict now goes through the core too (`nb_sink_format_refused()`, one
+  fourcc -- unlike DRI3, a compositor imports per fourcc).
 
 The broker also drops what it does not need: `PR_SET_DUMPABLE 0`,
 `PR_SET_NO_NEW_PRIVS`, and `--drop-user` (it retains no capabilities — the
@@ -372,6 +458,55 @@ was run:
   DRI3 that refuses an import), and `EV_DEVICE` with a real answer (needs a
   render node: weston's pixman renderer offers no dma-buf feedback and `Xvfb`
   no DRI3, so both reported `unknown`, as designed).
+
+### The review fixes, verified headlessly (2026-10-03, later the same day)
+
+A read-only review of the cursor/`EV_DEVICE` change returned ten findings;
+each fix carries a test that was run red against a mutation of the fix (the
+mutation, then the checks that failed):
+
+| fix | mutation | went red |
+|---|---|---|
+| fd identity before any filesystem question | `nb_fd_shmem_seals()` calls `fstatfs` first | the FUSE cases: broker stopped answering; `STATFS` from the main thread |
+| same, dma-buf path | `fstatfs` == `DMA_BUF_MAGIC` before the fdinfo proof | the FUSE dma-buf case: stalled, `STATFS` from the main thread |
+| close a refused fd off the main thread | `nb_fd_drop()` closes everything itself | the FUSE cases: stalled in `FLUSH` from the main thread |
+| a refusal case only the shmem proof catches | the proof deleted from `nb_cursor_read()` | the 4 KiB on-disk file is SHOWN as a cursor |
+| backends see only the paced snapshot | `nb_sink_tick()` hands backends the live copy | images 1.17 ms apart across commits; 40 changes in 49 ms |
+| x=0 for both alpha twins | the twin's verdict dropped | only AR24 told |
+| refusals are connection state | the reset dropped | the next connection still told x=0 |
+| a gate-dropped frame is answered x=0 | the core's `nb_format_tell_no()` call dropped | the unadvertised pair's frame got no `EV_FORMAT` |
+| ...once per pair per connection | the `fmt_told` dedupe dropped | the already-told twin told again; the second frame answered again |
+| hot spot on the guest's hot pixel | `floor` instead of `ceil` | 1.5x lands on 4,4; 65 310 sweep mismatches; 49 188 pixel mismatches |
+| device-resolution geometry | output scale ignored | scale 2 gives 16x16 |
+| 64-bit `gen` | `uint32_t` | wraps to 0 |
+| F_SHM still demands the seal | the seal check dropped | unsealed memfd and `/dev/shm` file accepted |
+
+- **The FUSE stall, for real**: `test/stall_fuse.py` mounts a filesystem (no
+  libfuse; `mount(2)` as root, `fusermount3` otherwise) whose daemon answers
+  only the test process. A 1 MiB file on it, sent as a cursor, an `F_SHM`
+  frame and a dma-buf frame: each refused, the broker answering `QUERY_FORMAT`
+  throughout, no request from its main thread, and the close arriving as a
+  `FLUSH` from the helper thread -- which stays parked until the test closes
+  `/dev/fuse` and the kernel aborts the connection.
+- **A real dma-buf still passes** the new fdinfo proof (a udmabuf, under the
+  broker's `PR_SET_DUMPABLE 0`) -- run locally; CI runners have no
+  `/dev/udmabuf`, so CI runs the refusal side only and prints the skip.
+- **HiDPI cursor, real compositor**: sway 1.11 nested in `Xvfb`
+  (`WLR_BACKENDS=x11`, pixman, `output * scale 2`), 1024x768 shm frames in a
+  512x384-logical window, a 32x32 guest cursor with hot spot 1,1. Before:
+  `create_buffer(..., 16, 16, ...)`, `set_cursor(..., 0, 0)`, and the X cursor
+  wlroots made from it (read back with XFixes) had lost the guest's right-hand
+  border to the downscale. After: `get_viewport` on the cursor surface,
+  `create_buffer(..., 32, 32, ...)`, `set_destination(16, 16)`,
+  `set_cursor(..., 1, 1)`, and XFixes reads back a 32x32 cursor with the exact
+  one-pixel border and hot spot 2,2 in device pixels.
+- **Not run anywhere**: the X11 DRI3-refusal path itself (needs a DRI3
+  server that refuses an import) -- the twin announcement and the reset are
+  the core's (`nb_sink_format_refused()`, `nb_client_state_reset()`), driven
+  through the test backend, and `x11_attach()` is one call into them; the
+  Wayland stale-cursor fix (needs a compositor that holds both cursor buffers
+  at once -- by reading only); and the Wayland `proven` reset on detach (needs
+  a compositor that refuses an import it advertised).
 
 ### Verified on hardware (RTX 3090, 580.105.08)
 

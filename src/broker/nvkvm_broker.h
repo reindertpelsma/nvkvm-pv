@@ -193,13 +193,20 @@ struct nb_buf_desc {
  *     hot_y < h, and px[0 .. w*h) is the image, packed (row pitch == w);
  *   - every pixel is premultiplied ARGB with each colour channel <= alpha.
  *
- * Backends read it (never write it) and must copy what they render: the core
- * overwrites px on the next SET.  `gen` changes on every change of the image
- * and never repeats within a process, so "have I already rendered this?" is
- * one comparison, across reconnects too.
+ * Backends read it (never write it) and must copy what they render.  What a
+ * backend is handed is the core's PUBLISHED snapshot (nb_sink.cursor_pub), which
+ * changes only when the pacing interval allows -- never the copy a SET writes
+ * into -- so a backend re-rendering on its own schedule (a frame commit, a
+ * resize, a buffer release, the grab ending) re-renders what was last
+ * published, not something newer the pacing has not let through yet.
+ *
+ * `gen` changes on every change of the image and never repeats within a
+ * process -- 64 bits, incremented by one, so it would take longer than the
+ * machine will run to wrap -- and "have I already rendered this?" is one
+ * comparison, across reconnects too.
  */
 struct nb_cursor {
-    uint32_t gen;
+    uint64_t gen;
     bool     defined;           /* an image was SET on this connection        */
     bool     visible;           /* SET/SHOW since the last HIDE               */
     uint32_t w, h, hot_x, hot_y;
@@ -244,15 +251,40 @@ bool nb_cursor_fits(uint32_t offset, uint32_t span, uint64_t size);
 void nb_cursor_load(struct nb_cursor *dst, const uint8_t *src, uint32_t w,
                     uint32_t h, uint32_t stride, uint32_t hot_x,
                     uint32_t hot_y);
+/* Make `dst` a copy of `src`: every field, and the w*h packed pixels when an
+ * image is defined (the rest of px is never read).  How the core publishes. */
+void nb_cursor_copy(struct nb_cursor *dst, const struct nb_cursor *src);
 /*
  * The cursor's size and hot spot after scaling by num_x/den_x horizontally and
- * num_y/den_y vertically -- the same factors the frame is scaled by -- rounded
- * to nearest, each edge at least 1 and at most `max`.  A zero numerator or
- * denominator means 1:1.  `c` must be defined.
+ * num_y/den_y vertically -- the same factors the frame is scaled by.
+ *
+ * SIZE: rounded to nearest, each edge at least 1 and at most `max` (past it,
+ * both edges shrink by the same factor, aspect kept).
+ *
+ * HOT SPOT: the output pixel nb_cursor_scale() fills FROM the guest's hot
+ * pixel -- ceil(hot * out / in), the first output index whose sample
+ * floor(x * in / out) reaches it -- so the scaled image's hot spot is the
+ * guest's hot pixel, not its neighbour.  Exact whenever the cursor is not
+ * shrunk (every source pixel is then sampled at least once); when it is
+ * shrunk and the hot pixel is one the scaler skips, it is the nearest sampled
+ * pixel after it, clamped to the last.  test/test_cursor.c sweeps this.
+ *
+ * A zero numerator or denominator means 1:1.  `c` must be defined.
  */
 void nb_cursor_scaled_geom(const struct nb_cursor *c, uint32_t num_x,
                            uint32_t den_x, uint32_t num_y, uint32_t den_y,
                            uint32_t max, struct nb_cursor_geom *out);
+/*
+ * The same cursor in DEVICE pixels on an output whose scale is scale_120/120
+ * (wp_fractional_scale_v1's unit): nb_cursor_scaled_geom() with the output
+ * scale folded into the factors, so a backend can render a buffer with the
+ * detail the output can show and let a viewport bring it to the logical size.
+ * A scale_120 below 120 (0 = unknown) is taken as 1, and one above 16x as 16x.
+ */
+void nb_cursor_device_geom(const struct nb_cursor *c, uint32_t num_x,
+                           uint32_t den_x, uint32_t num_y, uint32_t den_y,
+                           uint32_t scale_120, uint32_t max,
+                           struct nb_cursor_geom *out);
 /* Nearest-neighbour scale of the defined image into dst[0 .. dw*dh), packed.
  * dw, dh must be >= 1. */
 void nb_cursor_scale(const struct nb_cursor *c, uint32_t *dst, uint32_t dw,
@@ -263,6 +295,25 @@ bool nb_cursor_wanted(const struct nb_cursor *c, bool grabbed);
 /* FNV-1a over the packed pixels -- the test backend's way of saying exactly
  * which image it was handed. */
 uint32_t nb_cursor_hash(const struct nb_cursor *c);
+
+/*
+ * PAIRS THE DISPLAY REFUSED TO IMPORT after advertising them -- the core's
+ * memory (nb_sink.fmt_refused), filled through nb_sink_format_refused().  The
+ * X11 backend reports DRI3 refusals here; the Wayland backend keeps the same
+ * fact in its `proven` table, which also tracks probes.  Fixed capacity: a
+ * client chooses which pairs to try, so it must not choose how much this
+ * remembers; when full, the oldest entry is forgotten, which costs at most
+ * one more refused import of it.  8, because a DRI3 refusal fills two -- it
+ * is a refusal of both alpha twins -- so this holds four refused modifiers.
+ */
+#define NB_REFUSED_SLOTS 8
+struct nb_refused {
+    struct { uint32_t fourcc; uint64_t modifier; } e[NB_REFUSED_SLOTS];
+    unsigned n, next;
+};
+void nb_refused_add(struct nb_refused *r, uint32_t fourcc, uint64_t modifier);
+bool nb_refused_has(const struct nb_refused *r, uint32_t fourcc,
+                    uint64_t modifier);
 
 /* ── the policy core ─────────────────────────────────────────────────────── */
 struct nb_session;
@@ -384,11 +435,48 @@ struct nb_sink {
      * pointer behind an honest client) sends SETs, the display server sees a
      * bounded number of cursor uploads per second -- and the last one sent is
      * always the one that ends up on screen.
+     *
+     * TWO COPIES, and the split is what makes "paced" true.  `cursor` is where
+     * SET/HIDE/SHOW land, at once; `cursor_pub` is what the backend is handed
+     * and keeps a pointer to, and it changes ONLY in nb_sink_tick() (and on
+     * attach/detach, see nb_client_state_reset()).  Handing backends the
+     * first one -- as the first version did -- paced the core's ->cursor()
+     * calls and nothing else: every backend also re-renders on its own
+     * schedule (a frame commit, a configure, a buffer release, the grab
+     * ending), and each of those re-read the newest image straight past the
+     * interval.  test/test_cursor.py measures the interval across frame
+     * commits.
      */
     struct nb_cursor cursor;
+    struct nb_cursor cursor_pub;
     bool     cursor_dirty;      /* changed since the backend last saw it   */
     uint64_t cursor_applied_ms; /* when the backend last saw it            */
     uint64_t n_cursor, n_cursor_reject;
+
+    /*
+     * PAIRS THE DISPLAY REFUSED TO IMPORT after advertising them, as the
+     * backend reported them through nb_sink_format_refused().  Consulted by
+     * the one resolver ATTACH and QUERY_FORMAT share, so neither can say yes
+     * to a pair the other has seen fail.
+     *
+     * CONNECTION STATE, like the cursor: forgotten on attach and detach.  The
+     * refusal is triggered by a buffer the guest chose, so on a --persist
+     * broker a memory that outlived the client would let one VM decide the
+     * next VM's present path.  The Wayland backend's `proven` table is reset
+     * at the same moment for the same reason (wl_client_detach()), so the two
+     * backends still say the same thing on the wire: within a connection a
+     * refused pair stays refused, and a new connection starts from what the
+     * display advertises.  The cost is re-learning: one dropped probe frame on
+     * Wayland, one bounded blocking round trip on X11, per refused pair per
+     * connection.
+     */
+    struct nb_refused fmt_refused;
+    /*
+     * Pairs the client has been TOLD x=0 for on this connection, so the core
+     * can tell it whenever ATTACH's format gate refuses a pair it sent --
+     * once per pair, not once per frame.  Same lifetime as fmt_refused.
+     */
+    struct nb_refused fmt_told;
 };
 
 void nb_sink_init(struct nb_sink *s, struct nb_session *sess);
@@ -450,6 +538,20 @@ void nb_sink_pointer(struct nb_sink *s, bool inside);
  */
 void nb_sink_format_verdict(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
                             bool usable);
+/*
+ * The display REFUSED an import of a pair it advertised, and the backend wants
+ * the core to remember it: from now until the client detaches, ATTACH and
+ * QUERY_FORMAT both say no to the pair, and the client is told so with an
+ * unsolicited EV_FORMAT x=0 for EVERY fourcc this refuses.
+ *
+ * `both_twins`: the import path cannot see the fourcc at all -- DRI3 imports
+ * by depth and bpp, so XR24 and AR24 are one buffer description to it -- and
+ * a refusal of one is a refusal of the other.  Both are then remembered AND
+ * both announced: a relay holding x=1 for the twin it did not use would
+ * otherwise keep sending it into a refusal it was never told about.
+ */
+void nb_sink_format_refused(struct nb_sink *s, uint32_t fourcc, uint64_t mod,
+                            bool both_twins);
 void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h,
                      unsigned refresh_mhz);
 void nb_sink_frame(struct nb_sink *s);
@@ -587,10 +689,13 @@ struct nb_session_ops {
      * leaves this NULL exactly when it does not set that bit, and the core
      * then treats CMD_CURSOR as the violation an older broker would.
      *
-     * `cur` is the core's own state and stays valid for the life of the
-     * process; the backend may keep the pointer and re-read it whenever it
-     * needs to re-render (a resize changing the frame's scale, the grab
-     * ending).  It must not block, and it decides what is actually shown:
+     * `cur` is the core's PUBLISHED snapshot (nb_sink.cursor_pub) and stays
+     * valid for the life of the process; the backend may keep the pointer and
+     * re-read it whenever it needs to re-render (a resize changing the frame's
+     * scale, the grab ending, a frame commit), and what it finds there is
+     * only ever what the pacing has let through -- never a SET the interval
+     * is still holding back.  It must not block, and it decides what is
+     * actually shown:
      * nb_cursor_wanted() with the backend's OWN grab state, which is the
      * truth earlier than the core's during a grab transition.
      */
@@ -708,22 +813,6 @@ struct nb_formats {
 void nb_formats_add(struct nb_formats *f, uint32_t fourcc, uint64_t modifier);
 bool nb_formats_has(const struct nb_formats *f, uint32_t fourcc, uint64_t mod);
 void nb_formats_log(const struct nb_formats *f, const char *what);
-
-/*
- * PAIRS THE DISPLAY REFUSED TO IMPORT after advertising them.  The X11
- * backend's memory of DRI3 refusals (the Wayland backend keeps the same fact
- * in its `proven` table).  Fixed capacity: a client chooses which pairs to try,
- * so it must not choose how much this remembers; when full, the oldest entry
- * is forgotten, which costs at most one more refused import of it.
- */
-#define NB_REFUSED_SLOTS 4
-struct nb_refused {
-    struct { uint32_t fourcc; uint64_t modifier; } e[NB_REFUSED_SLOTS];
-    unsigned n, next;
-};
-void nb_refused_add(struct nb_refused *r, uint32_t fourcc, uint64_t modifier);
-bool nb_refused_has(const struct nb_refused *r, uint32_t fourcc,
-                    uint64_t modifier);
 
 /*
  * Resolve a DRM character device to the RENDER node of the same GPU through

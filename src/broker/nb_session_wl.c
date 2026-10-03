@@ -458,12 +458,21 @@ struct nb_wl {
      */
     const struct nb_cursor *gcur;
     struct wl_surface      *gc_surf;
+    /*
+     * HiDPI: the cursor buffer is rendered in DEVICE pixels (gc_bgeom) and
+     * this viewport brings it to the LOGICAL size (gc_geom), so a scale-2
+     * output shows the guest's own pixels instead of a logical-size image the
+     * compositor then magnifies.  NULL without wp_viewporter, in which case
+     * the buffer IS the logical size, as before.
+     */
+    struct wp_viewport     *gc_vp;
     struct wl_shm_pool     *gc_pool;
     uint32_t               *gc_px;      /* NB_GC_SLOTS slots, mapped      */
     struct nb_wl_gcslot     gc_slot[NB_GC_SLOTS];
     bool                    gc_valid;   /* gc_surf holds gc_gen at gc_geom */
-    uint32_t                gc_gen;
-    struct nb_cursor_geom   gc_geom;
+    uint64_t                gc_gen;
+    struct nb_cursor_geom   gc_geom;    /* logical: size and hot spot     */
+    struct nb_cursor_geom   gc_bgeom;   /* the buffer, in device pixels   */
     bool                    gc_on;      /* the content's cursor IS gc_surf */
     bool                    gc_starved; /* a re-render waits on a release  */
     bool                    gc_broken;  /* allocation failed: show none    */
@@ -1046,7 +1055,11 @@ static int wl_commit(struct nb_session *s, struct nb_sink *sink)
      */
     if (w->probe_bad_pending) {
         w->probe_bad_pending = false;
-        nb_sink_format_verdict(sink, w->probe_bad_fourcc, w->probe_bad_mod,
+        /* Through the core, so the core remembers it (ATTACH and QUERY_FORMAT
+         * answer no from its table as well as from `proven`) and knows the
+         * client has been told.  One fourcc: unlike DRI3, a compositor imports
+         * per fourcc, and may well take the opaque twin of what it refused. */
+        nb_sink_format_refused(sink, w->probe_bad_fourcc, w->probe_bad_mod,
                                false);
     }
 
@@ -1886,6 +1899,26 @@ static void wl_client_detach(struct nb_session *s, uint64_t generation)
      * host window. */
     w->clip_notice_until = 0;
     tb_update(w, w->tb_w > 0 ? w->tb_w : w->win_w);
+    /*
+     * WHAT THE DEPARTED VM'S BUFFERS TAUGHT US ABOUT THE DISPLAY GOES WITH IT.
+     *
+     * Every entry here was decided by a buffer the guest chose -- including
+     * the -1s, which also make QUERY_FORMAT say no -- so on a --persist broker
+     * a table that outlived the client let one VM decide the next one's
+     * present path.  The core forgets the X11 backend's refusals at this same
+     * moment (nb_sink.fmt_refused), so both backends agree on the wire: a
+     * refusal holds for the connection that provoked it.  Re-learning costs
+     * the next client one dropped probe frame per pair, never the connection:
+     * a first buffer always goes through the asynchronous probe.
+     *
+     * probe_inflight is KEPT: the outstanding probe's answer still arrives,
+     * and the one-probe-at-a-time rule is what attributes it.  With its slot
+     * gone, wl_pair_slot(..., false) finds nothing and the answer is dropped
+     * -- including a refusal, which must not reach the next client as an
+     * EV_FORMAT about a buffer it never sent.
+     */
+    memset(w->proven, 0, sizeof w->proven);
+    w->probe_bad_pending = false;
 }
 
 /* ── the output's fractional scale ───────────────────────────────────────── */
@@ -1990,6 +2023,9 @@ static void frac_scale(void *d, struct wp_fractional_scale_v1 *f,
      * but what the guest should render has.  cont_*, not surf_* -- see the
      * field's comment for why reporting surf_* oscillates. */
     wl_report_surface(w, w->cont_w, w->cont_h);
+    /* The guest's cursor is rendered in device pixels: a new scale is a new
+     * buffer size for it (gc_geom_now()). */
+    gc_refresh(w);
 }
 static const struct wp_fractional_scale_v1_listener frac_listener = {
     .preferred_scale = frac_scale,
@@ -2004,26 +2040,60 @@ static const struct wp_fractional_scale_v1_listener frac_listener = {
  * measured in, so the guest's pointer comes out exactly as large, relative to
  * the guest's picture, as the guest drew it.
  */
-static void gc_geom_now(const struct nb_wl *w, struct nb_cursor_geom *g)
+static void gc_scale_now(const struct nb_wl *w, uint32_t *nx, uint32_t *dx,
+                         uint32_t *ny, uint32_t *dy)
 {
-    uint32_t nx = 1, dx = 1, ny = 1, dy = 1;
-
+    *nx = *dx = *ny = *dy = 1;
     if (w->viewport && w->buf_w > 0 && w->buf_h > 0 &&
         w->fit_w > 0 && w->fit_h > 0) {
-        nx = (uint32_t)w->fit_w;
-        dx = (uint32_t)w->buf_w;
-        ny = (uint32_t)w->fit_h;
-        dy = (uint32_t)w->buf_h;
+        *nx = (uint32_t)w->fit_w;
+        *dx = (uint32_t)w->buf_w;
+        *ny = (uint32_t)w->fit_h;
+        *dy = (uint32_t)w->buf_h;
     }
+}
+
+/*
+ * `g`: the cursor in LOGICAL pixels -- its size on screen and the hot spot
+ * wl_pointer.set_cursor takes.  `b`: the buffer to render it into.  Without a
+ * viewport for the cursor surface, or at an output scale of 1, the two are the
+ * same.  With one, `b` is the same cursor in DEVICE pixels (the output scale
+ * folded in, wp_fractional_scale_v1's preferred scale), so the image keeps the
+ * detail the output can show and the viewport takes it to `g`'s size.
+ *
+ * The hot spot stays a LOGICAL integer: set_cursor's hotspot is an int in
+ * surface coordinates, so on a scale-2 output it can sit up to one device
+ * pixel from the guest's hot pixel -- the protocol cannot express finer --
+ * whereas the image itself loses nothing.
+ */
+static void gc_geom_now(const struct nb_wl *w, struct nb_cursor_geom *g,
+                        struct nb_cursor_geom *b)
+{
+    uint32_t nx, dx, ny, dy;
+
+    gc_scale_now(w, &nx, &dx, &ny, &dy);
     nb_cursor_scaled_geom(w->gcur, nx, dx, ny, dy, NB_CURSOR_SCALED_MAX, g);
+    if (w->gc_vp) {
+        nb_cursor_device_geom(w->gcur, nx, dx, ny, dy, w->scale_120,
+                              NB_CURSOR_SCALED_MAX, b);
+    } else {
+        *b = *g;
+    }
+}
+
+static bool gc_geom_eq(const struct nb_cursor_geom *a,
+                       const struct nb_cursor_geom *b)
+{
+    return a->w == b->w && a->h == b->h && a->hot_x == b->hot_x &&
+           a->hot_y == b->hot_y;
 }
 
 static bool gc_up_to_date(const struct nb_wl *w,
-                          const struct nb_cursor_geom *g)
+                          const struct nb_cursor_geom *g,
+                          const struct nb_cursor_geom *b)
 {
     return w->gc_valid && w->gcur && w->gc_gen == w->gcur->gen &&
-           w->gc_geom.w == g->w && w->gc_geom.h == g->h &&
-           w->gc_geom.hot_x == g->hot_x && w->gc_geom.hot_y == g->hot_y;
+           gc_geom_eq(&w->gc_geom, g) && gc_geom_eq(&w->gc_bgeom, b);
 }
 
 static void gc_buf_release(void *data, struct wl_buffer *b)
@@ -2088,6 +2158,11 @@ static bool gc_ensure(struct nb_wl *w)
     for (i = 0; i < NB_GC_SLOTS; i++) {
         w->gc_slot[i].w = w;
     }
+    /* Optional: without it the buffer is drawn at the logical size, which is
+     * what every compositor without wp_viewporter got before. */
+    if (w->viewporter) {
+        w->gc_vp = wp_viewporter_get_viewport(w->viewporter, w->gc_surf);
+    }
     return true;
 
 broken:
@@ -2106,27 +2181,38 @@ broken:
 
 /*
  * Make gc_surf hold the guest's image at the frame's current scale.  True when
- * it does -- freshly drawn, already drawn, or (both slots still held by the
- * compositor) the previous image, which a release will replace.
+ * it does -- freshly drawn, or already drawn -- and FALSE whenever what the
+ * surface holds is not the CURRENT image, including when it cannot be redrawn
+ * yet because the compositor still holds both slots.
+ *
+ * That last case used to answer gc_valid, i.e. "whatever the surface holds will
+ * do", and the surface could then be showing the PREVIOUS image -- after a
+ * --persist reconnect, the previous VM's pointer over the next VM's picture.
+ * Now the caller shows no host cursor until a release lets the current image
+ * be drawn (gc_buf_release() re-runs the decision).  Only a different SCALE of
+ * the same image is shown while starved: same picture, briefly the old size.
  */
 static bool gc_render(struct nb_wl *w)
 {
     const struct nb_cursor *c = w->gcur;
-    struct nb_cursor_geom g;
+    struct nb_cursor_geom g, b;
     struct wl_buffer *buf;
     uint32_t *px;
     int i, slot = -1;
+    /* What the surface already holds is acceptable if it is this image. */
+    bool fallback;
 
     if (!c || !c->defined) {
         return false;
     }
-    gc_geom_now(w, &g);
-    if (gc_up_to_date(w, &g)) {
-        return true;
-    }
     if (!gc_ensure(w)) {
         return false;
     }
+    gc_geom_now(w, &g, &b);
+    if (gc_up_to_date(w, &g, &b)) {
+        return true;
+    }
+    fallback = w->gc_valid && w->gc_gen == c->gen;
     for (i = 0; i < NB_GC_SLOTS; i++) {
         if (!w->gc_slot[i].busy) {
             slot = i;
@@ -2136,38 +2222,49 @@ static bool gc_render(struct nb_wl *w)
     if (slot < 0) {
         /* Never draw into a buffer the compositor may still be reading. */
         w->gc_starved = true;
-        return w->gc_valid;
+        return fallback;
     }
     if (w->gc_slot[slot].buf) {
         wl_buffer_destroy(w->gc_slot[slot].buf);
         w->gc_slot[slot].buf = NULL;
     }
-    /* g.w, g.h <= NB_CURSOR_SCALED_MAX, so this fits the slot by construction
-     * (nb_cursor_scaled_geom() guarantees it; test_cursor.c checks it) -- and
+    /* b.w, b.h <= NB_CURSOR_SCALED_MAX, so this fits the slot by construction
+     * (nb_cursor_device_geom() guarantees it; test_cursor.c checks it) -- and
      * is checked again here, where the write is, so no later change to the
      * geometry code can make it a write past the slot. */
-    if (g.w == 0 || g.h == 0 || (size_t)g.w * g.h > NB_GC_SLOT_PX) {
-        return w->gc_valid;
+    if (b.w == 0 || b.h == 0 || (size_t)b.w * b.h > NB_GC_SLOT_PX) {
+        return fallback;
     }
     px = w->gc_px + (size_t)slot * NB_GC_SLOT_PX;
-    nb_cursor_scale(c, px, g.w, g.h);
+    nb_cursor_scale(c, px, b.w, b.h);
     buf = wl_shm_pool_create_buffer(w->gc_pool,
                                     (int32_t)((size_t)slot * NB_GC_SLOT_BYTES),
-                                    (int32_t)g.w, (int32_t)g.h,
-                                    (int32_t)(g.w * 4u),
+                                    (int32_t)b.w, (int32_t)b.h,
+                                    (int32_t)(b.w * 4u),
                                     WL_SHM_FORMAT_ARGB8888);
     if (!buf) {
-        return w->gc_valid;
+        return fallback;
     }
     wl_buffer_add_listener(buf, &gc_buf_listener, &w->gc_slot[slot]);
     w->gc_slot[slot].buf = buf;
     w->gc_slot[slot].busy = true;
+    if (w->gc_vp) {
+        /* Unset when the buffer already IS the logical size: a viewport
+         * scaling by exactly one is still a viewport. */
+        if (b.w == g.w && b.h == g.h) {
+            wp_viewport_set_destination(w->gc_vp, -1, -1);
+        } else {
+            wp_viewport_set_destination(w->gc_vp, (int32_t)g.w,
+                                        (int32_t)g.h);
+        }
+    }
     wl_surface_attach(w->gc_surf, buf, 0, 0);
-    wl_surface_damage_buffer(w->gc_surf, 0, 0, (int32_t)g.w, (int32_t)g.h);
+    wl_surface_damage_buffer(w->gc_surf, 0, 0, (int32_t)b.w, (int32_t)b.h);
     wl_surface_commit(w->gc_surf);
     w->gc_valid = true;
     w->gc_gen = c->gen;
     w->gc_geom = g;
+    w->gc_bgeom = b;
     return true;
 }
 
@@ -2184,10 +2281,10 @@ static void gc_refresh(struct nb_wl *w)
         return;     /* nothing of ours is up and nothing should be */
     }
     if (want && w->gc_on) {
-        struct nb_cursor_geom g;
+        struct nb_cursor_geom g, b;
 
-        gc_geom_now(w, &g);
-        if (gc_up_to_date(w, &g)) {
+        gc_geom_now(w, &g, &b);
+        if (gc_up_to_date(w, &g, &b)) {
             return;
         }
     }
@@ -2216,6 +2313,10 @@ static void gc_drop(struct nb_wl *w)
     if (w->gc_pool) {
         wl_shm_pool_destroy(w->gc_pool);
         w->gc_pool = NULL;
+    }
+    if (w->gc_vp) {
+        wp_viewport_destroy(w->gc_vp);
+        w->gc_vp = NULL;
     }
     if (w->gc_surf) {
         wl_surface_destroy(w->gc_surf);

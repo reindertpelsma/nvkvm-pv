@@ -37,15 +37,27 @@
  *                                 backend learns this from the compositor
  *
  * The guest cursor is "shown" by logging exactly what a real backend would
- * put up -- size, hot spot, generation and a hash of the pixels -- or that it
- * would show none, which is what a test needs to tell "applied" from
- * "refused" from "coalesced away".
+ * put up -- size, hot spot, generation and a hash of the pixels, and the
+ * monotonic time it was put up -- or that it would show none, which is what a
+ * test needs to tell "applied" from "refused" from "coalesced away".  Like the
+ * real backends it also RE-RENDERS on its own schedule -- every frame COMMIT,
+ * which is when nb_session_wl.c re-runs gc_refresh() and nb_session_x11.c its
+ * cursor policy -- from the pointer it was handed, logging only when what it
+ * would show has changed.  That is what lets test/test_cursor.py measure the
+ * pacing interval across commits, the path that once bypassed it.
+ *
+ * And like the X11 backend it can be REFUSED an import it advertised: the pair
+ * (XR24 or AR24, NB_TEST_MOD_REFUSED) is advertised and every ATTACH of it is
+ * refused the way DRI3 refuses one, through the same core call
+ * (nb_sink_format_refused(), both alpha twins) -- so the wire behaviour of a
+ * taken-back yes is testable without a GPU.
  */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "nvkvm_broker.h"
@@ -54,6 +66,9 @@
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
      ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
+/* Advertised, and refused at import: see the header comment.  Vendor NONE,
+ * a value no real layout uses. */
+#define NB_TEST_MOD_REFUSED        0x0000000000c0ffeeULL
 
 struct nb_test {
     /* Settable so the harness can exercise the refresh hint without a
@@ -75,7 +90,20 @@ struct nb_test {
     uint64_t stale_fetch_generation;
     /* The core's cursor state, as a real backend keeps the pointer to it. */
     const struct nb_cursor *cursor;
+    /* What was last shown, so a re-render that changes nothing logs nothing
+     * -- the comparison the real backends make before re-uploading. */
+    bool     shown_valid;
+    bool     shown_wanted;
+    uint64_t shown_gen;
 };
+
+static uint64_t test_now_us(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 /*
  * Log what a real backend would now show over the guest's picture.  The
@@ -86,18 +114,45 @@ struct nb_test {
 static void test_cursor_show(struct nb_test *t)
 {
     const struct nb_cursor *c = t->cursor;
+    bool want;
 
     if (!c) {
         return;
     }
-    if (nb_cursor_wanted(c, t->grabbed)) {
-        nb_log("TEST cursor: shown %ux%u hot %u,%u gen %u hash 0x%08x",
-               c->w, c->h, c->hot_x, c->hot_y, c->gen, nb_cursor_hash(c));
+    want = nb_cursor_wanted(c, t->grabbed);
+    t->shown_valid = true;
+    t->shown_wanted = want;
+    t->shown_gen = c->gen;
+    if (want) {
+        nb_log("TEST cursor: shown %ux%u hot %u,%u gen %llu hash 0x%08x "
+               "t_us %llu", c->w, c->h, c->hot_x, c->hot_y,
+               (unsigned long long)c->gen, nb_cursor_hash(c),
+               (unsigned long long)test_now_us());
     } else {
         nb_log("TEST cursor: none (%s)",
                !c->defined ? "no image" :
                !c->visible ? "hidden" : "grabbed");
     }
+}
+
+/*
+ * A re-render on the backend's own schedule (here: every COMMIT).  Re-reads the
+ * held pointer, exactly as gc_refresh() and x11_cursor_policy() do, and shows
+ * something only if it differs from what is up -- so if the core ever hands a
+ * backend a cursor the pacing has not released, this is where it shows.
+ */
+static void test_cursor_refresh(struct nb_test *t)
+{
+    const struct nb_cursor *c = t->cursor;
+
+    if (!c) {
+        return;
+    }
+    if (t->shown_valid && t->shown_wanted == nb_cursor_wanted(c, t->grabbed) &&
+        (!t->shown_wanted || t->shown_gen == c->gen)) {
+        return;
+    }
+    test_cursor_show(t);
 }
 
 static void test_cursor(struct nb_session *s, const struct nb_cursor *cur)
@@ -233,6 +288,17 @@ static int test_attach(struct nb_session *s, const struct nb_buf_desc *d)
     struct nb_test *t = s->priv;
     char fcc[8];
 
+    if (!d->is_shm && d->modifier == NB_TEST_MOD_REFUSED) {
+        /* What x11_attach() does when DRI3 answers with an X error. */
+        nb_log("TEST attach: REFUSED %s mod=0x%016llx, as DRI3 refuses an "
+               "import it advertised", nb_fourcc_name(d->fourcc, fcc),
+               (unsigned long long)d->modifier);
+        if (s->sink) {
+            nb_sink_format_refused(s->sink, d->fourcc, d->modifier, true);
+        }
+        return -EINVAL;
+    }
+
     t->have_pending = true;
     t->pending_id = d->id;
     t->pending_w = d->width;
@@ -253,6 +319,7 @@ static int test_commit(struct nb_session *s, struct nb_sink *sink)
     }
     nb_log("TEST commit: id=%llu %ux%u", (unsigned long long)t->pending_id,
            t->pending_w, t->pending_h);
+    test_cursor_refresh(t);
     nb_sink_surface(sink, t->pending_w, t->pending_h, t->refresh_mhz);
     /* A real backend answers with these; produce them so a client's pacing
      * and recycling paths are exercised end to end. */
@@ -337,12 +404,19 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
     /*
      * A deliberately SMALL advertised set, so the selftest can prove both
      * halves of the format gate: XRGB8888 linear and XRGB8888 implicit are
-     * accepted, everything else — including ARGB8888, which a real backend
-     * would take — is rejected.
+     * accepted, everything else — including ARGB8888 in either layout, which
+     * a real backend would take — is rejected.  The only other pairs are the
+     * refused-at-import ones below, which no frame ever gets through.
      */
     nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'), 0);
     nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'),
                    NB_DRM_FORMAT_MOD_INVALID);
+    /* Advertised for both alpha twins, as DRI3 advertises a modifier, and
+     * refused at import: see the header comment. */
+    nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'),
+                   NB_TEST_MOD_REFUSED);
+    nb_formats_add(&t->formats, NB_FOURCC('A', 'R', '2', '4'),
+                   NB_TEST_MOD_REFUSED);
 
     s->accept_memfd = true;
     s->accept_shm   = true;
