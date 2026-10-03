@@ -189,6 +189,25 @@ int main(void)
         r.last_fd == second[0] && r.last_bw == 1280 && r.last_bh == 720 &&
         fd_open(r.last_fd));
 
+    /*
+     * EV_FORMAT merging.  The broker takes a yes BACK with an unsolicited x=0
+     * when the display refuses an import it advertised; the relay used to
+     * drop that as "already answered" and kept presenting zero-copy into a
+     * refusal.  A downgrade must land; an unsolicited upgrade must not.
+     */
+    chk("an outstanding query takes a yes",
+        relay_format_verdict_next(-1, true) == 1);
+    chk("an outstanding query takes a no",
+        relay_format_verdict_next(-1, false) == 0);
+    chk("a later no DOWNGRADES a yes",
+        relay_format_verdict_next(1, false) == 0);
+    chk("a repeated yes changes nothing",
+        relay_format_verdict_next(1, true) == 1);
+    chk("a later yes never upgrades a no",
+        relay_format_verdict_next(0, true) == 0);
+    chk("a repeated no changes nothing",
+        relay_format_verdict_next(0, false) == 0);
+
     close(r.last_fd);
     printf("%d/%d tests passed\n", passed, run);
     return passed == run ? 0 : 1;

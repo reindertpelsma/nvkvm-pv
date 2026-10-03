@@ -621,6 +621,36 @@ static void relay_pend_arm(NvkvmRelay *r, RelayPend what)
                       RELAY_PEND_DEADLINE_MS);
     }
 }
+
+/*
+ * The verdict a format slot holds after an EV_FORMAT arrives for it.
+ *
+ *   -1 (asked, waiting)  -> whatever the broker said: the answer to our query.
+ *    1 (yes) + x=0       -> 0.  A DOWNGRADE IS NEWS.  The broker sends an
+ *                           unsolicited x=0 when the display refuses an import
+ *                           it had advertised (the Wayland probe's `failed`,
+ *                           X11 DRI3 answering with an error).  Ignoring it --
+ *                           which this used to do, as "already answered" --
+ *                           kept every later frame on the zero-copy path the
+ *                           display had just refused: a black window, with the
+ *                           reason in the broker's log and not ours.
+ *    0 + x=1             -> 0.  Never an unsolicited upgrade: a refusal is
+ *                           something the display DID, a later yes is at most
+ *                           an advertisement it has already broken once.
+ *
+ * static inline because test_relay_wiring includes this region too and does
+ * not call it.
+ */
+static inline int relay_format_verdict_next(int held, bool usable)
+{
+    if (held == -1) {
+        return usable ? 1 : 0;
+    }
+    if (held == 1 && !usable) {
+        return 0;
+    }
+    return held;
+}
 /* NVKVM_RELAY_STATE_HELPERS_END */
 
 
@@ -1368,17 +1398,24 @@ static void relay_handle(NvkvmRelay *r, const struct nvkvm_broker_pkt *p)
                       "ignored", (unsigned)fourcc, (unsigned long long)mod);
             break;
         }
-        if (r->fmt[i].verdict != -1) {
-            break;                      /* already answered; nothing new */
+        {
+            int was = r->fmt[i].verdict;
+            int now = relay_format_verdict_next(was, p->x != 0);
+
+            if (now == was) {
+                break;                  /* nothing new; see the helper */
+            }
+            r->fmt[i].verdict = now;
+            info_report("nvkvm-broker: the display %s show fourcc 0x%08x "
+                        "modifier 0x%016llx%s%s",
+                        now ? "CAN" : "CANNOT",
+                        (unsigned)fourcc, (unsigned long long)mod,
+                        was == 1 ? " after all (it refused an import it had "
+                                   "advertised)" : "",
+                        now ? "" :
+                        " — frames must be read back through the guest's GPU "
+                        "into a LINEAR buffer the display can import");
         }
-        r->fmt[i].verdict = p->x ? 1 : 0;
-        info_report("nvkvm-broker: the display %s show fourcc 0x%08x "
-                    "modifier 0x%016llx%s",
-                    r->fmt[i].verdict ? "CAN" : "CANNOT",
-                    (unsigned)fourcc, (unsigned long long)mod,
-                    r->fmt[i].verdict ? "" :
-                    " — frames must be read back through the guest's GPU into "
-                    "a LINEAR buffer the display can import");
         break;
     }
 
