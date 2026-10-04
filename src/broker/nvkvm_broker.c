@@ -1520,16 +1520,29 @@ static void nb_violation(struct nb_sink *s, const char *why)
 
 /*
  * Is the pair usable at all: advertised by the display, AND not refused by it
- * since on this connection (nb_sink_format_refused()).  The refusal is checked
- * HERE, in the core, so that ATTACH and QUERY_FORMAT cannot disagree about it
- * on any backend that reports refusals.
+ * since on this connection (nb_sink_format_refused()), AND a layout whose
+ * extent the broker can bound (nb_modifier_layout()).  All three are checked
+ * HERE, in the core, so that ATTACH and QUERY_FORMAT cannot disagree about any
+ * of them on any backend.
+ *
+ * The third is not the display's question but it has to be asked here all the
+ * same: a modifier the display advertises and nb_frame_extent() cannot decode
+ * -- another vendor's tiling, or an NVIDIA field from a newer drm_fourcc.h --
+ * would otherwise be answered "yes" and then have every frame refused by the
+ * extent check, a black window with nothing on the wire to say why.  Asked
+ * here, the VMM hears x=0 and falls back to LINEAR like any other "no".
  */
 static bool nb_format_usable(struct nb_sink *s, uint32_t fourcc,
                              uint64_t modifier)
 {
     struct nb_session *ss = s->sess;
+    struct nb_layout layout;
+    const char *why;
 
     if (nb_refused_has(&s->fmt_refused, fourcc, modifier)) {
+        return false;
+    }
+    if (nb_modifier_layout(modifier, &layout, &why) != 0) {
         return false;
     }
     return ss->ops->format_ok(ss, fourcc, modifier);
@@ -1599,6 +1612,8 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
 {
     struct nb_session *ss = s->sess;
     struct stat st;
+    struct nb_layout layout;
+    const char *why;
     off_t size;
     uint32_t bpp;
     uint32_t fourcc;
@@ -1748,6 +1763,18 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         if (!nb_reject_log(s)) {
             return -EINVAL;
         }
+        if (nb_modifier_layout(c->modifier, &layout, &why) != 0) {
+            /* Whatever the display says about it: name the field, because
+             * "not advertised" would send the reader to the compositor. */
+            nb_err("ATTACH: fourcc %s modifier 0x%016llx (%s): %s -- the "
+                   "broker cannot bound what a display would read from this "
+                   "buffer, so no frame in it is presented (the VMM was sent "
+                   "EV_FORMAT x=0 for it)",
+                   nb_fourcc_name(c->fourcc, fcc),
+                   (unsigned long long)c->modifier,
+                   nb_modifier_vendor(c->modifier), why);
+            return -EINVAL;
+        }
         if (nb_refused_has(&s->fmt_refused, c->fourcc, c->modifier)) {
             /* Advertised, and then refused on this connection: "not
              * advertised" would send the reader looking for the wrong fault. */
@@ -1848,23 +1875,52 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
         return -EINVAL;
     }
     /*
-     * 64-bit throughout: stride and height are both uint32, so their product
-     * cannot wrap a uint64, and adding a uint32 offset to it cannot either.
-     * That is what makes this test overflow-safe without a separate check.
+     * THE EXTENT, PER MODIFIER -- nb_frame_extent() in nb_extent.c, the one
+     * function every frame's bound comes from.  For a linear frame it is
+     * offset + stride*height, as it always was.  For NVIDIA block-linear the
+     * height is rounded up to whole blocks and the stride must be whole
+     * 64-byte GOBs: until 2026-10-04 this line applied the linear formula to
+     * every modifier, and a box run (kayfabe, vast 54032077, NVIDIA DDX
+     * 580.159.04) had the X server import and present five block-linear
+     * descriptions that fitted it -- three to the byte -- and ended up to
+     * 64 KiB past their buffers, and a sixth whose pitch was not whole GOBs.
+     * The X server checks none of it.
+     *
+     * shm is linear by definition: its modifier field is not read, the same
+     * as the format gate above, so an F_SHM frame is bounded as LINEAR.
+     *
+     * Then two bounds, in this order, inside the same call: the extent must
+     * fit an int32_t (AUDIT 2026-08-27 S-3: wl_shm_create_pool takes one, and
+     * lseek on a sparse 4 GiB memfd costs the client nothing -- a stride of
+     * 0x40000 over 8192 rows once made the pool size land on INT32_MIN, a
+     * protocol error fatal to the connection at a moment the client picks),
+     * and it must fit the buffer.  Bounding stride and offset with them: each
+     * is <= the extent when height >= 1.
      */
-    need = (uint64_t)c->stride * c->height + (uint64_t)c->offset;
-    /*
-     * AND IT MUST FIT THE PROTOCOLS WE HAND IT TO.  AUDIT 2026-08-27 S-3:
-     * wl_shm_create_pool takes an int32_t, and nothing else bounded `need`
-     * from above -- lseek on a sparse 4 GiB memfd costs the client nothing, so
-     * a stride of 0x40000 over 8192 rows made the pool size land on
-     * INT32_MIN.  A negative size is a wl_shm protocol error, which is fatal
-     * to the connection, so the client picks the moment the broker dies.
-     * Bounding it HERE (rather than at the cast) keeps "reject, never clamp"
-     * in the one place both backends inherit it from, and bounds stride and
-     * offset with it: each is <= need when height >= 1.
-     */
-    if (need > (uint64_t)INT32_MAX) {
+    switch (nb_frame_extent(d->is_shm ? 0 /* DRM_FORMAT_MOD_LINEAR */
+                                      : c->modifier,
+                            c->height, c->stride, c->offset, (uint64_t)size,
+                            &need, &why)) {
+    case NB_EXTENT_OK:
+        break;
+    case NB_EXTENT_LAYOUT:
+        /* Unreachable through the format gate, which asks the same decoder;
+         * kept so this call stands on its own. */
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: modifier 0x%016llx (%s): %s — REJECTED",
+                   (unsigned long long)c->modifier,
+                   nb_modifier_vendor(c->modifier), why);
+        }
+        return -EINVAL;
+    case NB_EXTENT_PITCH:
+        if (nb_reject_log(s)) {
+            nb_err("ATTACH: %ux%u stride=%u modifier 0x%016llx: %s (%u is "
+                   "not a multiple of 64) — REJECTED", c->width, c->height,
+                   c->stride, (unsigned long long)c->modifier, why,
+                   c->stride);
+        }
+        return -EINVAL;
+    case NB_EXTENT_TOO_BIG:
         if (nb_reject_log(s)) {
             nb_err("ATTACH: %ux%u stride=%u offset=%u spans %llu bytes; the "
                    "largest buffer any display protocol here can be handed is "
@@ -1872,13 +1928,24 @@ static int nb_validate_desc(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
                    (unsigned long long)need, INT32_MAX);
         }
         return -EINVAL;
-    }
-    if (need > (uint64_t)size) {
+    default:    /* NB_EXTENT_SHORT */
         if (nb_reject_log(s)) {
+            char blocks[160] = "";
+
+            if (!d->is_shm &&
+                nb_modifier_layout(c->modifier, &layout, &why) == 0 &&
+                layout.block_linear) {
+                snprintf(blocks, sizeof blocks,
+                         "; block-linear modifier 0x%016llx stores rows in "
+                         "whole %u-row blocks, so its %u rows occupy %llu",
+                         (unsigned long long)c->modifier, layout.block_rows,
+                         c->height,
+                         (unsigned long long)((need - c->offset) / c->stride));
+            }
             nb_err("ATTACH: %ux%u stride=%u offset=%u needs %llu bytes but the "
                    "dma-buf is %lld — REJECTED (the compositor would read out of "
-                   "bounds)", c->width, c->height, c->stride, c->offset,
-                   (unsigned long long)need, (long long)size);
+                   "bounds)%s", c->width, c->height, c->stride, c->offset,
+                   (unsigned long long)need, (long long)size, blocks);
         }
         return -EINVAL;
     }
@@ -2277,12 +2344,20 @@ static void nb_handle_cmd(struct nb_sink *s, const struct nvkvm_broker_cmd *c,
          * command by a hostile one, so it shares the reject budget. */
         if (nb_reject_log(s)) {
             char fcc[8];
-            nb_log("QUERY_FORMAT %s modifier 0x%016llx (%s) -> %s%s",
+            struct nb_layout layout;
+            const char *why = "";
+            /* A "no" for a layout the broker cannot bound says so: it is the
+             * one "no" no change on the display's side can turn into a yes. */
+            bool unbounded =
+                nb_modifier_layout(c->modifier, &layout, &why) != 0;
+
+            nb_log("QUERY_FORMAT %s modifier 0x%016llx (%s) -> %s%s%s%s",
                    nb_fourcc_name(c->fourcc, fcc),
                    (unsigned long long)c->modifier,
                    nb_modifier_vendor(c->modifier),
                    ok ? "YES" : "NO",
-                   (ok && use != c->fourcc) ? " (as its opaque twin)" : "");
+                   (ok && use != c->fourcc) ? " (as its opaque twin)" : "",
+                   unbounded ? ": " : "", unbounded ? why : "");
         }
         nb_emit(s, NVKVM_BROKER_EV_FORMAT, ok ? 1 : 0, (int)c->fourcc,
                 (uint32_t)(c->modifier & 0xffffffffu),

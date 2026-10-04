@@ -155,8 +155,11 @@ struct nb_config {
  *   - width/height are non-zero and <= NVKVM_BROKER_MAX_DIM;
  *   - fourcc is one the backend's format_ok() said the GPU advertises,
  *     paired with this exact modifier;
- *   - stride >= width * bpp, and offset + stride*height <= the fd's real size
- *     measured with lseek(fd, 0, SEEK_END).
+ *   - stride >= width * bpp, and the frame's extent <= the fd's real size
+ *     measured with lseek(fd, 0, SEEK_END) -- nb_frame_extent()'s extent:
+ *     offset + stride*height for a linear frame, with the height rounded up
+ *     to whole blocks (and the stride whole 64-byte GOBs) for NVIDIA
+ *     block-linear, and no frame at all for a modifier it cannot decode.
  *
  * A backend may therefore import without re-deriving any of that.  It must
  * still check its own import calls for failure, because the compositor or X
@@ -295,6 +298,48 @@ bool nb_cursor_wanted(const struct nb_cursor *c, bool grabbed);
 /* FNV-1a over the packed pixels -- the test backend's way of saying exactly
  * which image it was handed. */
 uint32_t nb_cursor_hash(const struct nb_cursor *c);
+
+/* ── a frame's extent, per modifier (nb_extent.c) ────────────────────────── */
+
+/*
+ * A modifier's layout, as far as the extent needs it.  Linear (LINEAR, and the
+ * implicit layout): gob_width 1, block_rows 1.  NVIDIA block-linear: gob_width
+ * 64 and block_rows = GOB rows << log2(block height), a power of two <= 256.
+ */
+struct nb_layout {
+    bool     block_linear;
+    uint32_t gob_width;     /* the pitch must be a multiple of this (bytes) */
+    uint32_t block_rows;    /* rows are stored in whole multiples of this   */
+};
+
+/*
+ * Decode `modifier`: 0 with *l filled, or -1 with *why naming the vendor,
+ * layout or field (by its drm_fourcc.h bit range) that the broker cannot
+ * bound.  Pure.  nb_format_usable() asks this, so a modifier no frame could
+ * pass is never answered "yes" by CMD_QUERY_FORMAT either.
+ */
+int nb_modifier_layout(uint64_t modifier, struct nb_layout *l,
+                       const char **why);
+
+/* nb_frame_extent() verdicts. */
+#define NB_EXTENT_OK      0
+#define NB_EXTENT_LAYOUT  1   /* nb_modifier_layout() refused the modifier  */
+#define NB_EXTENT_PITCH   2   /* block-linear, pitch not whole 64-byte GOBs */
+#define NB_EXTENT_TOO_BIG 3   /* extent > INT32_MAX (wl_shm_create_pool)    */
+#define NB_EXTENT_SHORT   4   /* extent > the buffer's measured size        */
+
+/*
+ * THE frame bound -- the one nb_validate_desc() applies to every ATTACH:
+ * *need = offset + stride * (height rounded up to whole blocks of the
+ * modifier's layout), in 64 bits where no operand can wrap it, and the frame
+ * fits only if *need <= INT32_MAX and *need <= size.  *need is 0 for a LAYOUT
+ * verdict and the exact extent otherwise.  `*why` names the rule that failed
+ * ("" for OK).  Pure; test/test_extent.c drives it through every field and
+ * boundary.
+ */
+int nb_frame_extent(uint64_t modifier, uint32_t height, uint32_t stride,
+                    uint32_t offset, uint64_t size, uint64_t *need,
+                    const char **why);
 
 /*
  * PAIRS THE DISPLAY REFUSED TO IMPORT after advertising them -- the core's

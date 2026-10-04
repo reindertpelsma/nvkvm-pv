@@ -39,7 +39,13 @@ contain a bug conditional on it.
   line only a dma-buf's fdinfo carries) before it asks the fd's filesystem
   anything (`fstatfs` == `DMA_BUF_MAGIC`), so it needs a readable
   `/proc/self/fdinfo` to accept dma-buf frames; without one every dma-buf frame
-  is refused and the reason logged.
+  is refused and the reason logged. The geometry must fit the buffer's
+  measured size as the **modifier** lays it out: `offset + stride*height` for
+  `LINEAR` and the implicit layout; for NVIDIA block-linear the height rounded
+  up to whole blocks (`GOB rows << h`) and the stride a multiple of 64. A
+  modifier the broker cannot decode -- another vendor's, or a reserved NVIDIA
+  field -- is never usable, whatever the display advertises
+  ([broker-design: the block-linear extent](../internal/broker-design.md#the-block-linear-extent-2026-10-04)).
 - **`COMMIT`** presents the most recently attached buffer. No fd, and every
   descriptor field must be zero. Split from `ATTACH` because a compositor
   distinguishes "the content changed" from "the frame is finished", and
@@ -218,11 +224,11 @@ never treat an unsolicited `x` = 1 as an upgrade.
 The broker also sends one **whenever an `ATTACH` is dropped at the format
 gate** -- for the (fourcc, modifier) that `ATTACH` named, once per pair per
 connection. So a dropped frame is never silent on the wire, whatever made the
-pair unusable: never advertised, refused earlier on this connection, or
-refused under its opaque twin (a Wayland probe imports, and so reports, the
-twin the broker substituted -- XR24 for an AR24 frame -- and a relay that sent
-AR24 would otherwise have kept its yes). A relay that never asked about the
-pair may simply record it.
+pair unusable: never advertised, a layout the broker cannot bound, refused
+earlier on this connection, or refused under its opaque twin (a Wayland probe
+imports, and so reports, the twin the broker substituted -- XR24 for an AR24
+frame -- and a relay that sent AR24 would otherwise have kept its yes). A
+relay that never asked about the pair may simply record it.
 
 **Connection state**, on both backends: the refusal is forgotten when the
 client detaches, so a new connection is answered from what the display

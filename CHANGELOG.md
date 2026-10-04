@@ -73,7 +73,8 @@ against an older broker. What a relay can now use:
   before, a Wayland probe refusal named the opaque twin the broker imported,
   and a relay that had sent AR24 never heard about it.
 
-Behaviour fixed before release, found by review (no wire change):
+Behaviour fixed before release, found by review and on hardware (no wire
+change):
 
 - **A FUSE fd could stall the broker.** The fd checks asked the fd's
   filesystem (`fstatfs`) before proving what it was, and closing a refused fd
@@ -90,6 +91,19 @@ Behaviour fixed before release, found by review (no wire change):
   output the cursor is rendered at device resolution (with `wp_viewporter`),
   and a cursor the compositor has not released buffers for is hidden rather
   than shown stale.
+- **A block-linear frame was bounded as if it were linear**, found on hardware
+  (an RTX 3060 under the NVIDIA X server, 580.159.04). The size check was
+  `offset + stride * height` whatever the modifier, but an NVIDIA block-linear
+  surface spans whole blocks of rows -- 500 rows in 128-row blocks occupy 512 --
+  so a buffer could pass it and still end up to 64 KiB short, and the X server
+  imported and presented such buffers without an error. The bound is now the
+  modifier's own, decoded field by field from `drm_fourcc.h`. **This can refuse
+  a frame that used to be shown**: a block-linear buffer that does not hold
+  whole blocks of rows, a block-linear stride that is not a multiple of 64, and
+  any modifier other than `LINEAR`, the implicit layout or NVIDIA block-linear
+  (for those `QUERY_FORMAT` now answers no, so a relay falls back to `LINEAR`).
+  NVIDIA's allocators and kayfabe's GPU copy produce whole blocks; the
+  rejection log line names the rows the buffer needed.
 
 Wire layout: [`docs/reference/broker-protocol.md`](docs/reference/broker-protocol.md).
 

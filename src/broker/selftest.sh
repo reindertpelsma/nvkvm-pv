@@ -201,13 +201,17 @@ check   "and LINEAR itself is still USABLE" \
         'fourcc=XR24 modifier=0x0000000000000000 -> USABLE' "$CASE_OUT"
 check   "and a frame still reaches attach" 'TEST attach' "$CASE_LOG"
 
-# Four without it: XR24 LINEAR, XR24 implicit, and the two alpha twins of
-# the modifier the test backend advertises and then refuses at import, as DRI3
-# does (NB_TEST_MOD_REFUSED in nb_session_test.c; test/test_cursor.py).
+# Five without it: XR24 LINEAR, XR24 implicit, the two alpha twins of the
+# modifier the test backend advertises and then refuses at import, as DRI3
+# does (NB_TEST_MOD_REFUSED in nb_session_test.c; test/test_cursor.py), and an
+# XR24 block-linear modifier with a reserved field set, which the core refuses
+# to bound however much the display advertises it (NB_TEST_MOD_UNBOUNDED).
+# The advertised set is what the DISPLAY said; the core's verdict on each pair
+# is CMD_QUERY_FORMAT's to give, not this count's.
 BROKER_EXTRA=
 run_case '' --present 320x240 --query-format
-check   "without it, all four advertised pairs are kept" \
-        'advertises 4 \(format, modifier\) pairs' "$CASE_LOG"
+check   "without it, all five advertised pairs are kept" \
+        'advertises 5 \(format, modifier\) pairs' "$CASE_LOG"
 
 # TIER 3: a memfd must be accepted and presented through wl_shm.  This is the
 # floor under a display that advertises a modifier it will not import, so it
@@ -218,7 +222,7 @@ check   "without it, all four advertised pairs are kept" \
 BROKER_EXTRA=--present-mode=native
 run_case '' --present 320x240
 check   "--present-mode=native keeps every advertised pair" \
-        'advertises 4 \(format, modifier\) pairs' "$CASE_LOG"
+        'advertises 5 \(format, modifier\) pairs' "$CASE_LOG"
 BROKER_EXTRA=--present-mode=linear
 run_case '' --present 320x240
 check   "--present-mode=linear narrows to LINEAR alone" \

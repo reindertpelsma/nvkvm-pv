@@ -71,13 +71,27 @@ also runs as you and is also outside the sandbox. So a lie the broker believes
 is a bug in an unsandboxed process, which is the whole thing we were trying to
 avoid.
 
-Eight rules, all in `nvkvm_broker.c` (the eighth's pure half in `nb_cursor.c`),
-all exercised by `selftest.sh` or by `test/test_cursor.{c,py}`:
+Eight rules, all in `nvkvm_broker.c` (the first's arithmetic in `nb_extent.c`,
+the eighth's pure half in `nb_cursor.c`), all exercised by `selftest.sh` or by
+`test/test_cursor.{c,py}` and `test/test_extent.c`:
 
 1. **Declared geometry is validated against the REAL buffer size.**
    `lseek(fd, 0, SEEK_END)` measures the dma-buf; the frame is accepted only if
-   `offset + stride * height <= size`, computed in 64-bit so two `uint32`
-   operands cannot wrap it, and only if `stride >= width * bpp`.
+   its **extent** fits it, and only if `stride >= width * bpp`. The extent is
+   the modifier's, not one formula for every modifier (`nb_frame_extent()`,
+   2026-10-04 -- see [The block-linear extent](#the-block-linear-extent-2026-10-04)
+   for the bug that made it so):
+
+   | modifier | extent | refused when |
+   |---|---|---|
+   | `LINEAR`, and `INVALID` (implicit) | `offset + stride * height` | -- |
+   | NVIDIA block-linear | `offset + stride * roundup(height, GOB rows << h)` | the pitch is not a multiple of 64 (whole GOBs) |
+   | anything else | none | always: a layout the broker cannot decode is an extent it cannot bound |
+
+   All in 64 bits, where no operand can wrap it (a power-of-two block of at
+   most 256 rows rounds a `uint32` height to at most 2^32 rows), and the
+   extent must also be `<= INT32_MAX`, because `wl_shm_create_pool` takes an
+   `int32_t` (finding S-3 of `audit-broker-security-2026-08-27.md`).
    **Reject, never clamp.** This is finding **A-18** in
    `docs/internal/audit-boundaries-2026-08-20.md`, found once already one
    process further in; here the consumer that would read out of bounds is the
@@ -93,6 +107,13 @@ all exercised by `selftest.sh` or by `test/test_cursor.{c,py}`:
    list anywhere in the broker, because NVIDIA's block-linear modifiers are
    driver-version-specific (`src/guest/nvkvm_kms.c` carries two of them, read
    off real bos) and a hardcoded list would be wrong on the next driver.
+   What the broker DOES carry is a decoder (`nb_modifier_layout()`, rule 1),
+   and the pair must also pass it: advertised is necessary, not sufficient.
+   It is asked in `nb_format_usable()`, the one resolver `ATTACH` and
+   `QUERY_FORMAT` share, so a modifier the display advertises and the broker
+   cannot bound -- another vendor's tiling, or an NVIDIA field a newer
+   `drm_fourcc.h` defines -- is answered `x` = 0 rather than "yes" followed by
+   every frame refused at the extent.
 4. **The fd is proved to be a dma-buf** before anything imports it:
    `fstatfs(fd).f_type == DMA_BUF_MAGIC`. A memfd, a pipe, a socket, a file on
    your disk — all rejected. (`--backend test` also accepts a memfd; that is
@@ -508,6 +529,160 @@ mutation, then the checks that failed):
   at once -- by reading only); and the Wayland `proven` reset on detach (needs
   a compositor that refuses an import it advertised).
 
+### The block-linear extent (2026-10-04)
+
+**How it presented.** kayfabe's broker lane on hardware (vast 54032077, RTX
+3060 / GA106, host driver and NVIDIA DDX 580.159.04, KDE on Xorg; this broker
+at `badf2d7`) ran a DRI3 client that had the NVIDIA X server import a real
+512x512 block-linear bo -- modifier `0x0300000000606014`, 1 048 576 bytes --
+under ten malformed descriptions, one connection each. **The X server imported
+and presented every one with no X error and no Xid.** Three of them are the
+same bug in this broker: each fitted rule 1's old linear bound
+`offset + stride * height <= size` *to the byte*, and each ends past its buffer
+as the layout it names (kayfabe `origin/v3-broker`,
+`traces/v3_display/broker_20261004/README.md` finding 1, `brkF3/dri3.log`):
+
+| variant | declared | buffer | linear bound | as block-linear |
+|---|---|---|---|---|
+| `tail4k` | 512x510, offset 4096 | 1 048 576 | 1 048 576 | 1 052 672: 4 KiB past |
+| `tail64k` | 512x480, offset 65536 | 1 048 576 | 1 048 576 | 1 114 112: 64 KiB past |
+| `udmabuf_short` | 512x500 | 1 024 000 (udmabuf) | 1 024 000 | 1 048 576: 24 KiB past |
+| `pitch+64` | 512x480, pitch 2112 | 1 048 576 | 1 013 760 | 1 081 344: 32 KiB past |
+| `offset+4` | 512x480, offset 4 | 1 048 576 | 983 044 | 1 048 580: 4 bytes past |
+| `pitch+4` | 512x480, pitch 2052 | 1 048 576 | 984 960 | not whole GOBs |
+
+Whether the GPU actually read past the end is not known -- nothing faulted --
+but the broker's job is not to find out: the X server checks none of this, so
+the broker is the only place it is checked. The remaining variants (another
+page kind, a one-GOB block height, a full-size udmabuf) describe the same
+bytes *in bounds* under the wrong layout; they show garbage and read nothing
+they should not, and no size rule can tell a wrong in-bounds layout from a
+right one.
+
+**Why linear is wrong for block-linear.** An NVIDIA block-linear surface is a
+grid of **blocks**, each a column of 2^h **GOBs**, each GOB 64 bytes by 8 rows
+(4 rows on G80-GT2XX). The block is the unit of the layout, so a surface spans
+whole blocks of rows -- 500 rows in 128-row blocks occupy 512 rows of memory --
+and the hardware takes the pitch in GOBs. The extent is
+`offset + pitch * roundup(height, GOB rows << h)`, and the pitch must be a
+multiple of 64.
+
+**The rule, and where every number in it comes from** (`nb_extent.c`):
+
+- the field layout: `DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(c, s, g, k, h)`,
+  Linux 7.1 `include/uapi/drm/drm_fourcc.h` (field table `:940-1010`, macro
+  `:1012`) -- `h` 3:0, bit 4 must be 1, 8:5 and 11:9 reserved, `k` 19:12,
+  `g` 21:20, `s` bit 22 plus 27:26, `c` 25:23, 55:28 reserved. Older copies of
+  the header give `s` one bit; 27:26 arrived for GB20x's 8/16 bpp layouts;
+- `h` <= 5: the same header's `DRM_FORMAT_MOD_NVIDIA_16BX2_BLOCK(v)` -- "GOBs
+  are then stacked vertically by a power of 2 (1 to 32 GOBs)", "Valid values
+  are ... 5 == THIRTYTWO_GOBS" -- and that macro *is*
+  `BLOCK_LINEAR_2D(0, 0, 0, 0, v)`;
+- the GOB: 64 bytes wide on every generation, 8 rows from Fermi on
+  (`NVKMS_BLOCK_LINEAR_GOB_WIDTH` / `_GOB_HEIGHT`, open-gpu-kernel-modules
+  580.159.04 `src/nvidia-modeset/include/nvkms-types.h:110-114`), 4 rows when
+  the modifier's own `g` is 1 (`drm_fourcc.h`'s 21:20 table);
+- the pitch in whole GOBs: NVIDIA's KMS import refuses anything else for an
+  explicit block-linear layout (`src/nvidia-modeset/kapi/src/nvkms-kapi.c:2302-2305`,
+  "Invalid block-linear pitch alignment");
+- whole blocks of rows: the upstream kernel's own check for this modifier,
+  `nouveau_check_bl_size()` (Linux 7.1 `drivers/gpu/drm/nouveau/nouveau_display.c:226-253`,
+  geometry in `dispnv50/tile.h`), is exactly
+  `offset + ceil(pitch/64) * ceil(height / (GOB rows * GOBs per block)) * GOBs per block * GOB bytes <= size`;
+  and it is how such a surface is allocated -- NVIDIA's
+  `GetLog2GobsPerBlock()` (`nvkms-headsurface.c:91-111`) aligns the height to
+  the block before sizing, and kayfabe's GPU copy sizes its frames to "whole
+  block rows" (`VramGeom.extent`). So an honest buffer already holds the
+  extent, and every honest frame this broker has seen fits it: the 512x512
+  bo is exactly 1 MiB, kayfabe's 1024x695 guest copies are 768 rows.
+
+`k`, `s` and `c` arrange bytes *inside* a GOB (swizzle, sector remap,
+compression tags held outside the surface) and never change how many GOBs a
+surface spans, so every defined value is accepted and only their reserved
+values are refused. Every reserved field and value is refused **by name**
+(the rejection quotes its `drm_fourcc.h` bit range), and so is everything the
+decoder does not know: another vendor's modifier, vendor NONE other than
+`LINEAR`/`INVALID`, `TEGRA_TILED`, an NVIDIA modifier without bit 4. A
+modifier from a newer header is refused for the field it is newer in.
+
+**The implicit layout (`DRM_FORMAT_MOD_INVALID`) keeps the linear bound**, and
+that is a stated limit, not a proof: the importer works the layout out, the
+NVIDIA DDX was measured reading a block-linear bo handed in that way *as
+linear* (`x11_attach()`; "Known-bad on hardware" below), and the exporter's
+private layout metadata is invisible to this process, which links no libdrm
+and no GPU driver. A driver that imports by private metadata (NVKMS does:
+`GetSurfaceParams()` takes `pitchInBlocks` from the allocation when the layout
+is not explicit) validates against the allocation itself
+(`nvkms-surface.c` `ValidatePlaneProperties()`), not against what the broker
+was told.
+
+**One boundary, and the format gate asks the same decoder.** `nb_frame_extent()`
+is the one place a frame's bound is computed (`nb_validate_desc()` calls it for
+every `ATTACH`; `F_SHM` frames as `LINEAR`, their modifier unread, as before),
+and `nb_format_usable()` calls `nb_modifier_layout()` -- so `QUERY_FORMAT`
+answers `x` = 0 for an advertised modifier the broker cannot bound, and a frame
+in it is told `x` = 0 at the gate, instead of "yes" followed by every frame
+refused at the extent with nothing on the wire. A frame refused *at the extent*
+(rows or pitch) is a malformed frame, not a format verdict: logged, dropped,
+nothing sent, exactly like any other geometry refusal. No wire change.
+
+**The test backend's refused pair changed** from vendor NONE `0xc0ffee` -- which
+the decoder now refuses before any backend sees it -- to
+`0x0300000000606010` (one-GOB blocks, so `test/test_cursor.py`'s 64-row
+frames are whole blocks), and it now also advertises `0x0300000000606034`
+(bit 5 set, reserved 8:5) for XR24 as the newer-header case: `selftest.sh`'s
+"advertises N pairs" is 5 where it was 4.
+
+**Verified headlessly (no GPU on the machine this was written on), and each
+rule run red against a mutation of it.** `test/test_extent.c` (in
+`make check`, and under ASAN+UBSAN in `make check-sanitize`) drives the decoder
+through every block height 0..5 under each GOB generation, h 6..15, every
+reserved bit and value, every page kind, every defined `c` and `s`, all 255
+other vendor bytes, the real modifiers (`0x…606014`, `0x…e08014`, the box's
+`0x…606010`, the legacy `16BX2_BLOCK(0..5)`); the extent at 30 heights per
+block height -- multiples of the block, one row either side, at offset 0 and
+4096 -- each at the exact size and one byte short, against a block-by-block
+walk rather than the closed form; every box variant above; the `INT32_MAX`
+boundary from both sides, reached directly and only through the rounding;
+heights and pitches that wrap to 0 in 32 bits; and a 200 000-description sweep.
+`test/test_cursor.py` drives the same rule through the real socket and
+validator. The mutations (scratch copies, `make test-extent` +
+`test/test_cursor.py`):
+
+| mutation | went red |
+|---|---|
+| no row rounding (`rows = height`) | 84 500 unit checks; all three e2e refusals (the frames reached the backend) |
+| rounding in 32 bits | `UINT32_MAX` rows in 256-row blocks round to 2^32 rows, not 0 (3 checks) |
+| product in 32 bits | 65536 * 65536 = 2^32, not 0; the two maxima (7 checks) |
+| offset dropped | 38 419 unit checks; e2e "57 rows at offset 1024" |
+| pitch check dropped | 12 319 unit checks; e2e "a pitch of 260" |
+| `h` <= 6 | h = 6 accepted (3) |
+| `g` = 1 read as 8-row GOBs | g=1 h=0..5 block rows (7) |
+| 8:5, 11:9, `g` = 3, `c` 5-7, `s` 4-7, 55:28 each unchecked | that field's refusals (1-28 each); 8:5 also the four e2e "cannot bound" checks |
+| other vendors / vendor NONE / bit 4 clear decoded as linear | 255 / 3 / 3 refusals |
+| `INVALID` refused | "the implicit layout is bounded as linear" (3) |
+| `INT32_MAX` bound dropped | `INT32_MAX + 1`, the rounding-only crossing, the wraps (11) |
+| `>` → `>=` against the size | 63 479 unit checks; 13 e2e checks, every frame that fits exactly |
+| the validator applies the linear formula (`nb_frame_extent(0, ...)`) | unit suite GREEN -- e2e red: all four refusals reached the backend |
+| `F_SHM` bounded by its modifier | e2e "an F_SHM frame is bounded as linear" |
+| the format gate's decode dropped | unit suite GREEN -- e2e red: `QUERY_FORMAT` x=1, no `x` = 0, frame not refused in the core |
+
+The last three are why the end-to-end half exists: a pure unit test cannot see
+whether the boundary calls it. (Not counted above: two pre-existing cursor
+checks -- the `/dev/null` refusal and "the cursor from before the refusals is
+intact" -- fail on the machine this was written on in every run, mutated or
+not, because its `/dev/null` is a regular file on tmpfs; with a real
+`/dev/null` bind-mounted in a private mount namespace the unmutated tree is
+green, as CI is.)
+
+**Not verified on hardware.** The DRI3 client against this broker on the box
+(each refused variant should now log its rule and never reach the X server);
+kayfabe's GPU-copy frames and a Mode-1 guest's own block-linear scanout
+through this bound (both should fit -- kayfabe sizes whole block rows, and
+every allocator read above does -- but a real allocator that sized a
+block-linear bo to its rows rather than its blocks would now be refused, and
+the log line names the rows it needed).
+
 ### Verified on hardware (RTX 3090, 580.105.08)
 
 - **A frame on screen, both backends**, with a real block-linear dma-buf — see
@@ -712,6 +887,11 @@ nvkvm_broker.c        socket, SO_PEERCRED, privilege drop, the command
                       output ring, the main loop.
 nb_common.c           backend selection, the fourcc table, and the advertised
                       (fourcc, modifier) set the validator consults.
+nb_extent.c           pure: a frame's extent per DRM format modifier (linear,
+                      implicit, NVIDIA block-linear decoded field by field;
+                      anything else refused by name).  The one bound every
+                      ATTACH gets, and the decoder the format gate asks.
+nb_cursor.c           pure: the CMD_CURSOR record's rules, extent, copy, scale.
 nb_session_wl.c       Wayland: xdg_toplevel + zwp_linux_dmabuf_v1.  No GL.
 nb_session_x11.c      X11: xcb + DRI3 + Present, two windows (see the file
                       header for why).  No GL.
@@ -736,7 +916,12 @@ selftest.sh           43 behavioural checks, no GPU required.  Note it needs
                       or that one check fails for a permissions reason that
                       has nothing to do with the broker.
 test/*.py             adopted-socket authentication, clipboard framing/cap,
-                      and persistent-client generation/key-edge regressions.
+                      and persistent-client generation/key-edge regressions;
+                      test_cursor.py also the fd identity, format and
+                      block-linear extent rules over the real socket.
+test/test_extent.c    nb_extent.c driven through every field and boundary,
+                      linked against the same object (make check).
+test/test_cursor.c    nb_cursor.c, the same way.
 ```
 
 QEMU side: `src/qemu/nvkvm_display_relay.{c,h}`, the hook in

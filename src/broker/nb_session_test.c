@@ -66,9 +66,24 @@
     ((uint32_t)(a) | ((uint32_t)(b) << 8) | \
      ((uint32_t)(c) << 16) | ((uint32_t)(d) << 24))
 #define NB_DRM_FORMAT_MOD_INVALID  0x00ffffffffffffffULL
-/* Advertised, and refused at import: see the header comment.  Vendor NONE,
- * a value no real layout uses. */
-#define NB_TEST_MOD_REFUSED        0x0000000000c0ffeeULL
+/*
+ * Advertised, and refused at import: see the header comment.  A REAL layout,
+ * DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, 0) -- the one-GOB
+ * (8-row) block height of the modifier family the NVIDIA DDX advertises --
+ * because since nb_extent.c the core refuses, before any backend sees it, a
+ * modifier whose layout it cannot bound.  It was vendor NONE 0xc0ffee, which
+ * now never reaches a backend at all.  One-GOB blocks keep test/test_cursor.py's
+ * 64-row frames at 64 * stride bytes, and its stride of 256 is whole GOBs.
+ */
+#define NB_TEST_MOD_REFUSED        0x0300000000606010ULL
+/*
+ * Advertised, and never usable: block-linear with bit 5 set, which
+ * drm_fourcc.h reserves (bits 8:5, a 3D block depth).  A display can
+ * advertise a modifier from a newer header than the broker was built with;
+ * nb_modifier_layout() refuses the field by name, CMD_QUERY_FORMAT answers it
+ * x=0, and a frame in it is told x=0 -- test/test_cursor.py checks all three.
+ */
+#define NB_TEST_MOD_UNBOUNDED      0x0300000000606034ULL
 
 struct nb_test {
     /* Settable so the harness can exercise the refresh hint without a
@@ -406,7 +421,8 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
      * halves of the format gate: XRGB8888 linear and XRGB8888 implicit are
      * accepted, everything else — including ARGB8888 in either layout, which
      * a real backend would take — is rejected.  The only other pairs are the
-     * refused-at-import ones below, which no frame ever gets through.
+     * refused-at-import ones below and the one the core cannot bound, which
+     * no frame ever gets through.
      */
     nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'), 0);
     nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'),
@@ -417,6 +433,9 @@ static int test_open(struct nb_session *s, const struct nb_config *cfg)
                    NB_TEST_MOD_REFUSED);
     nb_formats_add(&t->formats, NB_FOURCC('A', 'R', '2', '4'),
                    NB_TEST_MOD_REFUSED);
+    /* Advertised, and a layout the core cannot bound: see its definition. */
+    nb_formats_add(&t->formats, NB_FOURCC('X', 'R', '2', '4'),
+                   NB_TEST_MOD_UNBOUNDED);
 
     s->accept_memfd = true;
     s->accept_shm   = true;

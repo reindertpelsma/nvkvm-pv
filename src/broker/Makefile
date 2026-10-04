@@ -36,7 +36,7 @@ CFLAGS  += -std=gnu11 -Wall -Wextra -Wno-unused-parameter \
            -D_GNU_SOURCE -I. -I../common
 LDFLAGS += -Wl,-z,relro,-z,now
 
-OBJS = nvkvm_broker.o nb_common.o nb_cursor.o nb_placeholder.o \
+OBJS = nvkvm_broker.o nb_common.o nb_cursor.o nb_extent.o nb_placeholder.o \
        nb_session_x11.o nb_session_wl.o nb_session_test.o
 
 # The broker -- and only the broker -- may start one helper thread: the one
@@ -192,13 +192,21 @@ test-cursor: test/test_cursor.c nb_cursor.c nvkvm_broker.h \
              ../common/nvkvm_broker_proto.h
 	$(CC) $(CFLAGS) -o $@ test/test_cursor.c nb_cursor.c $(LDFLAGS)
 
+# The frame-extent rule, per DRM format modifier, linked from the SAME object
+# the broker links -- nb_extent.c is pure like nb_cursor.c.  Every field of the
+# NVIDIA block-linear modifier and every boundary of the bound is driven here.
+test-extent: test/test_extent.c nb_extent.c nvkvm_broker.h \
+             ../common/nvkvm_broker_proto.h
+	$(CC) $(CFLAGS) -o $@ test/test_extent.c nb_extent.c $(LDFLAGS)
+
 # test/test_cursor.py mounts a FUSE filesystem that never answers the broker
 # (test/stall_fuse.py: mount(2) as root, fusermount3 otherwise -- package
 # fuse3).  Where FUSE is unusable that case prints SKIP; NB_REQUIRE_FUSE=1,
 # as CI sets it, makes that a failure instead.
-check: all test-utf8 test-cursor
+check: all test-utf8 test-cursor test-extent
 	./test-utf8
 	./test-cursor
+	./test-extent
 	bash selftest.sh
 	python3 test/test_adopted_socket.py ./$(BIN)
 	python3 test/test_clipboard.py ./$(BIN)
@@ -219,5 +227,5 @@ install: $(BIN)
 
 clean:
 	rm -f $(BIN) $(TESTCLIENT) $(RELAY) $(DMASRC) *.o *.d \
-	      *-client-protocol.h *-protocol.c test-utf8 test-cursor \
+	      *-client-protocol.h *-protocol.c test-utf8 test-cursor test-extent \
 	      test/utf8_extracted.inc

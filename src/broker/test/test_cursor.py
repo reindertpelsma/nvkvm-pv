@@ -16,9 +16,11 @@ a VIOLATION (BYE reason 2, connection closed), as the protocol header says.
 Also, because they share the fd and format machinery: which fds ATTACH takes
 (proved in-kernel, a real dma-buf when /dev/udmabuf exists), a FUSE file whose
 daemon never answers the broker (test/stall_fuse.py) sent as a cursor and as
-both kinds of frame, the cursor pacing measured across frame COMMITs, and the
+both kinds of frame, the cursor pacing measured across frame COMMITs, the
 unsolicited EV_FORMAT x=0 -- both alpha twins, once per pair, forgotten with
-the connection.
+the connection -- and a block-linear frame's extent: whole blocks of rows and
+whole GOBs of pitch, through the real validator, and a modifier the broker
+cannot bound answered "no" however much the display advertises it.
 """
 
 import os
@@ -45,8 +47,14 @@ F_KNOWN, F_RENDER = 1, 2
 AR24, XR24 = 0x34325241, 0x34325258
 F_ADD_SEALS, F_GET_SEALS, F_SEAL_SHRINK = 1033, 1034, 0x0002
 # The pair nb_session_test.c advertises (for both alpha twins) and then
-# refuses at import, the way DRI3 refuses one: NB_TEST_MOD_REFUSED.
-MOD_REFUSED = 0x0000000000c0ffee
+# refuses at import, the way DRI3 refuses one: NB_TEST_MOD_REFUSED.  A real
+# layout -- DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0, 1, 2, 0x06, 0), one-GOB
+# (8-row) blocks -- because the core now refuses a modifier it cannot decode
+# before any backend sees it.
+MOD_REFUSED = 0x0300000000606010
+# Advertised by nb_session_test.c for XR24, and never usable: block-linear
+# with bit 5 set, which drm_fourcc.h reserves (8:5, a 3D block depth).
+MOD_UNBOUNDED = 0x0300000000606034
 UDMABUF_CREATE = 0x40187542          # _IOW('u', 0x42, struct udmabuf_create)
 
 FAILS = []
@@ -548,6 +556,7 @@ def run(b):
     run_fuse(b)
     run_paced_across_commits(b)
     run_taken_back(b)
+    run_block_linear_extent(b)
 
 
 def attached(lines):
@@ -811,6 +820,102 @@ def run_taken_back(b):
     os.close(frame)
     s.close()
     time.sleep(0.2)
+
+
+def one_attach(b, w, h, stride, offset, size, modifier, fourcc=XR24):
+    """One ATTACH on a fresh connection (a frame the test backend refuses at
+    import would otherwise mark the pair refused for the rest of it); the
+    broker's log lines and the EV_FORMAT packets it answered with."""
+    s = connected(b)
+    frame = plain_memfd(size)
+    m = b.mark()
+    send(s, attach_cmd(w, h, stride, fourcc, modifier, offset=offset),
+         [frame])
+    pk = drain(s, 0.3)
+    lines = b.since(m, 0.05)
+    os.close(frame)
+    s.close()
+    time.sleep(0.15)
+    return lines, formats(pk)
+
+
+def run_block_linear_extent(b):
+    print("-- a block-linear frame spans whole blocks of rows and whole GOBs "
+          "of pitch (nb_extent.c), through the real validator")
+    # MOD_REFUSED's blocks are one 8-row GOB tall.  Every buffer below fits
+    # the LINEAR bound (offset + stride*height); the ones refused here are
+    # the shape the NVIDIA X server presented without a word on the box run
+    # of 2026-10-04 (kayfabe traces/v3_display/broker_20261004): rows that do
+    # not fill their last block, in a buffer that ends inside it.
+    def accepted(lines):
+        # The test backend refuses every import of MOD_REFUSED -- so reaching
+        # it IS the proof the validator let the frame through.
+        return any("TEST attach: REFUSED" in l for l in lines)
+
+    def rejected(lines, text):
+        return (not accepted(lines) and
+                any("ATTACH:" in l and "REJECTED" in l and text in l
+                    for l in lines))
+
+    cases = [
+        # (what, w, h, stride, offset, size, expect)
+        ("60 rows of 8-row blocks occupy 64: a buffer of exactly 60 rows "
+         "(the linear bound, to the byte) is refused",
+         64, 60, 256, 0, 60 * 256, "occupy 64"),
+        ("one byte short of the 64 rows", 64, 60, 256, 0, 64 * 256 - 1,
+         "needs 16384 bytes"),
+        ("57 rows at offset 1024 occupy 64 rows plus the offset",
+         64, 57, 256, 1024, 64 * 256 + 1023, "needs 17408 bytes"),
+        ("a pitch of 260 is not whole 64-byte GOBs",
+         64, 64, 260, 0, 64 * 260, "whole number of 64-byte GOBs"),
+    ]
+    for what, w, h, stride, offset, size, text in cases:
+        lines, told = one_attach(b, w, h, stride, offset, size, MOD_REFUSED)
+        check(rejected(lines, text), "refused: " + what)
+        check(not told, "and nothing is said on the wire: a malformed frame "
+              "is not a format verdict (got %r)" % (told,))
+    for what, w, h, stride, offset, size in [
+            ("60 rows in exactly 64 rows of buffer", 64, 60, 256, 0, 64 * 256),
+            ("57 rows at offset 1024 in exactly 64 rows + 1024",
+             64, 57, 256, 1024, 64 * 256 + 1024),
+            ("64 rows: whole blocks, no rounding", 64, 64, 256, 0, 64 * 256)]:
+        lines, _ = one_attach(b, w, h, stride, offset, size, MOD_REFUSED)
+        check(accepted(lines), "accepted (reaches the backend): " + what)
+    # LINEAR is unchanged: rows are rows, any pitch.
+    lines, _ = one_attach(b, 64, 60, 260, 0, 60 * 260, 0)
+    check(any("TEST attach: id=" in l and "stride=260" in l for l in lines),
+          "a LINEAR frame of 60 rows of 260 bytes still fits exactly 60 rows")
+    # shm is linear whatever its modifier field says.
+    s = connected(b)
+    frame = plain_memfd(60 * 256, seal=True)
+    m = b.mark()
+    send(s, attach_cmd(64, 60, 256, XR24, MOD_REFUSED, flags=CMD_F_SHM),
+         [frame])
+    drain(s, 0.3)
+    lines = b.since(m, 0.05)
+    check(any("TEST attach: id=" in l for l in lines),
+          "an F_SHM frame is bounded as linear, its modifier field unread")
+    os.close(frame)
+    s.close()
+    time.sleep(0.15)
+
+    print("-- an advertised modifier the broker cannot bound is a NO: on the "
+          "query, and on the frame")
+    s = connected(b)
+    check(asked(s, XR24, MOD_UNBOUNDED) == 0,
+          "QUERY_FORMAT answers x=0 although the display advertises it")
+    check(asked(s, AR24, MOD_UNBOUNDED) == 0, "and for its alpha twin")
+    check(asked(s, XR24, MOD_REFUSED) == 1,
+          "while a block-linear modifier it can bound still answers x=1")
+    s.close()
+    time.sleep(0.15)
+    lines, told = one_attach(b, 64, 64, 256, 0, 64 * 256, MOD_UNBOUNDED)
+    check(told == [(0, XR24, MOD_UNBOUNDED)],
+          "a frame in it is told EV_FORMAT x=0 for exactly that pair (got %r)"
+          % ([(x, hex(f), hex(md)) for x, f, md in told],))
+    check(not any("TEST attach" in l for l in lines) and
+          any("bits 8:5" in l and "cannot bound" in l for l in lines),
+          "and is refused in the core, naming the reserved field")
 
 
 if __name__ == "__main__":
