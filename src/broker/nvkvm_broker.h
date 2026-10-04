@@ -767,6 +767,7 @@ struct nb_session {
     void    *priv;
 
     uint32_t width, height;     /* current window size, in pixels             */
+    uint32_t refresh_mhz;       /* last host refresh hint; 0 means unknown    */
     uint32_t caps;              /* NVKVM_BROKER_CAP_*                         */
     uint32_t clipboard_caps;    /* NB_SESSION_CLIP_* actually implemented     */
     /*

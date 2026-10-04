@@ -51,7 +51,8 @@ enum {
     NVKVM_BROKER_EV_HELLO     = 1,  /* w0=proto version, w1=capability bits.
                                      * Always the first packet on a connection */
     NVKVM_BROKER_EV_SURFACE   = 2,  /* x=width y=height of the broker's window.
-                                     * Sent at attach and on every resize.     */
+                                     * w0=host refresh in mHz (0 unknown).
+                                     * At attach, resize, or refresh change.   */
     NVKVM_BROKER_EV_FRAME     = 3,  /* the display is ready for another frame
                                      * (wl frame callback / PresentComplete).
                                      * This is the pacing signal; it is NOT a

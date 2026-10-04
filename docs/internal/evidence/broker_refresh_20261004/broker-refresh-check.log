@@ -1,0 +1,262 @@
+make: Entering directory '/data/nvkvm-broker-refresh-20261004/src/broker'
+nvkvm-display-broker backends:
+  dma-buf test source : yes (libgbm)
+  wayland : yes
+  x11     : yes (dri3+present +xrender scaling and guest cursor) + xi2 raw motion
+cc -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wformat=2 -Wshadow -Wvla -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I. -I../common -DNB_HAVE_X11  -DNB_HAVE_XCB_RENDER  -DNB_HAVE_XCB_XINPUT  -DNB_HAVE_WAYLAND  -o nvkvm-broker-testclient testclient.c -Wl,-z,relro,-z,now
+  test    : yes (always)
+cc -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wformat=2 -Wshadow -Wvla -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I. -I../common -DNB_HAVE_X11  -DNB_HAVE_XCB_RENDER  -DNB_HAVE_XCB_XINPUT  -DNB_HAVE_WAYLAND  -o nvkvm-broker-relay dmabuf_relay.c -Wl,-z,relro,-z,now
+cc -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wformat=2 -Wshadow -Wvla -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I. -I../common -DNB_HAVE_X11  -DNB_HAVE_XCB_RENDER  -DNB_HAVE_XCB_XINPUT  -DNB_HAVE_WAYLAND   -DSRC_HAVE_X11 \
+      -o nvkvm-broker-dmabuf-src dmabuf_source.c -Wl,-z,relro,-z,now -lgbm -lxcb-dri3 -lxcb
+sed -n '/^static bool nb_utf8_ok/,/^}/p' nvkvm_broker.c > test/utf8_extracted.inc
+cc -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wformat=2 -Wshadow -Wvla -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I. -I../common -DNB_HAVE_X11  -DNB_HAVE_XCB_RENDER  -DNB_HAVE_XCB_XINPUT  -DNB_HAVE_WAYLAND  -o test-cursor test/test_cursor.c nb_cursor.c -Wl,-z,relro,-z,now
+cc -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wformat=2 -Wshadow -Wvla -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I. -I../common -DNB_HAVE_X11  -DNB_HAVE_XCB_RENDER  -DNB_HAVE_XCB_XINPUT  -DNB_HAVE_WAYLAND  -o test-extent test/test_extent.c nb_extent.c -Wl,-z,relro,-z,now
+cc -O2 -g -std=gnu11 -Wall -Wextra -Wno-unused-parameter -Wformat=2 -Wshadow -Wvla -fstack-protector-strong -D_FORTIFY_SOURCE=2 -D_GNU_SOURCE -I. -I../common -DNB_HAVE_X11  -DNB_HAVE_XCB_RENDER  -DNB_HAVE_XCB_XINPUT  -DNB_HAVE_WAYLAND  -I test -o test-utf8 test/test_utf8.c
+./test-utf8
+ok   ascii                        accepted
+ok   empty                        accepted
+ok   2-byte u+00e9                accepted
+ok   3-byte u+20ac                accepted
+ok   4-byte u+1f600               accepted
+ok   embedded NUL                 rejected
+ok   lone continuation            rejected
+ok   truncated 2-byte             rejected
+ok   truncated 3-byte             rejected
+ok   truncated 4-byte             rejected
+ok   overlong 2-byte /            rejected
+ok   overlong 3-byte              rejected
+ok   overlong 4-byte              rejected
+ok   surrogate d800               rejected
+ok   surrogate dfff               rejected
+ok   above u+10ffff               rejected
+ok   5-byte form                  rejected
+ok   0xfe                         rejected
+ok   bad continuation             rejected
+ok   valid then trunc             rejected
+
+all passed
+./test-cursor
+test_cursor: 219 checks, 0 failed
+./test-extent
+test_extent: all 1009297 checks passed
+bash selftest.sh
+== nvkvm display broker selftest ==
+
+-- socket and handshake
+  [32mPASS[0m socket is mode 0600
+  [32mPASS[0m HELLO is the first packet
+  [32mPASS[0m HELLO announces protocol 2
+  [32mPASS[0m HELLO announces grab capability
+  [32mPASS[0m HELLO announces dma-buf capability
+  [32mPASS[0m SURFACE reports the window size
+  [32mPASS[0m FRAME primes the client
+  [32mPASS[0m second client is refused
+  [32mPASS[0m the refused client got no HELLO
+  [32mPASS[0m an unlisted uid is rejected
+  [32mPASS[0m the rejected uid got no HELLO
+
+-- ATTACH validation (the privileged side parsing a hostile VMM)
+  [32mPASS[0m a well-formed buffer is accepted
+  [32mPASS[0m COMMIT presents it
+  [32mPASS[0m the client is told the buffer was released
+  [32mPASS[0m no rejection on the happy path
+  [32mPASS[0m the buffer the broker imported has a non-zero id
+  [32mPASS[0m RELEASE names the buffer that was attached, not some other one
+  [32mPASS[0m RELEASE never names buffer 0 (which would translate to nothing)
+  [32mPASS[0m a buffer smaller than its claimed geometry is REJECTED
+  [32mPASS[0m and is not clamped into an attach
+  [32mPASS[0m a rejected frame does not kill the client
+  [32mPASS[0m an unadvertised fourcc is rejected
+  [32mPASS[0m and does not reach attach
+  [32mPASS[0m AR24 falls back to its advertised opaque twin XR24
+  [32mPASS[0m and the frame is attached, not refused
+  [32mPASS[0m with no rejection
+  [32mPASS[0m an advertised pair answers USABLE
+  [32mPASS[0m an alpha format its twin covers answers USABLE
+  [32mPASS[0m a foreign-vendor modifier answers NOT USABLE
+  [32mPASS[0m the broker logs the query and its verdict
+  [32mPASS[0m a query is not treated as a protocol violation
+  [32mPASS[0m --linear-only narrows the advertised set to one pair
+  [32mPASS[0m and LINEAR itself is still USABLE
+  [32mPASS[0m and a frame still reaches attach
+  [32mPASS[0m without it, all five advertised pairs are kept
+  [32mPASS[0m --present-mode=native keeps every advertised pair
+  [32mPASS[0m --present-mode=linear narrows to LINEAR alone
+  [32mPASS[0m --present-mode=shm advertises no dma-buf format at all
+  [32mPASS[0m and an F_SHM frame is still presented
+  [32mPASS[0m an F_SHM frame is accepted despite an unadvertised modifier
+  [32mPASS[0m and is not rejected for that modifier
+  [32mPASS[0m an UNSEALED shm memfd is rejected
+  [32mPASS[0m and the unsealed frame is not presented
+  [32mPASS[0m and the client is NOT disconnected for it
+  [32mPASS[0m --resolution nonsense is refused at startup
+  [32mPASS[0m --resolution 0x0 is refused at startup
+  [32mPASS[0m --resolution 99999x1 is refused at startup
+  [32mPASS[0m --resolution auto is accepted
+  [32mPASS[0m --resolution none is accepted
+  [32mPASS[0m --resolution guest is accepted
+  [32mPASS[0m --resolution 1920x1080 is accepted
+  [32mPASS[0m --refresh 0 is refused at startup
+  [32mPASS[0m --refresh 2000 is refused at startup
+  [32mPASS[0m --refresh junk is refused at startup
+  [32mPASS[0m --refresh -1 is refused at startup
+  [32mPASS[0m --refresh auto is accepted
+  [32mPASS[0m --refresh none is accepted
+  [32mPASS[0m --refresh 144 is accepted
+  [32mPASS[0m --refresh 59.94 is accepted
+  [32mPASS[0m dimensions past the 8192 clamp are rejected
+  [32mPASS[0m and do not reach attach
+  [32mPASS[0m an fd that is not a dma-buf is rejected
+  [32mPASS[0m and does not reach attach
+
+-- protocol violations (disconnect, never partial recovery)
+  [32mPASS[0m two fds on one ATTACH is a violation
+  [32mPASS[0m and the client is disconnected
+  [32mPASS[0m a non-zero reserved field is a violation
+  [32mPASS[0m and the reserved-field client is disconnected
+  [32mPASS[0m an fd on a COMMIT is a violation
+  [32mPASS[0m a short message is never acted on
+  [32mPASS[0m an unknown command type is a violation
+
+-- window resize
+  [32mPASS[0m a WINDOW request is answered with SURFACE
+
+-- input policy state machine
+  [32mPASS[0m no KEY while unfocused
+  [32mPASS[0m KEY flows once focused
+  [32mPASS[0m no ABS while the pointer is outside
+  [32mPASS[0m ABS flows when focused and inside
+  [32mPASS[0m CTRL+ALT+G turns grab on
+  [32mPASS[0m the G keypress is NOT forwarded
+  [32mPASS[0m REL flows under grab
+  [32mPASS[0m ABS is suppressed under grab
+  [32mPASS[0m focus loss releases the held key
+  [32mPASS[0m focus loss drops the grab
+  [32mPASS[0m the client is told the grab ended
+
+82 checks run
+all checks passed
+python3 test/test_adopted_socket.py ./nvkvm-display-broker
+adopted-socket authentication tests passed
+python3 test/test_clipboard.py ./nvkvm-display-broker
+python3 test/test_lifecycle.py ./nvkvm-display-broker
+python3 test/test_cursor.py ./nvkvm-display-broker
+-- handshake: the five-packet prefix is unchanged, DEVICE follows
+  PASS HELLO SURFACE FOCUS GRAB FRAME, byte-for-byte the old order
+  PASS EV_DEVICE is the sixth packet
+  PASS HELLO advertises CAP_CURSOR
+  PASS HELLO advertises CAP_DEVICE
+  PASS seq has no gap
+  PASS the test backend's device is 'unknown': x=0 y=0 w0=0 w1=0
+-- EV_DEVICE again when the display moves
+  PASS a changed device is re-sent: x=KNOWN|RENDER w0=226 w1=128
+-- SET: copied from the right rows, premultiplied, shown
+  PASS SET 24x20 hot 5,7 is shown
+  PASS the pixels are the sent ones, premultiplied (hash 6e4131ba)
+-- the last row needs only its pixels: an exact-size memfd
+  PASS the memfd really is 24 bytes
+  PASS a tightly packed last row is accepted
+-- HIDE / SHOW, and the grab
+  PASS HIDE shows none
+  PASS SHOW brings the last image back
+  PASS CTRL+ALT+G: the grab hides the guest's cursor
+  PASS ending the grab shows it again
+-- REFUSED: the connection lives and the previous cursor stays
+  PASS precondition: an fd to a regular file on a non-shmem filesystem, at least the 64-byte span (F_GET_SEALS: EINVAL)
+  PASS refused, and nothing re-shown: an XR24 cursor
+  PASS refused, and nothing re-shown: a 257-wide cursor
+  PASS refused, and nothing re-shown: a 257-high cursor
+  PASS refused, and nothing re-shown: a zero-size cursor
+  PASS refused, and nothing re-shown: hot_x == width
+  PASS refused, and nothing re-shown: hot_y == height
+  PASS refused, and nothing re-shown: stride < width*4
+  PASS refused, and nothing re-shown: stride > 1024
+  PASS refused, and nothing re-shown: geometry past the memfd's end
+  PASS refused, and nothing re-shown: an offset that would wrap 32 bits
+  PASS refused, and nothing re-shown: a pipe instead of a memfd
+  PASS refused, and nothing re-shown: a socket instead of a memfd
+  PASS refused, and nothing re-shown: /dev/null (TMPFS_MAGIC, but not shmem)
+  PASS refused, and nothing re-shown: /dev/zero (TMPFS_MAGIC, readable, not shmem)
+  PASS refused, and nothing re-shown: a 4 KiB regular file on disk (big enough; only the shmem proof refuses it)
+  PASS the connection survived every refusal
+  PASS the cursor from before the refusals is intact
+-- PACED: a burst is coalesced and the LAST image wins
+  PASS the last of 60 SETs is the one on screen
+  PASS 60 SETs reached the display as 3 uploads
+-- a new client never inherits the old one's cursor
+  PASS detach forgets the image at once
+  PASS SHOW on a fresh connection shows nothing
+-- VIOLATIONS: BYE(protocol) and the connection is closed
+  PASS violation: flags set
+  PASS violation: reserved1 set
+  PASS violation: op 0
+  PASS violation: op 4
+  PASS violation: SET without an fd
+  PASS violation: HIDE with an fd
+  PASS violation: HIDE with a width
+  PASS violation: SHOW with a hot spot
+  PASS violation: two fds on one SET
+-- ATTACH: which fds are a buffer, proved without asking their filesystem
+  PASS accepted: a memfd, on the test backend's memfd-for-dma-buf path
+  PASS accepted: an F_SHM memfd sealed with F_SEAL_SHRINK
+  PASS refused: an F_SHM memfd WITHOUT F_SEAL_SHRINK
+  PASS precondition: a /dev/shm file reports F_GET_SEALS 0x1 (got 1)
+  PASS refused: an F_SHM fd to a /dev/shm file (shmem, but never sealable)
+  PASS refused: an F_SHM fd to a file on disk
+  PASS refused: an fd to a file on disk, as a dma-buf
+  PASS precondition: a udmabuf's fdinfo carries exp_name:
+  PASS accepted: a real dma-buf (udmabuf), proved by its fdinfo
+-- a FUSE fd whose daemon never answers: refused, and the broker never waits on it
+  PASS precondition: a 1 MiB FUSE file the test itself can use
+  PASS CURSOR SET: the broker still answers (it did not wait on the daemon)
+  PASS CURSOR SET: refused (CURSOR SET: the fd is not a memfd)
+  PASS CURSOR SET: no request from the broker's main thread reached the daemon (got [])
+  PASS ATTACH F_SHM: the broker still answers (it did not wait on the daemon)
+  PASS ATTACH F_SHM: refused (F_SHM was set but the fd is not a memfd)
+  PASS ATTACH F_SHM: no request from the broker's main thread reached the daemon (got [])
+  PASS ATTACH (the dma-buf path): the broker still answers (it did not wait on the daemon)
+  PASS ATTACH (the dma-buf path): refused (the fd is not a dma-buf)
+  PASS ATTACH (the dma-buf path): no request from the broker's main thread reached the daemon (got [])
+  PASS the refused fds' close() was a FLUSH from the closing thread, not from the main loop (saw [('FLUSH', 709659)]; everything: [('FLUSH', 709659)])
+-- PACED across frame COMMITs: a backend re-render shows only what the interval released
+  PASS precondition: the frames were committed (40)
+  PASS precondition: several images reached the backend (7)
+  PASS no two cursor images reached the backend closer than the pacing allows (closest 7.38 ms over 7 changes)
+  PASS 7 image changes in 49 ms is within one per 8 ms
+  PASS and the last image sent is the one left on screen
+-- a taken-back yes: EV_FORMAT x=0 for BOTH alpha twins, for this connection only
+  PASS before: both twins of the pair answer x=1 (advertised)
+  PASS the import is refused, as DRI3 refuses one
+  PASS unsolicited x=0 for AR24 AND its twin XR24 (got [('0x34325241', '0x300000000606010'), ('0x34325258', '0x300000000606010')])
+  PASS after: QUERY_FORMAT answers x=0 for both
+  PASS the twin's frame is refused by the core, without asking again
+  PASS and the client, already told, is not told again (got [])
+  PASS a NEW connection starts from what the display advertises: x=1 again (the refusal was the previous VM's)
+-- every pair the format gate refuses is TOLD (x=0), once per connection
+  PASS an unadvertised pair's frame is answered with EV_FORMAT x=0 for exactly that pair (got [(0, '0x34325258', '0x300000000606014')])
+  PASS a second frame in it is not answered again
+  PASS a new connection is told again
+-- a block-linear frame spans whole blocks of rows and whole GOBs of pitch (nb_extent.c), through the real validator
+  PASS refused: 60 rows of 8-row blocks occupy 64: a buffer of exactly 60 rows (the linear bound, to the byte) is refused
+  PASS and nothing is said on the wire: a malformed frame is not a format verdict (got [])
+  PASS refused: one byte short of the 64 rows
+  PASS and nothing is said on the wire: a malformed frame is not a format verdict (got [])
+  PASS refused: 57 rows at offset 1024 occupy 64 rows plus the offset
+  PASS and nothing is said on the wire: a malformed frame is not a format verdict (got [])
+  PASS refused: a pitch of 260 is not whole 64-byte GOBs
+  PASS and nothing is said on the wire: a malformed frame is not a format verdict (got [])
+  PASS accepted (reaches the backend): 60 rows in exactly 64 rows of buffer
+  PASS accepted (reaches the backend): 57 rows at offset 1024 in exactly 64 rows + 1024
+  PASS accepted (reaches the backend): 64 rows: whole blocks, no rounding
+  PASS a LINEAR frame of 60 rows of 260 bytes still fits exactly 60 rows
+  PASS an F_SHM frame is bounded as linear, its modifier field unread
+-- an advertised modifier the broker cannot bound is a NO: on the query, and on the frame
+  PASS QUERY_FORMAT answers x=0 although the display advertises it
+  PASS and for its alpha twin
+  PASS while a block-linear modifier it can bound still answers x=1
+  PASS a frame in it is told EV_FORMAT x=0 for exactly that pair (got [(0, '0x34325258', '0x300000000606034')])
+  PASS and is refused in the core, naming the reserved field
+cursor/device tests passed
+python3 test/test_surface.py ./nvkvm-display-broker
+SURFACE_PASS refresh-only=5 duplicate=5 resize=1 reconnect=1
+make: Leaving directory '/data/nvkvm-broker-refresh-20261004/src/broker'

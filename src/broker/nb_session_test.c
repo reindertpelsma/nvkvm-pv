@@ -247,6 +247,13 @@ static void test_line(struct nb_session *s, struct nb_sink *sink,
     case 'p': nb_sink_pointer(sink, a != 0); break;
     case 'c': test_finish_fetch(s->priv, sink, (unsigned)a); break;
     case 's': test_finish_stale_fetch(s->priv, sink); break;
+    case 'm': /* host surface hint: width height refresh_mhz (0 = unknown) */
+        if (a > 0 && b > 0 && f >= 0) {
+            struct nb_test *t = s->priv;
+            t->refresh_mhz = (unsigned)f;
+            nb_sink_surface(sink, (unsigned)a, (unsigned)b, t->refresh_mhz);
+        }
+        break;
     case 'd':
         s->dev_flags = (uint32_t)f;
         s->dev_major = (uint32_t)a;

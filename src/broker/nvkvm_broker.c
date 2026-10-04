@@ -440,7 +440,7 @@ int nb_sink_attach(struct nb_sink *s, int fd)
     r = nb_send_now(fd, &p);
     if (r == 0) {
         p = nb_pkt(s, NVKVM_BROKER_EV_SURFACE,
-                   (int)ss->width, (int)ss->height, 0, 0);
+                   (int)ss->width, (int)ss->height, ss->refresh_mhz, 0);
         r = nb_send_now(fd, &p);
     }
     if (r == 0) {
@@ -832,11 +832,15 @@ void nb_sink_surface(struct nb_sink *s, unsigned w, unsigned h,
     if (w == 0 || h == 0) {
         return;
     }
-    if (s->sess->width == w && s->sess->height == h) {
+    /* A refresh-only host mode change matters to a VMM's virtual vblank even
+     * when the pixel dimensions stay fixed. Cache it for reconnects too. */
+    if (s->sess->width == w && s->sess->height == h &&
+        s->sess->refresh_mhz == refresh_mhz) {
         return;
     }
     s->sess->width = w;
     s->sess->height = h;
+    s->sess->refresh_mhz = refresh_mhz;
     /* w0 carries the host's refresh in MILLIHERTZ, 0 when unknown.  It was
      * a reserved zero, so an older VMM reads it as 'unknown' -- which is
      * what it meant. */

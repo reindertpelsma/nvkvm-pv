@@ -1,0 +1,112 @@
+=== building (make -k) ===
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -o test_objects test_objects.c ../../src/qemu/nvkvm_objects.c ../../src/qemu/nvkvm_handle.c unit_stubs.c -lpthread
+../../src/qemu/nvkvm_objects.c: In function ‘nvkvm_client_free’:
+../../src/qemu/nvkvm_objects.c:191:46: warning: unused parameter ‘session’ [-Wunused-parameter]
+  191 | void nvkvm_client_free(struct nvkvm_session *session,
+      |                        ~~~~~~~~~~~~~~~~~~~~~~^~~~~~~
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -o test_handle test_handle.c ../../src/qemu/nvkvm_handle.c unit_stubs.c -lpthread
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -static -o mock_stub mock_stub.c
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -D_GNU_SOURCE -o test_isolate test_isolate.c ../../src/qemu/nvkvm_isolate.c ../../src/qemu/nvkvm_handle.c unit_stubs.c -lpthread
+../../src/qemu/nvkvm_isolate.c: In function ‘nvkvm_child_park_drm_fds’:
+../../src/qemu/nvkvm_isolate.c:182:24: warning: comparison of integer expressions of different signedness: ‘int’ and ‘unsigned int’ [-Wsign-compare]
+  182 |                 if (fd != NVKVM_DRM_FD(k)) {
+      |                        ^~
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -D_GNU_SOURCE -DNVKVM_TABLES_NO_KVM -o test_tables test_tables.c ../../src/qemu/nvkvm_tables.c -lpthread
+test_tables.c:17:9: warning: ‘_GNU_SOURCE’ redefined
+   17 | #define _GNU_SOURCE
+      |         ^~~~~~~~~~~
+<command-line>: note: this is the location of the previous definition
+/usr/bin/x86_64-linux-gnu-ld.bfd: warning: /tmp/cckm6AVA.o: requires executable stack (because the .note.GNU-stack section is executable)
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -D_GNU_SOURCE -o test_open_scm test_open_scm.c -lpthread
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -o test_ctrl_gate test_ctrl_gate.c
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -o test_nvkms_allowlist test_nvkms_allowlist.c
+awk '/^static void (clamp_inner_params_size|zero_nvos64_rights)/,/^}$/' ../../src/stub/nvkvm_stub.c > stub_sanitize.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_stub_ptr_sanitize test_stub_ptr_sanitize.c
+awk '/NVKVM_KVM_SLOT_POOL_BEGIN/,/NVKVM_KVM_SLOT_POOL_END/' ../../src/qemu/nvkvm_mmap_host.c > kvm_slot_pool.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_kvm_slot test_kvm_slot.c -lpthread
+awk '/NVKVM_STUB_WINDOW_BEGIN/,/NVKVM_STUB_WINDOW_END/' ../../src/stub/nvkvm_stub.c > stub_window.inc
+awk '/NVKVM_WIN_ALLOC_BEGIN/,/NVKVM_WIN_ALLOC_END/' ../../src/qemu/nvkvm_isolate_handlers.c > win_alloc.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_stub_window test_stub_window.c
+awk '/NVKVM_DRM_PARAM_STRUCTS_BEGIN/,/NVKVM_DRM_PARAM_STRUCTS_END/' ../../src/guest/nvkvm_drm.c > drm_param_structs.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_drm_devinfo test_drm_devinfo.c
+awk '/NVKVM_R1_TYPE_DEV_BEGIN/,/NVKVM_R1_TYPE_DEV_END/' ../../src/qemu/nvkvm_isolate_handlers.c > r1_type_dev.inc
+awk '/^#define NVKVM_DEV_UNKNOWN/ { print } \
+     /^static int handle_type_matches_dev/,/^}$/ { print }' ../../src/stub/nvkvm_stub.c > r1_stub_type_dev.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_r1_type_dev test_r1_type_dev.c
+awk '/^bool nvkvm_transport_ready/,/^}$/' ../../src/guest/nvkvm_virtio.c > transport_ready.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -Wno-unused-function -o test_transport_ready test_transport_ready.c
+awk '/NVKVM_RELAY_STATE_HELPERS_BEGIN/,/NVKVM_RELAY_STATE_HELPERS_END/' ../../src/qemu/nvkvm_display_relay.c > relay_state_helpers.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_relay_state test_relay_state.c
+In file included from test_relay_state.c:98:
+relay_state_helpers.inc:91:13: warning: ‘relay_pend_arm’ defined but not used [-Wunused-function]
+   91 | static void relay_pend_arm(NvkvmRelay *r, RelayPend what)
+      |             ^~~~~~~~~~~~~~
+relay_state_helpers.inc:77:13: warning: ‘relay_pend_deadline’ defined but not used [-Wunused-function]
+   77 | static void relay_pend_deadline(void *opaque)
+      |             ^~~~~~~~~~~~~~~~~~~
+relay_state_helpers.inc:64:13: warning: ‘relay_pend_clear’ defined but not used [-Wunused-function]
+   64 | static void relay_pend_clear(NvkvmRelay *r)
+      |             ^~~~~~~~~~~~~~~~
+relay_state_helpers.inc:58:13: warning: ‘relay_want_writable’ defined but not used [-Wunused-function]
+   58 | static bool relay_want_writable(const NvkvmRelay *r)
+      |             ^~~~~~~~~~~~~~~~~~~
+awk '/NVKVM_RELAY_CLIP_BATCH_BEGIN/,/NVKVM_RELAY_CLIP_BATCH_END/' ../../src/qemu/nvkvm_display_relay.c > relay_clip_batch.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_relay_clip test_relay_clip.c
+awk '/NVKVM_RELAY_FD_OWNERSHIP_BEGIN/,/NVKVM_RELAY_FD_OWNERSHIP_END/' ../../src/qemu/nvkvm_display_relay.c > relay_fd_ownership.inc
+awk '/NVKVM_RELAY_CLIP_WIRING_BEGIN/,/NVKVM_RELAY_CLIP_WIRING_END/' ../../src/qemu/nvkvm_display_relay.c > relay_clip_wiring.inc
+awk '/NVKVM_RELAY_WRITABLE_WIRING_BEGIN/,/NVKVM_RELAY_WRITABLE_WIRING_END/' ../../src/qemu/nvkvm_display_relay.c > relay_writable_wiring.inc
+awk '/NVKVM_RELAY_CONNECT_WIRING_BEGIN/,/NVKVM_RELAY_CONNECT_WIRING_END/' ../../src/qemu/nvkvm_display_relay.c > relay_connect_wiring.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -Wno-unused-function -o test_relay_wiring test_relay_wiring.c
+awk '/NVKVM_RELAY_BUFMAP_BEGIN/,/NVKVM_RELAY_BUFMAP_END/' ../../src/qemu/nvkvm_display_relay.c > relay_bufmap.inc
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I. -o test_relay_bufmap test_relay_bufmap.c
+gcc -Wall -Wextra -g -Istubs -I../../src -I../../src/qemu -I../../src/common -I../../src/guest -I../../src/common -o test_uidmap test_uidmap.c -lpthread
+
+=== binaries ===
+  test_uidmap      built
+  test_objects     built
+  test_handle      built
+  test_isolate     built
+  test_tables      built
+  test_open_scm    built
+  test_ctrl_gate   built
+  test_nvkms_allowlist built
+  test_stub_ptr_sanitize built
+  test_kvm_slot    built
+  test_stub_window built
+  test_drm_devinfo built
+  test_r1_type_dev built
+  test_transport_ready built
+  test_relay_state built
+  test_relay_clip  built
+  test_relay_wiring built
+  test_relay_bufmap built
+  mock_stub        built
+
+=== suites ===
+  test_nvkms_allowlist exit=0  618/618 tests passed
+  test_relay_wiring exit=0  22/22 tests passed
+  test_objects     exit=0  20/20 tests passed
+  test_tables      exit=0  17/17 tests passed
+  test_kvm_slot    exit=0  12/12 tests passed
+  test_stub_ptr_sanitize exit=0  17/17 tests passed
+  test_transport_ready exit=0  6/6 tests passed
+  test_relay_bufmap exit=0  12/12 tests passed
+  test_r1_type_dev exit=0  33/33 tests passed
+  test_handle      exit=0  12/12 tests passed
+  test_drm_devinfo exit=0  67/67 tests passed
+  test_relay_clip  exit=0  35/35 tests passed
+  test_relay_state exit=0  23/23 tests passed
+  test_stub_window exit=0  27/27 tests passed
+  test_ctrl_gate   exit=0
+  test_open_scm    exit=0
+  test_uidmap      exit=0
+
+=== test_isolate (known-failing set) ===
+  cases run   : 9 (expected 9)
+  failing now : <none>
+  known-failing: 
+  env-dependent:  (either outcome accepted)
+  compared    : <none>
+
+UNIT SUITE OK — all 17 suites built and ran; 9 isolate cases
+ran with no known failures.

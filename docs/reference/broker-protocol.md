@@ -73,7 +73,7 @@ rejected as an unadvertised fourcc.
 | type | meaning |
 |---|---|
 | `HELLO` 1 | `w0` = protocol version, `w1` = capability bits. Always first. |
-| `SURFACE` 2 | `x`,`y` = the broker's window size. At attach and on every resize. |
+| `SURFACE` 2 | `x`,`y` = the broker's window size; `w0` = host refresh in millihertz (0 if unknown). At attach and when size or refresh changes; identical hints are deduplicated. |
 | `FRAME` 3 | the display is ready for another frame (wl frame callback / `PresentCompleteNotify`) |
 | `RELEASE` 4 | `w0`,`w1` = low,high 32 bits of the buffer id (its dma-buf inode) — no longer being read |
 | `KEY` 5 | `x` = Linux evdev keycode, `y` = down |
@@ -274,4 +274,3 @@ explanation. Wayland has no equivalent: `create_immed` reports failure without
 a round trip, which is why it is used in preference to `create`.
 
 ---
-

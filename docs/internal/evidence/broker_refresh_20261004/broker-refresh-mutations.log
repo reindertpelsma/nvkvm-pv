@@ -1,0 +1,19 @@
+Traceback (most recent call last):
+  File "/data/nvkvm-broker-refresh-20261004/src/broker/test/test_surface.py", line 44, in <module>
+    main()
+    ~~~~^^
+  File "/data/nvkvm-broker-refresh-20261004/src/broker/test/test_surface.py", line 29, in main
+    assert got == [(width, height, hz)], got
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: []
+MUTATION size-only guard: rc=1
+Traceback (most recent call last):
+  File "/data/nvkvm-broker-refresh-20261004/src/broker/test/test_surface.py", line 44, in <module>
+    main()
+    ~~~~^^
+  File "/data/nvkvm-broker-refresh-20261004/src/broker/test/test_surface.py", line 37, in main
+    assert got == [(1024, 768, 60000)], got
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: [(1024, 768, 0)]
+MUTATION forget rate on reconnect: rc=1
+SURFACE_PASS refresh-only=5 duplicate=5 resize=1 reconnect=1

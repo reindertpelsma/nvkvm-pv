@@ -6,6 +6,22 @@ hardware and what has not. None of it is needed to *use* the broker — for
 that see [`src/broker/README.md`](../../src/broker/README.md) — but all of it
 is needed to change it safely.
 
+**2026-10-04 — refresh-only surface notifications, candidate branch.** The
+core previously discarded a host refresh change whenever width and height were
+unchanged. It also sent zero refresh on reconnect. This kept a VMM's virtual
+vblank at the previous host rate. The session now retains the last refresh hint,
+deduplicates the complete `(width, height, refresh_mhz)` tuple, and includes that
+rate in a new connection's initial `SURFACE`. Zero still means unknown; no wire
+layout or capability changes. X11 continues to report unknown refresh.
+
+The real-socket test `src/broker/test/test_surface.py` checks five same-size rate
+changes, repeated identical hints, a resize and reconnect. Restoring either the
+old size-only guard or the zero-on-reconnect behavior makes it fail. Broker
+`make check`, all 17 unit suites, QEMU syntax with both compilers, uncached ABI
+parity and ShellCheck 0.10.0 pass locally; logs are in
+`evidence/broker_refresh_20261004/`. Hardware verification with kayfabe is pending.
+This does not establish the separate nvkvm VMM's hardware merge bar.
+
 Wire protocol lives in
 [`../reference/broker-protocol.md`](../reference/broker-protocol.md).
 Field findings from the display bring-up are in
@@ -929,4 +945,3 @@ QEMU side: `src/qemu/nvkvm_display_relay.{c,h}`, the hook in
 `patches/0011` (QAPI `DisplayType`) and `patches/0012` (one meson line).
 
 ---
-

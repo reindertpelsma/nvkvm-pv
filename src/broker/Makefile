@@ -212,6 +212,7 @@ check: all test-utf8 test-cursor test-extent
 	python3 test/test_clipboard.py ./$(BIN)
 	python3 test/test_lifecycle.py ./$(BIN)
 	python3 test/test_cursor.py ./$(BIN)
+	python3 test/test_surface.py ./$(BIN)
 
 # Keep the sanitizer invocation reproducible locally and in CI.  A clean
 # rebuild matters here: mixing instrumented and ordinary objects links fine

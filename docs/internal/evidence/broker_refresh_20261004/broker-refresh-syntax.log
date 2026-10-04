@@ -1,0 +1,18 @@
+  nvkvm_display_relay.c        ok
+  nvkvm_handle.c               ok
+  nvkvm_isolate.c              ok
+  nvkvm_isolate_handlers.c     ok
+  nvkvm_mmap_host.c            skip (needs real QEMU headers)
+  nvkvm_objects.c              ok
+  nvkvm_present_egl.c          NOT COVERED (body is behind CONFIG_OPENGL NVKVM_QEMU_GRAPHICS, undefined here)
+  nvkvm_tables.c               ok
+  nvkvm_udmabuf.c              ok
+  virtio_nvgpu.c               skip (needs real QEMU headers)
+  virtio_nvgpu_pci.c           skip (needs real QEMU headers)
+
+QEMU SYNTAX CHECK OK — 7 file(s) parsed clean under 15.
+
+  NOT COVERED, and not counted above -- nvkvm_present_egl.c
+  Their bodies are conditioned out (CONFIG_OPENGL / NVKVM_QEMU_GRAPHICS),
+  so this gate says NOTHING about them. Compile them against a configured
+  QEMU tree before treating the display path as reviewed.
