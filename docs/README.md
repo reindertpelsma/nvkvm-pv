@@ -16,6 +16,7 @@ value is), or rationale (why it is that way).
 | [Build](howto/build.md) | the isolate stub, the patched QEMU, the guest kernel module |
 | [Run a guest](howto/run.md) | image preparation, the QEMU command line, first bring-up, what to check |
 | [Stage the guest NVIDIA userspace](howto/stage-guest-libraries.md) | `make_host_bundle.sh` on the host, `stage_guest_libs.sh` in the guest, and why the failures here are silent |
+| [Live-migrate a guest](howto/live-migration.md) | releasing the GPU with cuda-checkpoint, `NVKVM_MIGRATABLE=1` (no 9p at migration time), what QEMU checks and refuses, the limits |
 | [Add a driver version](howto/add-a-driver-version.md) | measuring a new ABI profile row and what else may need to change |
 
 ## Reference

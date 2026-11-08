@@ -318,6 +318,8 @@ write_files:
       [Service]
       Type=oneshot
       RemainAfterExit=yes
+      # Optional settings, e.g. NVKVM_MIGRATABLE=1 (see the last ExecStart).
+      EnvironmentFile=-/etc/nvkvm/guest.conf
       # The 9p source mount is deliberately read-only.  Build from a private
       # guest directory so loading the module never grants guest root a write
       # path into host-owned source.  mktemp makes the cleanup target concrete
@@ -336,6 +338,19 @@ write_files:
       # policy was "ignore everything".  It now exits 3 for the CUDA-critical
       # set, so tolerate 0 and 2 and let 3 fail the unit.
       ExecStart=/bin/bash -c 'if ls /opt/nvidia-host/libcuda.so.* >/dev/null 2>&1; then NVKVM_LINK_LIBS=1 bash /mnt/nvkvm/scripts/stage_guest_libs.sh /opt/nvidia-host; elif ls -d /mnt/nvkvm/host-libs-* >/dev/null 2>&1; then bash /mnt/nvkvm/scripts/stage_guest_libs.sh; fi; rc=$?; if [ $rc -eq 3 ]; then echo "nvkvm-guest: CUDA-critical libraries did not stage; see stage_guest_libs output above" >&2; exit 3; fi; exit 0'
+      # NVKVM_MIGRATABLE=1 (in /etc/nvkvm/guest.conf): leave NO 9p share mounted
+      # once the GPU is up, because QEMU refuses to live-migrate a guest with a
+      # mounted 9p export.  The host bundle is copied once per driver version to
+      # /var/lib/nvkvm/host-libs-<version> -- outside every package-managed path,
+      # so the property the links above exist for (a guest apt upgrade has no
+      # driver library to replace) still holds -- and bind-mounted read-only over
+      # /opt/nvidia-host, where those links point.  A process that already uses the
+      # 9p libraries (a service that started first) makes the unmount busy: the share
+      # is then detached lazily, new programs get the local copy, and the 9p device
+      # numbers go to /run/nvkvm/9p-devs so nvkvm-migrate-guest drain can name the
+      # processes that must restart before QEMU will migrate the VM.  Ordering such
+      # services After=nvkvm-guest.service avoids it.  See docs/howto/live-migration.md.
+      ExecStart=/bin/bash -c 'if [ "x$NVKVM_MIGRATABLE" = x1 ]; then v=unchanged; busy=; mkdir -p /run/nvkvm; : > /run/nvkvm/9p-devs; if mountpoint -q /opt/nvidia-host && [ "$(findmnt -no FSTYPE /opt/nvidia-host)" = 9p ]; then v=$(ls /opt/nvidia-host/libcuda.so.*.* 2>/dev/null | sed -n "s|.*/libcuda.so.||p" | head -1); [ -n "$v" ] || { echo "nvkvm-guest: no libcuda.so.<version> in /opt/nvidia-host" >&2; exit 1; }; d=/var/lib/nvkvm/host-libs-$v; if [ ! -d "$d" ]; then mkdir -p /var/lib/nvkvm && rm -rf -- "$d.tmp" && cp -a /opt/nvidia-host "$d.tmp" && mv "$d.tmp" "$d" || exit 1; fi; for o in /var/lib/nvkvm/host-libs-*; do [ "$o" = "$d" ] || rm -rf -- "$o"; done; mountpoint -d /opt/nvidia-host >> /run/nvkvm/9p-devs; umount /opt/nvidia-host 2>/dev/null || { umount -l /opt/nvidia-host || exit 1; busy="$busy /opt/nvidia-host"; }; mount --bind "$d" /opt/nvidia-host && mount -o remount,bind,ro /opt/nvidia-host || exit 1; fi; if mountpoint -q /mnt/nvkvm && [ "$(findmnt -no FSTYPE /mnt/nvkvm)" = 9p ]; then mountpoint -d /mnt/nvkvm >> /run/nvkvm/9p-devs; umount /mnt/nvkvm 2>/dev/null || { umount -l /mnt/nvkvm && busy="$busy /mnt/nvkvm"; }; fi; echo "nvkvm-guest: migratable: host libraries local ($v), 9p shares mounted: $(mount -t 9p | wc -l)"; [ -z "$busy" ] || echo "nvkvm-guest: still in use from before the switch:$busy. QEMU will not migrate this VM until the processes using them restart (nvkvm-migrate-guest drain names them)."; fi; exit 0'
       [Install]
       WantedBy=multi-user.target
 
