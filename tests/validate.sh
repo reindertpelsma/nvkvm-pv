@@ -2839,6 +2839,8 @@ reg_invariant host_register_cow_fork cow_after_fork.c \
     "child registered inherited COW heap; parent's copy intact"
 reg_invariant host_register_two_process_share fork_both_register.c \
     "two processes each register the same MAP_SHARED buffer; both see both writes"
+reg_invariant host_register_survives_fd_close register_survives_fd_close.c \
+    "registered memory keeps its contents when the GPU fds close (as cuda-checkpoint does)"
 
 # --- classify skips ----------------------------------------------------------
 UNEXPECTED_SKIPS=""
