@@ -56,6 +56,7 @@
 
 /* Bring in QEMU's virtio helpers */
 #include "hw/virtio/virtio.h"
+#include "qemu/notify.h"     /* NotifierWithReturn (live migration) */
 #include "hw/pci/pci.h"
 #include "qemu/iov.h"
 /* exec/memory.h (for MemoryRegion) is transitively included via virtio.h */
@@ -414,6 +415,27 @@ typedef struct VirtIONvgpu {
 	 * free of ui/console.h.
 	 */
 	void               *present_ctx;
+
+	/*
+	 * Live migration.  Only a QUIESCED device migrates: zero GPU sessions and
+	 * zero forwarded requests in flight (see nvkvm_quiesced()).  Everything
+	 * else on this struct is then either session-scoped (empty) or rebuilt at
+	 * realize from the target host, so the stream carries only the virtio
+	 * state plus the mig_* snapshot below, which travels in an early section
+	 * (sent before any RAM) so the target can refuse while the source still
+	 * runs.
+	 */
+	NotifierWithReturn  migration_notifier;
+	uint32_t            inflight_works;  /* thread-pool works not yet done (atomic) */
+	uint32_t            mig_num_gpus;
+	uint32_t            mig_graphics;
+	uint64_t            mig_slot_size;
+	uint64_t            mig_block_base;
+	uint64_t            mig_sparse_size;
+	uint64_t            mig_shm_base;
+	uint64_t            mig_shm_len;
+	uint64_t            mig_cfg_flags;
+	uint8_t             mig_driver_version[64];
 } VirtIONvgpu;
 
 #define TYPE_VIRTIO_NVGPU  "virtio-nvgpu-device"

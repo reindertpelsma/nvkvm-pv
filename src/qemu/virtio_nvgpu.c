@@ -44,6 +44,9 @@
 #include "qemu/aio.h"
 #include "system/memory.h"
 #include "system/address-spaces.h"
+#include "migration/vmstate.h"   /* live migration: device state */
+#include "migration/misc.h"      /* live migration: setup notifier */
+#include "qemu/atomic.h"
 
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -736,6 +739,7 @@ static int nvkvm_ioctl_work_fn(void *opaque)
 static void nvkvm_ioctl_work_done(void *opaque, int ret)
 {
 	struct nvkvm_ioctl_work *w = opaque;
+	qatomic_dec(&w->nv->inflight_works);   /* live migration */
 	struct { struct nvkvm_hdr h;
 		 struct nvkvm_resp_ioctl_on_isolate r; } out;
 	out.h = w->hdr;
@@ -774,6 +778,7 @@ static int nvkvm_enter_loop_work_fn(void *opaque)
 static void nvkvm_enter_loop_work_done(void *opaque, int ret)
 {
 	struct nvkvm_enter_loop_work *w = opaque;
+	qatomic_dec(&w->nv->inflight_works);   /* live migration */
 	struct { struct nvkvm_hdr h;
 		 struct nvkvm_resp_enter_loop r; } out;
 	out.h = w->hdr;
@@ -1054,6 +1059,7 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 			w->hdr  = hdr;
 			iov_to_buf(elem->out_sg, elem->out_num, sizeof(hdr),
 				   &w->req, sizeof(w->req));
+			qatomic_inc(&nv->inflight_works);   /* live migration */
 			thread_pool_submit_aio(nvkvm_enter_loop_work_fn, w,
 					       nvkvm_enter_loop_work_done, w);
 			continue;
@@ -1112,6 +1118,7 @@ static void nvkvm_tx_handler(VirtIODevice *vdev, VirtQueue *vq)
 				if (!w->aux_buf)
 					w->req.aux_size = 0;
 			}
+			qatomic_inc(&nv->inflight_works);   /* live migration */
 			thread_pool_submit_aio(nvkvm_ioctl_work_fn, w,
 					       nvkvm_ioctl_work_done, w);
 			continue;  /* elem now owned by the work item */
@@ -1312,6 +1319,195 @@ static char *nvkvm_get_isolate_mode_active(Object *obj, Error **errp)
 	return g_strdup(nv->isolate_mode_active ? nv->isolate_mode_active
 					        : "unknown");
 }
+
+/* ── Live migration ─────────────────────────────────────────────────────────
+ *
+ * GPU state lives on the HOST (VRAM, RM objects, the per-session isolates and
+ * their KVM memslots) and cannot be carried in a migration stream.  So only a
+ * quiesced device migrates: no GPU session open and no forwarded request in
+ * flight.  A guest gets there by releasing the GPU, e.g. by checkpointing
+ * every CUDA process with cuda-checkpoint (which copies VRAM into process
+ * memory and closes the /dev/nvidia* fds); after the move it restores them
+ * onto the target's GPU (cuda-checkpoint --device-map old=new).
+ *
+ * With nothing session-scoped left, the device's remaining state is the
+ * virtio transport (queues, features, status, PCI BARs/MSI-X), which
+ * VMSTATE_VIRTIO_DEVICE carries, so the guest driver keeps running across
+ * the move without re-probing.  An early section (sent before RAM) carries
+ * a snapshot of the source's host-dependent values; the target refuses the
+ * migration if its own differ, instead of handing the guest a layout or ABI
+ * it did not negotiate, and it does so while the source is still running.
+ */
+static unsigned nvkvm_live_sessions(VirtIONvgpu *nv)
+{
+	struct nvkvm_session *s;
+	unsigned n = 0;
+
+	pthread_mutex_lock(&nv->sessions_lock);
+	TAILQ_FOREACH(s, &nv->sessions, link)
+		n++;
+	pthread_mutex_unlock(&nv->sessions_lock);
+	return n;
+}
+
+static uint32_t nvkvm_host_gpu_count(void)
+{
+	char path[32];
+	uint32_t n = 0;
+
+	for (int i = 0; i < 16; i++) {
+		snprintf(path, sizeof(path), "/dev/nvidia%d", i);
+		if (access(path, F_OK) == 0)
+			n++;
+	}
+	return n;
+}
+
+static bool nvkvm_quiesced(VirtIONvgpu *nv, Error **errp)
+{
+	unsigned sessions = nvkvm_live_sessions(nv);
+	unsigned works = qatomic_read(&nv->inflight_works);
+
+	if (sessions || works) {
+		error_setg(errp, "virtio-nvgpu: %u GPU session(s) open and %u "
+			   "request(s) in flight; GPU state cannot be migrated. "
+			   "Release the GPU in the guest first (checkpoint every "
+			   "GPU process, e.g. with cuda-checkpoint).",
+			   sessions, works);
+		return false;
+	}
+	return true;
+}
+
+static int nvkvm_migration_notify(NotifierWithReturn *notifier,
+				  MigrationEvent *e, Error **errp)
+{
+	VirtIONvgpu *nv = container_of(notifier, VirtIONvgpu,
+				       migration_notifier);
+
+	if (e->type == MIG_EVENT_SETUP && !nvkvm_quiesced(nv, errp))
+		return -EBUSY;
+	return 0;
+}
+
+/* Early section (.early_setup): sent at migration START, before any RAM, so a
+ * target that cannot host this device fails the migration while the source
+ * still runs.  (A rejected load at switchover is fatal: by then the source
+ * has been stopped.)  Only values fixed at realize are compared; the window
+ * base the guest programmed into the BAR travels in the PCI config, and the
+ * target installs its memslot lazily on first use (nvkvm_sparse_ensure). */
+static bool virtio_nvgpu_early_pre_save(void *opaque, Error **errp)
+{
+	VirtIONvgpu *nv = opaque;
+
+	nv->mig_num_gpus    = nvkvm_host_gpu_count();
+	nv->mig_graphics    = nv->graphics ? 1 : 0;
+	nv->mig_slot_size   = nv->slot_size;
+	nv->mig_block_base  = nv->gpa.block_base;
+	nv->mig_sparse_size = nv->gpa.sparse_size;
+	nv->mig_shm_base    = le64_to_cpu(nv->config_space.shm_base);
+	nv->mig_shm_len     = le64_to_cpu(nv->config_space.shm_len);
+	nv->mig_cfg_flags   = le64_to_cpu(nv->config_space.flags);
+	memset(nv->mig_driver_version, 0, sizeof(nv->mig_driver_version));
+	memcpy(nv->mig_driver_version, nv->driver_version,
+	       MIN(sizeof(nv->mig_driver_version) - 1,
+		   strnlen(nv->driver_version, sizeof(nv->driver_version))));
+	return true;
+}
+
+static bool virtio_nvgpu_early_post_load(void *opaque, int version_id,
+					 Error **errp)
+{
+	VirtIONvgpu *nv = opaque;
+	char src_drv[sizeof(nv->mig_driver_version) + 1] = { 0 };
+	uint32_t gpus = nvkvm_host_gpu_count();
+
+	memcpy(src_drv, nv->mig_driver_version, sizeof(nv->mig_driver_version));
+	if (strcmp(src_drv, nv->driver_version) != 0) {
+		error_setg(errp, "virtio-nvgpu: source host NVIDIA driver %s, this "
+			   "host %s; the guest's userspace must match the host "
+			   "driver", src_drv, nv->driver_version);
+		return false;
+	}
+	if (nv->mig_num_gpus != gpus) {
+		error_setg(errp, "virtio-nvgpu: source host exposed %u GPU(s), "
+			   "this host has %u", nv->mig_num_gpus, gpus);
+		return false;
+	}
+	if (nv->mig_graphics != (nv->graphics ? 1u : 0u)) {
+		error_setg(errp, "virtio-nvgpu: graphics=%s on the source, %s here",
+			   nv->mig_graphics ? "on" : "off",
+			   nv->graphics ? "on" : "off");
+		return false;
+	}
+	if (nv->mig_slot_size != nv->slot_size ||
+	    nv->mig_block_base != nv->gpa.block_base ||
+	    nv->mig_sparse_size != nv->gpa.sparse_size ||
+	    nv->mig_shm_base != le64_to_cpu(nv->config_space.shm_base) ||
+	    nv->mig_shm_len != le64_to_cpu(nv->config_space.shm_len) ||
+	    nv->mig_cfg_flags != le64_to_cpu(nv->config_space.flags)) {
+		error_setg(errp, "virtio-nvgpu: GPA layout differs from the source "
+			   "(block 0x%" PRIx64 "/0x%" PRIx64 ", sparse 0x%" PRIx64
+			   "/0x%" PRIx64 ", shm 0x%" PRIx64 "/0x%" PRIx64 "); "
+			   "check that both hosts have the same MAXPHYADDR and the "
+			   "VM the same RAM size and phys-bits",
+			   nv->mig_block_base, nv->gpa.block_base,
+			   nv->mig_sparse_size, nv->gpa.sparse_size,
+			   nv->mig_shm_base,
+			   (uint64_t)le64_to_cpu(nv->config_space.shm_base));
+		return false;
+	}
+	return true;
+}
+
+static const VMStateDescription vmstate_virtio_nvgpu_early = {
+	.name = "virtio-nvgpu-early",
+	.version_id = 1,
+	.minimum_version_id = 1,
+	.early_setup = true,
+	.pre_save_errp = virtio_nvgpu_early_pre_save,
+	.post_load_errp = virtio_nvgpu_early_post_load,
+	.fields = (const VMStateField[]) {
+		VMSTATE_UINT32(mig_num_gpus, VirtIONvgpu),
+		VMSTATE_UINT32(mig_graphics, VirtIONvgpu),
+		VMSTATE_UINT64(mig_slot_size, VirtIONvgpu),
+		VMSTATE_UINT64(mig_block_base, VirtIONvgpu),
+		VMSTATE_UINT64(mig_sparse_size, VirtIONvgpu),
+		VMSTATE_UINT64(mig_shm_base, VirtIONvgpu),
+		VMSTATE_UINT64(mig_shm_len, VirtIONvgpu),
+		VMSTATE_UINT64(mig_cfg_flags, VirtIONvgpu),
+		VMSTATE_BUFFER(mig_driver_version, VirtIONvgpu),
+		VMSTATE_END_OF_LIST()
+	},
+};
+
+/* Device section (inside the virtio state, at switchover): the guest keeps
+ * running during precopy and may have opened a session since
+ * MIG_EVENT_SETUP.  Failing here aborts the migration; the source resumes. */
+static bool virtio_nvgpu_pre_save(void *opaque, Error **errp)
+{
+	return nvkvm_quiesced(opaque, errp);
+}
+
+static const VMStateDescription vmstate_virtio_nvgpu_device = {
+	.name = "virtio-nvgpu-device",
+	.version_id = 1,
+	.minimum_version_id = 1,
+	.pre_save_errp = virtio_nvgpu_pre_save,
+	.fields = (const VMStateField[]) {
+		VMSTATE_END_OF_LIST()
+	},
+};
+
+static const VMStateDescription vmstate_virtio_nvgpu = {
+	.name = "virtio-nvgpu",
+	.version_id = 1,
+	.minimum_version_id = 1,
+	.fields = (const VMStateField[]) {
+		VMSTATE_VIRTIO_DEVICE,
+		VMSTATE_END_OF_LIST()
+	},
+};
 
 static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 {
@@ -1621,11 +1817,19 @@ static void virtio_nvgpu_device_realize(DeviceState *dev, Error **errp)
 	 */
 	if (nv->graphics)
 		nvkvm_present_console_init(dev, nv);
+
+	/* Live migration: refuse at setup unless quiesced, and send the
+	 * compatibility snapshot ahead of RAM (see "Live migration" above). */
+	migration_add_notifier(&nv->migration_notifier, nvkvm_migration_notify);
+	vmstate_register_any(VMSTATE_IF(dev), &vmstate_virtio_nvgpu_early, nv);
 }
 
 static void virtio_nvgpu_device_unrealize(DeviceState *dev)
 {
 	VirtIONvgpu *nv = VIRTIO_NVGPU(dev);
+
+	migration_remove_notifier(&nv->migration_notifier);
+	vmstate_unregister(VMSTATE_IF(dev), &vmstate_virtio_nvgpu_early, nv);
 
 	/* #102: close the present console before tearing down the device. */
 	nvkvm_present_console_fini(nv);
@@ -1789,6 +1993,7 @@ static void nvkvm_gpu_class_init(ObjectClass *klass, const void *data)
 	k->revision  = 0xa1;
 	k->class_id  = PCI_CLASS_DISPLAY_VGA;
 	dc->desc     = "nvkvm emulated NVIDIA GPU PCI identity (no BARs, no MMIO, no DMA)";
+	dc->vmsd     = &vmstate_pci_device;   /* live migration: PCI config space */
 	set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
@@ -1833,6 +2038,10 @@ static void virtio_nvgpu_class_init(ObjectClass *klass, const void *data)
 	vdc->unrealize   = virtio_nvgpu_device_unrealize;
 	vdc->get_features = nvkvm_get_features;
 	vdc->get_config   = nvkvm_get_config;
+
+	/* Live migration of a quiesced device (see "Live migration" above). */
+	dc->vmsd  = &vmstate_virtio_nvgpu;
+	vdc->vmsd = &vmstate_virtio_nvgpu_device;
 }
 
 static void virtio_nvgpu_register_types(void)
