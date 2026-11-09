@@ -674,6 +674,7 @@ void nvkvm_cpu_pages_reap_stale(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_refresh(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_writeback(struct nvkvm_fd_ctx *ctx);
 void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx);
+void nvkvm_cpu_pages_pending_free_all(void);
 /* Eagerly migrate every guest page in [gva, gva+len) onto memfds shared with
  * the isolate.  Used by NV_ESC_RM_ALLOC_MEMORY hClass=NV01_MEMORY_SYSTEM_OS_-
  * DESCRIPTOR so the kernel's pin_user_pages on the stub's mm finds memfd

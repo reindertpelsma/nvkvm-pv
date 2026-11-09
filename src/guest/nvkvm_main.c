@@ -3490,6 +3490,7 @@ static void __exit nvkvm_exit(void)
 	nvkvm_hostfile_exit();
 	unregister_devices();
 	unregister_virtio_driver(&nvkvm_virtio_driver);
+	nvkvm_cpu_pages_pending_free_all();
 	idr_destroy(&nvkvm.sessions_idr);
 	pr_info("nvkvm: module unloaded\n");
 }

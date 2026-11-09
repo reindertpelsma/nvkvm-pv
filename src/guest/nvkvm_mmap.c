@@ -30,6 +30,7 @@
 #include <linux/list.h>
 #include <linux/pfn.h>
 #include <linux/highmem.h>
+#include <linux/uaccess.h>   /* copy_from_user_nofault() - restore on close */
 #include <linux/gfp.h>
 #include <linux/pagemap.h>
 #include <linux/pgtable.h>
@@ -1302,18 +1303,200 @@ put:
  * the buffer still mapped), then from the isolate, closes the handle, and
  * releases the pin.
  */
+/*
+ * Registered host memory must survive the fd close.
+ *
+ * nvkvm_cpu_pages_migrate_range() moves a registered buffer's pages into a
+ * window memfd and retypes the VMA to VM_PFNMAP; the original pages are freed.
+ * When the fd closes, nvkvm_cpu_page_release() zaps those window PTEs (audit
+ * H-9, required so the recycled GPA cannot alias) and leaves the VMA an EMPTY
+ * VM_PFNMAP shell.  The process's buffer then reads back as zeros, and a later
+ * re-registration of the same address fails in get_user_pages_fast() with
+ * -EFAULT.  cuda-checkpoint closes every /dev/nvidia* fd while keeping host
+ * allocations, so checkpoint silently loses pinned memory and restore fails.
+ *
+ * Fix: before the release, copy each range out (page faults disabled: the
+ * window PTEs are present, and this must never sleep on mmap_lock in case a
+ * caller holds it).  Release exactly as before, so the H-9 order is unchanged.
+ * Then undo the retype of each VMA that has no window PTEs left and copy the
+ * data back in (that copy faults in fresh anon / shmem pages).
+ *
+ * A VMA can only be retyped once NO fd still maps window pages into it, and
+ * a process holds several fds whose registrations can share one VMA (adjacent
+ * same-flag VMAs merge).  So a range that cannot be restored yet stays on a
+ * module-wide pending list, keyed by mm, and is retried at every later close
+ * of that mm (the last one always succeeds) and before any re-registration
+ * in it.  It is dropped only once restored, once its mm has exited, or when
+ * its VMA was replaced.
+ *
+ * Only for the address space of the closing task (the normal fput task_work
+ * path).  At process exit current->mm is NULL, and a foreign mm cannot be
+ * touched with copy_*_user, so those keep the old behavior.
+ */
+struct nvkvm_cpu_restore {
+	struct mm_struct *mm;      /* mmgrab()ed */
+	unsigned long     gva;
+	unsigned long     len;
+	void             *buf;
+	struct list_head  list;
+};
+
+static LIST_HEAD(nvkvm_pending_restores);
+static DEFINE_MUTEX(nvkvm_pending_lock);
+
+enum nvkvm_restore_result { NVKVM_RESTORE_DONE, NVKVM_RESTORE_BUSY, NVKVM_RESTORE_GONE };
+
+static enum nvkvm_restore_result
+nvkvm_cpu_pages_restore_one(struct nvkvm_cpu_restore *rs)
+{
+	struct mm_struct *mm = rs->mm;
+	struct vm_area_struct *vma;
+	unsigned long a, end = rs->gva + rs->len;
+	enum nvkvm_restore_result res = NVKVM_RESTORE_GONE;
+
+	if (!mmget_not_zero(mm))
+		return NVKVM_RESTORE_GONE;          /* the process has exited */
+	mmap_write_lock(mm);
+	vma = find_vma(mm, rs->gva);
+	if (vma && vma->vm_start <= rs->gva && vma->vm_end >= end) {
+		if (vma->vm_flags & VM_PFNMAP) {
+			res = NVKVM_RESTORE_DONE;
+			for (a = vma->vm_start; a < vma->vm_end; a += PAGE_SIZE)
+				if (nvkvm_gva_pfn(mm, a)) { res = NVKVM_RESTORE_BUSY; break; }
+			if (res == NVKVM_RESTORE_DONE) {
+				vma_start_write(vma);
+				vm_flags_clear(vma, VM_PFNMAP | VM_IO |
+					       VM_DONTEXPAND | VM_DONTDUMP);
+				if (!(vma->vm_flags & VM_SHARED))
+					vm_flags_set(vma, VM_MAYWRITE);
+				vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+			}
+		} else {
+			res = NVKVM_RESTORE_DONE;   /* an earlier entry already retyped it */
+		}
+	}
+	mmap_write_unlock(mm);
+
+	if (res == NVKVM_RESTORE_DONE &&
+	    copy_to_user((void __user *)rs->gva, rs->buf, rs->len))
+		pr_warn("nvkvm: restore: copy back to 0x%lx+0x%lx faulted\n",
+			rs->gva, rs->len);
+	else if (res == NVKVM_RESTORE_GONE)
+		pr_warn("nvkvm: restore: 0x%lx+0x%lx no longer maps the registered range; not restored\n",
+			rs->gva, rs->len);
+	mmput(mm);
+	return res;
+}
+
+/* Retry every pending restore for the CURRENT task's mm.  No lock is held
+ * across a restore (it takes mmap_lock and may fault), so this mm's entries
+ * are moved to a private list first; those still busy go back. */
+static void nvkvm_cpu_pages_restore_pending(void)
+{
+	struct mm_struct *mm = current->mm;
+	struct nvkvm_cpu_restore *rs, *tmp;
+	unsigned long restored = 0;
+	LIST_HEAD(mine);
+	LIST_HEAD(busy);
+
+	if (!mm)
+		return;
+	mutex_lock(&nvkvm_pending_lock);
+	list_for_each_entry_safe(rs, tmp, &nvkvm_pending_restores, list)
+		if (rs->mm == mm)
+			list_move_tail(&rs->list, &mine);
+	mutex_unlock(&nvkvm_pending_lock);
+
+	list_for_each_entry_safe(rs, tmp, &mine, list) {
+		enum nvkvm_restore_result r = nvkvm_cpu_pages_restore_one(rs);
+
+		if (r == NVKVM_RESTORE_BUSY) {
+			list_move_tail(&rs->list, &busy);
+			continue;
+		}
+		if (r == NVKVM_RESTORE_DONE)
+			restored += rs->len;
+		list_del(&rs->list);
+		mmdrop(rs->mm);
+		kvfree(rs->buf);
+		kfree(rs);
+	}
+	if (!list_empty(&busy)) {
+		mutex_lock(&nvkvm_pending_lock);
+		list_splice_tail(&busy, &nvkvm_pending_restores);
+		mutex_unlock(&nvkvm_pending_lock);
+	}
+	if (restored)
+		pr_info("nvkvm: restore: returned %lu KiB of registered host memory to the process\n",
+			restored >> 10);
+}
+
+/* Module unload: nothing can still be waiting on a process's ranges. */
+void nvkvm_cpu_pages_pending_free_all(void)
+{
+	struct nvkvm_cpu_restore *rs, *tmp;
+
+	mutex_lock(&nvkvm_pending_lock);
+	list_for_each_entry_safe(rs, tmp, &nvkvm_pending_restores, list) {
+		list_del(&rs->list);
+		mmdrop(rs->mm);
+		kvfree(rs->buf);
+		kfree(rs);
+	}
+	mutex_unlock(&nvkvm_pending_lock);
+}
+
 void nvkvm_cpu_pages_free(struct nvkvm_fd_ctx *ctx)
 {
 	struct nvkvm_cpu_page *cp, *tmp;
+	struct nvkvm_cpu_restore *rs;
+	struct mm_struct *mm = current->mm;
 	LIST_HEAD(to_free);
+	LIST_HEAD(saved);
 	__u32 isolate_id = ctx->session ? ctx->session->isolate_id : 0;
 
 	mutex_lock(&ctx->cpu_pages_lock);
 	list_splice_init(&ctx->cpu_pages, &to_free);
 	mutex_unlock(&ctx->cpu_pages_lock);
 
+	if (mm) {
+		list_for_each_entry(cp, &to_free, list) {
+			if (cp->page || cp->mm != mm || !cp->length)
+				continue;
+			rs = kmalloc(sizeof(*rs), GFP_KERNEL);
+			if (!rs)
+				continue;
+			rs->buf = kvmalloc(cp->length, GFP_KERNEL);
+			if (!rs->buf) {
+				kfree(rs);
+				continue;
+			}
+			if (copy_from_user_nofault(rs->buf,
+						   (const void __user *)cp->gva,
+						   cp->length)) {
+				pr_warn("nvkvm: restore: could not save 0x%lx+0x%lx\n",
+					cp->gva, cp->length);
+				kvfree(rs->buf);
+				kfree(rs);
+				continue;
+			}
+			mmgrab(mm);
+			rs->mm  = mm;
+			rs->gva = cp->gva;
+			rs->len = cp->length;
+			list_add_tail(&rs->list, &saved);
+		}
+	}
+
 	list_for_each_entry_safe(cp, tmp, &to_free, list)
 		nvkvm_cpu_page_release(cp, isolate_id);
+
+	if (!list_empty(&saved)) {
+		mutex_lock(&nvkvm_pending_lock);
+		list_splice_tail(&saved, &nvkvm_pending_restores);
+		mutex_unlock(&nvkvm_pending_lock);
+	}
+	nvkvm_cpu_pages_restore_pending();
 }
 
 void nvkvm_mmap_release_fd(struct nvkvm_fd_ctx *ctx)
@@ -2031,6 +2214,11 @@ int nvkvm_cpu_pages_migrate_range(struct nvkvm_fd_ctx *ctx,
 	 * against the first and inherits its memory: the GPU then reads the
 	 * freed buffer's bytes.  See nvkvm_cpu_page_entry_live(). */
 	nvkvm_cpu_pages_reap_stale(ctx);
+
+	/* A range given up by an earlier fd close may still be waiting to be
+	 * returned to this process (see "Registered host memory must survive
+	 * the fd close"); return it first so the pin below sees ordinary memory. */
+	nvkvm_cpu_pages_restore_pending();
 
 	mutex_lock(&ctx->cpu_pages_lock);
 	list_for_each_entry(cpdup, &ctx->cpu_pages, list)
